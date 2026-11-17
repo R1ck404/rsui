@@ -1,0 +1,151 @@
+//! A trace file: what was kept about an app's frames and state, saved to hand to someone or attach to a bug, and opened
+//! again with `rsui-tsx --view`, which shows it the same way wherever it's opened.
+//!
+//! It's JSON, so anything can read it too: `frames` each with what was carried out and what rendered and why, `history`
+//! with each change of state, and `summary` as `profile` says it.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use rsui::{App, FrameRecord};
+use rsui::runtime::Cause;
+use serde_json::{Value, json};
+
+/// What it says it is, and which version of what's in it.
+const KIND: &str = "rsui trace";
+const VERSION: u32 = 1;
+
+fn ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1_000_000.0).round() / 1000.0
+}
+
+/// A frame, as a trace file has it.
+pub(crate) fn frame_json(frame: &FrameRecord) -> Value {
+    json!({
+        "number": frame.number,
+        "at": ms(frame.at),
+        "script": ms(frame.script),
+        "layout": ms(frame.layout),
+        "paint": ms(frame.paint),
+        "gpu": ms(frame.gpu),
+        "present": ms(frame.present),
+        "handled": frame.handled.iter().map(|handled| json!({
+            "action": handled.action.name(),
+            "key": handled.key.to_string(),
+            "took": ms(handled.took),
+            "note": handled.note,
+            "rejected": handled.rejected,
+        })).collect::<Vec<_>>(),
+        "renders": frame.renders.iter().map(|render| json!({
+            "name": render.name.as_ref().map(ToString::to_string),
+            "cause": match render.cause {
+                Cause::Mounted => "mounted",
+                Cause::Props => "props",
+                Cause::State => "state",
+            },
+            "took": ms(render.took),
+            "own": ms(render.own),
+            "changed": render.changed,
+            "depth": render.depth,
+            "why": rsui::inspect::describe_render(render)
+                .split_once(": ")
+                .map(|(_, why)| why.to_owned()),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Each change of state kept, as a trace file has them.
+pub(crate) fn history_json() -> Vec<Value> {
+    crate::why::history_entries()
+        .into_iter()
+        .map(|(number, component, said)| json!({ "number": number, "component": component, "said": said }))
+        .collect()
+}
+
+/// What's kept about an app, as a trace file has it.
+pub(crate) fn trace_of(app: &App, title: &str) -> Value {
+    let frames: Vec<Value> = app.frames().map(frame_json).collect();
+    let history = history_json();
+    json!({
+        "kind": KIND,
+        "version": VERSION,
+        "app": title,
+        "file": crate::bridge::app_file().file_name().map(|name| name.to_string_lossy().into_owned()),
+        "frames": frames,
+        "history": history,
+        "summary": rsui::summary(app.frames()),
+        "replay": crate::replay::json(app),
+    })
+}
+
+/// Saves what's kept about an app to a file.
+pub(crate) fn save(app: &App, title: &str, path: &Path) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(&trace_of(app, title)).map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Saves it next to the app, under a name no other has, for ctrl+shift+S in a window. Says where.
+pub(crate) fn save_beside_app(app: &App) -> Result<PathBuf, String> {
+    let main = crate::bridge::app_file();
+    let folder = std::path::absolute(&main)
+        .ok()
+        .and_then(|main| main.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let stem = main.file_stem().map_or_else(
+        || "app".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let path = folder.join(format!("{stem}-{seconds}.rsuitrace"));
+    save(app, &stem, &path)?;
+    Ok(path)
+}
+
+/// Checks a file is a trace this can show, and says why not if it isn't.
+pub(crate) fn check(path: &Path) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{} isn't a trace: {error}", path.display()))?;
+    if value["kind"] != KIND {
+        return Err(format!("{} isn't a trace saved by rsui", path.display()));
+    }
+    if value["version"]
+        .as_u64()
+        .is_none_or(|version| version > u64::from(VERSION))
+    {
+        return Err(format!(
+            "{} was saved by a newer rsui than this",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// What tells the viewer which trace to show, or the folder where apps say they can be looked at while they run, and which
+/// of those it's to look at.
+pub(crate) const TRACE_VAR: &str = "RSUI_TRACE";
+pub(crate) const LIVE_VAR: &str = "RSUI_LIVE";
+pub(crate) const PID_VAR: &str = "RSUI_LIVE_PID";
+
+/// Whether this is the viewer, which isn't itself to be looked at.
+pub(crate) fn is_viewer() -> bool {
+    std::env::var_os(TRACE_VAR).is_some() || std::env::var_os(LIVE_VAR).is_some()
+}
+
+/// The viewer, as an app, which reads the trace that `RSUI_TRACE` names, or looks at an app in `RSUI_LIVE`.
+pub(crate) const VIEWER: &str = include_str!("viewer.tsx");
+
+/// Puts the viewer where it can be run from, and says where.
+pub(crate) fn viewer_file() -> Result<PathBuf, String> {
+    let folder = std::env::temp_dir().join("rsui-viewer");
+    std::fs::create_dir_all(&folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    let file = folder.join("viewer.tsx");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(VIEWER) {
+        std::fs::write(&file, VIEWER).map_err(|error| format!("{}: {error}", file.display()))?;
+    }
+    Ok(file)
+}

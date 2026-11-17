@@ -1,0 +1,24 @@
+[package]
+name = "rsui-runtime"
+description = "Components, state and effects that update a rsui tree by what changed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+foldhash = "0.2.0"
+rsui-core = { path = "../rsui-core" }
+thin-vec = "0.2.21"
+triomphe = "0.1.17"
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1"
+rsui-alloc = { path = "../rsui-alloc" }
+
+[[bench]]
+name = "runtime"
+harness = false

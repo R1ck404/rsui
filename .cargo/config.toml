@@ -1,0 +1,42 @@
+# Puts the part of the C runtime that doesn't come with Windows inside each program. Without this they need
+# VCRUNTIME140.dll, which a clean copy of Windows may not have, and they wouldn't start. The rest of it comes
+# with Windows 10 and later, so this costs about 23 KB, where all of it would cost about 190 KB. A library can't
+# choose this for the programs using it, so a program of your own needs this file too.
+#
+# The libraries after that are only loaded the first time something in them is called, rather than before `main`.
+# Loading them all up front took about 3 ms of a 6 ms start before anything ran, and most programs never call
+# some of them (the file dialogs, sockets) or not until their window opens. They all come with Windows, so loading
+# them later can't fail where loading them first wouldn't have. A program that calls none of one gets a warning
+# from the linker about it, which is harmless.
+#
+# A function declared by hand from one of these has to be linked as the `windows` crate links them,
+# `#[link(name = "shell32.dll", kind = "raw-dylib", modifiers = "+verbatim")]`, not `#[link(name = "shell32")]`. The
+# second takes it from the system's SHELL32.lib, and a function the `windows` crate doesn't also import ends up
+# with no place in the library's table: calling it crashes in the linker's delay-load helper, which is how
+# `shell.reveal` ended a program in a real window (`ShellExecuteExW`; `MessageBeep`, for `sound.beep`, was missing
+# the same way). crates/rsui-tsx/tests/imports.rs checks for both.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/NODEFAULTLIB:vcruntime.lib",
+    "-C", "link-arg=/DEFAULTLIB:libvcruntime.lib",
+    "-C", "link-arg=/DEFAULTLIB:delayimp.lib",
+    "-C", "link-arg=/DELAYLOAD:user32.dll",
+    "-C", "link-arg=/DELAYLOAD:gdi32.dll",
+    "-C", "link-arg=/DELAYLOAD:ole32.dll",
+    "-C", "link-arg=/DELAYLOAD:oleaut32.dll",
+    "-C", "link-arg=/DELAYLOAD:combase.dll",
+    "-C", "link-arg=/DELAYLOAD:shell32.dll",
+    "-C", "link-arg=/DELAYLOAD:dwrite.dll",
+    "-C", "link-arg=/DELAYLOAD:advapi32.dll",
+    "-C", "link-arg=/DELAYLOAD:ws2_32.dll",
+    "-C", "link-arg=/DELAYLOAD:dbghelp.dll",
+]
+
+# The JavaScript interpreter (`Vm::run_loop` in crates/rsui-js) picks its next instruction with one `match`. Left to
+# itself, LLVM gives the whole loop a single shared jump to the next handler, so the CPU has one place to predict every
+# next instruction from, and how well it does that depends on where every handler happens to land in memory. Unrelated
+# edits moved them and made the interpreter 10-50% slower or faster on code that hadn't changed. Letting LLVM copy that
+# jump onto the end of each handler (it skips blocks with more than 16 ways in and out unless told otherwise) gives each
+# handler its own, which predicts better and stopped those swings. It makes the programs about 5 KB bigger.
+[target.'cfg(all())']
+rustflags = ["-C", "llvm-args=-tail-dup-pred-size=1000 -tail-dup-succ-size=1000"]

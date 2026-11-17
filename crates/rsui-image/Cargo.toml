@@ -1,0 +1,12 @@
+[package]
+name = "rsui-image"
+description = "Reads PNG and JPEG files at the size they'll be shown, in as little memory as possible."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dev-dependencies]
+proptest = "1"

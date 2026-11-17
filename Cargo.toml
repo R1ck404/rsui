@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rsui",
+    "crates/rsui-agent",
+    "crates/rsui-alloc",
+    "crates/rsui-core",
+    "crates/rsui-headless",
+    "crates/rsui-image",
+    "crates/rsui-js",
+    "crates/rsui-layout",
+    "crates/rsui-render",
+    "crates/rsui-runtime",
+    "crates/rsui-text",
+    "crates/rsui-tsx",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/R1ck404/rsui"
+
+# What a finished program should use. Measured against the defaults, the gallery goes from 668 KB to
+# 493 KB and runs slightly faster. `opt-level = "s"` gets it to 378 KB at about 5% slower.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+debug = true
+# Benchmarks measure the code rather than the linker, and rebuild much sooner this way.
+lto = false
+codegen-units = 16
+strip = false

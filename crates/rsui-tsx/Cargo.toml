@@ -1,0 +1,43 @@
+[package]
+name = "rsui-tsx"
+description = "Writes rsui apps in TypeScript and JSX, with hooks like React's, on rsui's own JavaScript engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+retained-frame = ["rsui/retained-frame"]
+# rsui-js's baseline JIT (crates/rsui-js/JIT.md) is built in by default. `RSUI_JIT=0` turns it off at run time, and
+# `--no-default-features` builds rsui-tsx without it.
+default = ["jit"]
+jit = ["rsui-js/jit"]
+# The JIT's feedback for an optimizing tier; off by default.
+jit-opt = ["jit", "rsui-js/jit-opt"]
+# Counting what the engine runs, by step (rsui-js's `counts`); for measuring only.
+counts = ["rsui-js/counts"]
+# Native UI-thread stack sampling; diagnostic builds only, with no default-path code.
+sampling-profile = []
+render-diagnostics = ["rsui/render-diagnostics"]
+# Experimental ordinary App backend; deliberately off by default.
+automatic-render = ["rsui/automatic-render"]
+mutation-pilot = ["rsui/mutation-pilot"]
+# Counts what each stage holds (`census` in steps), for measuring memory. Off by default.
+alloc-owners = ["rsui/alloc-owners", "rsui-js/owners"]
+# Leaves out rsui-alloc's allocator, so everything comes from the process heap. Off by default.
+system-alloc = []
+
+[dependencies]
+rsui = { path = "../rsui" }
+rsui-agent = { path = "../rsui-agent" }
+rsui-js = { path = "../rsui-js" }
+serde_json = "1"
+
+[dev-dependencies]
+windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_System_StationsAndDesktops", "Win32_System_Threading", "Win32_Security"] }
+rsui-headless = { path = "../rsui-headless" }
+rsui-image = { path = "../rsui-image" }
+serde_json = "1"
+

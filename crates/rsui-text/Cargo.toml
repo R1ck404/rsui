@@ -1,0 +1,24 @@
+[package]
+name = "rsui-text"
+description = "Fonts, text measuring, line breaking and glyph rendering for rsui, with no dependencies on the system."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+foldhash = "0.2.0"
+rsui-core = { path = "../rsui-core" }
+rsui-image = { path = "../rsui-image" }
+rsui-layout = { path = "../rsui-layout" }
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1"
+rsui-alloc = { path = "../rsui-alloc" }
+
+[[bench]]
+name = "text"
+harness = false

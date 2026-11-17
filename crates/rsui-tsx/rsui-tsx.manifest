@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Put into rsui-tsx.exe by build.rs, and so into every program packing an app
+     makes, which is a copy of it. (An XML comment can't have two hyphens in a row, so no flags here.)
+     It asks Windows 10 2004 and later for the segment heap as the program's process heap: getImageData+putImageData ran twice
+     as fast with it, and memory and everything else measured stayed the same. Older Windows ignores it.
+     Nothing else is said here, so everything else is as it is for a program without a manifest: the window sets its own DPI
+     awareness when it starts, as before. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2020="http://schemas.microsoft.com/SMI/2020/WindowsSettings">
+      <ws2020:heapType>SegmentHeap</ws2020:heapType>
+    </windowsSettings>
+  </application>
+</assembly>

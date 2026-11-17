@@ -1,0 +1,20533 @@
+// What `import ... from 'rsui/web'` gives, and what a page's tags and CSS are drawn with: it's loaded the first time an app uses a
+// page's tag or a CSS file. There's no page here, so CSS is worked out into props when something's drawn, and what can't be turned into
+// props is said once and left out. The page's globals, `document` and `window` among them, are `rsui/dom-globals`'s, which is only
+// loaded once one of them is touched, and the nodes code makes, with ranges and the selection, are `rsui/dom`'s, loaded once code
+// makes one or asks for one.
+
+const rsui = require('rsui');
+const React = require('react');
+const { Children, cloneElement, createContext, isValidElement, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } = React;
+const { attachRef } = rsui.__react;
+// The layer keeps this same host object for the VM's lifetime; read its methods at each use.
+const rsuiHostMethods = rsui.__host();
+// What Rust does for this, as reading CSS is: see `css.rs`.
+const natives = rsuiHostMethods.css;
+// What Rust works out about each element, in `layout.rs`, which is given this back each time, for what it's found out about this engine.
+const layout = natives.cssLayoutStart();
+// What `cssChildren` and `cssChild` are asked, about what's in an element and about one thing in it.
+const ALONG = 0;
+const ANY_FLOAT = 1;
+const LINES = 2;
+const HOLDS_BLOCK = 3;
+const BLOCK_CHILD = 4;
+const TEXT_KINDS = 5;
+const LINE_BOXES = 7;
+const SAID_FLOW = 0;
+const FLOAT_OF = 1;
+const CLEARS = 2;
+const GOES_ON_LINE = 3;
+
+/// An element, as it is, without what `react` does to a page's tags, which is what this is making them into.
+function make(type, props, ...kids) {
+    let given = props ?? {};
+    if (given.disabled === true && typeof type === 'string' && given.plainDisabled === undefined) {
+        // What can't be used looks as its CSS says, as a page's does, rather than faded as rsui's own are.
+        given = { ...given, plainDisabled: true };
+    }
+    return __jsx(type, given, kids.length === 0 ? undefined : kids, 'key' in given);
+}
+
+// What's been said about, so that it's only said once.
+const unsupported = new Set();
+
+function notHere(what) {
+    if (!unsupported.has(what)) {
+        unsupported.add(what);
+        console.warn('rsui/web: ' + what + " can't be done here, so it's left out");
+    }
+}
+
+// What CSS says about the whole page: its variables, how big a rem is, and what's on `body`.
+
+let remSize = 16;
+const rootVariables = new Map();
+/// Variables that only count while a class is on the page, as `.dark { --text: white }` is.
+const classVariables = new Map();
+const pageClasses = new Set();
+const pageVariables = new Map();
+/// How many rules `pageRuleVariables` looks at, and what it last found.
+let pageWhenCount = 0;
+let pageWhenKept = { at: -1, count: 0, value: null };
+/// What CSS said about `body`, about each class and about each kind of element, as `button { ... }` does. It's kept as it was written, as
+/// what it comes to depends on variables, which can come later or change.
+const sheets = [];
+/// How many times which sheets there are, or the order they're in, or what's in one that's been emptied, has changed: everything
+/// found from all of them together is found again then. What's only been added to one changes only what it was about: see
+/// `touchedRules`.
+let sheetsShape = 0;
+let sheet = newSheet();
+
+function newSheet() {
+    const made = { page: [], classes: new Map(), tags: new Map(), tagRules: new Map(), complex: [], keys: new Set() };
+    sheets.push(made);
+    return made;
+}
+
+/// Empties a sheet, for what it says to be put in again.
+function emptySheet(one) {
+    forgetSheet(one);
+    Object.assign(one, { page: [], body: [], root: [], rootFont: [], bodyFont: [], classes: new Map(), tags: new Map(), tagRules: new Map(), complex: [], complexOrder: [], compiled: undefined, pageWhen: [], keys: new Set(), mediaQueries: undefined, viewportKeys: undefined, viewportVariables: undefined });
+}
+
+/// Takes a sheet out of the cascade.
+function dropSheet(one) {
+    const at = sheets.indexOf(one);
+    if (at >= 0) {
+        sheets.splice(at, 1);
+        forgetSheet(one);
+    }
+}
+
+/// Has what's found from all the sheets together found again for what this one said, as it's no longer saying it.
+function forgetSheet(one) {
+    // What its rules were about is drawn again, and what it said about the page and its variables is looked at again.
+    for (const key of one.keys ?? ['*']) {
+        restyleKey(key);
+    }
+    if ((one.page?.length ?? 0) > 0 || (one.pageWhen?.length ?? 0) > 0 || (one.root?.length ?? 0) > 0 || (one.rootFont?.length ?? 0) > 0) {
+        restyle.page = true;
+    }
+    for (const name of one.classes.keys()) {
+        touchedRules.add('classes ' + name);
+    }
+    for (const name of one.tags.keys()) {
+        touchedRules.add('tags ' + name);
+        touchedRules.add('tagRules ' + name);
+    }
+}
+
+/// A sheet for something in `<head>`, where it counts in the order it's there: after the sheet of what's nearest before it that
+/// has one, or else before the sheet of what's nearest after it, or else last.
+function sheetInHead(node) {
+    const made = { page: [], classes: new Map(), tags: new Map(), tagRules: new Map(), complex: [], keys: new Set() };
+    const at = headNodes.indexOf(node);
+    let place = -1;
+    for (let other = at - 1; other >= 0 && place < 0; other -= 1) {
+        const before = headNodes[other].__added?.sheet;
+        place = before === undefined ? -1 : sheets.indexOf(before) + 1 || -1;
+    }
+    for (let other = at + 1; other < headNodes.length && place < 0; other += 1) {
+        const after = headNodes[other].__added?.sheet;
+        place = after === undefined ? -1 : sheets.indexOf(after);
+    }
+    sheets.splice(place < 0 ? sheets.length : place, 0, made);
+    return made;
+}
+
+/// The classes and kinds of element, as `classes name` and `tags name`, that rules have been added about since they were last
+/// looked up, which are found again.
+const touchedRules = new Set();
+
+/// What every sheet says about each class and each kind of element, in the order the sheets are in, found once for each, for as
+/// long as nothing's been added about it, rather than each time it's looked up.
+let merged = { shape: -1, lists: new Map() };
+
+/// What every sheet says about a class or a kind of element, in the order they were added. It's not to be changed.
+function rulesIn(which, name) {
+    if (merged.shape !== sheetsShape) {
+        merged = { shape: sheetsShape, lists: new Map() };
+        touchedRules.clear();
+    } else if (touchedRules.size > 0) {
+        for (const key of touchedRules) {
+            merged.lists.delete(key);
+        }
+        touchedRules.clear();
+    }
+    const key = which + ' ' + name;
+    let found = merged.lists.get(key);
+    if (found === undefined && !merged.lists.has(key)) {
+        for (const one of sheets) {
+            const rules = one[which].get(name);
+            if (rules !== undefined) {
+                found = found === undefined ? rules.slice() : found.concat(rules);
+            }
+        }
+        merged.lists.set(key, found);
+    }
+    return found;
+}
+
+/// What a styled component has made up a class for, as it's passing what it looks like to another component.
+const madeClasses = new Map();
+const classForLook = new Map();
+
+/// A class that means this, which is what a styled component passes to another, with what it says about itself, and what's come from
+/// around it: `{ compiled, extra, parts }`. It's always the same class for the same thing.
+function classOf(record) {
+    const key = (record.compiled?.id ?? 0) + JSON.stringify(record.extra) + JSON.stringify(record.parts);
+    let name = classForLook.get(key);
+    if (name === undefined) {
+        name = 'rsui-look-' + classForLook.size;
+        classForLook.set(key, name);
+        madeClasses.set(name, record);
+        worked.classSets?.clear();
+        forgetKinds();
+    }
+    return name;
+}
+
+let version = 0;
+// Learning what a component renders changes flow, not what any CSS declaration says.
+let flowVersion = 0;
+/// How many times what Rust has found out from CSS about elements has been forgotten, for what's kept to know it's out of date: see
+/// `keptKids`.
+let kindsForgotten = 0;
+/// How many times what declarations come to may have changed, apart from what's in the sheets: variables, classes on the page,
+/// how big the window is. What a sheet's rules come to is kept for as long as neither it nor this changes.
+let declared = 0;
+/// Whether a sheet has set something that what other sheets' declarations come to depends on, as a variable on `:root` is.
+let variablesTouched = false;
+const listeners = new Set();
+let tellSoon = false;
+
+/// Says that anything about what CSS comes to may have changed.
+function changed() {
+    declared += 1;
+    restyleAll('changed()');
+    restyled();
+}
+
+// What's drawn again when CSS changes. A browser restyles only what a change can be about, and so does this: a sheet's
+// rules are about what has the class, id, attribute or tag of their last step (`keyOfStep`), what it's in or after is about what
+// they're about too, and a variable is about what uses it. Everything that's drawn says what it is (`live.me`) and which variables
+// it read, so that what's told is only what has one of the keys of what changed, and what that's in. Anything else that changes
+// (`changed()`) still has everything drawn again. `RSUI_RESTYLE_CHECK=1` draws everything again after each time only some of it
+// was, and says what came out different, which would have been missed.
+
+const RESTYLE_ENV = (() => {
+    try {
+        return { check: globalThis.process?.env?.RSUI_RESTYLE_CHECK === '1', log: globalThis.process?.env?.RSUI_RESTYLE_LOG === '1' };
+    } catch {
+        return { check: false, log: false };
+    }
+})();
+// Diagnostic counters only: combine plan activity into one log per job batch,
+// rather than logging individual selector rules or class lookups.
+let restylePlanResets = 0, restyleClassPlanMisses = 0, restyleOtherPlanMisses = 0;
+let restylePlanLogPending = false, restylePlanFromVersion = -1;
+function logRestylePlanActivity(resetFrom, classes) {
+    if (resetFrom !== null) restylePlanResets += 1;
+    else if (classes) restyleClassPlanMisses += 1;
+    else restyleOtherPlanMisses += 1;
+    if (restylePlanLogPending) {
+        if (resetFrom !== null) restylePlanFromVersion = Math.min(restylePlanFromVersion, resetFrom);
+        return;
+    }
+    restylePlanLogPending = true;
+    restylePlanFromVersion = resetFrom ?? version;
+    queueMicrotask(() => {
+        console.error('rsui css plans: version=' + restylePlanFromVersion + '->' + version
+            + ' resets=' + restylePlanResets + ' class_misses=' + restyleClassPlanMisses
+            + ' other_misses=' + restyleOtherPlanMisses);
+        restylePlanResets = restyleClassPlanMisses = restyleOtherPlanMisses = 0;
+        restylePlanLogPending = false;
+    });
+}
+
+// Experimental construction from changed variable bindings only. Read once; the ordinary path remains the default/control.
+const VARIABLE_DELTAS = (() => {
+    try { return globalThis.process?.env?.RSUI_VAR_DELTAS === '1'; } catch { return false; }
+})();
+/// What's to be drawn again the next time what's drawn is told: everything, or what has one of `keys`, or reads one of `variables`.
+/// `page` says the page's own variables may have changed, which are compared with what they were.
+const restyle = { all: false, keys: new Set(), variables: new Set(), page: false, why: null };
+/// Each class, id, attribute and tag (as `keyOfStep` has them) that some rule asks of what's around or before what it's about, or in
+/// its `:is()`, `:not()` or `:has()`, with the keys of what those rules are about, which change when that does.
+const restyleDependents = new Map();
+/// Each variable that some rule uses, with the keys of what the rules that use it are about, and the variables set with it.
+const variableUsers = new Map();
+const variableSetters = new Map();
+/// The page's own variables, as they were last told.
+let pageVariablesTold = null;
+
+/// The states something keeps track of for what's in it or after it, as `STATES` below.
+const KEPT_STATES = ['hover', 'active', 'focus', 'focus-visible', 'focus-within', 'checked'];
+
+function restyleAll(why) {
+    if (!restyle.all) {
+        restyle.all = true;
+        restyle.why = RESTYLE_ENV.log ? why + ' ' + (new Error().stack ?? '').split('\n').slice(2, 5).join(' / ') : why;
+    }
+}
+function restyleKey(key) {
+    if (key === '*') {
+        restyleAll('a rule about anything');
+    } else {
+        restyle.keys.add(key);
+    }
+}
+function addTo(map, key, value) {
+    let set = map.get(key);
+    if (set === undefined) {
+        set = new Set();
+        map.set(key, set);
+    }
+    set.add(value);
+}
+
+/// What can be told apart of a step, as keys: its id, classes, attributes and tag, with what's in its `:is()` and the like.
+function stepFeatures(step, out) {
+    if (step.id !== null && step.id !== undefined) {
+        out.push('#' + step.id);
+    }
+    for (const name of step.classes) {
+        out.push('.' + name);
+    }
+    for (const attr of step.attrs) {
+        out.push('[' + attr.name);
+    }
+    if (step.tag !== null && step.tag !== undefined) {
+        out.push(step.tag);
+    }
+    for (const pseudo of step.pseudo) {
+        // These selectors read a property even without an explicit [attribute] in the selector. Its primitive value
+        // must change the owner chain, just as an explicit ancestor attribute does.
+        for (const name of SELF_PSEUDO[pseudo.name] ?? []) out.push('[' + (name === 'className' ? 'class' : name === 'htmlFor' ? 'for' : name));
+        for (const inner of pseudo.list ?? []) {
+            for (const one of inner ?? []) {
+                stepFeatures(one, out);
+            }
+        }
+    }
+    return out;
+}
+
+/// The keys of what a rule's last step can be about: what `keyOfStep` finds, or, for one that's only `:is(.a, .b)`, each of those.
+function subjectKeys(step) {
+    const key = keyOfStep(step);
+    if (key !== '*') {
+        return [key];
+    }
+    for (const pseudo of step.pseudo) {
+        if ((pseudo.name === 'is' || pseudo.name === 'where' || pseudo.name === 'matches') && (pseudo.list?.length ?? 0) > 0) {
+            const keys = [];
+            for (const inner of pseudo.list) {
+                const last = inner?.[inner.length - 1];
+                const found = last === undefined ? ['*'] : subjectKeys(last);
+                if (found.includes('*')) {
+                    return ['*'];
+                }
+                keys.push(...found);
+            }
+            return keys;
+        }
+    }
+    return ['*'];
+}
+
+/// Notes what a rule that's put in or taken out is about, for what's drawn again: see `restyled`.
+function noteRule(steps, declarations) {
+    const subjects = subjectKeys(steps[steps.length - 1]);
+    for (const [name, value] of declarations) {
+        if (usesViewportUnits(value)) {
+            if (name.startsWith('--')) {
+                (sheet.viewportVariables ??= new Set()).add(name);
+            } else {
+                for (const key of subjects) (sheet.viewportKeys ??= new Set()).add(key);
+            }
+        }
+    }
+    if (RESTYLE_ENV.log && subjects.includes('*') && !restyle.all) {
+        restyleAll('a rule about anything: ' + JSON.stringify(steps.map((step) => [step.tag, step.classes, step.attrs.map((attr) => attr.name), step.pseudo.map((one) => one.name)])));
+    }
+    const own = (sheet.keys ??= new Set());
+    for (const key of subjects) {
+        own.add(key);
+        restyleKey(key);
+    }
+    const features = [];
+    steps.forEach((step, at) => {
+        if (at < steps.length - 1) {
+            stepFeatures(step, features);
+            if (step.pseudo.some((one) => KEPT_STATES.includes(one.name))) {
+                // What's to keep track of how it is, as `.group:hover .x` has `.group` do, is told too.
+                const key = keyOfStep(step);
+                own.add(key);
+                restyleKey(key);
+            }
+        } else {
+            for (const pseudo of step.pseudo) {
+                for (const inner of pseudo.list ?? []) {
+                    for (const one of inner ?? []) {
+                        stepFeatures(one, features);
+                    }
+                }
+            }
+        }
+    });
+    for (const feature of features) {
+        for (const key of subjects) {
+            addTo(restyleDependents, feature, key);
+        }
+    }
+    if (steps.some(hasHas)) {
+        // What's inside it, as it's drawn, which no key says: told whenever anything is, as everything was before.
+        for (const key of subjects) {
+            hasSubjects.add(key);
+        }
+    }
+    for (const [name, value] of declarations) {
+        if (typeof value === 'string' && value.includes('var(')) {
+            for (const used of namesIn(value)) {
+                for (const key of subjects) {
+                    addTo(variableUsers, used, key);
+                }
+                if (name.startsWith('--')) {
+                    addTo(variableSetters, used, name);
+                }
+            }
+        }
+    }
+}
+
+/// The `@font-face`s that have been said.
+const fontFacesSeen = new Set();
+
+/// Says that a class or an attribute (`features`) of `html` or `body` has changed, or the page's own variables: what rules about
+/// what's in it ask of that is drawn again, and what uses a variable that's different now.
+function pageChanged(features) {
+    declared += 1;
+    restyle.page = true;
+    restyleDependentsOf(features);
+    restyled();
+}
+
+/// The keys of what rules with `:has()` are about, which is about what's drawn inside it.
+const hasSubjects = new Set();
+function hasHas(step) {
+    return step.pseudo.some((one) => one.name === 'has' || (one.list ?? []).some((inner) => (inner ?? []).some(hasHas)));
+}
+
+/// Has what rules ask of what's around them as one of `features` drawn again, as a class or attribute that `html` or `body` has has
+/// changed.
+function restyleDependentsOf(features) {
+    for (const feature of features) {
+        for (const key of restyleDependents.get(feature) ?? []) {
+            restyleKey(key);
+        }
+    }
+}
+
+/// Which of the page's own variables are different from when they were last told, with those set with them.
+function pageVariablesChanged() {
+    const now = new Map();
+    const names = new Set([...rootVariables.keys(), ...universalVariables.keys(), ...pageVariables.keys()]);
+    for (const name of pageRuleVariables()?.keys() ?? []) {
+        names.add(name);
+    }
+    for (const kind of pageClasses) {
+        for (const name of classVariables.get(kind)?.keys() ?? []) {
+            names.add(name);
+        }
+    }
+    for (const name of names) {
+        now.set(name, variableValue(name));
+    }
+    const out = [];
+    if (pageVariablesTold !== null) {
+        for (const [name, value] of now) {
+            if (pageVariablesTold.get(name) !== value) {
+                out.push(name);
+            }
+        }
+        for (const name of pageVariablesTold.keys()) {
+            if (!now.has(name)) {
+                out.push(name);
+            }
+        }
+    }
+    pageVariablesTold = now;
+    return out;
+}
+
+/// What's to be drawn again now, which is everything (`null`), or what has these keys or reads these variables, and starts again.
+function takeRestyle() {
+    if (restyle.page || restyle.variables.size > 0) {
+        const changedNow = restyle.page ? pageVariablesChanged() : [];
+        const todo = [...changedNow, ...restyle.variables];
+        const seen = new Set();
+        while (todo.length > 0) {
+            const name = todo.pop();
+            if (seen.has(name)) {
+                continue;
+            }
+            seen.add(name);
+            for (const key of variableUsers.get(name) ?? []) {
+                restyleKey(key);
+            }
+            for (const setter of variableSetters.get(name) ?? []) {
+                todo.push(setter);
+            }
+        }
+        restyle.variables = seen;
+        if (changedNow.length > 0) {
+            if (RESTYLE_ENV.log) {
+                let currentSheets = 0, currentNested = 0;
+                for (const one of sheets) {
+                    if (one.compiled?.declared === declared && one.compiled.count > 0) {
+                        currentSheets += 1;
+                        currentNested += one.compiled.nested.length;
+                    }
+                }
+                console.error('rsui css late-declared: version=' + version + ' declared=' + declared + '->' + (declared + 1)
+                    + ' variables=' + JSON.stringify(changedNow) + ' variablesTouched=' + variablesTouched
+                    + ' current_sheets=' + currentSheets + ' current_nested=' + currentNested);
+            }
+            declared += 1;
+        }
+    }
+    if (rootFontSize() !== remSize) {
+        restyleAll('how big a rem is');
+    }
+    for (const key of hasSubjects) {
+        restyleKey(key);
+    }
+    const plan = restyle.all || restyle.keys.size > 256 ? null : {
+        classes: new Set(), ids: new Set(), attrs: [], tags: new Set(), variables: restyle.variables, keys: restyle.keys,
+    };
+    if (plan !== null) {
+        for (const key of restyle.keys) {
+            if (key[0] === '.') {
+                plan.classes.add(key.slice(1));
+            } else if (key[0] === '#') {
+                plan.ids.add(key.slice(1));
+            } else if (key[0] === '[') {
+                const name = key.slice(1);
+                plan.attrs.push(name === 'class' ? 'className' : name === 'for' ? 'htmlFor' : name);
+            } else {
+                plan.tags.add(key);
+            }
+        }
+    }
+    if (RESTYLE_ENV.log) {
+        console.error('rsui restyle: ' + (plan === null ? 'everything (' + (restyle.why ?? restyle.keys.size + ' keys') + ')' : [...restyle.keys].join(' ') + (restyle.variables.size > 0 ? ' vars: ' + [...restyle.variables].join(' ') : '')));
+    }
+    restyle.all = false;
+    restyle.keys = new Set();
+    restyle.variables = new Set();
+    restyle.page = false;
+    restyle.why = null;
+    return plan;
+}
+
+/// What an element passes down of its variables, the same as last time while it says the same, so that what's inside that reads
+/// all of them, as a picture does, isn't drawn again for a new one each time it is.
+function keptVariablesDown(live, down) {
+    const was = live.variablesDown;
+    if (VARIABLE_DELTAS && was === down) {
+        return was;
+    }
+    if (down !== null && was instanceof Map && was.size === down.size) {
+        const ownBefore = was[OWN_VARIABLES];
+        const ownAfter = down[OWN_VARIABLES];
+        if (natives.cssVariablesSame(was, down) && (ownBefore === ownAfter || natives.cssVariablesSame(ownBefore, ownAfter))) {
+            return was;
+        }
+    }
+    live.variablesDown = down;
+    return down;
+}
+
+/// What an element passes down of its look for `inherit`, the same as last time while it says the same.
+function keptLookDown(live, look) {
+    const was = live.lookDown;
+    if (was !== undefined && was !== null) {
+        const keys = Object.keys(look);
+        if (keys.length === Object.keys(was).length && keys.every((key) => key in was && sameValue(was[key], look[key]))) {
+            return was;
+        }
+    }
+    live.lookDown = look;
+    return look;
+}
+
+/// The variables what's written on an element uses.
+function inlineVarNames(written) {
+    let out = null;
+    for (const name in written) {
+        const value = written[name];
+        if (typeof value === 'string' && value.includes('var(')) {
+            (out ??= []).push(...namesIn(value));
+        }
+    }
+    return out;
+}
+
+/// What of what something is, that rules ask of what's around or before what they're about, it has, with which of its own rules
+/// about what's inside it go down: what's inside it is under a new chain when that changes.
+function chainKey(me, compiled, nested) {
+    let out = nested.length === 0 ? '' : nested.map((rule) => compiled.nested.indexOf(rule)).join(',');
+    if (restyleDependents.size === 0) {
+        return out;
+    }
+    if (me.id !== undefined && me.id !== null && restyleDependents.has('#' + me.id)) {
+        out += '#' + me.id;
+    }
+    for (const name of me.classes) {
+        if (restyleDependents.has('.' + name)) {
+            out += '.' + name;
+        }
+    }
+    if (me.tag !== null && me.tag !== undefined && restyleDependents.has(me.tag)) {
+        out += '<' + me.tag;
+    }
+    const props = me.props;
+    for (const name in props ?? {}) {
+        const attr = name === 'className' ? 'class' : name === 'htmlFor' ? 'for' : name;
+        if (restyleDependents.has('[' + attr)) {
+            const value = props[name];
+            out += '[' + attr + '=' + (typeof value === 'object' || typeof value === 'function' ? typeof value : String(value));
+        }
+    }
+    return out;
+}
+
+/// Whether something that's drawn is about what's changed.
+function restyleTouches(live, plan) {
+    const me = live.me;
+    if (me === undefined || live.nativeKids === true) {
+        return true;
+    }
+    if (plan.tags.has(me.tag)) {
+        return true;
+    }
+    if (me.id !== undefined && me.id !== null && plan.ids.has(me.id)) {
+        return true;
+    }
+    if (plan.classes.size > 0) {
+        for (const name of me.classes) {
+            if (plan.classes.has(name)) {
+                return true;
+            }
+        }
+    }
+    const props = me.props;
+    if (props !== undefined && props !== null) {
+        for (const name of plan.attrs) {
+            if (name in props) {
+                return true;
+            }
+        }
+    }
+    if (plan.variables.size > 0) {
+        for (const list of [live.varsRead, live.inlineVars, live.ownVars, live.pageVarsRead]) {
+            if (list !== undefined && list !== null) {
+                for (const name of list) {
+                    if (plan.variables.has(name)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// The nearest page element something's in, which has decided how what's in it is laid out by what it is.
+function liveAbove(live) {
+    let at = live.instance?.parent ?? null;
+    while (at !== null && at !== undefined) {
+        if (at.__pageLive !== undefined && at.__pageLive !== live) {
+            return at.__pageLive;
+        }
+        at = at.parent;
+    }
+    return null;
+}
+
+/// Says that what's in the sheets has changed. What's drawn hears about it once, after what's running now, however many times it's
+/// said, as CSS-in-JS adds rules one at a time: everything, or only what it's about, as above.
+function restyled() {
+    if (variablesTouched) {
+        variablesTouched = false;
+        declared += 1;
+        restyle.page = true;
+    }
+    version += 1;
+    // What Rust has found out from CSS is found out again, as what's here is.
+    forgetKinds();
+    // Nothing's drawn until something's been looked up, as what the app's CSS tools make is put in at the first look-up, while the
+    // page is first drawn.
+    if (lookedAt >= 0 && !tellSoon) {
+        tellSoon = true;
+        queueMicrotask(tellRestyled);
+    }
+}
+
+function tellRestyled() {
+    tellSoon = false;
+    const plan = takeRestyle();
+    let told = 0;
+    for (const listener of listeners) {
+        if (typeof listener === 'function') {
+            listener();
+        } else if (listener.seen !== version && (plan === null || restyleTouches(listener, plan))) {
+            // A `Styled`'s: see there. What it's in decided how it's laid out by what it is, as whether it goes along a line.
+            listener.redraw();
+            told += 1;
+            if (plan !== null) {
+                liveAbove(listener)?.redraw?.();
+            }
+        }
+    }
+    if (RESTYLE_ENV.log) {
+        console.error('rsui restyle: told ' + told + ' of ' + listeners.size);
+    }
+    if (RESTYLE_ENV.check && plan !== null && told < listeners.size) {
+        restyleCheckSoon();
+    }
+}
+
+// `RSUI_RESTYLE_CHECK=1`: what everything comes to once only some of it's been drawn again, drawn again all of it, and compared.
+let restyleChecking = false;
+let restyleCheckLeft = 0;
+/// How big the window was when the check started: what it draws after the window's changed size is told everything anyway.
+let restyleCheckSize = '';
+function restyleCheckSoon() {
+    if (restyleChecking) {
+        return;
+    }
+    restyleChecking = true;
+    setTimeout(function look() {
+        // Not while something's still to be told, as a window's size that's changed is: that would be found different.
+        if (tellSoon || restyle.all || restyle.keys.size > 0) {
+            setTimeout(look, 0);
+            return;
+        }
+        restyleChecking = false;
+        restyleCheckSize = String(globalThis.__rsuiPageSize);
+        let count = 0;
+        for (const listener of listeners) {
+            if (typeof listener !== 'function' && listener.signature !== undefined) {
+                listener.checkWas = listener.signature;
+                listener.redraw();
+                count += 1;
+            }
+        }
+        // Each is drawn with what's above it made from nothing, as the base did, until all of them have been.
+        restyleFresh = new Map();
+        restyleCheckLeft = count;
+        setTimeout(() => {
+            restyleFresh = null;
+        }, 2000);
+        console.error('rsui restyle check: drawing ' + count + ' again');
+    }, 0);
+}
+
+/// What something that's drawn came to, for `RSUI_RESTYLE_CHECK`, and says so if it's checking and that's different.
+function restyleSigned(live, out, type, font, children, given, state) {
+    // The last of what `RSUI_RESTYLE_CHECK` drew again ends drawing from chains made from nothing.
+    const checking = live.checkWas !== undefined;
+    // What it was given, what code set on it and how it is: only what comes out different with the same is something missed, as
+    // what React gave it again, as a transition does, is drawn again by React.
+    const size = String(globalThis.__rsuiPageSize);
+    const same = live.signedGiven === given && live.signedState === (state & ~REDRAWN) && live.signedAttributes === live.attributesSet
+        && live.signedHas === live.hasVersion && live.signedContainer === live.containerVersion && live.signedSize === size;
+    live.signedHas = live.hasVersion;
+    live.signedContainer = live.containerVersion;
+    live.signedSize = size;
+    live.signedGiven = given;
+    live.signedState = state & ~REDRAWN;
+    live.signedAttributes = live.attributesSet;
+    if (!same) {
+        live.checkWas = undefined;
+    }
+    const own = {};
+    for (const key of Object.keys(out).sort()) {
+        const value = out[key];
+        if (typeof value !== 'function' && key !== 'children' && key !== 'ref' && key !== 'key' && key !== '__elements') {
+            own[key] = value;
+        }
+    }
+    const kids = [];
+    for (const one of Children.toArray(children ?? [])) {
+        kids.push(typeof one === 'string' || typeof one === 'number' ? String(one) : isValidElement(one) ? (typeof one.type === 'string' ? one.type : one.type?.displayName ?? one.type?.name ?? '?') + ':' + JSON.stringify(one.props?.style ?? null) : '?');
+    }
+    let signature;
+    try {
+        signature = JSON.stringify([type, own, font, kids]);
+    } catch {
+        signature = '?';
+    }
+    if (live.checkWas !== undefined) {
+        if (live.checkWas !== signature && restyleCheckSize === String(globalThis.__rsuiPageSize)) {
+            const me = live.me;
+            const name = (me?.tag ?? '?') + (me?.id ? '#' + me.id : '') + (me?.classes?.length > 0 ? '.' + me.classes.slice(0, 6).join('.') : '');
+            let where = '';
+            try {
+                const [a, b] = [JSON.parse(live.checkWas), JSON.parse(signature)];
+                const keys = new Set([...Object.keys(a[1] ?? {}), ...Object.keys(b[1] ?? {})]);
+                where = [...keys].filter((key) => JSON.stringify(a[1]?.[key]) !== JSON.stringify(b[1]?.[key])).map((key) => key + ': ' + JSON.stringify(a[1]?.[key]) + ' -> ' + JSON.stringify(b[1]?.[key])).join('; ');
+                if (a[0] !== b[0]) {
+                    where += ' type ' + a[0] + ' -> ' + b[0];
+                }
+                if (JSON.stringify(a[2]) !== JSON.stringify(b[2])) {
+                    where += ' font ' + JSON.stringify(a[2]) + ' -> ' + JSON.stringify(b[2]);
+                }
+                if (JSON.stringify(a[3]) !== JSON.stringify(b[3])) {
+                    where += ' kids ' + JSON.stringify(a[3]).slice(0, 300) + ' -> ' + JSON.stringify(b[3]).slice(0, 300);
+                }
+            } catch {}
+            console.error('rsui restyle check: MISSED ' + name + ' ' + where.slice(0, 1200) + ' | key ' + live.domKey + ' props ' + JSON.stringify(Object.fromEntries(Object.entries(me?.props ?? {}).filter(([key, value]) => typeof value !== 'object' && typeof value !== 'function'))).slice(0, 400) + ' nth ' + JSON.stringify(me?.nth === null || me?.nth === undefined ? null : [me.nth.index, me.nth.count]) + ' chain ' + JSON.stringify(live.chainEl?.props?.['data-disabled']));
+        }
+        live.checkWas = undefined;
+    }
+    live.signature = signature;
+    if (checking && restyleFresh !== null && --restyleCheckLeft <= 0) {
+        restyleFresh = null;
+    }
+}
+function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+}
+const currentVersion = () => version + ':' + flowVersion;
+/// What's drawn with what CSS says, drawn again when that changes. What the app's CSS tools make is put in first, if it's due, so
+/// that what this is drawn with is what it's drawn with, rather than changing while it's drawn.
+// `ResizeObserver`, as a page has it. What's watched is looked at once it's been laid out after it's watched, and again after a
+// page's elements have rendered or the window's changed size, and each observer is told about what's a different size since it was
+// last told, as a browser tells it. Nothing's looked at while nothing's watched, and nothing waits on a timer once nothing's changing.
+
+/// Each element being watched, with its observer, which box it's watching and the size that was last said.
+const resizeWatches = new Set();
+/// Whether something's been watched since the window was last laid out, which it's told about even if nothing's laid out again.
+let resizeFirst = false;
+
+/// Has what's watched looked at after each time the window's laid out, while there's anything watched.
+function lookForResizes() {
+    const wanted = resizeWatches.size !== 0 || afterLayout.size !== 0 || hasWatched.size !== 0 || containerWatched.size !== 0;
+    rsuiHostMethods.wantLaidOut(wanted);
+    globalThis.__rsuiLaidOut = wanted ? laidOut : undefined;
+}
+
+/// What's to run once, the next time the window's been laid out, as editing placing its caret: see `editing.js`.
+const afterLayout = new Set();
+
+function laidOut() {
+    if (resizeWatches.size !== 0) {
+        checkResizes();
+    }
+    if (hasWatched.size !== 0) {
+        checkHasWatched();
+    }
+    if (containerWatched.size !== 0) {
+        checkContainerWatched();
+    }
+    const now = [...afterLayout];
+    afterLayout.clear();
+    for (const run of now) {
+        try {
+            run();
+        } catch (error) {
+            console.error(error);
+        }
+    }
+    lookForResizes();
+}
+
+/// An element's boxes, as `[border width, border height, content width, content height, content left, content top]`.
+function boxesOf(target) {
+    // Only its size, from Rust, for an element of the page that's found by its key, rather than all that's along the way to it
+    // as `getBoundingClientRect()` asks for, which is the same size.
+    const size = target?.__domKey !== undefined && target.__placedByKey === true ? rsuiHostMethods.sizeOf(target.__domKey) : undefined;
+    const rect = size !== undefined ? { width: size[0], height: size[1] } : layoutBoxOf(target);
+    // Only the padding and border, as `getComputedStyle()` says them: this is asked of every watched element after every layout,
+    // and making the whole computed style, its size and what it inherits each time was most of a spinner's frame.
+    const [paddingTop, paddingRight, paddingBottom, paddingLeft, borderTop, borderRight, borderBottom, borderLeft] = paddingAndBorderOf(target);
+    const left = paddingLeft + borderLeft;
+    const top = paddingTop + borderTop;
+    const width = Math.max(0, rect.width - left - paddingRight - borderRight);
+    const height = Math.max(0, rect.height - top - paddingBottom - borderBottom);
+    return [rect.width, rect.height, width, height, paddingLeft, paddingTop];
+}
+
+/// An element's padding and border widths, top, right, bottom and left, as numbers of pixels: what `parseFloat` makes of what
+/// `getComputedStyle()` says of them, or 0.
+function paddingAndBorderOf(element) {
+    if (element === body || element === documentElement) {
+        return [0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    const look = lookNow(element);
+    if (look === undefined && element?.__chain === undefined) {
+        const n = (value) => parseFloat(value) || 0;
+        return [...SIDES.map((side) => n(pageStyle['padding' + side])), ...SIDES.map((side) => n(pageStyle['border' + side + 'Width']))];
+    }
+    const out = [0, 0, 0, 0, 0, 0, 0, 0];
+    SIDES.forEach((side, at) => {
+        const border = look?.['border' + side + 'Width'] ?? look?.borderWidth ?? 0;
+        const padding = look?.['padding' + side];
+        out[at] = typeof padding === 'number' ? Math.max(0, padding - (typeof border === 'number' ? border : 0)) || 0 : pixelsSaid(padding);
+        out[at + 4] = pixelsSaid(border);
+    });
+    return out;
+}
+
+/// What `parseFloat` makes of a length as `getComputedStyle()` says it (`computedPx`), or 0.
+function pixelsSaid(value) {
+    return typeof value === 'number' ? value || 0 : typeof value === 'string' ? parseFloat(value) || 0 : 0;
+}
+
+function checkResizes() {
+    resizeFirst = false;
+    const told = new Map();
+    for (const watch of [...resizeWatches]) {
+        const boxes = boxesOf(watch.target);
+        const [w, h] = watch.box === 'border-box' ? [boxes[0], boxes[1]] : [boxes[2], boxes[3]];
+        if (w === watch.last[0] && h === watch.last[1]) {
+            continue;
+        }
+        watch.last = [w, h];
+        const [cw, ch, x, y] = [boxes[2], boxes[3], boxes[4], boxes[5]];
+        const entry = {
+            target: watch.target,
+            contentRect: { x, y, width: cw, height: ch, top: y, left: x, right: x + cw, bottom: y + ch, toJSON: () => ({ x, y, width: cw, height: ch, top: y, right: x + cw, bottom: y + ch, left: x }) },
+            borderBoxSize: [{ inlineSize: boxes[0], blockSize: boxes[1] }],
+            contentBoxSize: [{ inlineSize: cw, blockSize: ch }],
+            devicePixelContentBoxSize: [{ inlineSize: cw * (globalThis.devicePixelRatio ?? 1), blockSize: ch * (globalThis.devicePixelRatio ?? 1) }],
+        };
+        const list = told.get(watch.observer) ?? [];
+        list.push(entry);
+        told.set(watch.observer, list);
+    }
+    for (const [observer, entries] of told) {
+        try {
+            observer.callback.call(observer, entries, observer);
+        } catch (error) {
+            console.error(error);
+        }
+    }
+}
+
+class PageResizeObserver {
+    constructor(callback) {
+        if (typeof callback !== 'function') {
+            throw new TypeError("Failed to construct 'ResizeObserver': The callback provided as parameter 1 is not a function.");
+        }
+        this.callback = callback;
+    }
+    observe(target, options) {
+        if (target === null || typeof target !== 'object') {
+            throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+        }
+        for (const watch of resizeWatches) {
+            if (watch.observer === this && watch.target === target) {
+                resizeWatches.delete(watch);
+            }
+        }
+        // Where it is is asked of the tree each time, rather than kept from when it was found.
+        if (target.__domKey !== undefined) {
+            target.__placedByKey = true;
+            rsuiHostMethods.keepLaidOut();
+        }
+        resizeWatches.add({ observer: this, target, box: options?.box ?? 'content-box', last: [0, 0] });
+        lookForResizes();
+        // As soon as it's laid out, or a little later if nothing needs laying out again.
+        if (!resizeFirst) {
+            resizeFirst = true;
+            setTimeout(() => {
+                if (resizeFirst) {
+                    checkResizes();
+                }
+            }, 50);
+        }
+    }
+    unobserve(target) {
+        for (const watch of resizeWatches) {
+            if (watch.observer === this && watch.target === target) {
+                resizeWatches.delete(watch);
+            }
+        }
+        lookForResizes();
+    }
+    disconnect() {
+        for (const watch of resizeWatches) {
+            if (watch.observer === this) {
+                resizeWatches.delete(watch);
+            }
+        }
+        lookForResizes();
+    }
+}
+
+const usePage = () => {
+    if (addedCss.length > 0) {
+        workedOut();
+    }
+    return useSyncExternalStore(subscribe, currentVersion);
+};
+
+/// The last version of what CSS says that anything was worked out from.
+let lookedAt = -1;
+
+/// What's been worked out of what CSS said, for as long as nothing's changed.
+let worked = { at: -1, page: null, box: {}, classes: new Map(), tags: new Map() };
+function workedOut() {
+    if (addedCss.length > 0 && builtSheets()) {
+        // What's been drawn already is drawn again, with what's been made.
+        restyled();
+    }
+    lookedAt = version;
+    if (worked.at !== version) {
+        // How big a rem is, which what's worked out from here on is in, as the root's font size can come from variables or the
+        // window's size.
+        const rem = rootFontSize();
+        if (rem !== remSize) {
+            remSize = rem;
+            declared += 1;
+            forgetKinds();
+        }
+        worked = { at: version, page: null, box: {}, margin: {}, classes: new Map(), tags: new Map(), classSets: new Map(), classOrder: new Map(), classNames: new Map() };
+    }
+    return worked;
+}
+
+function lookFrom(declarations) {
+    return declareBlock(declarations, 16);
+}
+
+// Variables that are set on elements, rather than on the page, as `.shadow-sm { --shadow: ...; box-shadow: var(--shadow) }` sets
+// one: what each element has is what the rules on it say, and what it's in, as CSS has it. What uses one is worked out with what
+// the page has, as everything else is, and again for an element that sets it, or is inside one that does, when it's drawn.
+
+/// The names of the variables that something on an element sets.
+const elementVariables = new Set();
+
+/// What some declarations come to as props: what Rust makes of them, with what they say about variables kept too, as `--name`,
+/// and each that uses a variable an element can set kept as it was written, as `__var name`, with what it came to here.
+function declareBlock(declarations, fontSize) {
+    for (const [name] of declarations) {
+        if (name.startsWith('--')) {
+            elementVariables.add(name);
+        }
+    }
+    const waits = (value) => value.includes('var(') && namesIn(value).some((one) => elementVariables.has(one));
+    let waiting = declarations.filter(([name, value]) => !name.startsWith('--') && waits(value));
+    if (waiting.length > 0 && declarations.length > 1) {
+        // What's said after it about the same thing, or that's `!important` when it isn't, goes over it, as the classes of
+        // `<span class="badge text-bg-warning">` say `color: var(--bs-badge-color)` and then `color: #000 !important`.
+        // Only what's all said again goes, as `padding: var(--x)` then `padding-top: 4px` still says the other sides.
+        waiting = waiting.filter((one) => {
+            const at = declarations.indexOf(one);
+            const keys = propertyKeys(one[0]);
+            const over = new Set();
+            declarations.forEach((other, index) => {
+                if (index !== at && !other[0].startsWith('--') && (one[2] === true ? other[2] === true && index > at : index > at || other[2] === true)) {
+                    for (const key of propertyKeys(other[0])) {
+                        over.add(key);
+                    }
+                }
+            });
+            return keys.length === 0 || !keys.every((key) => over.has(key));
+        });
+    }
+    if (waiting.length === 0 && !declarations.some(([name]) => name.startsWith('--'))) {
+        return natives.cssDeclare(declarations, fontSize, remSize, declaring);
+    }
+    // What waits for an element's own variables is worked out again for each element that has them, so what it comes to with only
+    // the page's isn't something to say can't be done. What doesn't wait is said about as usual.
+    const quietly = (given) => {
+        const was = declaring.warn;
+        declaring.warn = () => {};
+        try {
+            return natives.cssDeclare(given, fontSize, remSize, declaring);
+        } finally {
+            declaring.warn = was;
+        }
+    };
+    const props = waiting.length === 0 ? natives.cssDeclare(declarations, fontSize, remSize, declaring) : quietly(declarations);
+    if (waiting.length > 0) {
+        natives.cssDeclare(declarations.filter((one) => !waiting.includes(one)), fontSize, remSize, declaring);
+    }
+    for (const [name, value] of declarations) {
+        if (name.startsWith('--')) {
+            props[name] = value;
+        }
+    }
+    for (const [name, value, important] of waiting) {
+        props['__var ' + name] = { value, fontSize, made: quietly([[name, value]]), important: important === true };
+    }
+    props.__vars = true;
+    return props;
+}
+
+/// The variables some text uses, as `var(--name)`.
+function namesIn(text) {
+    // A name can have an escape in it, as Chakra's `--chakra-spacing-1\.5` does.
+    return [...text.matchAll(/var\(\s*(--(?:[\w-]|\\.)+)/g)].map((found) => found[1]);
+}
+
+/// Where what `withElementVariables` gives keeps the element's own variables with those that aren't passed down, for what's
+/// worked out for the element itself, as its keyframes are (see `ownVariables`).
+const OWN_VARIABLES = Symbol('own variables');
+/// What's said in what goes down to everything inside something that's the box what's `position: fixed` in it is placed in,
+/// rather than the window: something with a `transform`, a `filter` or `will-change: transform`, as CSS has it.
+const FIXED_BOX = '--rsui-fixed-box';
+const holdsFixed = (look) => (typeof look.transform === 'string' && look.transform !== '' && look.transform !== 'none')
+    || (typeof look.filter === 'string' && look.filter !== '' && look.filter !== 'none')
+    || (typeof look.willChange === 'string' && /(transform|filter)/.test(look.willChange));
+/// The variables what's above passes down, saying they're in such a box, made once for each, so that what's inside isn't drawn
+/// again for a map that's only new.
+const fixedBoxes = new WeakMap();
+const noVariables = new Map();
+/// What's in a portal into `body` is in `body`, so what's fixed in it is placed in the window, wherever the portal's written (see
+/// `PagePortal` in layer.js): a Sheet opened from a sidebar in a transformed frame covers the window.
+function OutOfFixedBox({ children }) {
+    // Its DOM siblings are in body, not beside the React component that opened it. In particular, a menu's content mustn't
+    // teach the origin's parent that its trigger has the content's classes, then flip that back on the next render.
+    rsui.__provideHere(NthContext, null);
+    const variables = useContext(InheritedVariables);
+    const plain = useMemo(() => {
+        if (variables?.get?.(FIXED_BOX) !== true) {
+            return variables;
+        }
+        const made = new Map(variables);
+        made.delete(FIXED_BOX);
+        if (variables[OWN_VARIABLES] !== undefined) {
+            made[OWN_VARIABLES] = new Map(variables[OWN_VARIABLES]);
+            made[OWN_VARIABLES].delete(FIXED_BOX);
+        }
+        return made;
+    }, [variables]);
+    return plain === variables ? children : React.createElement(InheritedVariables.Provider, { value: plain }, children);
+}
+rsui.__portalContent = OutOfFixedBox;
+
+function withFixedBox(variables) {
+    const from = variables ?? noVariables;
+    if (from.get(FIXED_BOX) === true) {
+        return from;
+    }
+    let made = fixedBoxes.get(from);
+    if (made === undefined) {
+        made = new Map(from);
+        made.set(FIXED_BOX, true);
+        if (from[OWN_VARIABLES] !== undefined) {
+            made[OWN_VARIABLES] = new Map(from[OWN_VARIABLES]);
+            made[OWN_VARIABLES].set(FIXED_BOX, true);
+        }
+        fixedBoxes.set(from, made);
+    }
+    return made;
+}
+/// The variables an element itself sees, from what `withElementVariables` gave it, or what's above it.
+const ownVariables = (inside, above) => inside?.[OWN_VARIABLES] ?? inside ?? above;
+
+/// What an element's own variables come to, with what's set on what it's in that it gets from there: puts what uses them into
+/// its look, as what the element has makes it, and gives back what it has itself, worked out, for what's inside it.
+/// `fresh` says what uses a variable was only kept to be worked out here, as a field's look is, so what it came to without one isn't
+/// there to say nothing's gone over it since. Each variable it looks for goes in `note.names`, if it's given, and what it sets for
+/// what's inside in `note.own`, for `InheritedVariables.passedOn`.
+function withElementVariables(look, inherited, fresh = false, note) {
+    if (look.__vars !== true) {
+        return null;
+    }
+    delete look.__vars;
+    let own = null;
+    const used = [];
+    for (const key of natives.cssVariableKeys(layout, look)) {
+        if (key.startsWith('--')) {
+            (own ??= new Map()).set(key, look[key]);
+            delete look[key];
+        } else if (key.startsWith('__var ')) {
+            if (look[key] !== null && look[key] !== undefined) {
+                used.push([key.slice(6), look[key]]);
+            }
+            delete look[key];
+        }
+    }
+    const local = (name) => {
+        note?.names.push(name);
+        return own !== null && own.has(name) ? own.get(name) : inherited?.get(name);
+    };
+    const resolve = (text, depth = 0) => {
+        let at = text.indexOf('var(');
+        if (at < 0 || depth > 16) {
+            return text;
+        }
+        let out = '';
+        let from = 0;
+        while (at >= 0) {
+            out += text.slice(from, at);
+            const [inside, end] = insideParens(text, at + 3);
+            const comma = inside.indexOf(',');
+            const name = (comma < 0 ? inside : inside.slice(0, comma)).trim();
+            const found = setTo(local(name) ?? variableValue(name));
+            out += apart(out, resolve(found !== undefined ? found : comma < 0 ? '' : inside.slice(comma + 1).trim(), depth + 1), text[end]);
+            from = end;
+            at = text.indexOf('var(', from);
+        }
+        return out + text.slice(from);
+    };
+    for (const [name, said] of used) {
+        // What's `!important` isn't gone over by what isn't, as `.badge { color: var(--bs-badge-color) }` isn't over
+        // `.text-bg-warning { color: #000 !important }`.
+        if (said.important !== true && look.__important !== undefined) {
+            const keys = (said.keys ??= varKeys(name, said.made));
+            if (keys.length > 0 && keys.every((key) => look.__important.includes(key))) {
+                continue;
+            }
+        }
+        // Only what an element's own variables change is worked out again, and only if nothing said after it has taken its place.
+        if (!(said.names ??= namesIn(said.value)).some((one) => local(one) !== undefined)) {
+            continue;
+        }
+        // What's been said again after it (see `replacedVars`), or isn't what it made any more, stays as that says, and the rest is
+        // what it comes to, as Pico's checked radio's `border-width: .35em` takes the width from `border: var(--pico-border-width)
+        // solid var(--pico-border-color)`, which still says its color. Once all of it's been said again, it's nothing. With `fresh`, what's not there at all
+        // hasn't been gone over: it was only kept to be worked out here.
+        // Of the longhands of `transition` and `animation`, which are said together, only its own part is looked at.
+        const unchanged = (key) => (key === '__transitionParts' || key === '__animationParts'
+            ? look[key]?.[name] === said.made[key]?.[name]
+            : sameValue(look[key], said.made[key]));
+        const over = [...(said.over ?? []), ...Object.keys(said.made).filter((key) => said.made[key] !== undefined && !unchanged(key) && !(fresh && look[key] === undefined))];
+        if (over.length > 0 && (said.keys ??= varKeys(name, said.made)).every((key) => over.includes(key))) {
+            continue;
+        }
+        // What it comes to, with the variables put in, is the same for every element where they come to the same.
+        const text = resolve(said.value);
+        const key = name + '\u0000' + text + '\u0000' + said.fontSize + '\u0000' + remSize;
+        const cache = usesViewportUnits(text) ? resolvedViewportDeclarations : resolvedDeclarations;
+        let props = cache.get(key);
+        if (props === undefined) {
+            props = natives.cssDeclare([[name, text]], said.fontSize, remSize, declaring);
+            if (cache.size > 5000) {
+                cache.clear();
+            }
+            cache.set(key, props);
+        }
+        // A longhand of `transition` or `animation` is one part of what the others say too, as `transition-duration:
+        // var(--transition-duration)` is of `transition-property: transform, width`: it goes over that part of them.
+        const transitionParts = look.__transitionParts;
+        const animationParts = look.__animationParts;
+        for (const made of Object.keys(said.made)) {
+            if (!over.includes(made)) {
+                delete look[made];
+            }
+        }
+        if (over.length === 0) {
+            Object.assign(look, props);
+        } else {
+            for (const key of Object.keys(props)) {
+                if (!over.includes(key)) {
+                    look[key] = props[key];
+                }
+            }
+        }
+        if (transitionParts !== undefined && props.__transitionParts !== undefined && look.__transitionParts === props.__transitionParts) {
+            look.__transitionParts = { ...transitionParts, ...props.__transitionParts };
+        }
+        if (animationParts !== undefined && props.__animationParts !== undefined && look.__animationParts === props.__animationParts) {
+            look.__animationParts = { ...animationParts, ...props.__animationParts };
+        }
+    }
+    if (own === null) {
+        return null;
+    }
+    if (VARIABLE_DELTAS) {
+        return variablesFromChanges(own, inherited, resolve, note);
+    }
+    // What goes down to what's inside, as it is here, which is all of them apart from what `@property` says doesn't.
+    const down = new Map(inherited ?? []);
+    let self = null;
+    if (note !== undefined) {
+        note.own ??= [];
+    }
+    // This map is private to variable resolution and is not mutated here. forEach avoids an entry array and its
+    // destructuring iterator for every local variable on every element.
+    own.forEach((value, name) => {
+        if (registered.get(name)?.inherits !== false) {
+            const resolved = resolve(value);
+            down.set(name, resolved);
+            if (note !== undefined) {
+                (note.own ??= []).push([name, resolved]);
+            }
+        } else {
+            // Not passed down, but the element's own all the same, as its keyframes see it: tw-animate-css's
+            // `--tw-enter-opacity` is `@property` with `inherits: false`, set by `fade-in-0` on the element `animate-in` plays on.
+            (self ??= []).push([name, resolve(value)]);
+        }
+    });
+    if (self !== null) {
+        const ownDown = new Map(down);
+        for (const [name, value] of self) {
+            ownDown.set(name, value);
+        }
+        down[OWN_VARIABLES] = ownDown;
+    }
+    return down;
+}
+
+// A repeated reset need not copy and rewrite all inherited variables before discovering it changed nothing. Resolve every
+// local declaration as before, including its reads, and retain every local binding in the context note even when it agrees
+// with the parent: that binding must still shield a later parent change. These maps are private computed string bindings.
+function variablesFromChanges(own, inherited, resolve, note) {
+    // A parent's noninheriting bindings are its own only. A Map copy strips that symbol metadata for the child.
+    let down = inherited?.[OWN_VARIABLES] !== undefined ? new Map(inherited) : null;
+    let self = null;
+    if (note !== undefined) {
+        note.own ??= [];
+    }
+    own.forEach((value, name) => {
+        const resolved = resolve(value);
+        if (registered.get(name)?.inherits !== false) {
+            if (down !== null) {
+                down.set(name, resolved);
+            } else if (inherited === null || inherited === undefined || !inherited.has(name) || inherited.get(name) !== resolved) {
+                down = new Map(inherited ?? []);
+                down.set(name, resolved);
+            }
+            if (note !== undefined) {
+                note.own.push([name, resolved]);
+            }
+        } else {
+            (self ??= []).push([name, resolved]);
+        }
+    });
+    if (self !== null) {
+        // Attaching the element's private values must never mutate the parent's map, even when every inherited value agrees.
+        down ??= new Map(inherited ?? []);
+        const ownDown = new Map(down);
+        for (const [name, value] of self) {
+            ownDown.set(name, value);
+        }
+        down[OWN_VARIABLES] = ownDown;
+    }
+    return down ?? inherited ?? new Map();
+}
+
+/// What a declaration comes to with what its variables stand for put in, for each that's been worked out: see `withElementVariables`.
+const resolvedDeclarations = new Map();
+// Resolved var() text can still contain viewport units. Its computed lengths
+// expire with the viewport, while unrelated variable declarations stay warm.
+const resolvedViewportDeclarations = new Map();
+
+const sameValue = (a, b) => a === b || (typeof a === 'object' && a !== null && JSON.stringify(a) === JSON.stringify(b));
+
+/// The variables set on what something is in, which it has too.
+const InheritedVariables = createContext(null);
+
+/// What the element something is in says of itself, for `inherit` on what isn't passed down by itself, as Bootstrap's
+/// `flex-wrap: inherit` is. Elements only hand it down once something on the page has asked for it, so a page that never says
+/// `inherit` pays nothing for it.
+const ParentLook = createContext(null);
+let inheritAsked = false;
+
+// What reads these says what it read of them (`rsui.__readsHere`), and only renders again when that's changed: see `toldChanged` in
+// layer.js. Each gives back what the element passes down now, or `undefined` if it has to render again to know. One whose
+// natively drawn children are told what it passes down (`tellNativeKids`) always renders again, as they aren't watching.
+InheritedVariables.passedOn = (note, before, after, own) => {
+    if (note.live?.nativeKids === true) {
+        return undefined;
+    }
+    for (const name of note.names) {
+        if (before?.get(name) !== after?.get(name)) {
+            return undefined;
+        }
+    }
+    if (note.own === null) {
+        // It passes on what it's given.
+        return own === before ? after : undefined;
+    }
+    const down = new Map(after ?? []);
+    for (const [name, value] of note.own) {
+        down.set(name, value);
+    }
+    return down;
+};
+ParentLook.passedOn = (note, before, after, own) => {
+    if (note.live?.nativeKids === true) {
+        return undefined;
+    }
+    for (const prop of note.props) {
+        if (prop === null || before === null || before === undefined || after === null || after === undefined || !sameValue(before[prop], after[prop])) {
+            return undefined;
+        }
+    }
+    if (note.through) {
+        return own === before ? after : undefined;
+    }
+    // What it passes down is its own look, which is as it was.
+    return own;
+};
+/// What each property is tried with, to find which of rsui's props it sets: see `propsOfProperty`.
+const INHERIT_PROBES = {
+    'flex-wrap': 'wrap', 'flex-direction': 'column', 'flex-flow': 'column wrap', flex: '1 1 1px', 'flex-grow': '1', 'flex-shrink': '0',
+    'align-items': 'center', 'align-self': 'center', 'align-content': 'center', 'justify-content': 'center', background: 'red',
+    'background-color': 'red', 'background-image': 'linear-gradient(red, blue)', border: '1px solid red', 'border-color': 'red',
+    'border-style': 'solid', opacity: '0.5', overflow: 'hidden', 'overflow-x': 'hidden', 'overflow-y': 'hidden', position: 'relative',
+    'z-index': '1', 'text-decoration': 'underline', outline: '1px solid red', 'box-sizing': 'border-box', 'vertical-align': 'middle',
+    transition: 'opacity 1s', 'text-overflow': 'ellipsis', 'box-shadow': '0 0 1px red',
+};
+const inheritProps = new Map();
+
+/// Which of rsui's props a CSS property sets, found once by declaring it.
+function propsOfProperty(name) {
+    let keys = inheritProps.get(name);
+    if (keys === undefined) {
+        keys = Object.keys(declareBlock([[name, INHERIT_PROBES[name] ?? '1px']], 16)).filter((key) => !key.startsWith('__inherit_'));
+        inheritProps.set(name, keys);
+    }
+    return keys;
+}
+
+/// What `html`, `:root` and `body` say of themselves, together, as what's at the top of the page is in.
+function pageParentLook() {
+    const now = workedOut();
+    return (now.pageParent ??= lookFrom(sheets.flatMap((one) => one.page)));
+}
+
+/// Puts the parent's own values in for what `look` says is `inherit`, and takes the markers away. Each of the parent's props it
+/// reads goes in `reads`, if it's given, for `ParentLook.passedOn`.
+function withInherited(look, parent, reads) {
+    let asked = false;
+    for (const key of Object.keys(look)) {
+        if (!key.startsWith('__inherit_')) {
+            continue;
+        }
+        const name = look[key];
+        delete look[key];
+        if (typeof name !== 'string') {
+            continue;
+        }
+        asked = true;
+        // What's at the top of the page has `body` around it, in `html`, as Bulma's `html { box-sizing: border-box }` with
+        // `* { box-sizing: inherit }` has everything inside it be.
+        if (parent === null || parent === undefined) {
+            // What's at the top of the page isn't what's passed down, so what's read of it can't be compared.
+            reads?.push(null);
+        }
+        parent ??= pageParentLook();
+        for (const prop of propsOfProperty(name)) {
+            reads?.push(prop);
+            if (parent[prop] === undefined) {
+                delete look[prop];
+            } else {
+                look[prop] = parent[prop];
+            }
+        }
+    }
+    if (asked && !inheritAsked) {
+        // From now on every element hands down what it says, and everything is drawn again with it.
+        inheritAsked = true;
+        queueMicrotask(changed);
+    }
+}
+
+/// What only a flex container has, from `flex-direction`, `flex-wrap`, `align-items` and `justify-content`, taken off one that
+/// isn't flex or grid, as they do nothing to it in CSS: a block with `flex-direction: column` still lays out as a block, and its
+/// children are still as wide as it is, whatever its `align-items`. A grid keeps its `align` and `justify`, which it has too.
+function withoutFlexOnBlock(look) {
+    if (look.__flex === true || look.display === 'contents') {
+        return;
+    }
+    if (look.direction !== undefined) {
+        delete look.direction;
+        delete look.reverse;
+    }
+    if (look.flexWrap !== undefined) {
+        delete look.flexWrap;
+    }
+    if (look.display !== 'grid') {
+        if (look.align !== undefined) {
+            delete look.align;
+        }
+        if (look.justify !== undefined) {
+            delete look.justify;
+        }
+    }
+}
+
+/// `translate`, `rotate` and `scale`, which are each a part of `transform`, put together with it as CSS does: moved, then turned,
+/// then made bigger or smaller, then whatever `transform` says.
+function withTransformParts(look) {
+    // `transform: none` is said so that it wins over what came before it in the cascade; what's left is no transform at all.
+    if (look.transform === 'none') {
+        delete look.transform;
+    }
+    if (look.__translate === undefined && look.__rotate === undefined && look.__scale === undefined) {
+        return look;
+    }
+    const parts = [];
+    const said = (value) => value !== undefined && value !== 'none';
+    if (said(look.__translate)) {
+        const [x, y = '0px'] = words(look.__translate);
+        parts.push('translate(' + x + ', ' + y + ')');
+    }
+    if (said(look.__rotate)) {
+        const turned = angleOf(look.__rotate);
+        if (turned !== undefined) {
+            parts.push('rotate(' + turned + 'deg)');
+        }
+    }
+    if (said(look.__scale)) {
+        const [x, y = x] = words(look.__scale).map((one) => (one.endsWith('%') ? Number(one.slice(0, -1)) / 100 : Number(one)));
+        parts.push('scale(' + x + ', ' + y + ')');
+    }
+    if (typeof look.transform === 'string') {
+        parts.push(look.transform);
+    }
+    delete look.__translate;
+    delete look.__rotate;
+    delete look.__scale;
+    if (parts.length > 0) {
+        look.transform = parts.join(' ');
+    }
+    return look;
+}
+
+/// An angle, in degrees, from what CSS says, with `calc()` worked out: `calc(90deg * -1)` is -90.
+function angleOf(text) {
+    const DEGREES = { deg: 1, rad: 180 / Math.PI, turn: 360, grad: 0.9 };
+    const plain = text.replace(/calc\(/g, '(').replace(/(-?[0-9.]+)(deg|rad|turn|grad)\b/g, (_, number, unit) => String(Number(number) * DEGREES[unit]));
+    if (!/^[0-9.+\-*/()\s]+$/.test(plain)) {
+        return undefined;
+    }
+    // What's left is numbers and arithmetic, which is worked out as written.
+    let at = 0;
+    const space = () => {
+        while (plain[at] === ' ') {
+            at += 1;
+        }
+    };
+    const term = () => {
+        space();
+        if (plain[at] === '(') {
+            at += 1;
+            const inside = sum();
+            space();
+            at += 1;
+            return inside;
+        }
+        const found = /^-?[0-9.]+/.exec(plain.slice(at));
+        if (found === null) {
+            return NaN;
+        }
+        at += found[0].length;
+        return Number(found[0]);
+    };
+    const product = () => {
+        let value = term();
+        for (space(); plain[at] === '*' || plain[at] === '/'; space()) {
+            const op = plain[at++];
+            const next = term();
+            value = op === '*' ? value * next : value / next;
+        }
+        return value;
+    };
+    const sum = () => {
+        let value = product();
+        for (space(); plain[at] === '+' || plain[at] === '-'; space()) {
+            const op = plain[at++];
+            const next = product();
+            value = op === '+' ? value + next : value - next;
+        }
+        return value;
+    };
+    const value = sum();
+    return Number.isFinite(value) ? value : undefined;
+}
+
+/// Puts what `props` says over what `look` says, apart from what `look` has that was `!important`, unless `props` says that's
+/// `!important` too.
+function mergeLook(look, props) {
+    if (props === undefined || props === null) {
+        return look;
+    }
+    const kept = look.__important;
+    const strong = props.__important;
+    if (look.__vars === true) {
+        replacedVars(look, props, kept, strong);
+    }
+    variablesAssigned(look, props);
+    const transitionParts = look.__transitionParts;
+    const animationParts = look.__animationParts;
+    // A `display: flex` says nothing of which way a flex box goes that another rule said before it: see `declare.rs`.
+    const direction = props.__directionByDisplay === true && look.direction !== undefined && look.__directionByDisplay !== true
+        ? [look.direction, look.reverse] : null;
+    if (kept === undefined && strong === undefined) {
+        Object.assign(look, props);
+    } else {
+        for (const key of Object.keys(props)) {
+            if (key === '__important' || (kept !== undefined && kept.includes(key) && !(strong !== undefined && strong.includes(key)))) {
+                continue;
+            }
+            look[key] = props[key];
+        }
+        if (strong !== undefined) {
+            look.__important = [...(kept ?? []), ...strong];
+        }
+    }
+    if (transitionParts !== undefined || animationParts !== undefined) {
+        longhandsOver(look, props, '__transition', '__transitionParts', transitionParts);
+        longhandsOver(look, props, '__animation', '__animationParts', animationParts);
+    }
+    if (direction !== null) {
+        [look.direction, look.reverse] = direction;
+        delete look.__directionByDisplay;
+    }
+    return look;
+}
+
+/// `Object.assign(look, props)`, apart from the longhands of `transition` and `animation`, which go over what `look` had of
+/// them (see `longhandsOver`), as an element's own `style.transitionDuration = '0ms'` is still about what its classes say moves.
+function assignLook(look, props) {
+    const transitionParts = look.__transitionParts;
+    const animationParts = look.__animationParts;
+    variablesAssigned(look, props);
+    Object.assign(look, props);
+    if (transitionParts !== undefined || animationParts !== undefined) {
+        longhandsOver(look, props, '__transition', '__transitionParts', transitionParts);
+        longhandsOver(look, props, '__animation', '__animationParts', animationParts);
+    }
+    return look;
+}
+
+/// The props with a side along a line, in pairs, which a logical property (`margin-inline-start`, `inset-inline-end`,
+/// `border-inline-start-width`...) puts on the side it means where text goes from left to right, noting it under `~` and the name
+/// (`declare_logical` in declare.rs).
+const LOGICAL_PAIRS = [['marginLeft', 'marginRight'], ['marginLeftShare', 'marginRightShare'], ['__autoLeft', '__autoRight'],
+    ['paddingLeft', 'paddingRight'], ['paddingLeftShare', 'paddingRightShare'], ['left', 'right'],
+    ['borderLeftWidth', 'borderRightWidth'], ['borderLeftColor', 'borderRightColor']];
+const LOST = Symbol('lost');
+
+/// What logical properties said, on the sides they mean now that it's known which way the text goes (CSS Logical Properties 1
+/// §4, Writing Modes 3 §2.1): where it goes from right to left, the start of a line is its right, so what `margin-inline-start`
+/// put at the left goes to the right, and what was said of the right by a physical property stays there. What a logical property
+/// went over on its left-to-right side, as `inset-0` before `start-2` has `left`, is taken to have been what the other side says,
+/// as a physical property nearly always says both sides alike. Which of two said last isn't kept: a logical property is taken as
+/// later than a physical one.
+function logicalSides(look) {
+    delete look.__logical;
+    const backwards = look.textDirection === 'rtl';
+    for (const [a, b] of LOGICAL_PAIRS) {
+        const noteA = '~' + a;
+        const noteB = '~' + b;
+        const la = look[noteA];
+        const lb = look[noteB];
+        if (la === undefined && lb === undefined) {
+            continue;
+        }
+        delete look[noteA];
+        delete look[noteB];
+        if (!backwards) {
+            continue;
+        }
+        const pa = la !== undefined && look[a] === la ? LOST : look[a];
+        const pb = lb !== undefined && look[b] === lb ? LOST : look[b];
+        const nowB = la !== undefined ? la : pb === LOST ? (pa === LOST ? undefined : pa) : pb;
+        const nowA = lb !== undefined ? lb : pa === LOST ? (pb === LOST ? undefined : pb) : pa;
+        if (nowA === undefined) {
+            delete look[a];
+        } else {
+            look[a] = nowA;
+        }
+        if (nowB === undefined) {
+            delete look[b];
+        } else {
+            look[b] = nowB;
+        }
+    }
+    const radii = look['~cornerRadii'];
+    if (radii !== undefined) {
+        delete look['~cornerRadii'];
+        if (backwards && look.cornerRadii === radii) {
+            // Corners as top-left, top-right, bottom-right and bottom-left, each across and down: the left ones and the right
+            // ones change places.
+            const at = radii.split(' ');
+            look.cornerRadii = [at[2], at[3], at[0], at[1], at[6], at[7], at[4], at[5]].map((one) => one ?? '').join(' ');
+        }
+    }
+}
+
+/// What a look had of the longhands of `transition` or `animation` (`parts`, as `__transitionParts`), with what `props` says of
+/// them over it, rather than only what `props` says: `.indicator { transition-property: transform, width; transition-duration: 0ms }`
+/// then `.indicator[data-initialized] { transition-duration: 150ms }` is still about `transform` and `width`, as Mantine's
+/// SegmentedControl has it. A shorthand in `props` (`__transition`) says all of it again, as CSS has it.
+function longhandsOver(look, props, shorthand, parts, before) {
+    if (before === undefined) {
+        return;
+    }
+    if (props[shorthand] !== undefined) {
+        if (props[parts] === undefined) {
+            delete look[parts];
+        }
+    } else if (props[parts] !== undefined && look[parts] === props[parts]) {
+        look[parts] = { ...before, ...props[parts] };
+    } else if (props[parts] === undefined && look[parts] === undefined) {
+        look[parts] = before;
+    }
+}
+
+/// How much what's being put into a look by `fromAbove` says about what it's for (see `specificity`), as an element's look has
+/// what its kind and its classes say before it, whatever order they'd be in: only what says more than a class does goes over
+/// what waits for a variable there. Anything else is put in in the cascade's order.
+let mergeWeight = Infinity;
+/// Whether what's being put in comes after everything already in, in the cascade's order, as each rule of a plan that's gone
+/// through in order does, which goes over what waits for a variable whatever it says about: Mantine's dot badge's
+/// `:where([data-mantine-color-scheme=light]) .m_fbd81e3d { background-color: white }` after `.m_347db0ec { background:
+/// var(--badge-bg) }`.
+let mergeInOrder = false;
+
+// Cascading another declaration only needs to revisit declarations waiting on variables, not all the layout/color values
+// already in the look. Sidecars hold names, never computed values, so changed variables are still resolved normally.
+const pendingVariableFields = new WeakMap();
+function pendingVariablesOf(look) {
+    let keys = pendingVariableFields.get(look);
+    if (keys === undefined) {
+        keys = Object.keys(look).filter((key) => key.startsWith('__var '));
+        pendingVariableFields.set(look, keys);
+    }
+    return keys;
+}
+
+function variablesAssigned(look, props) {
+    if (props.__vars !== true) {
+        return;
+    }
+    const before = look.__vars === true ? pendingVariablesOf(look) : [];
+    const more = pendingVariablesOf(props);
+    const added = more.filter((key) => !before.includes(key));
+    pendingVariableFields.set(look, added.length === 0 ? before : before.concat(added));
+}
+
+/// Takes out of `look` each declaration that waits for an element's own variables, as `background-color: var(--v)` does, that
+/// `props` says something else for, as a later or more particular rule does: `.a { --v: #eee; background-color: var(--v) }` then
+/// `.a:checked { background-color: green }` is green, which the variable mustn't go back over once the element's variables are
+/// known. What it made with only the page's variables can't say that when that was nothing, so it's what the property sets.
+function replacedVars(look, props, kept, strong) {
+    if (mergeWeight <= 100 && !mergeInOrder) {
+        return;
+    }
+    for (const key of pendingVariablesOf(look)) {
+        if (key in props) {
+            continue;
+        }
+        const said = look[key];
+        if (said === null || said === undefined) {
+            continue;
+        }
+        const keys = (said.keys ??= varKeys(key.slice(6), said.made));
+        const over = keys.filter((one) => one in props && !(kept !== undefined && kept.includes(one) && !(strong !== undefined && strong.includes(one))));
+        if (keys.length > 0 && over.length === keys.length) {
+            delete look[key];
+        } else if (over.length > 0 && !over.every((one) => said.over?.includes(one))) {
+            // Some of what it sets is said again after it, as Pico's checked radio's `border-width: .35em` is after `border:
+            // var(--pico-border-width) solid var(--pico-border-color)`, which still says its color, or Mantine's dot badge's `background-color: white` after `background: var(--badge-bg)`:
+            // that's kept, for this look.
+            look[key] = { ...said, over: [...new Set([...(said.over ?? []), ...over])] };
+        }
+    }
+}
+
+/// Which of rsui's props a CSS property that uses a variable sets: what it made, and what it makes with a value it takes.
+function varKeys(name, made) {
+    const keys = new Set(Object.keys(made ?? {}).filter((one) => !one.startsWith('__')));
+    for (const one of propertyKeys(name)) {
+        keys.add(one);
+    }
+    return [...keys];
+}
+
+/// Which of rsui's props a CSS property sets, found once by declaring it with a value it takes, leaving out what only marks how
+/// something was said, as `__ownBorder` does, which other properties set too.
+const propertyKeysFound = new Map();
+function propertyKeys(name) {
+    let keys = propertyKeysFound.get(name);
+    if (keys !== undefined) {
+        return keys;
+    }
+    const found = new Set();
+    const was = declaring.warn;
+    declaring.warn = () => {};
+    try {
+        for (const one of propsOfProperty(name)) {
+            if (!one.startsWith('__')) {
+                found.add(one);
+            }
+        }
+        for (const probe of ['red', 'none', 'auto']) {
+            if (found.size > 0) {
+                break;
+            }
+            for (const one of Object.keys(natives.cssDeclare([[name, probe]], 16, remSize, declaring))) {
+                if (!one.startsWith('__')) {
+                    found.add(one);
+                }
+            }
+        }
+    } finally {
+        declaring.warn = was;
+    }
+    keys = [...found];
+    propertyKeysFound.set(name, keys);
+    return keys;
+}
+
+/// What's said about where the page goes, as `#app` is, which is something around everything that's there.
+function rootLook() {
+    return lookFrom(sheets.flatMap((one) => one.root ?? []));
+}
+
+function pageLook() {
+    const now = workedOut();
+    if (now.page === null) {
+        // How `html` and `body` lay out what's in them isn't for the window, as it's only what each of them does to the next.
+        const all = lookFrom(sheets.flatMap((one) => one.page));
+        now.page = {};
+        now.box = {};
+        for (const name of Object.keys(all)) {
+            if (['background', 'backgroundGradient', 'color', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', '__lineScale', ...PAGE_SCROLLBAR_SAID].includes(name)) {
+                now.page[name] = all[name];
+            } else if (name.startsWith('border') || name.startsWith('padding')) {
+                // What's around everything, which goes on what's inside the window.
+                now.box[name] = all[name];
+            } else if (name.startsWith('margin')) {
+                now.margin[name] = all[name];
+            } else if (name === '__scroll') {
+                // Whether the page scrolls, which it does unless it says it doesn't.
+                now.pageScroll = all.__scroll ?? 'none';
+            }
+        }
+        // The text size is what `body` says, as a share of the root's if it's in em or %, or else the root's.
+        const bodyFont = lastSaid('bodyFont');
+        if (bodyFont !== undefined) {
+            const size = declareBlock([['font-size', bodyFont]], remSize).fontSize;
+            if (typeof size === 'number') {
+                now.page.fontSize = size;
+            }
+        } else if (lastSaid('rootFont') !== undefined) {
+            now.page.fontSize = remSize;
+        }
+        // What `body` says about its own box: how it lays out what's in it, how big it is, and the rest that isn't the window's or what's
+        // around everything, or what text inside it has, which goes down from the window as it is.
+        const body = lookFrom(sheets.flatMap((one) => one.body ?? []));
+        now.body = {};
+        for (const name of Object.keys(body)) {
+            if (!(name in now.page) && !(name in now.box) && !(name in now.margin) && !name.startsWith('margin') && !BODY_TEXT.has(name)) {
+                now.body[name] = body[name];
+            }
+        }
+    }
+    return now.page;
+}
+
+/// The last of what the sheets, in the order they're in, said about the page's font size: `rootFont` for `html` and `:root`, or
+/// `bodyFont` for `body`.
+function lastSaid(which) {
+    let said;
+    for (const one of sheets) {
+        const list = one[which];
+        if (list !== undefined && list.length > 0) {
+            said = list[list.length - 1];
+        }
+    }
+    return said;
+}
+
+/// How big a rem is: the root's font size, with what variables in it stand for, and a percentage or em of the browser's 16px.
+function rootFontSize() {
+    const said = lastSaid('rootFont');
+    if (said === undefined) {
+        return 16;
+    }
+    const text = withVariables(said).trim();
+    const percent = /^([0-9.]+)%$/.exec(text);
+    const size = percent !== null ? (Number(percent[1]) * 16) / 100 : natives.cssLength(text, 16, 16);
+    return typeof size === 'number' && size > 0 ? size : 16;
+}
+
+/// What `body` says that's for the text inside it rather than its box, which the window has, or that's the window's.
+const BODY_TEXT = new Set(['background', 'backgroundGradient', 'color', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', '__lineScale',
+    'textAlign', 'letterSpacing', 'wordSpacing', 'keepWords', 'noWrap', '__whiteSpace', '__case', '__scroll', '__hidden', '__fontScale', '__important']);
+
+function classLook(name) {
+    const now = workedOut();
+    let look = now.classes.get(name);
+    if (look !== undefined) {
+        return look;
+    }
+    const rules = rulesIn('classes', name);
+    if (rules === undefined) {
+        return undefined;
+    }
+    look = lookFrom(rules.length === 1 ? rules[0].declarations : rules.flatMap((rule) => rule.declarations));
+    now.classes.set(name, look);
+    return look;
+}
+
+/// How many rules about a class have been read, which is the order they're in within a sheet.
+let ruleCount = 0;
+
+/// What the page's rules about these classes say together, as the cascade has it: each says as much as the next, so it's the
+/// order the rules are in, sheet by sheet, that says which goes over which, with what's `!important` over the rest, rather than
+/// the order the classes are written in. Classes a styled component made, which aren't the page's, are left out.
+function pageClassesLook(classes, key = null) {
+    // What it comes to for the same `className` is kept, which is most of what's looked up.
+    const now = workedOut();
+    if (key !== null) {
+        const known = now.classNames.get(key);
+        if (known !== undefined || now.classNames.has(key)) {
+            return known;
+        }
+        const found = pageClassesLook(classes);
+        now.classNames.set(key, found);
+        return found;
+    }
+    let names = null;
+    for (const name of classes) {
+        if (!madeClasses.has(name) && rulesIn('classes', name) !== undefined && !(names ??= []).includes(name)) {
+            names.push(name);
+        }
+    }
+    if (names === null) {
+        return undefined;
+    }
+    if (names.length === 1) {
+        return classLook(names[0]);
+    }
+    const joined = names.join(' ');
+    let look = now.classOrder.get(joined);
+    if (look === undefined) {
+        const rank = sheetRanks();
+        const rules = names.flatMap((name) => rulesIn('classes', name));
+        rules.sort((a, b) => rank.get(a.sheet) - rank.get(b.sheet) || a.at - b.at);
+        look = lookFrom(rules.flatMap((rule) => rule.declarations));
+        now.classOrder.set(joined, look);
+    }
+    return look;
+}
+
+/// Where each sheet is in the cascade, for as long as that's so.
+let ranks = { shape: -1, of: new Map() };
+function sheetRanks() {
+    if (ranks.shape !== sheetsShape || ranks.count !== sheets.length) {
+        ranks = { shape: sheetsShape, count: sheets.length, of: new Map(sheets.map((one, at) => [one, at])) };
+    }
+    return ranks.of;
+}
+
+function tagLook(name) {
+    const now = workedOut();
+    let look = now.tags.get(name);
+    if (look !== undefined) {
+        return look;
+    }
+    const rules = rulesIn('tags', name);
+    if (rules === undefined) {
+        return undefined;
+    }
+    look = lookFrom(rules);
+    delete look.__hidden;
+    now.tags.set(name, look);
+    return look;
+}
+
+/// What's being drawn, which notes each of the page's variables it reads: see `restyleTouches`.
+let variableReader = null;
+
+function variableValue(name) {
+    if (variableReader !== null) {
+        (variableReader.pageVarsRead ??= new Set()).add(name);
+    }
+    if (pageVariables.has(name)) {
+        return pageVariables.get(name);
+    }
+    const when = pageRuleVariables();
+    if (when !== null && when.has(name)) {
+        return when.get(name);
+    }
+    for (const kind of pageClasses) {
+        const own = classVariables.get(kind);
+        if (own !== undefined && own.has(name)) {
+            return own.get(name);
+        }
+    }
+    const root = rootVariables.get(name);
+    if (root !== undefined) {
+        return root;
+    }
+    return universalVariables.has(name) ? universalVariables.get(name) : registered.get(name)?.initial;
+}
+
+/// The text inside a pair of parentheses that starts at `open`, and where it ends.
+function insideParens(text, open) {
+    let depth = 0;
+    for (let at = open; at < text.length; at += 1) {
+        if (text[at] === '(') {
+            depth += 1;
+        } else if (text[at] === ')') {
+            depth -= 1;
+            if (depth === 0) {
+                return [text.slice(open + 1, at), at + 1];
+            }
+        }
+    }
+    return [text.slice(open + 1), text.length];
+}
+
+const words = (text) => natives.cssWords(text);
+const commas = (text) => natives.cssCommas(text);
+
+/// Puts in what `var(--name)` stands for.
+/// What a variable's value is, or `undefined` if it's `initial`, which a variable is set to for it to stand for nothing, as
+/// Bootstrap's `.table { --bs-table-bg-state: initial }` is, so that `var(--bs-table-bg-state, ...)` is what comes after the comma.
+function setTo(value) {
+    return value === undefined || value === null || (value.length < 16 && value.trim().toLowerCase() === 'initial') ? undefined : value;
+}
+
+/// What a `var()` is, put where it was, as tokens of its own, as CSS has them: what's said next to it, as Tailwind's
+/// `var(--tw-duration,.15s)var(--tw-ease,ease)` is, doesn't run into it, as `.15sease` would.
+const RUNS_ON = /[\w.%#)-]/;
+function apart(before, value, next) {
+    if (value === '') {
+        return value;
+    }
+    let out = value;
+    if (before !== '' && RUNS_ON.test(before[before.length - 1]) && RUNS_ON.test(out[0])) {
+        out = ' ' + out;
+    }
+    if (next !== undefined && RUNS_ON.test(out[out.length - 1]) && /[\w.#-]/.test(next)) {
+        out += ' ';
+    }
+    return out;
+}
+
+function withVariables(text, depth = 0, variables = null) {
+    let at = text.indexOf('var(');
+    if (at < 0 || depth > 16) {
+        return text;
+    }
+    let out = '';
+    let from = 0;
+    while (at >= 0) {
+        out += text.slice(from, at);
+        const [inside, end] = insideParens(text, at + 3);
+        const comma = inside.indexOf(',');
+        const name = (comma < 0 ? inside : inside.slice(0, comma)).trim();
+        const fallback = comma < 0 ? '' : inside.slice(comma + 1).trim();
+        const found = setTo((variables === null ? undefined : variables.get(name)) ?? variableValue(name));
+        out += apart(out, withVariables(found !== undefined ? found : fallback, depth + 1, variables), text[end]);
+        from = end;
+        at = text.indexOf('var(', from);
+    }
+    return out + text.slice(from);
+}
+
+// Sizes
+
+/// A size, with `calc()`, `min()`, `max()` and `clamp()`, worked out in Rust, in `css.rs`.
+function length(text, fontSize = 16) {
+    return natives.cssLength(text, fontSize, remSize);
+}
+
+// Colors
+
+/// A color as rsui takes it, or `undefined` if it isn't one. It's worked out in Rust, in `css.rs`.
+function color(text) {
+    return natives.cssColor(text);
+}
+
+// CSS, as text, into rules
+
+/// A sheet's text as its declarations, `[name, value]`, or `[name, value, true]` for what's `!important`, and its rules, as
+/// `{ selector, block }`. It's read in Rust, in `css.rs`.
+const readCss = (text) => natives.cssRead(text);
+
+// Declarations into props
+
+/// What a block's declarations come to as props is worked out in Rust, in `declare.rs`, and this is what's passed along for what only
+/// this knows: what a `var()` stands for, what `content` says, and what to say once as something that can't be done here. `em` is
+/// which props have ever been said in `em`, in the order they were, which `declare.rs` keeps here, as it's the page's.
+const declaring = { em: '', vars: withVariables, content: contentOf, warn: notHere };
+
+/// What `content` says, in `::before` and `::after`: it's only there at all if it says this. Text, counters and attributes together
+/// are worked out for each element it's on.
+function contentOf(value) {
+    if (/(counter|attr)\(/.test(value)) {
+        return { template: contentTemplate(value) };
+    }
+    if (value !== 'none' && value !== 'normal') {
+        // What's in quotes, with what CSS writes as `\201C` as the character it is.
+        return value
+            .replace(/^["']|["']$/g, '')
+            .replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+            .replace(/\\(.)/g, '$1');
+    }
+    return undefined;
+}
+
+/// What font props come to here: a file, for a family that CSS has given files for, with the nearest weight there is, and otherwise a
+/// system font in regular or bold. These stay as CSS has them until the end, so that a weight can go down without the family, as it does.
+/// It's worked out in Rust, in `layout.rs`, which has the files `@font-face` gave.
+const finalFont = (given) => natives.cssFinalFont(layout, given);
+
+/// Puts in what was said as a share of the size of the text, now that it's known: `parent` is the size of the text around it.
+function resolveRelative(look, parent) {
+    if (typeof look.__fontScale === 'number') {
+        look.fontSize = look.__fontScale * parent;
+    }
+    delete look.__fontScale;
+    const own = typeof look.fontSize === 'number' ? look.fontSize : parent;
+    for (const key of Object.keys(look)) {
+        if (key.startsWith('__em_')) {
+            const share = look[key];
+            if (typeof share === 'number') {
+                look[key.slice(5)] = share * own;
+            }
+            delete look[key];
+        }
+    }
+    return look;
+}
+
+// Selectors
+
+/// What's after `::`, as `::before` is: a part of something, rather than something it can be.
+const PARTS = new Set(['before', 'after', 'placeholder', 'selection', 'first-line', 'first-letter', 'marker', 'backdrop']);
+/// What's about where something is among what's around it.
+const STRUCTURAL = new Set(['first-child', 'last-child', 'only-child', 'first-of-type', 'last-of-type', 'only-of-type', 'nth-child', 'nth-last-child', 'nth-of-type', 'nth-last-of-type']);
+/// A state that's only there to draw something again, as setting an attribute on it does.
+const REDRAWN = 1 << 20;
+const HOVER = 1;
+const PRESS = 2;
+const FOCUS = 4;
+const WITHIN = 8;
+/// Whether what has the keyboard shows that it has, as it does when it's been tabbed to rather than clicked, which `:focus-visible`
+/// is about. Rust says so (as `focus_ring`).
+const RING = 32;
+/// Whether anything's said where something is among what's around it, which is only worth keeping track of once something has.
+let structural = false;
+/// Whether anything's been drawn while that wasn't kept track of, which has to be drawn again once it is.
+let drawnUnstructured = false;
+/// Whether anything's said about where something is among those of its kind, as `:first-of-type` does, which is when what a
+/// component makes matters to what's around it.
+let ofType = false;
+
+function readAttribute(text) {
+    const found = /^\s*([\w-]+)\s*(?:([~|^$*]?=)\s*["']?([^"']*)["']?\s*(?:[is])?)?\s*$/.exec(text);
+    return found === null ? { name: '', op: '=', value: '\u0000' } : { name: found[1], op: found[2], value: found[3] };
+}
+
+/// One step of a selector, as `a.link:hover`, with how it's joined to the one before: inside it anywhere, right inside it (`>`), right
+/// after it (`+`), or anywhere after it (`~`).
+function readCompound(text, link) {
+    const step = { tag: null, id: null, classes: [], attrs: [], pseudo: [], part: null, link, unknown: false, self: false };
+    let at = 0;
+    // A name, with what's escaped in it as the character it is: `\:` is `:`, and `\31 ` is `1`, as class names from tools have them.
+    const name = () => {
+        let out = '';
+        while (at < text.length) {
+            const c = text[at];
+            if (c === '\\') {
+                const hex = /^[0-9a-fA-F]{1,6}(\r\n|[ \t\r\n\f])?/.exec(text.slice(at + 1, at + 9));
+                if (hex !== null) {
+                    out += String.fromCodePoint(parseInt(hex[0], 16));
+                    at += 1 + hex[0].length;
+                } else {
+                    out += text[at + 1] ?? '';
+                    at += 2;
+                }
+            } else if (/[\w-]/.test(c) || c.charCodeAt(0) > 127) {
+                out += c;
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        return out;
+    };
+    while (at < text.length) {
+        const c = text[at];
+        if (c === '&') {
+            step.self = true;
+            at += 1;
+        } else if (c === '*') {
+            at += 1;
+        } else if (c === '.') {
+            at += 1;
+            step.classes.push(name());
+        } else if (c === '#') {
+            at += 1;
+            step.id = name();
+        } else if (c === '[') {
+            const end = text.indexOf(']', at);
+            if (end < 0) {
+                step.unknown = true;
+                break;
+            }
+            step.attrs.push(readAttribute(text.slice(at + 1, end)));
+            at = end + 1;
+        } else if (c === ':') {
+            const isPart = text[at + 1] === ':';
+            at += isPart ? 2 : 1;
+            const pseudo = name().toLowerCase();
+            let arg = null;
+            if (text[at] === '(') {
+                const [inside, end] = insideParens(text, at);
+                arg = inside.trim();
+                at = end;
+            }
+            if (isPart || PARTS.has(pseudo) || pseudo.startsWith('-webkit-') || pseudo.startsWith('-moz-') || pseudo.startsWith('-ms-')) {
+                step.part = pseudo;
+            } else {
+                const takesList = pseudo === 'not' || pseudo === 'is' || pseudo === 'where' || pseudo === 'matches' || pseudo === 'has';
+                // `:nth-child(2n+1 of .item)` counts only what the selectors after `of` say.
+                const of = (pseudo === 'nth-child' || pseudo === 'nth-last-child') && arg !== null ? /^(.*?)\s+of\s+(.+)$/is.exec(arg) : null;
+                if (of !== null) {
+                    step.pseudo.push({ name: pseudo, arg: of[1].trim(), list: null, of: commas(of[2]).map((one) => readSelector(one.trim())) });
+                } else {
+                    step.pseudo.push({ name: pseudo, arg, list: takesList ? commas(arg ?? '').map((one) => readSelector(one)) : null });
+                }
+                if (pseudo.endsWith('-of-type')) {
+                    ofType = true;
+                }
+                // `:has(+ .x)` needs to know what comes after, which everything's told with where it is.
+                const afterHas = pseudo === 'has' && step.pseudo[step.pseudo.length - 1].list?.some((one) => one !== null && isAfter(one));
+                if ((STRUCTURAL.has(pseudo) || afterHas) && !structural) {
+                    structural = true;
+                    // What's drawn already without keeping track of where things are among what's around them is drawn again.
+                    if (drawnUnstructured) {
+                        queueMicrotask(changed);
+                    }
+                }
+            }
+        } else if (/[a-zA-Z]/.test(c)) {
+            step.tag = name().toLowerCase();
+        } else {
+            step.unknown = true;
+            break;
+        }
+    }
+    return step;
+}
+
+/// A selector as its steps, or `null` if it has what can't be followed here. Each is read once, as the same selectors are read
+/// again and again: when their sheet's read, and when its rules are worked out. What it turns on, as `:first-child` turns on
+/// keeping track of where things are, is turned on each time it's read, as reading it would. The steps aren't to be changed, but
+/// what's given back is a list of its own.
+const readSelectors = new Map();
+function readSelector(text) {
+    let found = readSelectors.get(text);
+    if (found === undefined) {
+        const was = [structural, ofType, drawnUnstructured];
+        structural = false;
+        ofType = false;
+        drawnUnstructured = false;
+        let steps;
+        try {
+            steps = readSelectorNow(text);
+        } finally {
+            found = { steps, structural, ofType };
+            [structural, ofType, drawnUnstructured] = was;
+        }
+        if (readSelectors.size > 50000) {
+            readSelectors.clear();
+        }
+        readSelectors.set(text, found);
+    }
+    if (found.structural && !structural) {
+        structural = true;
+        // What's drawn already without keeping track of where things are among what's around them is drawn again.
+        if (drawnUnstructured) {
+            queueMicrotask(changed);
+        }
+    }
+    ofType ||= found.ofType;
+    return found.steps === null ? null : found.steps.slice();
+}
+
+function readSelectorNow(text) {
+    const steps = [];
+    let link = null;
+    let current = '';
+    let depth = 0;
+    const flush = () => {
+        if (current.trim() !== '') {
+            steps.push(readCompound(current.trim(), steps.length === 0 ? link : link ?? 'descendant'));
+            link = null;
+        }
+        current = '';
+    };
+    for (let at = 0; at < text.length; at += 1) {
+        const c = text[at];
+        if (c === '\\') {
+            // What's escaped is part of a name, whatever it is. A character by its number, as `\2c ` is, ends at a space, which is
+            // part of it rather than between two steps, as CSS Syntax reads it.
+            const hex = /^[0-9a-fA-F]{1,6}(\r\n|[ \t\r\n\f])?/.exec(text.slice(at + 1, at + 9));
+            if (hex !== null) {
+                current += c + hex[0];
+                at += hex[0].length;
+            } else {
+                current += c + (text[at + 1] ?? '');
+                at += 1;
+            }
+            continue;
+        }
+        if (c === '(' || c === '[') {
+            depth += 1;
+        } else if (c === ')' || c === ']') {
+            depth -= 1;
+        }
+        if (depth === 0 && (c === '>' || c === '+' || c === '~')) {
+            flush();
+            link = c === '>' ? 'child' : c === '+' ? 'adjacent' : 'sibling';
+            if (c !== '>') {
+                // What comes before something matters to it, so that's kept track of.
+                structural = true;
+                // And what kind of element that is, as Tailwind's `[&>svg~*]:pl-7` on shadcn's Alert asks of the icon component
+                // before its title, which is only known once it's drawn.
+                if (steps.length > 0 && steps[steps.length - 1].tag !== null) {
+                    ofType = true;
+                }
+            }
+            continue;
+        }
+        if (depth === 0 && /\s/.test(c)) {
+            flush();
+            continue;
+        }
+        current += c;
+    }
+    flush();
+    return steps.length === 0 || steps.some((step) => step.unknown) ? null : steps;
+}
+
+let nextCompiled = 1;
+
+/// What a block of CSS comes to: what it says without conditions, the rules on itself that have some, and the rules about what's inside it.
+function compile(block, fontSize = 16, sorted = true) {
+    const out = { id: nextCompiled++, own: {}, rules: [], nested: [], needs: 0 };
+    addBlock(out, block, [{ tag: null, id: null, classes: [], attrs: [], pseudo: [], part: null, link: null, self: true }], fontSize);
+    // Only a background that changes under the pointer is something rsui does by itself, and fades, as browsers don't.
+    out.rules = out.rules.filter((rule) => {
+        // What only undoes an `inherit` before it says nothing here.
+        const said = Object.keys(rule.props).filter((key) => !(key.startsWith('__inherit_') && rule.props[key] === undefined));
+        const background = said.length === 1 && rule.props.background !== undefined;
+        const plain = rule.part === null && rule.classes.length === 0 && rule.attrs.length === 0 && rule.id === null && rule.pseudo.length === 1;
+        const state = plain ? rule.pseudo[0].name : null;
+        if (background && (state === 'hover' || state === 'active')) {
+            out.own[state === 'hover' ? 'hover' : 'pressed'] = rule.props.background;
+            return false;
+        }
+        return true;
+    });
+    // What says more about what it's for goes over what says less, whatever order they're in, and the later of two that say as much.
+    out.rules.sort((a, b) => specificity([a]) - specificity([b]));
+    if (sorted) {
+        out.nested.sort((a, b) => specificity(a.steps) - specificity(b.steps));
+    }
+    for (const rule of out.rules) {
+        out.needs |= needsOf(rule.pseudo);
+    }
+    for (const rule of out.nested) {
+        out.needs |= needsOf(rule.steps[0].pseudo);
+        rule.owner = { ...rule.steps[0], tag: null };
+    }
+    return out;
+}
+
+/// How much a selector says about what it's for, as one number: ids, then classes, attributes and states, then kinds of element.
+function specificity(steps) {
+    let score = 0;
+    for (const step of steps) {
+        score += (step.id !== null && step.id !== undefined ? 10000 : 0) + (step.classes.length + step.attrs.length) * 100 + (step.tag ? 1 : 0) + (step.part ? 1 : 0);
+        for (const one of step.pseudo) {
+            score += pseudoSpecificity(one);
+        }
+    }
+    return score;
+}
+
+/// How much a pseudo-class says, as CSS counts it: `:where()` nothing at all, `:is()`, `:not()` and `:has()` as much as the most
+/// that what's in them says, `:nth-child(… of S)` a class and that, and the rest a class, so that Pico's `:where(ol, ul) li`
+/// says less than `nav li` does.
+function pseudoSpecificity(one) {
+    // What `@container` a rule's in says nothing about how much the rule says: see `containerRule`.
+    if (one.name === 'where' || one.name === '__container') {
+        return 0;
+    }
+    const most = (list) => list.reduce((best, steps) => Math.max(best, steps === null ? 0 : specificity(steps)), 0);
+    if (one.list !== null && one.list !== undefined) {
+        return most(one.list);
+    }
+    return 100 + (one.of !== undefined ? most(one.of) : 0);
+}
+
+function needsOf(pseudo) {
+    let needs = 0;
+    for (const one of pseudo) {
+        switch (one.name) {
+            case 'hover':
+                needs |= HOVER;
+                break;
+            case 'active':
+                needs |= PRESS;
+                break;
+            case 'focus':
+                needs |= FOCUS;
+                break;
+            case 'focus-visible':
+                needs |= FOCUS | RING;
+                break;
+            case 'focus-within':
+                needs |= FOCUS | WITHIN;
+                break;
+            default:
+        }
+    }
+    return needs;
+}
+
+/// What only means something when everything's been said, which is just before it goes on an element, as a new look. It's worked out in
+/// Rust, in `layout.rs`, apart from what CSS says moves, which `motionProps` works out here.
+/// What `settle` does, for an element: with what its own variables come to, and its transform put together, first.
+function settleElement(look) {
+    withElementVariables(look, null);
+    return settle(withTransformParts(look));
+}
+
+function settle(look) {
+    const [transitions, animation] = motionOf(look);
+    return natives.cssSettle(layout, look, transitions, animation, declaring.em !== '');
+}
+
+function fontSizeIn(block, given) {
+    for (const [name, value] of block.declarations) {
+        if (name === 'font-size') {
+            const size = length(withVariables(value), given);
+            if (typeof size === 'number') {
+                return size;
+            }
+        }
+    }
+    return given;
+}
+
+function addBlock(out, block, steps, fontSize) {
+    const size = fontSizeIn(block, fontSize);
+    if (block.declarations.length > 0) {
+        addDeclarations(out, block.declarations, steps, size);
+    }
+    for (const rule of block.rules) {
+        if (rule.selector.startsWith('@')) {
+            addAtRule(out, rule, steps, size);
+            continue;
+        }
+        for (const selector of commas(rule.selector)) {
+            const given = readSelector(selector);
+            if (given === null) {
+                notHere('the selector ' + selector);
+                continue;
+            }
+            // `&` is what it's in, and a selector without one goes somewhere inside that.
+            const last = steps[steps.length - 1];
+            if (given[0].self) {
+                const merged = {
+                    ...last,
+                    tag: given[0].tag ?? last.tag,
+                    id: given[0].id ?? last.id,
+                    classes: [...last.classes, ...given[0].classes],
+                    attrs: [...last.attrs, ...given[0].attrs],
+                    pseudo: [...last.pseudo, ...given[0].pseudo],
+                    part: given[0].part ?? last.part,
+                };
+                addBlock(out, rule.block, [...steps.slice(0, -1), merged, ...given.slice(1)], size);
+            } else {
+                given[0] = { ...given[0], link: given[0].link ?? 'descendant' };
+                addBlock(out, rule.block, [...steps, ...given], size);
+            }
+        }
+    }
+}
+
+function addAtRule(out, rule, steps, fontSize) {
+    const text = rule.selector.toLowerCase();
+    if (text.startsWith('@media')) {
+        if (sheetMediaApplies(text.slice(6))) {
+            addBlock(out, rule.block, steps, fontSize);
+        }
+    } else if (text.startsWith('@supports')) {
+        if (supportsApplies(rule.selector.slice(9))) {
+            addBlock(out, rule.block, steps, fontSize);
+        }
+    } else if (text.startsWith('@layer')) {
+        addBlock(out, rule.block, steps, fontSize);
+    } else if (text.startsWith('@container')) {
+        // What a styled component says under `@container` is about it where the query holds.
+        const marker = readSelector('&' + containerRule({ selector: '&', block: rule.block }, rule.selector.slice(10)).selector.slice(1));
+        const last = steps[steps.length - 1];
+        const merged = marker === null ? last : { ...last, pseudo: [...last.pseudo, ...marker[0].pseudo] };
+        addBlock(out, rule.block, [...steps.slice(0, -1), merged], fontSize);
+    } else if (text.startsWith('@property')) {
+        registerProperty(rule.selector.slice(9).trim(), rule.block);
+    } else if (/^@(-webkit-|-moz-|-o-|-ms-)?keyframes/.test(text)) {
+        addKeyframes(rule.selector, rule.block);
+    } else if (!SAYS_NOTHING_HERE.test(text)) {
+        notHere(rule.selector);
+    }
+}
+
+/// What has nothing to do here: fonts are added for the whole page, and what's imported has been put in by what imported it. What's
+/// only for printing, or only one browser's, isn't for a window here, and what's left of what Tailwind reads, once it's made the
+/// CSS, says nothing to a browser either.
+const SAYS_NOTHING_HERE = /^@(font-face|import|charset|namespace|page|-moz-document|-ms-viewport|viewport|reference|source|config|plugin|apply|tailwind|theme|utility|variant|custom-variant)\b/;
+
+/// Whether what `@supports` asks about can be done here: `(name: value)` can if it's said without anything being left out, and
+/// `not`, `and`, `or` and `selector()` mean what they say.
+function supportsApplies(condition) {
+    const text = condition.trim();
+    if (/^not\b/i.test(text)) {
+        return !supportsApplies(text.slice(3));
+    }
+    // What's joined by `and` or `or` outside parentheses.
+    const parts = [];
+    const joins = [];
+    let depth = 0;
+    let from = 0;
+    for (let at = 0; at < text.length; at += 1) {
+        const c = text[at];
+        if (c === '(') {
+            depth += 1;
+        } else if (c === ')') {
+            depth -= 1;
+        } else if (depth === 0 && /\s/.test(c)) {
+            const join = /^\s+(and|or)\s+/i.exec(text.slice(at));
+            if (join !== null) {
+                parts.push(text.slice(from, at));
+                joins.push(join[1].toLowerCase());
+                at += join[0].length - 1;
+                from = at + 1;
+            }
+        }
+    }
+    parts.push(text.slice(from));
+    if (parts.length > 1) {
+        const each = parts.map(supportsApplies);
+        return joins[0] === 'and' ? each.every((one) => one) : each.some((one) => one);
+    }
+    const one = parts[0].trim();
+    if (/^selector\(/i.test(one)) {
+        return commas(insideParens(one, one.indexOf('('))[0]).every((selector) => readSelector(selector) !== null);
+    }
+    if (!one.startsWith('(')) {
+        // What it asks about isn't something this knows to ask, as `font-tech()` is.
+        return false;
+    }
+    const inside = insideParens(one, 0)[0].trim();
+    if (inside.startsWith('(') || /^not\b/i.test(inside) || /^selector\(/i.test(inside)) {
+        return supportsApplies(inside);
+    }
+    const colon = inside.indexOf(':');
+    if (colon < 0) {
+        return supportsApplies(inside);
+    }
+    const name = inside.slice(0, colon).trim().toLowerCase();
+    const value = inside.slice(colon + 1).trim();
+    if (name.startsWith('--')) {
+        return true;
+    }
+    let left = false;
+    natives.cssDeclare([[name, value]], 16, remSize, { ...declaring, em: '', warn: () => (left = true) });
+    return !left;
+}
+
+/// What `@property` says about a variable: what it is before anything sets it, and whether what's inside something gets it from
+/// what it's in.
+const registered = new Map();
+
+function registerProperty(name, block) {
+    if ((block?.declarations ?? []).some(([key, value]) => key === 'initial-value' && usesViewportUnits(value))) {
+        (sheet.viewportVariables ??= new Set()).add(name);
+    }
+    const said = Object.fromEntries((block?.declarations ?? []).map(([key, value]) => [key, value]));
+    const before = registered.get(name);
+    registered.set(name, { initial: said['initial-value'], inherits: said.inherits !== 'false' });
+    if (before === undefined || before.initial !== said['initial-value'] || before.inherits !== (said.inherits !== 'false')) {
+        restyleAll('@property ' + name);
+    }
+    variablesTouched = true;
+}
+
+/// What a variable is when nothing that's set it applies: what `*` gives everything, as it's on every element, and otherwise what
+/// `@property` says it starts as.
+const universalVariables = new Map();
+
+/// A sheet's rules in the order they count, as a browser has them: what's in `@layer`s first, a layer at a time in the order they
+/// were first named, then what isn't in one. What's under a condition is there if the condition holds, a rule inside another, as
+/// CSS nesting writes, is one of its own, and `@property` says what a variable is before anything sets it.
+function inCascadeOrder(rules) {
+    const layers = new Map();
+    const plain = [];
+    let unnamed = 0;
+    const into = (layer) => {
+        if (layer === null) {
+            return plain;
+        }
+        let list = layers.get(layer);
+        if (list === undefined) {
+            list = [];
+            layers.set(layer, list);
+        }
+        return list;
+    };
+    const walk = (list, layer) => {
+        for (const rule of list) {
+            const selector = rule.selector;
+            const lower = selector.toLowerCase();
+            const block = rule.block ?? { declarations: [], rules: [] };
+            if (lower.startsWith('@layer')) {
+                const names = commas(selector.slice(6));
+                const named = (name) => (layer === null ? name : layer + '.' + name);
+                if (block.rules.length === 0 && block.declarations.length === 0) {
+                    // `@layer a, b;`, which says what order they go in.
+                    names.forEach((name) => into(named(name)));
+                } else {
+                    const name = named(names[0] ?? '\u0000' + unnamed++);
+                    into(name);
+                    walk(block.rules, name);
+                }
+            } else if (lower.startsWith('@media')) {
+                if (sheetMediaApplies(lower.slice(6))) {
+                    walk(block.rules, layer);
+                }
+            } else if (lower.startsWith('@supports')) {
+                if (supportsApplies(selector.slice(9))) {
+                    walk(block.rules, layer);
+                }
+            } else if (lower.startsWith('@container')) {
+                walk(containerRules(block.rules, selector.slice(10)), layer);
+            } else if (lower.startsWith('@property')) {
+                registerProperty(selector.slice(9).trim(), block);
+            } else if (selector.startsWith('@')) {
+                into(layer).push(rule);
+            } else {
+                into(layer).push(...unnested(selector, block));
+            }
+        }
+    };
+    walk(rules, null);
+    return [...[...layers.values()].flat(), ...plain];
+}
+
+/// A rule with rules inside it, as CSS nesting writes them, as the rules they are: what's under a condition inside it is part of
+/// it when the condition holds, as `@supports` in a rule is, and a rule inside it is about what `&` stands for, or what's inside
+/// that if it doesn't say.
+function unnested(selector, block) {
+    const own = { selector, block: { declarations: [...block.declarations], rules: [] } };
+    const out = [own];
+    const inside = (list) => {
+        for (const inner of list) {
+            const lower = inner.selector.toLowerCase();
+            if (lower.startsWith('@supports')) {
+                if (supportsApplies(inner.selector.slice(9))) {
+                    own.block.declarations.push(...inner.block.declarations);
+                    inside(inner.block.rules);
+                }
+            } else if (lower.startsWith('@media')) {
+                if (sheetMediaApplies(lower.slice(6))) {
+                    own.block.declarations.push(...inner.block.declarations);
+                    inside(inner.block.rules);
+                }
+            } else if (lower.startsWith('@layer')) {
+                own.block.declarations.push(...inner.block.declarations);
+                inside(inner.block.rules);
+            } else if (lower.startsWith('@container')) {
+                // What it says itself is about the rule it's in, where the query holds, as a rule of its own.
+                const prelude = inner.selector.slice(10);
+                const rules = [{ selector, block: { declarations: [...inner.block.declarations], rules: [] } }, ...inner.block.rules.flatMap((one) => (one.selector.startsWith('@') ? [] : [{ ...one, selector: commas(one.selector).flatMap((part) => commas(selector).map((parent) => (part.includes('&') ? part.replace(/&/g, parent) : parent + ' ' + part))).join(', ') }]))];
+                for (const made of containerRules(rules, prelude)) {
+                    out.push(...unnested(made.selector, made.block));
+                }
+            } else if (!inner.selector.startsWith('@')) {
+                const parents = commas(selector);
+                const joined = commas(inner.selector).flatMap((one) => parents.map((parent) => (one.includes('&') ? one.replace(/&/g, parent) : parent + ' ' + one)));
+                out.push(...unnested(joined.join(', '), inner.block));
+            }
+        }
+    };
+    inside(block.rules);
+    return out;
+}
+
+// Container queries (CSS Containment 3): `@container [name] (condition)` holds for an element when the nearest element above it
+// that's a container of that name (`container-type: inline-size` or `size`, `container-name`), and of a type that can say what the
+// condition asks, is laid out at a size that fits. Each rule inside one is the same rule with `:__container(N)` on what it's about,
+// which is matched against that container's size as it was last laid out (see `containerMatches`). What's matched like that is
+// looked at again each time the page has been laid out, and drawn again if what it said is different, which is a browser's one
+// pass of laying out again.
+
+/// Each `@container`'s query, by its place here, as `{ name, condition }`.
+const containerQueries = [];
+const containerQueryAt = new Map();
+
+/// A rule inside `@container`, as a rule of its own that holds only where the query does: `:__container(N)` on what each of its
+/// selectors is about, before a pseudo-element if it ends with one.
+function containerRule(rule, prelude) {
+    const text = prelude.trim();
+    let at = containerQueryAt.get(text);
+    if (at === undefined) {
+        const named = /^(?!not\b|and\b|or\b)([a-zA-Z_-][\w-]*)\s*(.*)$/s.exec(text);
+        const query = named !== null && !named[1].startsWith('(')
+            ? { name: named[1], condition: named[2].trim() }
+            : { name: null, condition: text };
+        at = containerQueries.length;
+        containerQueries.push(query);
+        containerQueryAt.set(text, at);
+    }
+    const marker = ':__container(' + at + ')';
+    const selector = commas(rule.selector).map((one) => {
+        const part = one.trim();
+        const element = part.search(/::[a-zA-Z-]+(\([^)]*\))?$/);
+        return element < 0 ? part + marker : part.slice(0, element) + marker + part.slice(element);
+    }).join(', ');
+    return { ...rule, selector };
+}
+
+/// The rules inside `@container`, each as `containerRule` makes it, with what's in a rule inside those too.
+function containerRules(rules, prelude) {
+    const out = [];
+    for (const rule of rules) {
+        if (rule.selector.startsWith('@')) {
+            const lower = rule.selector.toLowerCase();
+            if (lower.startsWith('@container')) {
+                // One inside another holds where both do, which is each of what's in it in its own.
+                for (const inner of containerRules(rule.block.rules, rule.selector.slice(10))) {
+                    out.push(containerRule(inner, prelude));
+                }
+            } else if (lower.startsWith('@media') ? sheetMediaApplies(lower.slice(6)) : lower.startsWith('@supports') ? supportsApplies(rule.selector.slice(9)) : false) {
+                out.push(...containerRules(rule.block.rules, prelude));
+            }
+            continue;
+        }
+        out.push(containerRule(rule, prelude));
+    }
+    return out;
+}
+
+/// What's matched against a container's size, by what it's drawn with (its `live`): each query it asked, with what that said,
+/// and the container it was about.
+const containerWatched = new Map();
+
+/// Whether `:__container(N)` holds for what's being matched, from the containers it's in (`chain`, nearest first).
+function containerMatches(pseudo, own, chain) {
+    const query = containerQueries[Number(pseudo.arg)];
+    if (query === undefined) {
+        return false;
+    }
+    const container = containerAbove(chain, query);
+    const holds = container !== null && containerHolds(query.condition, containerSize(container));
+    const live = own.live;
+    if (live !== undefined && own.node === undefined) {
+        // What's drawn is looked at again once it's been laid out, as how big its container is may be different then.
+        let asked = containerWatched.get(live);
+        if (asked === undefined) {
+            asked = new Map();
+            containerWatched.set(live, asked);
+            lookForResizes();
+        }
+        asked.set(pseudo.arg, { holds, container, query });
+    }
+    return holds;
+}
+
+/// The nearest container above something that a query can ask: one of the name it says, if it says one, of a type that can say how
+/// wide it is (`inline-size`, `size`), or how tall, for what asks that (`size`).
+function containerAbove(chain, query) {
+    const tall = /height|block-size|aspect-ratio|orientation/.test(query.condition);
+    for (let at = chain; at !== null && at !== undefined; at = at.up) {
+        const live = at.el?.live ?? at.el?.node?.live;
+        const type = live?.containerType;
+        if (type === undefined || type === 'normal') {
+            continue;
+        }
+        if (query.name !== null && !(live.containerNames ?? []).includes(query.name)) {
+            continue;
+        }
+        if (type === 'size' || (type === 'inline-size' && !tall)) {
+            return live;
+        }
+    }
+    return null;
+}
+
+/// How big a container is inside its padding and border, as it was last laid out, or null if it hasn't been.
+function containerSize(live) {
+    const size = live.domKey === undefined ? undefined : rsuiHostMethods.sizeOf?.(live.domKey);
+    if (size === undefined || size === null) {
+        return null;
+    }
+    const [paddingTop, paddingRight, paddingBottom, paddingLeft, borderTop, borderRight, borderBottom, borderLeft] = paddingAndBorderOf({ __live: live });
+    const font = typeof live.look?.fontSize === 'number' ? live.look.fontSize : 16;
+    return {
+        width: Math.max(0, size[0] - paddingLeft - paddingRight - borderLeft - borderRight),
+        height: Math.max(0, size[1] - paddingTop - paddingBottom - borderTop - borderBottom),
+        font,
+    };
+}
+
+/// Whether a container query's condition holds for a container this size: `not`, `and` and `or` between what's in brackets, each
+/// a size feature, as `(width >= 28rem)`, `(min-width: 400px)` or `(10em < inline-size <= 40em)` is.
+function containerHolds(condition, size) {
+    if (size === null) {
+        return false;
+    }
+    const text = condition.trim();
+    if (/^not\b/i.test(text)) {
+        return !containerHolds(text.slice(3), size);
+    }
+    const parts = [];
+    const joins = [];
+    let depth = 0;
+    let from = 0;
+    for (let at = 0; at < text.length; at += 1) {
+        const c = text[at];
+        if (c === '(') {
+            depth += 1;
+        } else if (c === ')') {
+            depth -= 1;
+        } else if (depth === 0 && /\s/.test(c)) {
+            const join = /^\s+(and|or)\s+/i.exec(text.slice(at));
+            if (join !== null) {
+                parts.push(text.slice(from, at));
+                joins.push(join[1].toLowerCase());
+                at += join[0].length - 1;
+                from = at + 1;
+            }
+        }
+    }
+    parts.push(text.slice(from));
+    if (parts.length > 1) {
+        const each = parts.map((one) => containerHolds(one, size));
+        return joins[0] === 'and' ? each.every((one) => one) : each.some((one) => one);
+    }
+    const one = parts[0].trim();
+    if (!one.startsWith('(')) {
+        return false;
+    }
+    const inside = insideParens(one, 0)[0].trim();
+    if (inside.startsWith('(') || /^not\b/i.test(inside)) {
+        return containerHolds(inside, size);
+    }
+    return containerFeature(inside.toLowerCase(), size);
+}
+
+/// One size feature of a container query, for a container this size.
+function containerFeature(text, size) {
+    const along = { width: size.width, 'inline-size': size.width, height: size.height, 'block-size': size.height };
+    const pixels = (amount, unit) => {
+        const number = Number(amount);
+        switch (unit) {
+            case 'em':
+                return number * size.font;
+            case 'rem':
+                return number * remSize;
+            case 'ch':
+                return number * size.font * 0.5;
+            default:
+                return number;
+        }
+    };
+    if (text.startsWith('orientation')) {
+        const said = text.split(':')[1]?.trim();
+        return said === (size.height >= size.width ? 'portrait' : 'landscape');
+    }
+    const ratio = /^(min-|max-)?aspect-ratio\s*:\s*([0-9.]+)\s*(?:\/\s*([0-9.]+))?$/.exec(text);
+    if (ratio !== null) {
+        const want = Number(ratio[2]) / Number(ratio[3] ?? 1);
+        const have = size.height === 0 ? Infinity : size.width / size.height;
+        return ratio[1] === 'min-' ? have >= want : ratio[1] === 'max-' ? have <= want : Math.abs(have - want) < 1e-9;
+    }
+    const said = /^(min-|max-)?(width|height|inline-size|block-size)\s*:\s*(-?[0-9.]+)(px|em|rem|ch)?$/.exec(text);
+    if (said !== null) {
+        const have = along[said[2]];
+        const want = pixels(said[3], said[4]);
+        return said[1] === 'min-' ? have >= want : said[1] === 'max-' ? have <= want : have === want;
+    }
+    const compare = (a, op, b) => (op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : op === '>=' ? a >= b : a === b);
+    const flip = { '<': '>', '<=': '>=', '>': '<', '>=': '<=', '=': '=' };
+    const amount = '(-?[0-9.]+)(px|em|rem|ch)?';
+    const feature = '(width|height|inline-size|block-size)';
+    const checks = [];
+    for (const [, name, op, number, unit] of text.matchAll(new RegExp('(?:^|\\s)' + feature + '\\s*(<=|>=|<|>|=)\\s*' + amount, 'g'))) {
+        checks.push(compare(along[name], op, pixels(number, unit)));
+    }
+    for (const [, number, unit, op, name] of text.matchAll(new RegExp(amount + '\\s*(<=|>=|<|>|=)\\s*' + feature, 'g'))) {
+        checks.push(compare(along[name], flip[op], pixels(number, unit)));
+    }
+    if (checks.length === 0) {
+        notHere('@container (' + text + ')');
+        return false;
+    }
+    return checks.every((one) => one);
+}
+
+/// What `containerMatches` said for each element that asked, said again now that the page's been laid out: what's different is
+/// drawn again, with what it says now.
+function checkContainerWatched() {
+    for (const [live, asked] of [...containerWatched]) {
+        if (live.weak !== undefined && live.weak.deref() === undefined) {
+            containerWatched.delete(live);
+            continue;
+        }
+        let changed = false;
+        for (const said of asked.values()) {
+            const now = said.container !== null && containerHolds(said.query.condition, containerSize(said.container));
+            if (now !== said.holds) {
+                said.holds = now;
+                changed = true;
+            }
+        }
+        if (changed) {
+            // Counted, as what's drawn again for it isn't a change of CSS: see `restyleSigned`.
+            live.containerVersion = (live.containerVersion ?? 0) + 1;
+            live.redraw?.();
+        }
+    }
+}
+
+/// Dark mode is known, and the rest would have to change along with the window, so what they say isn't used.
+/// Whether any CSS has asked how big the window is, so that a page's CSS is worked out again when that changes.
+let sizeQueries = false;
+/// What `window.addEventListener('resize', ...)` was given.
+const resizeListeners = new Set();
+
+function mediaApplies(text) {
+    // A list of queries, as `screen and (min-width: 769px), print` is, holds if any of them does.
+    return commas(text).some((one) => oneMediaApplies(one.trim().toLowerCase()));
+}
+
+/// Conditions that actually participated in compiling CSS, rather than every
+/// matchMedia object a library creates. Nested inactive branches are discovered
+/// when their outer condition changes and the sheet is compiled again.
+function sheetMediaApplies(text) {
+    const holds = mediaApplies(text);
+    (sheet.mediaQueries ??= new Map()).set(text, holds);
+    return holds;
+}
+
+const usesViewportUnits = (value) => typeof value === 'string' && /(?:\d|\.)\s*[sld]?v(?:w|h|i|b|min|max)\b/i.test(value);
+
+function resizedCss() {
+    resolvedViewportDeclarations.clear();
+    let mediaChanged = false;
+    if (sizeQueries) {
+        for (const one of sheets) {
+            for (const [query, was] of one.mediaQueries ?? []) {
+                const now = mediaApplies(query);
+                if (now !== was) {
+                    one.mediaQueries.set(query, now);
+                    mediaChanged = true;
+                }
+            }
+        }
+    }
+    if (mediaChanged) {
+        refillSheets();
+        changed();
+    } else if (globalThis.__rsuiViewportUnits === true) {
+        // Viewport lengths are resolved from retained declaration strings. Only
+        // their consumers need fresh computed styles; the sheets did not change.
+        for (const one of sheets) {
+            for (const key of one.viewportKeys ?? []) restyleKey(key);
+            for (const name of one.viewportVariables ?? []) restyle.variables.add(name);
+        }
+        for (const live of listeners) {
+            if (typeof live !== 'function' && (live.viewportUnits === true || viewportKeyframes.has(live.animationName))) {
+                for (const [name, value] of live.variablesDown ?? []) {
+                    if (usesViewportUnits(value)) restyle.variables.add(name);
+                }
+                live.redraw();
+                liveAbove(live)?.redraw?.();
+            }
+        }
+        restyle.page = true;
+        declared += 1;
+        restyled();
+    }
+}
+
+/// What a browser's screen is for each kind of media there is: it's a screen, and it's all.
+const MEDIA_TYPES = { all: true, screen: true, print: false, speech: false, tty: false, tv: false, projection: false, handheld: false, braille: false, embossed: false, aural: false };
+
+/// Whether one media query holds: `not` or `only`, a kind of media, and each of the features after it, with `and` between them,
+/// or `or`, as newer CSS writes it.
+function oneMediaApplies(text) {
+    let rest = text;
+    let negate = false;
+    if (/^not\s/.test(rest)) {
+        negate = true;
+        rest = rest.slice(4).trim();
+    } else if (/^only\s/.test(rest)) {
+        rest = rest.slice(5).trim();
+    }
+    let holds = true;
+    const type = /^([a-z-]+)(?=\s|$)/.exec(rest);
+    if (type !== null && type[1] !== 'and' && type[1] !== 'not') {
+        holds = MEDIA_TYPES[type[1]] ?? false;
+        rest = rest.slice(type[0].length).trim();
+    }
+    const features = [...rest.matchAll(/\(([^()]*)\)/g)].map((found) => found[1].trim());
+    if (features.length > 0) {
+        const each = features.map(mediaFeature);
+        holds &&= /\)\s*or\s*\(/.test(rest) ? each.some((one) => one) : each.every((one) => one);
+    } else if (type === null && rest !== '') {
+        notHere('@media ' + text);
+        return false;
+    }
+    return negate ? !holds : holds;
+}
+
+/// Whether a media feature, as what's inside `(...)` says it, holds for the window as it is. What's about how big it is is worked
+/// out again when it changes.
+function mediaFeature(text) {
+    const [name, value] = text.includes(':') ? text.split(':').map((part) => part.trim()) : [text, null];
+    switch (name) {
+        case 'prefers-color-scheme':
+            return value === (rsui.__colorScheme() === 'dark' ? 'dark' : 'light');
+        case 'prefers-reduced-motion':
+            return (value === 'reduce') === !rsuiHostMethods.animationsOn();
+        case 'hover':
+        case 'any-hover':
+            return value === null || value === 'hover';
+        case 'pointer':
+        case 'any-pointer':
+            return value === null || value === 'fine';
+        case 'prefers-contrast':
+        case 'forced-colors':
+        case 'inverted-colors':
+        case 'prefers-reduced-transparency':
+        case 'prefers-reduced-data':
+            return value === 'no-preference' || value === 'none';
+        case 'color':
+            return true;
+        case 'monochrome':
+        case 'grid':
+            return value === '0';
+        case 'scripting':
+            return value === null || value === 'enabled';
+        case 'display-mode':
+            return value === 'browser';
+        case 'update':
+            return value === null || value === 'fast';
+        default:
+    }
+    if (!/width|height|aspect-ratio|orientation|resolution/.test(name)) {
+        notHere('@media (' + text + ')');
+        return false;
+    }
+    sizeQueries = true;
+    const [width, height] = globalThis.__rsuiPageSize ?? [800, 600];
+    if (name === 'orientation') {
+        return value === (height >= width ? 'portrait' : 'landscape');
+    }
+    if (/resolution/.test(name)) {
+        const dpi = /([0-9.]+)\s*(dppx|x|dpi)?/.exec(value ?? '');
+        const ratio = dpi === null ? 1 : dpi[2] === 'dpi' ? Number(dpi[1]) / 96 : Number(dpi[1]);
+        return name.startsWith('min-') ? 1 >= ratio : name.startsWith('max-') ? 1 <= ratio : 1 === ratio;
+    }
+    const pixels = (amount, unit) => Number(amount) * (unit === 'em' || unit === 'rem' ? 16 : 1);
+    const said = /^(min|max)-(width|height)$/.exec(name);
+    if (said !== null) {
+        const size = said[2] === 'width' ? width : height;
+        const found = /^([0-9.]+)(px|em|rem)?$/.exec(value ?? '');
+        if (found === null) {
+            notHere('@media (' + text + ')');
+            return false;
+        }
+        return said[1] === 'min' ? size >= pixels(found[1], found[2]) : size <= pixels(found[1], found[2]);
+    }
+    // As newer CSS writes it, `width >= 40rem`, or `40rem <= width < 64rem`, which is the same with the size either side.
+    const compare = (a, op, b) => (op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : op === '>=' ? a >= b : a === b);
+    const flip = { '<': '>', '<=': '>=', '>': '<', '>=': '<=', '=': '=' };
+    const amount = '([0-9.]+)(px|em|rem)?';
+    const checks = [];
+    for (const [, axis, op, number, unit] of text.matchAll(new RegExp('(?:^|\\s)(width|height)\\s*(<=|>=|<|>|=)\\s*' + amount, 'g'))) {
+        checks.push(compare(axis === 'width' ? width : height, op, pixels(number, unit)));
+    }
+    for (const [, number, unit, op, axis] of text.matchAll(new RegExp(amount + '\\s*(<=|>=|<|>|=)\\s*(width|height)', 'g'))) {
+        checks.push(compare(axis === 'width' ? width : height, flip[op], pixels(number, unit)));
+    }
+    if (checks.length === 0) {
+        notHere('@media (' + text + ')');
+        return false;
+    }
+    return checks.every((one) => one);
+}
+
+function addDeclarations(out, declarations, steps, fontSize) {
+    const props = declareBlock(declarations, fontSize);
+    if (steps.length === 1) {
+        const self = steps[0];
+        const plain = self.part === null && self.classes.length === 0 && self.attrs.length === 0 && self.pseudo.length === 0 && self.id === null;
+        if (plain) {
+            Object.assign(out.own, props);
+        } else {
+            out.rules.push({ classes: self.classes, id: self.id, attrs: self.attrs, pseudo: self.pseudo, part: self.part, props });
+        }
+        return;
+    }
+    out.nested.push({ steps, props, part: steps[steps.length - 1].part });
+}
+
+// What something is, for checking a selector against: `{ tag, id, classes, props, state, nth, empty, prevs }`. `nth` is where it is among
+// what's around it, if that's known, and `prevs` is what comes before it, if that is.
+
+function attributeMatches(attr, props) {
+    const value = props?.[attr.name === 'class' ? 'className' : attr.name === 'for' ? 'htmlFor' : attr.name];
+    // What isn't there matches nothing about its value either: `[cmdk-group-items=""]` isn't every element without one, which
+    // had cmdk's `item.closest()` find the item itself and put it in itself.
+    // React writes `false` as the word for `aria-` and `data-` attributes, as `aria-pressed={false}` is `aria-pressed="false"`,
+    // and leaves out any other that's false.
+    const spelled = value === false && (attr.name.startsWith('aria-') || attr.name.startsWith('data-'));
+    if (value === undefined || (value === false && !spelled) || value === null) {
+        return false;
+    }
+    if (attr.op === undefined) {
+        return true;
+    }
+    const text = String(value);
+    switch (attr.op) {
+        case '=':
+            return text === attr.value;
+        case '~=':
+            return text.split(/\s+/).includes(attr.value);
+        case '^=':
+            return text.startsWith(attr.value);
+        case '$=':
+            return text.endsWith(attr.value);
+        case '*=':
+            return text.includes(attr.value);
+        case '|=':
+            return text === attr.value || text.startsWith(attr.value + '-');
+        default:
+            return false;
+    }
+}
+
+/// Whether the one at `index`, counting from 1, is one that `an+b` says.
+function nthMatches(arg, index) {
+    const text = (arg ?? '').replace(/\s+/g, '');
+    if (text === 'odd') {
+        return index % 2 === 1;
+    }
+    if (text === 'even') {
+        return index % 2 === 0;
+    }
+    const found = /^([+-]?\d*)n([+-]\d+)?$/.exec(text);
+    if (found === null) {
+        return index === Number(text);
+    }
+    const a = found[1] === '' || found[1] === '+' ? 1 : found[1] === '-' ? -1 : Number(found[1]);
+    const b = Number(found[2] ?? 0);
+    if (a === 0) {
+        return index === b;
+    }
+    return (index - b) / a >= 0 && (index - b) % a === 0;
+}
+
+/// Whether something is where `:nth-child(an+b of S)` says among what's around it that `S` says, counting from the end for
+/// `:nth-last-child`. What comes after it is only known when it's being found, rather than drawn.
+function nthOfMatches(pseudo, own, chain, page, fromEnd) {
+    const fits = (one) => pseudo.of.some((steps) => steps !== null && selectorMatches(steps, one, chain, page));
+    if (!fits(own)) {
+        return false;
+    }
+    if (!fromEnd) {
+        return nthMatches(pseudo.arg, (own.prevs ?? []).filter(fits).length + 1);
+    }
+    const siblings = own.nth?.siblings;
+    if (siblings === undefined || siblings.length !== own.nth.count || siblings.some((one) => typeof one?.tag === 'undefined')) {
+        notHere(':nth-last-child() with of in CSS');
+        return false;
+    }
+    return nthMatches(pseudo.arg, siblings.slice(own.nth.index + 1).filter(fits).length + 1);
+}
+
+function pseudoMatches(pseudo, own, chain = null, page = undefined) {
+    const state = own.state ?? 0;
+    const props = own.props ?? {};
+    // Query descriptions work out sibling positions lazily. Only structural selectors, and the
+    // CSS-only sibling form of :has(), need them; even the anchor inside a query's :has() does not.
+    const at = STRUCTURAL.has(pseudo.name) || (pseudo.name === 'has' && own.node === undefined) ? own.nth ?? null : null;
+    switch (pseudo.name) {
+        case 'hover':
+            return (state & HOVER) !== 0;
+        case 'active':
+            return (state & PRESS) !== 0;
+        case 'focus':
+            return (state & FOCUS) !== 0;
+        case 'focus-visible':
+            // As a browser has it: what's been tabbed to or focused from code, and anything that's typed in however it was
+            // focused, but not a button that's been clicked.
+            return (state & FOCUS) !== 0 && ((state & RING) !== 0 || typedIn(own));
+        case 'focus-within':
+            return (state & (FOCUS | WITHIN)) !== 0;
+        case 'checked':
+            return props.checked === true;
+        case 'disabled':
+            return props.disabled === true;
+        case 'enabled':
+            return props.disabled !== true;
+        // Only fields are required or not, as `:optional` says of a field that isn't.
+        case 'required':
+            return FIELD_TAGS.has(own.tag) && saysFlag(props.required);
+        case 'optional':
+            return FIELD_TAGS.has(own.tag) && !saysFlag(props.required);
+        case 'valid':
+            return validityMatches(own, true, false);
+        case 'invalid':
+            return validityMatches(own, false, false);
+        case 'user-valid':
+            return validityMatches(own, true, true);
+        case 'user-invalid':
+            return validityMatches(own, false, true);
+        case 'read-only':
+            return props.readOnly === true;
+        case 'read-write':
+            return props.readOnly !== true;
+        case 'placeholder-shown':
+            return props.placeholder !== undefined && (props.value ?? '') === '';
+        case 'empty':
+            return own.empty === true;
+        case 'not':
+            return !(pseudo.list ?? []).some((selector) => selector !== null && selectorMatches(selector, own, chain, page));
+        case 'is':
+        case 'where':
+        case 'matches':
+            return (pseudo.list ?? []).some((selector) => selector !== null && selectorMatches(selector, own, chain, page));
+        case 'has':
+            if (own.node !== undefined) {
+                // Something found in the page, which has what's in it there.
+                for (const selector of pseudo.list ?? []) {
+                    if (selector !== null && nodeHas(own.node, selector)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if (hasFromPage && own.live?.domKey !== undefined) {
+                // Worked out again once what's in it is in the page (see `freshLook`), from what's there.
+                const node = pageTree()?.byKey.get(own.live.domKey);
+                if (node !== undefined) {
+                    return (pseudo.list ?? []).some((selector) => selector !== null && nodeHas(node, selector));
+                }
+            }
+            hasMetComponent = false;
+            if ((pseudo.list ?? []).some((selector) => selector !== null && (isAfter(selector)
+                ? hasAfter(selector, at, chain, page)
+                : hasInside(selector, own.props?.children)))) {
+                return true;
+            }
+            return hasMetComponent && own.live !== undefined && hasDrawn(pseudo.list ?? [], own.live, pseudo.arg);
+        case '__node':
+            return own.node === pseudo.node;
+        case '__container':
+            return containerMatches(pseudo, own, chain);
+        case 'first-child':
+            return at !== null && at.index === 0;
+        case 'last-child':
+            return at !== null && at.index === at.count - 1;
+        case 'only-child':
+            return at !== null && at.count === 1;
+        case 'first-of-type':
+            return at !== null && at.typeIndex === 0;
+        case 'last-of-type':
+            return at !== null && at.typeIndex === at.typeCount - 1;
+        case 'only-of-type':
+            return at !== null && at.typeCount === 1;
+        case 'nth-child':
+            if (pseudo.of !== undefined) {
+                return at !== null && nthOfMatches(pseudo, own, chain, page, false);
+            }
+            return at !== null && nthMatches(pseudo.arg, at.index + 1);
+        case 'nth-last-child':
+            if (pseudo.of !== undefined) {
+                return at !== null && nthOfMatches(pseudo, own, chain, page, true);
+            }
+            return at !== null && nthMatches(pseudo.arg, at.count - at.index);
+        case 'scope':
+            // What's being looked in, for `querySelector()`, and otherwise the page.
+            return scopeNode === null ? own.tag === 'html' : own.node === scopeNode;
+        case 'nth-of-type':
+            return at !== null && nthMatches(pseudo.arg, at.typeIndex + 1);
+        case 'nth-last-of-type':
+            return at !== null && nthMatches(pseudo.arg, at.typeCount - at.typeIndex);
+        case 'link':
+        case 'any-link':
+            return props.href !== undefined;
+        case 'modal':
+            return props.__modal === true;
+        case 'open':
+            return props.open === true;
+        case 'root':
+            // Only the page itself, `html`, as `:root:not([data-theme=dark]) { --x: ... }` is about it rather than everything in it.
+            return own.tag === 'html';
+        case 'in-range':
+            return true;
+        case 'visited':
+        case 'target':
+        // What's only in a shadow tree, which there isn't here.
+        case 'host':
+        case 'host-context':
+        case 'indeterminate':
+        case 'out-of-range':
+        case 'fullscreen':
+        // What `showPopover()` shows, which there isn't here. floating-ui asks it of each element above what it places, every
+        // time it places it, which is on every scroll.
+        case 'popover-open':
+            return false;
+        default:
+            notHere(':' + pseudo.name);
+            return false;
+    }
+}
+
+function stepMatches(step, own, chain = null, page = undefined) {
+    if (step.tag !== null && step.tag !== own.tag) {
+        return false;
+    }
+    if (step.id !== null && step.id !== own.id) {
+        return false;
+    }
+    for (const name of step.classes) {
+        if (!own.classes.includes(name)) {
+            return false;
+        }
+    }
+    for (const attr of step.attrs) {
+        if (!attributeMatches(attr, own.props)) {
+            return false;
+        }
+    }
+    for (const pseudo of step.pseudo) {
+        if (!pseudoMatches(pseudo, own, chain, page)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// What a selector is matched against. Each element is described as `{ tag, id, classes, props, state, nth, prevs, empty, kind }`:
+// what kind of element it is, its id, its classes, its attributes as React has them (`className`, `htmlFor`), which of `HOVER`,
+// `PRESS`, `FOCUS` and `WITHIN` it is, where it is among its parent's elements (`{ index, count, typeIndex, typeCount }`), the
+// elements before it, nearest last, whether it has nothing in it, and `component` or `element`. What it's in is a chain,
+// `{ el, up }`, nearest first, which what's inside it shares, as `passedDown` makes it: `null` is nothing above. The page, as
+// `html`, is above the chain when `page` says so, as it does for a rule about what's inside one element, and is at the end of the
+// chain for the page's own rules, which have `body` and `html` as the first of what's above everything: see `pageAncestors`.
+
+/// The page itself, as something a selector can be about: `html`, with the classes that have been put on it and on `body`. It's the
+/// same for as long as nothing's changed.
+function pageElement() {
+    if (restyleFresh !== null) {
+        return freshChain(pageAbove.up).el;
+    }
+    const now = workedOut();
+    if (now.pageElement === undefined) {
+        // The same one each time, with what it has now, as what's in the page keeps it above it: see `pageOwners`.
+        Object.assign(pageAbove.up.el, { classes: [...pageClasses], props: pageAttributes(documentElement) });
+        now.pageElement = pageAbove.up.el;
+    }
+    return now.pageElement;
+}
+
+/// What everything in the page is in: `body`, in `html`.
+function pageAncestors() {
+    const now = workedOut();
+    if (now.pageAncestors === undefined) {
+        pageElement();
+        Object.assign(pageAbove.el, { classes: [...pageClasses], props: pageAttributes(body) });
+        now.pageAncestors = pageAbove;
+    }
+    return now.pageAncestors;
+}
+const pageAbove = {
+    el: { tag: 'body', id: undefined, classes: [], props: {}, state: 0, nth: null, prevs: [], kind: 'element' },
+    up: { el: { tag: 'html', id: undefined, classes: [], props: {}, state: 0, nth: null, prevs: [], kind: 'element' }, up: null },
+};
+
+/// While `RSUI_RESTYLE_CHECK` draws everything again, the chains made from nothing so far, by what's kept: new nodes, so that no
+/// match is remembered, and `html` and `body` as they are now, as the base made them each version.
+let restyleFresh = null;
+/// The page's rules about what's in it, found again from what `body` is now, for `freshChain`'s look.
+function freshPageRules() {
+    let made = restyleFresh.get(PAGE_RULES);
+    if (made === undefined) {
+        const complex = pageRules();
+        made = complex === null ? [] : rulesNow(complex, freshChain(pageAbove).el);
+        restyleFresh.set(PAGE_RULES, made);
+    }
+    return made;
+}
+function freshChain(node) {
+    if (node === null || node === undefined) {
+        return null;
+    }
+    let made = restyleFresh.get(node);
+    if (made === undefined) {
+        const el = node.el === pageAbove.el ? { tag: 'body', id: undefined, classes: [...pageClasses], props: pageAttributes(body), state: 0, nth: null, prevs: [], kind: 'element' }
+            : node.el === pageAbove.up.el ? { tag: 'html', id: undefined, classes: [...pageClasses], props: pageAttributes(documentElement), state: 0, nth: null, prevs: [], kind: 'element' }
+            : node.el.__live?.me ?? node.el;
+        made = { el, up: freshChain(node.up) };
+        restyleFresh.set(node, made);
+    }
+    return made;
+}
+
+/// The attributes `html` or `body` has been given, as a selector looks at them.
+function pageAttributes(element) {
+    return element?.__attributes === undefined ? {} : Object.fromEntries(element.__attributes);
+}
+
+/// Has `html` or `body` keep the attributes it's given, with `dataset` as its `data-` ones, for the page's rules to be about
+/// them, as `html[data-theme=dark] .x` and `body[dir=rtl]` are: what's drawn is worked out again when one changes.
+function keepsPageAttributes(element) {
+    const attributes = new Map();
+    const set = (name, value) => {
+        const key = String(name).toLowerCase();
+        const text = String(value);
+        if (attributes.get(key) !== text) {
+            attributes.set(key, text);
+            pageChanged(['[' + key]);
+        }
+    };
+    const remove = (name) => {
+        if (attributes.delete(String(name).toLowerCase())) {
+            pageChanged(['[' + String(name).toLowerCase()]);
+        }
+    };
+    const dataName = (name) => 'data-' + String(name).replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase());
+    element.__attributes = attributes;
+    element.setAttribute = set;
+    element.getAttributeNames = () => [...attributes.keys()];
+    element.hasAttributes = () => attributes.size > 0;
+    Object.defineProperty(element, 'attributes', {
+        get: () => {
+            const list = [...attributes].map(([name, value]) => ({ name, value, localName: name, nodeName: name, nodeValue: value, namespaceURI: null,
+                prefix: null, specified: true, nodeType: 2, ownerElement: element }));
+            list.item = (index) => list[index] ?? null;
+            list.getNamedItem = (name) => list.find((one) => one.name === String(name).toLowerCase()) ?? null;
+            return list;
+        },
+        configurable: true,
+    });
+    element.getAttribute = (name) => attributes.get(String(name).toLowerCase()) ?? null;
+    element.hasAttribute = (name) => attributes.has(String(name).toLowerCase());
+    element.removeAttribute = remove;
+    element.toggleAttribute = (name, force) => {
+        const on = force ?? !attributes.has(String(name).toLowerCase());
+        if (on) {
+            if (!attributes.has(String(name).toLowerCase())) {
+                set(name, '');
+            }
+        } else {
+            remove(name);
+        }
+        return on;
+    };
+    element.dataset = new Proxy({}, {
+        get: (_, name) => (typeof name === 'string' ? attributes.get(dataName(name)) : undefined),
+        set: (_, name, value) => {
+            set(dataName(name), value);
+            return true;
+        },
+        deleteProperty: (_, name) => {
+            remove(dataName(name));
+            return true;
+        },
+        has: (_, name) => attributes.has(dataName(name)),
+        ownKeys: () => [...attributes.keys()].filter((key) => key.startsWith('data-')).map((key) => key.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())),
+        getOwnPropertyDescriptor: (_, name) => (attributes.has(dataName(name)) ? { value: attributes.get(dataName(name)), writable: true, enumerable: true, configurable: true } : undefined),
+    });
+}
+
+/// Whether a whole selector, as one inside `:is()` is, ends on `own`, with `chain` being what it's in, and the page above that,
+/// as `:is(.dark *)` has it when `.dark` is on `html`, unless `page` is `null`, when the chain has it already.
+function selectorMatches(steps, own, chain = null, page = undefined) {
+    return matchChain(steps, steps.length - 1, own, chain, page === undefined ? pageElement() : page);
+}
+
+/// Whether a whole selector ends on `own`, with `above` being what it's in, outermost first, as finding elements in the page has it.
+function matchAll(steps, at, own, above) {
+    let chain = null;
+    for (const one of above) {
+        chain = { el: one, up: chain };
+    }
+    return matchChain(steps, at, own, chain, null);
+}
+
+function matchChain(steps, at, own, chain, page) {
+    if (!stepMatches(steps[at], own, chain, page)) {
+        return false;
+    }
+    if (at === 0) {
+        return true;
+    }
+    switch (steps[at].link ?? 'descendant') {
+        case 'child':
+            return chain !== null ? matchChain(steps, at - 1, chain.el, chain.up, page) : page !== null && matchChain(steps, at - 1, page, null, null);
+        case 'descendant':
+            return matchedAbove(steps, at - 1, chain, page, matchChain);
+        case 'adjacent': {
+            const before = own.prevs ?? [];
+            return before.length > 0 && matchChain(steps, at - 1, before[before.length - 1], chain, page);
+        }
+        case 'sibling':
+            for (const one of own.prevs ?? []) {
+                if (matchChain(steps, at - 1, one, chain, page)) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+/// Whether step `at` of a selector ends on anything in `chain`, as `matchChain` or `matchFrom` (`how`) has it, with the page beyond
+/// it for `matchChain`. It's worked out once for each place in a chain, which everything inside that place shares, so that `.dark *`
+/// on every element of a page looks at each element above them once, rather than once for each element below it.
+function matchedAbove(steps, at, chain, page, how) {
+    if (chain === null) {
+        return how === matchChain && page !== null && matchChain(steps, at, page, null, null);
+    }
+    // Kept for as long as what CSS says is the same, as what's in a chain is kept from one version to the next.
+    if (chain.matchedAt !== version || chain.flowMatchedAt !== flowLearnedCount) {
+        chain.matchedAt = version;
+        chain.flowMatchedAt = flowLearnedCount;
+        chain.chainMatched = undefined;
+        chain.fromMatched = undefined;
+    }
+    const memo = how === matchChain ? (chain.chainMatched ??= new Map()) : (chain.fromMatched ??= new Map());
+    let found = memo.get(steps);
+    if (found === undefined) {
+        found = [];
+        memo.set(steps, found);
+    }
+    const slot = at * 2 + (page === null || page === undefined ? 0 : 1);
+    let matched = found[slot];
+    if (matched === undefined) {
+        matched = how(steps, at, chain.el, chain.up, page) || matchedAbove(steps, at, chain.up, page, how);
+        found[slot] = matched;
+    }
+    return matched;
+}
+
+/// Whether what's been given to an element, as its children, fits what `:has()` says, as a selector that starts at the element
+/// itself: right inside it for `:has(> svg)`, anywhere in it for `:has(.inner img)`, with each step after that as it says. What a
+/// component makes is only known once it's been made, as what kind of element that is. What comes after the element itself, as
+/// `:has(+ .x)` asks about, isn't known while it's drawn.
+function hasInside(steps, children) {
+    const first = steps[0].link ?? 'descendant';
+    if (first === 'adjacent' || first === 'sibling') {
+        notHere(':has() about what comes after something');
+        return false;
+    }
+    // The selector's first step is anchored to the element itself, which is above everything it's given.
+    const anchored = [HAS_ANCHOR, { ...steps[0], link: first }, ...steps.slice(1)];
+    const last = anchored.length - 1;
+    const visit = (value, chain) => {
+        const elements = [];
+        const gather = (one) => {
+            if (Array.isArray(one)) {
+                one.forEach(gather);
+            } else if (isValidElement(one)) {
+                elements.push(one);
+            }
+        };
+        gather(value);
+        const before = [];
+        for (const one of elements) {
+            const own = describe(one, null, before.slice());
+            if (typeof one.type === 'function' && one.type.__webTag === undefined) {
+                // A component is the element it was found to make, with what that was given, as a lucide icon is an `<svg>`,
+                // which Button's `has-[>svg]:px-3` asks about, and shadcn's CardAction a `div[data-slot=card-action]`, which
+                // CardHeader's `has-data-[slot=card-action]:grid-cols-[1fr_auto]` does. Until that's known, the first one that's
+                // drawn says, and everything's drawn again.
+                hasAsked = true;
+                const made = renderedMade.get(one.type);
+                if (made !== undefined) {
+                    own.tag = made.tag;
+                    own.props = { ...made.props, ...own.props };
+                    own.classes = [...new Set([...classesOf(made.props.className), ...own.classes])];
+                } else {
+                    hasWaiting.add(one.type);
+                }
+            }
+            if (matchChain(anchored, last, own, chain, null) || visit(one.props?.children, { el: own, up: chain })) {
+                return true;
+            }
+            if (own.kind === 'component' && (own.tag === null || typeof one.type === 'function')) {
+                // What it makes isn't known until it's been made, and what it was found to make before is only how it started: its
+                // state (a Radix checkbox's `data-state`) is the page's once it's drawn, which `hasDrawn` asks.
+                hasMetComponent = true;
+            }
+            before.push(own);
+        }
+        return false;
+    };
+    return visit(children, { el: HAS_SCOPE, up: null });
+}
+
+/// Whether `hasInside` came to a component it couldn't see into, whose element is only known once it's been drawn.
+let hasMetComponent = false;
+
+/// `:has()` about what's inside an element that's being drawn, where what it's given isn't enough to say: a component that makes
+/// the element asked for, as shadcn's `FieldContent` makes a `<div data-slot="field-content">` in a `Field` that's
+/// `has-[>[data-slot=field-content]]:items-start`. It's said as the page has it once it's been laid out, as a browser says it
+/// once it's all there: until then, the element is drawn again once it has been.
+function hasDrawn(list, live, text) {
+    const said = (live.hasDrawn ??= new Map());
+    // By what the selectors say, rather than by the list, which is made again each time the page's rules are, so that what was found
+    // once it was laid out isn't forgotten then, and drawn without for a frame.
+    const key = typeof text === 'string' ? text : (list.hasKey ??= hasKeyOf(list));
+    if (!said.has(key)) {
+        said.set(key, { selectors: list, was: false });
+        hasRecipesChanged();
+    }
+    // It's looked at each time the page has been laid out, outside drawing, as what's in it can change without it being drawn
+    // again, as a checkbox in a card label is ticked, and it's drawn again when that's different from what it was drawn with.
+    if (!hasWatched.has(live)) {
+        hasWatched.add(live);
+        hasRecipesChanged();
+        lookForResizes();
+    }
+    return said.get(key).was;
+}
+
+/// What a `:has()` list says, as text, or the list itself if it can't be said (one about a node of the page).
+function hasKeyOf(list) {
+    try {
+        return JSON.stringify(list);
+    } catch {
+        return list;
+    }
+}
+
+/// What's drawn with what `:has()` said once it had been laid out: see `hasDrawn`.
+const hasWatched = new Set();
+
+// A receipt contains only weak owners and bounded primitive inputs. Unsupported
+// recipes and unsafe data surfaces retain full matching. This prototype is opt-in.
+const HAS_INPUT_RECEIPTS = (() => {
+    try { return globalThis.process?.env?.RSUI_HAS_INPUT_RECEIPTS === '1'; }
+    catch { return false; }
+})();
+let hasRecipeEpoch = 0;
+let hasReceiptFieldsEpoch = -1;
+let hasReceiptFields = null;
+let hasReceiptProgram = undefined;
+let hasInputReceipt = undefined;
+let hasReceiptNativeVersion = undefined;
+
+function hasRecipesChanged() {
+    hasRecipeEpoch += 1;
+    hasReceiptFieldsEpoch = -1;
+    hasReceiptFields = null;
+    hasReceiptProgram = undefined;
+    hasInputReceipt = undefined;
+    hasReceiptNativeVersion = undefined;
+}
+
+function hasInputFields() {
+    const fields = new Set();
+    const program = [];
+    let owners = 0;
+    let recipes = 0;
+    for (const live of hasWatched) {
+        if (++owners > 256) return hasReceiptFields = null;
+        if (typeof live.domKey !== 'string') return hasReceiptFields = null;
+        program.push(live.domKey);
+        for (const one of live.hasDrawn?.values() ?? []) {
+            if (++recipes > 512 || !Array.isArray(one.selectors)) return hasReceiptFields = null;
+            program.push('recipe', one.selectors.length);
+            for (const steps of one.selectors) {
+                if (steps === null) continue;
+                if (!Array.isArray(steps) || steps.length === 0 || steps.length > 64) return hasReceiptFields = null;
+                program.push('selector', steps.length);
+                for (const step of steps) {
+                    if (step === null || typeof step !== 'object' || step.part !== null
+                        || ![null, undefined, 'child', 'descendant', 'adjacent', 'sibling'].includes(step.link)
+                        || !Array.isArray(step.classes) || !Array.isArray(step.attrs) || !Array.isArray(step.pseudo)) return hasReceiptFields = null;
+                    if ((step.tag !== null && typeof step.tag !== 'string')
+                        || (step.id !== null && typeof step.id !== 'string')
+                        || step.classes.length > 128 || step.attrs.length > 32 || step.pseudo.length > 16) return hasReceiptFields = null;
+                    program.push('step', step.tag, step.id, step.link, step.classes.length, step.attrs.length, step.pseudo.length);
+                    for (const name of step.classes) {
+                        if (typeof name !== 'string') return hasReceiptFields = null;
+                        program.push(name);
+                    }
+                    if (step.tag !== null) fields.add('@tag');
+                    if (step.id !== null) fields.add('id');
+                    if (step.classes.length !== 0) fields.add('className');
+                    for (const attr of step.attrs) {
+                        if (typeof attr.name !== 'string' || attr.name.length > 128 || attr.name.startsWith('@')
+                            || ![undefined, '=', '~=', '^=', '$=', '*=', '|='].includes(attr.op)
+                            || (attr.op !== undefined && typeof attr.value !== 'string')) return hasReceiptFields = null;
+                        fields.add(attr.name === 'class' ? 'className' : attr.name === 'for' ? 'htmlFor' : attr.name);
+                        program.push('attr', attr.name, attr.op, attr.op === undefined ? null : attr.value);
+                    }
+                    for (const pseudo of step.pseudo) {
+                        if (pseudo.name !== 'disabled' && pseudo.name !== 'enabled') return hasReceiptFields = null;
+                        fields.add('disabled');
+                        program.push('pseudo', pseudo.name);
+                    }
+                    if (fields.size > 32) return hasReceiptFields = null;
+                    if (program.length > 8192) return hasReceiptFields = null;
+                }
+            }
+        }
+    }
+    let units = 0;
+    for (const value of program) {
+        if (typeof value === 'string') units += value.length;
+        if (units > 32768) return hasReceiptFields = null;
+    }
+    const signature = JSON.stringify(program);
+    if (signature.length > 65536) return hasReceiptFields = null;
+    if (hasReceiptFieldsEpoch === hasRecipeEpoch && hasReceiptProgram === signature) return hasReceiptFields;
+    hasReceiptFieldsEpoch = hasRecipeEpoch;
+    hasReceiptProgram = signature;
+    hasInputReceipt = undefined;
+    hasReceiptNativeVersion = undefined;
+    return hasReceiptFields = [...fields];
+}
+
+function checkHasWatched() {
+    recheckHas([...hasWatched], true);
+}
+
+/// How many times what `:has()` says of something drawn has changed, which what was worked out with it compares against.
+let hasEpoch = 0;
+/// Whether `:has()` is matched against what's in the page now, rather than what an element's being drawn with.
+let hasFromPage = false;
+
+/// What `:has()` says of each of these now, from the page as it is: each that's different is drawn again, with what's inside it.
+let selectorReadGeneration = 0;
+let selectorReading = 0;
+// Only selectors whose matches use topology, text and current live props/state.
+// Unknown and container-dependent predicates keep the original geometry path.
+function selectorTopologyOnly(selectors) {
+    if (!Array.isArray(selectors)) return false;
+    for (const steps of selectors) {
+        if (steps === null) continue;
+        if (!Array.isArray(steps) || steps.length === 0) return false;
+        for (const step of steps) {
+            if (!Array.isArray(step.pseudo)) return false;
+            for (const one of step.pseudo) {
+                const logical = one.name === 'not' || one.name === 'is' || one.name === 'where' || one.name === 'matches' || one.name === 'has';
+                if (logical) { if (!selectorTopologyOnly(one.list)) return false; }
+                else if (SELF_PSEUDO[one.name] === undefined && !STRUCTURAL.has(one.name)
+                    && !['scope', 'valid', 'invalid', 'user-valid', 'user-invalid', 'popover-open', '__node'].includes(one.name)) return false;
+                if (one.of !== undefined && !selectorTopologyOnly(one.of)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function recheckHas(lives, always = false) {
+    // Most style reads revisit a live already checked in this native tree. Avoid
+    // walking its selector recipes or comparing native topology in that case.
+    const version = rsuiHostMethods.treeNow();
+    let pending = false;
+    for (const live of lives) {
+        if (live?.hasDrawn !== undefined && (always || version === undefined || live.hasCheckedIn !== version)) {
+            pending = true;
+            break;
+        }
+    }
+    if (!pending) return;
+
+    const receiptFields = HAS_INPUT_RECEIPTS
+        && rsuiHostMethods.selectorReceiptSafeIntrinsics?.() === true
+        && rsuiHostMethods.selectorReceiptSafePrograms?.(hasWatched) === true ? hasInputFields() : null;
+    const receiptEpoch = hasRecipeEpoch;
+    // A retained detached handle can carry an old recipe after unregistering.
+    // The global certificate proves only the currently registered watchers.
+    let receiptCoversLives = receiptFields !== null;
+    if (receiptCoversLives) {
+        for (const live of lives) {
+            if (live?.hasDrawn !== undefined && !hasWatched.has(live)) {
+                receiptCoversLives = false;
+                break;
+            }
+        }
+    }
+    let receiptMatched = false;
+    if (receiptCoversLives && restyleFresh === null && pageNow !== null && hasInputReceipt !== undefined) {
+        const nativeVersion = rsuiHostMethods.pageTreeContentVersion?.();
+        if (nativeVersion !== undefined && nativeVersion === pageNow.selectorContentVersion
+            && nativeVersion === hasReceiptNativeVersion
+            && rsuiHostMethods.selectorInputsKept?.(hasInputReceipt, pageNow.byKey, receiptFields, receiptEpoch, pageLives, notShownLives) === true) {
+            receiptMatched = true;
+            if (!RESTYLE_ENV.check) {
+                for (const live of hasWatched) {
+                    if (live?.hasDrawn !== undefined) live.hasCheckedIn = version;
+                }
+                return;
+            }
+            // A successful certificate is checked against a new native snapshot
+            // and fresh descriptors, not against its own cached inputs.
+            pageNow = null;
+        }
+    }
+
+    const beforeReading = selectorReading;
+    hasInputReceipt = undefined;
+    hasReceiptNativeVersion = undefined;
+    selectorReading = ++selectorReadGeneration;
+    let receiptTree;
+    let candidateReceipt;
+    let candidateNativeVersion;
+    let attemptedReceipt = false;
+    try {
+        let tree;
+        let oracleTree;
+        let reuseTopology = pageNow !== null && restyleFresh === null;
+        if (restyleFresh !== null) pageNow = null; // Independent fresh oracle.
+        if (reuseTopology) {
+            for (const live of lives) {
+                for (const one of live?.hasDrawn?.values() ?? []) {
+                    one.topologyOnly ??= selectorTopologyOnly(one.selectors);
+                    if (!one.topologyOnly) { reuseTopology = false; break; }
+                }
+                if (!reuseTopology) break;
+            }
+            reuseTopology &&= rsuiHostMethods.pageTreeContentKept?.() === true;
+        }
+        for (const live of lives) {
+            if (live?.hasDrawn === undefined || (!always && version !== undefined && live.hasCheckedIn === version)) {
+                continue;
+            }
+            live.hasCheckedIn = version;
+            tree ??= reuseTopology ? pageNow : pageTree();
+            if (!attemptedReceipt && receiptFields !== null && always && restyleFresh === null && tree != null) {
+                attemptedReceipt = true;
+                const nativeVersion = rsuiHostMethods.pageTreeContentVersion?.();
+                if (nativeVersion !== undefined && tree.selectorContentVersion === nativeVersion) {
+                    // Certify before executing any matcher. A getter that removes
+                    // itself during matching must never create a valid receipt.
+                    candidateReceipt = rsuiHostMethods.captureSelectorInputs?.(tree.byKey, receiptFields, receiptEpoch, pageLives, notShownLives);
+                    candidateNativeVersion = nativeVersion;
+                }
+            }
+            const node = live.domKey === undefined ? undefined : tree?.byKey.get(live.domKey);
+            if (node === undefined) {
+                if (live.weak !== undefined && live.weak.deref() === undefined) {
+                    hasWatched.delete(live);
+                    hasRecipesChanged();
+                }
+                continue;
+            }
+            let changed = false;
+            for (const one of live.hasDrawn.values()) {
+                const now = one.selectors.some((selector) => selector !== null && !isAfter(selector) && nodeHas(node, selector));
+                if (receiptMatched && now !== one.was) throw new Error('Selector input receipt oracle mismatch for ' + live.domKey);
+                if (reuseTopology && RESTYLE_ENV.check) {
+                    if (oracleTree === undefined) {
+                        // Compare the optimized answer with a native serialization and
+                        // new JS descriptors, independent of the retained topology.
+                        pageNow = null;
+                        oracleTree = pageTree();
+                    }
+                    const freshNode = oracleTree?.byKey.get(live.domKey);
+                    const expected = freshNode !== undefined && one.selectors.some((selector) => selector !== null && !isAfter(selector) && nodeHas(freshNode, selector));
+                    if (now !== expected) throw new Error('Selector topology oracle mismatch for ' + live.domKey);
+                }
+                if (now !== one.was) {
+                    one.was = now;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                hasEpoch += 1;
+                live.hasVersion = (live.hasVersion ?? 0) + 1;
+                live.redraw?.();
+            }
+        }
+        receiptTree = tree;
+    } finally { selectorReading = beforeReading; }
+
+    if (receiptFields !== null && always && restyleFresh === null && receiptEpoch === hasRecipeEpoch && receiptTree != null) {
+        const nativeVersion = rsuiHostMethods.pageTreeContentVersion?.();
+        if (candidateReceipt !== undefined && nativeVersion !== undefined
+            && nativeVersion === candidateNativeVersion && receiptTree.selectorContentVersion === nativeVersion
+            && rsuiHostMethods.selectorInputsKept?.(candidateReceipt, receiptTree.byKey, receiptFields, receiptEpoch, pageLives, notShownLives) === true) {
+            hasInputReceipt = candidateReceipt;
+            hasReceiptNativeVersion = nativeVersion;
+        } else {
+            hasInputReceipt = undefined;
+            hasReceiptNativeVersion = undefined;
+        }
+    }
+}
+
+/// What's different about an element's look now from what it was drawn with, where what `:has()` says of it or of what it's in has
+/// changed since, as a browser works its style out again before it says it: its rules worked out again, with what's written on
+/// it over them, and each that comes to something else. `null` when nothing's changed. It's drawn again with that too.
+function freshLook(element) {
+    const live = element?.__live;
+    const cascade = live?.cascade;
+    if (cascade === undefined || hasWatched.size === 0) {
+        return null;
+    }
+    recheckHas([live, ...(livesAbove(element, 64) ?? [])]);
+    if (cascade.epoch === hasEpoch) {
+        return null;
+    }
+    // What was matched along the way is matched again.
+    for (const owner of cascade.owners ?? []) {
+        for (let at = owner.above; at !== null && at !== undefined; at = at.up) {
+            at.chainMatched = undefined;
+            at.fromMatched = undefined;
+        }
+    }
+    const again = { ...cascade.started };
+    hasFromPage = true;
+    try {
+        fromAbove(cascade.owners, cascade.me, again, {}, cascade.isHost, cascade.passedOn);
+    } finally {
+        hasFromPage = false;
+    }
+    // What's different, with what's no longer said as nothing, which is what it inherits or starts as, and what's written on it
+    // over all of that as it was.
+    let fresh = null;
+    for (const key of new Set([...Object.keys(again), ...Object.keys(cascade.cascaded)])) {
+        if (!key.startsWith('__') && again[key] !== cascade.cascaded[key] && (cascade.written === null || !(key in cascade.written))) {
+            (fresh ??= {})[key] = again[key];
+        }
+    }
+    cascade.epoch = hasEpoch;
+    cascade.fresh = fresh;
+    return fresh;
+}
+
+/// Whether `:has()` asks about what comes after the element, as `:has(+ .subtitle)` and `:has(~ p)` do.
+function isAfter(steps) {
+    const first = steps[0].link ?? 'descendant';
+    return first === 'adjacent' || first === 'sibling';
+}
+
+/// Whether what comes after an element, among what it's in, is what `:has()` asks for, as Bulma's `.title:has(+ .subtitle)` does:
+/// the next one for `+`, any after it for `~`, and what's in that for the rest of the selector. It's known from where the
+/// element is (`at`), which is told it with everything that's around it.
+function hasAfter(steps, at, chain, page) {
+    if (at === null || at === undefined || at.elements === undefined) {
+        return false;
+    }
+    const after = steps[0].link === 'adjacent' ? at.elements.slice(at.index + 1, at.index + 2) : at.elements.slice(at.index + 1);
+    const first = [{ ...steps[0], link: null }];
+    const rest = steps.slice(1);
+    if (rest.length > 0 && isAfter(rest)) {
+        notHere(':has() about what comes after what comes after something');
+        return false;
+    }
+    return after.some((one) => selectorMatches(first, describe(one, null, []), chain, page) && (rest.length === 0 || hasInside(rest, one.props?.children)));
+}
+
+/// The element `:has()` is about, as what everything it's given is in, and the step that's about it and nothing else.
+const HAS_SCOPE = { tag: null, id: undefined, classes: [], props: {}, state: 0, nth: null, prevs: [], kind: 'element', node: {} };
+const HAS_ANCHOR = { tag: null, id: null, classes: [], attrs: [], pseudo: [{ name: '__node', node: HAS_SCOPE.node, arg: null, list: null }], part: null, link: null, self: false };
+
+/// Whether a rule's steps end on `own`, with `chain` being what's between it and what the rule belongs to, which is its first step,
+/// and which has been checked already. `page` is what's above that, if the chain doesn't end with it: see `matchChain`.
+function ruleMatches(steps, chain, own, page = undefined) {
+    return matchFrom(steps, steps.length - 1, own, chain, page === undefined ? pageElement() : page);
+}
+
+function matchFrom(steps, at, own, chain, page) {
+    if (!stepMatches(steps[at], own, chain, page)) {
+        return false;
+    }
+    const link = steps[at].link ?? 'descendant';
+    if (at === 1) {
+        // What comes before is what the rule belongs to.
+        if (link === 'child') {
+            return chain === null;
+        }
+        return link === 'descendant';
+    }
+    switch (link) {
+        case 'child':
+            return chain !== null && matchFrom(steps, at - 1, chain.el, chain.up, page);
+        case 'descendant':
+            return matchedAbove(steps, at - 1, chain, page, matchFrom);
+        case 'adjacent': {
+            const before = own.prevs ?? [];
+            return before.length > 0 && matchFrom(steps, at - 1, before[before.length - 1], chain, page);
+        }
+        case 'sibling':
+            return (own.prevs ?? []).some((one) => matchFrom(steps, at - 1, one, chain, page));
+        default:
+            return false;
+    }
+}
+
+/// Whether a rule that's on something itself, with conditions, counts for it as it is now.
+function ruleOnSelf(rule, own) {
+    if (rule.id !== null && rule.id !== own.id) {
+        return false;
+    }
+    for (const name of rule.classes) {
+        if (!own.classes.includes(name)) {
+            return false;
+        }
+    }
+    for (const attr of rule.attrs) {
+        if (!attributeMatches(attr, own.props)) {
+            return false;
+        }
+    }
+    for (const pseudo of rule.pseudo) {
+        if (!pseudoMatches(pseudo, own)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Puts what some CSS says about something into its look, and its parts, as it is now.
+function applyCompiled(compiled, own, look, parts) {
+    mergeLook(look, compiled.own);
+    for (const rule of compiled.rules) {
+        if (ruleOnSelf(rule, own)) {
+            if (rule.part === null) {
+                mergeLook(look, rule.props);
+            } else {
+                parts[rule.part] = { ...parts[rule.part], ...rule.props };
+            }
+        }
+    }
+}
+
+/// What rules about what's inside something are worth passing on, given how it is now.
+function rulesNow(compiled, own) {
+    return compiled.nested.filter((rule) => ruleOnSelf(rule.owner, own));
+}
+
+// Elements
+
+const TEXT_TAGS = new Set(['span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'label', 'small', 'strong', 'em', 'b', 'i', 'pre', 'code', 'legend', 'blockquote', 'sup', 'sub', 'u', 's', 'mark', 'abbr', 'cite', 'kbd', 'time', 'del', 'ins', 'samp', 'var', 'dfn', 'q', 'data', 'output', 'bdi', 'bdo']);
+const SVG_TAGS = { svg: rsui.Svg, path: rsui.Path, g: rsui.G, circle: rsui.Circle, rect: rsui.Rect, line: rsui.Line, polyline: rsui.Polyline, polygon: rsui.Polygon, ellipse: rsui.Ellipse };
+/// What a browser says each element looks like by itself, which a page's own CSS goes over, as it's worked out in `declare.rs`, which
+/// does it once for every page there is. What's been asked for is kept here, as the same thing each time.
+const browserLooks = new Map();
+
+/// What a browser says this element looks like by itself, as it is before anything's been worked out from it. An input's depends on
+/// its `type`, as a checkbox isn't drawn as a field.
+function browserLook(tag, type, disabled = false) {
+    if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
+        tag = type;
+    } else if (tag === 'input' && buttonInput({ type })) {
+        // Drawn as a button is.
+        tag = 'button';
+    } else if (tag === 'input' && (type === 'range' || type === 'hidden' || type === 'file' || type === 'color')) {
+        return undefined;
+    }
+    const own = browserSays(tag);
+    // What can't be used is fainter, as a browser's own CSS says, which a page's goes over.
+    const faint = disabled ? browserSays(tag + ':disabled') : undefined;
+    return faint === undefined ? own : { ...own, ...faint };
+}
+
+/// What a browser's own sheet says of an element by its `dir`, as Chromium's `[dir=rtl i] { direction: rtl }` does, which a page's
+/// CSS goes over: which way its text goes, and so where its flex rows start (see `place` in layout.rs).
+function dirLook(dir) {
+    const said = typeof dir === 'string' ? dir.toLowerCase() : '';
+    return said === 'rtl' ? DIR_RTL : said === 'ltr' ? DIR_LTR : undefined;
+}
+const DIR_RTL = Object.freeze({ textDirection: 'rtl' });
+const DIR_LTR = Object.freeze({ textDirection: 'ltr' });
+
+function browserSays(selector) {
+    let look = browserLooks.get(selector);
+    if (look === undefined && !browserLooks.has(selector)) {
+        look = natives.cssBrowserLook(selector);
+        if (look?.__hidden === false) {
+            // What the browser's sheet says an element is shown as doesn't go over its own `[hidden]`, which says more.
+            delete look.__hidden;
+        }
+        browserLooks.set(selector, look);
+    }
+    return look;
+}
+
+/// How much room a list's marker has before its item, which is more than any needs.
+const MARKER_ROOM = 200;
+
+/// A disc, circle or square before an item, drawn as a browser draws one rather than as a character: a third of the text's size
+/// across, on its first line, ending a little before the item starts. `null` for any other kind of marker.
+function markerShape(type, look, fontAbove) {
+    if (type !== 'disc' && type !== 'circle' && type !== 'square') {
+        return null;
+    }
+    const size = typeof look.fontSize === 'number' ? look.fontSize : typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 16;
+    const across = size / 3;
+    const color = look.color ?? fontAbove?.color ?? '#000000';
+    // In the middle of where a line of text would be, as tall as its line is.
+    const line = typeof look.lineHeight === 'number' ? look.lineHeight : size * 1.15;
+    const middle = (line - size * 1.15) / 2 + size * 0.594;
+    return make('group', {
+        key: '__marker',
+        position: 'absolute',
+        left: -(size * 0.68 + across),
+        top: middle - across / 2,
+        width: across,
+        height: across,
+        radius: type === 'square' ? 0 : across / 2,
+        background: type === 'circle' ? undefined : color,
+        borderWidth: type === 'circle' ? 1 : undefined,
+        borderColor: type === 'circle' ? color : undefined,
+        inert: true,
+    });
+}
+
+/// The marker before an item of a list, as `list-style-type` says, for the item that's `index` among them.
+function listMarker(type, index) {
+    switch (type) {
+        case 'disc':
+            return '\u2022 ';
+        case 'circle':
+            return '\u25E6 ';
+        case 'square':
+            return '\u25AA ';
+        case 'decimal':
+            return index + 1 + '. ';
+        case 'decimal-leading-zero':
+            return String(index + 1).padStart(2, '0') + '. ';
+        case 'lower-alpha':
+        case 'lower-latin':
+            return String.fromCharCode(97 + (index % 26)) + '. ';
+        case 'upper-alpha':
+        case 'upper-latin':
+            return String.fromCharCode(65 + (index % 26)) + '. ';
+        case 'lower-roman':
+            return roman(index + 1).toLowerCase() + '. ';
+        case 'upper-roman':
+            return roman(index + 1) + '. ';
+        default:
+            return null;
+    }
+}
+
+function roman(number) {
+    const parts = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+    let out = '';
+    for (const [value, letters] of parts) {
+        while (number >= value) {
+            out += letters;
+            number -= value;
+        }
+    }
+    return out;
+}
+const DROPPED = new Set(['webBase', 'onSubmit', 'open', 'id', 'htmlFor', 'role', 'autoComplete', 'autoFocus', 'spellCheck', 'target', 'rel', 'xmlns', 'xmlnsXlink', 'method', 'action', 'noValidate', 'formAction', 'formMethod', 'formEncType', 'formNoValidate', 'formTarget', 'encType', 'acceptCharset', 'onScroll', 'onScrollCapture', 'onScrollEnd', 'as', 'forwardedAs', 'ref', 'contentEditable', 'dir', 'lang', 'webTag', 'minLength', 'pattern', 'required', 'wrap', 'cols', 'loading', 'decoding', 'crossOrigin', 'srcSet', 'sizes', 'onBeforeInput', '__canvas']);
+/// What `eventProps` sees to, for which there's nothing to do here.
+const HANDLED_EVENTS = new Set(['onFocus', 'onBlur', 'onFocusCapture', 'onBlurCapture', 'onMouseEnter', 'onMouseLeave', 'onMouseOver', 'onMouseOut', 'onPointerEnter', 'onPointerLeave', 'onPointerOver', 'onPointerOut', 'onDoubleClick', 'onContextMenu', 'onReset']);
+/// The handlers a page's element passes on to rsui's, which calls them itself.
+const RSUI_HANDLERS = new Set(['onClick', 'onChange', 'onToggle', 'onKeyPress', 'onResize', 'onDismiss', 'onDropFiles', 'onClose']);
+
+/// Whether this is a handler of something React DOM knows of that never happens here, as touches, `pointercancel`, an animation
+/// starting and the like, which a browser could call but nothing here does. It's left out, as an element in a browser that's never
+/// touched never hears of it. rsui's own elements still say when they're given a handler that would never be called.
+function neverHeard(name, value) {
+    if (typeof value !== 'function' || name.length < 3 || name.charCodeAt(0) !== 111 || name.charCodeAt(1) !== 110) {
+        return false;
+    }
+    const third = name.charCodeAt(2);
+    return third >= 65 && third <= 90 && !RSUI_HANDLERS.has(name);
+}
+
+/// What a handler written for the web is given when something changes, from what rsui gives it.
+function changeEvent(value, extra) {
+    const target = { value, checked: value === true, ...extra };
+    return { target, currentTarget: target, type: 'change', preventDefault() {}, stopPropagation() {}, persist() {} };
+}
+
+/// A page's field's `onChange`, which hears of it as from the element itself, as in a browser: `event.target` is the field, with
+/// what it holds now, so that `target.value`, `target.checked` and `target.setSelectionRange()` are the field's, as Checkbox.Group
+/// and react-number-format count on. What it was given is the field's `value` and `checked` until it's drawn again.
+function fieldChange(run, live, tag) {
+    return (plain) => {
+        const said = plain?.target ?? {};
+        const box = /^(checkbox|radio)$/i.test(String(live.given?.type ?? ''));
+        let typed;
+        // Typing, deleting or undoing in it, which a page hears as `beforeinput`, which can stop it, and then `input`, with React's
+        // `onChange` heard where its root is, as in a browser: see `edit_in_progress` in rsui's app.rs.
+        const edit = box || said.value === undefined ? undefined : rsuiHostMethods.editing?.();
+        const element = edit === undefined ? null : handleOf(live, tag);
+        let InputEvent;
+        try {
+            InputEvent = domEvents().InputEvent;
+        } catch {
+            // An app that isn't a page has no page's events, and its `onChange` hears it as it is.
+        }
+        if (element !== null && element !== undefined && InputEvent !== undefined) {
+            const [inputType, data] = edit;
+            const before = new InputEvent('beforeinput', { bubbles: true, cancelable: true, composed: true, inputType, data });
+            before.isTrusted = true;
+            if (!dispatchOn(element, before)) {
+                return;
+            }
+            typed = said.value === null ? '' : String(said.value);
+            live.pendingValue = typed;
+            const input = new InputEvent('input', { bubbles: true, composed: true, inputType, data });
+            input.isTrusted = true;
+            try {
+                dispatchOn(element, input);
+            } finally {
+                if (live.pendingValue === typed && live.current?.value === typed) {
+                    live.pendingValue = undefined;
+                }
+            }
+            return;
+        }
+        if (box) {
+            live.pendingChecked = said.checked === true;
+        } else if (said.value !== undefined) {
+            typed = said.value === null ? '' : String(said.value);
+            live.pendingValue = typed;
+        }
+        const event = asWeb(undefined, 'change', live, tag);
+        try {
+            event.target = event.srcElement = event.currentTarget;
+        } catch {
+            // It keeps what it was made with.
+        }
+        event.bubbles = true;
+        event.nativeEvent ??= event;
+        event.persist ??= () => {};
+        try {
+            run(event);
+        } finally {
+            // What it says next is what it's drawn with, unless what heard this changed it again.
+            if (typed !== undefined && live.pendingValue === typed && live.current?.value === typed) {
+                live.pendingValue = undefined;
+            }
+        }
+    };
+}
+
+/// Whether what's selected in a field changing is heard yet, which it is once a page has a field.
+let selectingHeard = false;
+
+/// Hears from Rust when what's selected in the field with the keyboard has changed, and sends that field `selectionchange`, and
+/// `select` when it's become more than a caret, as a browser does when someone types or selects in it: see `publish_selection` in
+/// rsui's app_events.rs.
+function hearSelecting() {
+    if (selectingHeard) {
+        return;
+    }
+    selectingHeard = true;
+    listenOn('window', 'rsuiselect', (event) => {
+        const target = event.target;
+        if (target === null || target === undefined || target.__live === undefined) {
+            return;
+        }
+        if (typeof globalThis.Event !== 'function') {
+            return;
+        }
+        selectionChanged(target);
+        if (event.data === 'caret') {
+            return;
+        }
+        const made = new globalThis.Event('select', { bubbles: true, cancelable: false });
+        made.isTrusted = true;
+        dispatchOn(target, made);
+    }, { capture: true });
+}
+
+/// Sends a field `selectionchange` once what's running now has finished, once however many times its caret or what's selected in
+/// it moved meanwhile, as a browser does: input-otp hears it on `document` to select the digit after the caret, which the next key
+/// types over.
+function selectionChanged(element) {
+    if (element.__selectionChangeDue === true) {
+        return;
+    }
+    element.__selectionChangeDue = true;
+    setTimeout(() => {
+        element.__selectionChangeDue = false;
+        let made;
+        try {
+            made = new globalThis.Event('selectionchange', { bubbles: true, cancelable: false });
+            made.isTrusted = true;
+        } catch {
+            return;
+        }
+        dispatchOn(element, made);
+    }, 0);
+}
+
+/// `onChange` for what's written for the web, which wants an event.
+function change(run, extra) {
+    return typeof run === 'function' ? (value) => run(changeEvent(value, extra)) : undefined;
+}
+
+/// What the web calls each key that rsui names, as `KeyboardEvent.key` has it, and where it is, as `code` has it.
+const KEY_NAMES = { enter: 'Enter', escape: 'Escape', esc: 'Escape', tab: 'Tab', space: ' ', backspace: 'Backspace', delete: 'Delete', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', home: 'Home', end: 'End', page_up: 'PageUp', page_down: 'PageDown', pageup: 'PageUp', pagedown: 'PageDown', insert: 'Insert', shift: 'Shift', control: 'Control', alt: 'Alt', meta: 'Meta', caps_lock: 'CapsLock', num_lock: 'NumLock', scroll_lock: 'ScrollLock', pause: 'Pause', print_screen: 'PrintScreen', context_menu: 'ContextMenu', process: 'Process' };
+const KEY_CODES = { ' ': 'Space', Shift: 'ShiftLeft', Control: 'ControlLeft', Alt: 'AltLeft', Meta: 'MetaLeft', '-': 'Minus', '=': 'Equal', '[': 'BracketLeft', ']': 'BracketRight', '\\': 'Backslash', ';': 'Semicolon', "'": 'Quote', ',': 'Comma', '.': 'Period', '/': 'Slash', '`': 'Backquote' };
+
+/// A key as rsui names it, like `ctrl+shift+s` or `f5`, as the web's `KeyboardEvent` has it.
+function webKey(pressed) {
+    const parts = String(pressed).split('+');
+    const last = parts.pop() ?? '';
+    const shift = parts.includes('shift');
+    let key = KEY_NAMES[last] ?? (/^f[0-9]{1,2}$/.test(last) ? last.toUpperCase() : last);
+    if (key.length === 1 && shift) {
+        key = key.toUpperCase();
+    }
+    const lower = key.toLowerCase();
+    const code = KEY_CODES[key] ?? (/^[a-z]$/.test(lower) ? 'Key' + lower.toUpperCase() : /^[0-9]$/.test(key) ? 'Digit' + key : key);
+    return { key, code, ctrlKey: parts.includes('ctrl'), shiftKey: shift, altKey: parts.includes('alt'), metaKey: parts.includes('win') };
+}
+
+/// `onKeyPress` for what's written for the web, which wants an event, and says whether that stopped it.
+function keyDown(run) {
+    if (typeof run !== 'function') {
+        return undefined;
+    }
+    return (pressed) => {
+        let stopped = false;
+        run({
+            ...webKey(pressed),
+            type: 'keydown',
+            repeat: false,
+            preventDefault() {
+                stopped = true;
+            },
+            stopPropagation() {
+                stopped = true;
+            },
+        });
+        return stopped;
+    };
+}
+
+const PASS_CLICK = rsui.__passClick;
+
+/// An element's `onClick` as a page has it: the event says what was clicked and what's hearing about it, and the click goes on to
+/// what's around it, unless `stopPropagation()` says otherwise. `live` keeps the element that handlers and refs see.
+function webClick(run, live, tag) {
+    return (event) => {
+        const web = asWeb(event, 'click', live, tag);
+        if (web.__chain === undefined && (event?.__within ?? 0) > 0) {
+            // With nothing to say what's inside that was pressed, it's something inside this, which is all that can be said.
+            web.target = web.srcElement = { ...fakeElement(), tagName: 'DIV', nodeName: 'DIV', parentElement: web.currentTarget };
+        }
+        run(web);
+        return web.__stopped === true ? undefined : PASS_CLICK;
+    };
+}
+
+/// Props written for the web as rsui's. What has no meaning without a page goes, and handlers get what they expect.
+function hostProps(tag, given) {
+    const out = {};
+    for (const name of Object.keys(given)) {
+        const value = given[name];
+        if (name === 'id' || name === 'htmlFor') {
+            // What a label is for, which is kept until it's been seen to.
+            out[name === 'id' ? '__id' : '__for'] = value;
+            continue;
+        }
+        if (name === 'aria-label' && typeof value === 'string') {
+            // What it's called, for anyone who can't see it, and for finding it.
+            out.__label = value;
+            continue;
+        }
+        if (name.startsWith('$') || name.startsWith('aria-') || name.startsWith('__') || DROPPED.has(name) || HANDLED_EVENTS.has(name) || WEB_HANDLERS.has(name)) {
+            continue;
+        }
+        if (name.startsWith('data-')) {
+            // Kept as it is, for what an event happened to to say, as `dataset` does.
+            if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+                out[name] = String(value);
+            }
+            continue;
+        }
+        if (neverHeard(name, value)) {
+            continue;
+        }
+        switch (name) {
+            case 'maxLength': {
+                // As much as a field can have typed or pasted into it, as input-otp's six-character one counts on.
+                const most = Number(value);
+                if ((tag === 'input' || tag === 'textarea') && Number.isInteger(most) && most >= 0) {
+                    out.maxLength = most;
+                }
+                break;
+            }
+            case 'readOnly':
+                // A field that can have the keyboard, be selected in and copied from, but not be changed, as rsui's own `readOnly`
+                // input has it. On a box or a button it means nothing, as in a browser.
+                if (value === true && (tag === 'textarea' || (tag === 'input' && !NO_TEXT_TYPES.has(String(given.type ?? 'text').toLowerCase()) && given.type !== 'range'))) {
+                    out.readOnly = true;
+                }
+                break;
+            case 'className':
+                // Kept for finding it by, as `class`. As `className`, JSX means a page's element, which this is making.
+                out.class = value;
+                break;
+            case 'title':
+                out.tooltip = value;
+                break;
+            case 'name':
+                if (tag === 'input' || tag === 'textarea' || tag === 'select' || tag === 'button') {
+                    out.__formName = value;
+                } else {
+                    out.name = value;
+                }
+                break;
+            case 'alt':
+                out.name = value;
+                break;
+            case 'width':
+            case 'height':
+                // A picture's size as it says it, in pixels if it's only a number, which CSS goes over.
+                if (tag === 'svg' || tag === 'img' || tag === 'canvas') {
+                    const pixels = typeof value === 'number' ? value : /^\s*[0-9.]+(px)?\s*$/.test(String(value)) ? parseFloat(value) : value;
+                    out[name === 'width' ? '__ownWidth' : '__ownHeight'] = pixels;
+                } else {
+                    out[name] = value;
+                }
+                break;
+            case 'hidden':
+                if (value === true) {
+                    out.__hidden = true;
+                }
+                break;
+            case 'onKeyPress':
+                // What's left of a key once what has the keyboard has done with it: `onKeyDown` hears it before.
+                out.onKeyPress = keyDown(value);
+                break;
+            case 'type':
+                // A button's is only for forms, and an input's says what it is, which `makeHost` is going to want.
+                if (tag !== 'button') {
+                    out.type = value;
+                }
+                if (tag === 'input' && String(value).toLowerCase() === 'password') {
+                    // What's typed shows as dots, as a browser has it, and isn't read out.
+                    out.password = true;
+                }
+                break;
+            default:
+                out[name] = value;
+        }
+    }
+    return out;
+}
+
+/// What to make for a tag written for the web, which can depend on what's in it.
+function hostType(tag, props, children) {
+    // Whether anything in it is text, and whether everything in it goes along a line, from `layout.rs`.
+    const kinds = (TEXT_TAGS.has(tag) || BLOCK_TAGS.has(tag)) && children !== undefined ? natives.cssChildren(layout, children, TEXT_KINDS) : 2;
+    const flowing = BLOCK_TAGS.has(tag) && children !== undefined && (kinds & 1) !== 0;
+    if (TEXT_TAGS.has(tag) || flowing) {
+        const inline = (kinds & 2) !== 0;
+        // If it says how what's in it goes, as a flex box, a grid or a cell of a table does, what's in it isn't one piece of text,
+        // nor is it when it's been put on lines, as text with an inline-block in it is: see `Styled`.
+        const arranged = props.__lined === true || props.display !== undefined || props.direction !== undefined || props.tablePart === 'cell';
+        return inline && !arranged ? 'text' : 'group';
+    }
+    if (SVG_TAGS[tag] !== undefined) {
+        return SVG_TAGS[tag];
+    }
+    switch (tag) {
+        case 'a':
+            return 'link';
+        case 'img':
+        case 'canvas':
+            return 'image';
+        case 'button':
+            return 'button';
+        case 'li':
+            return 'item';
+        case 'input':
+        case 'textarea':
+            if (props.type === 'checkbox' || props.type === 'radio') {
+                return rsui.Checkbox;
+            }
+            if (tag === 'input' && (props.type === 'submit' || props.type === 'reset' || props.type === 'button')) {
+                // A button, which shows its value: see `buttonInput`.
+                return 'button';
+            }
+            return props.type === 'range' ? rsui.Slider : 'input';
+        case 'select':
+            return Select;
+        case 'option':
+            return Option;
+        default:
+            return 'group';
+    }
+}
+
+/// Whether an `<input>` is a button, as `type="submit"`, `"reset"` and `"button"` are, which shows its `value` as its text.
+const buttonInput = (props) => props.type === 'submit' || props.type === 'reset' || props.type === 'button';
+
+/// What a button that's an `<input>` says: its `value`, or what a browser says for one without one.
+const buttonInputText = (props) => String(props.value ?? props.defaultValue ?? (props.type === 'submit' ? 'Submit' : props.type === 'reset' ? 'Reset' : ''));
+
+/// The options a `<select>` is given, in order, as a browser lists them: `<option>`s, those in each `<optgroup>` (whose label isn't
+/// one), and what a component that only says which options there are makes, as Mantine's `ComboboxNativeOption` and shadcn's
+/// `NativeSelectOption` do. One with hooks isn't asked, as that's only for when it's drawn: the page says what those made once
+/// they have (see `Select`). Each has its text, its value (its text if it says none), whether it can't be chosen, and whether
+/// it says it's the one chosen to start with.
+function gatherOptions(children) {
+    const found = { labels: [], values: [], off: [], selected: [], grouped: [] };
+    const gather = (list, groupOff, grouped = false) => {
+        for (const child of Children.toArray(list)) {
+            if (!isValidElement(child)) {
+                continue;
+            }
+            const own = child.props ?? {};
+            const kids = child.kids ?? own.children;
+            const tag = child.type === 'option' || child.type === Option ? 'option' : child.type === 'optgroup' ? 'optgroup' : tagOf(child);
+            if (tag === 'option') {
+                const label = Children.toArray(kids).join('').replace(/\s+/g, ' ').trim();
+                found.labels.push(label);
+                found.values.push(String(own.value ?? label));
+                found.off.push(groupOff || own.disabled === true);
+                found.selected.push(own.selected === true);
+                found.grouped.push(grouped);
+            } else if (tag === 'optgroup') {
+                gather(kids, groupOff || own.disabled === true, true);
+            } else if (typeof child.type === 'function' && !child.type.prototype?.isReactComponent && !/\buse[A-Z]/.test(Function.prototype.toString.call(child.type))) {
+                let made = null;
+                try {
+                    made = child.type(own);
+                } catch {
+                    made = null;
+                }
+                gather(made, groupOff, grouped);
+            } else {
+                gather(kids, groupOff, grouped);
+            }
+        }
+    };
+    gather(children, false);
+    return found;
+}
+
+/// The element of the page with this key, as code holds it.
+function pageHandleOf(key, tag) {
+    const live = key === undefined ? undefined : pageLives.get(key)?.deref();
+    return live === undefined ? undefined : live.handle ?? handleOf(live, tag);
+}
+
+/// `<select>` with `<option>`s in it. What it looks like is its CSS, and what it shows when it's opened is a list below it. Closed
+/// and with the keyboard, as a browser's is on Windows: the arrows (left and right too), Home and End choose the next option that
+/// can be chosen, the one before, the first or the last, and typing chooses by how the options start (see `typeAhead`); each
+/// choice is sent to the page as `input` and then `change` on the element, as the person made it. Alt+Down, Alt+Up, F4, Space
+/// and a click open the list, where a click on an option chooses it.
+function Select({ children, value: given, defaultValue, onChange: changed, disabled, className, style, appearance, ...rest }) {
+    const [open, setOpen] = useState(false);
+    // One that nothing says the value of keeps what was chosen, as in a browser.
+    const [ownValue, setOwnValue] = useState(defaultValue);
+    const value = given === undefined ? ownValue : given;
+    // The element of the page it is, when a page drew it, which what's chosen is sent to.
+    const key = typeof rest.domKey === 'string' ? rest.domKey : typeof rest.key === 'string' && rest.key.startsWith('__dom') ? rest.key : undefined;
+    const gathered = gatherOptions(children);
+    // Options a component with hooks made are only known once they're drawn, as elements of the page in it: they're read from
+    // there, and it's drawn again with them once they have been.
+    const [fromPage, setFromPage] = useState(null);
+    const fromComponents = gathered.labels.length === 0;
+    const { labels: options, values, off } = fromComponents && fromPage !== null ? fromPage : gathered;
+    useLayoutEffect(() => {
+        if (!fromComponents || key === undefined) {
+            return;
+        }
+        const element = pageHandleOf(key, 'select');
+        const list = element === undefined ? [] : Array.from(element.querySelectorAll?.('option') ?? []);
+        const now = { labels: list.map((one) => one.text), values: list.map((one) => one.value), off: list.map((one) => one.disabled === true) };
+        const same = fromPage !== null && JSON.stringify(now) === JSON.stringify(fromPage);
+        if (!same && (fromPage !== null || now.labels.length > 0)) {
+            setFromPage(now);
+        }
+    });
+    const index = Math.max(0, values.indexOf(String(value)));
+    const selectName = rest.__formName ?? rest.name;
+    useFormField({
+        name: selectName,
+        type: 'select-one',
+        disabled: disabled === true,
+        value: values[index] ?? '',
+        defaultValue: defaultValue === undefined ? '' : String(defaultValue),
+        entries: () => (values.length === 0 ? [] : [[String(selectName), values[index]]]),
+        reset: () => setOwnValue(defaultValue),
+    });
+    delete rest.__formName;
+    const pageClick = rest.onClick;
+    delete rest.onClick;
+    const look = { ...cls(className, 'select', undefined, disabled === true), ...webStyle(style), ...rest };
+    delete look.__nth;
+    delete look.className;
+    delete look.webBase;
+    withInherited(look, useContext(ParentLook));
+    const shown = look.__appearance ?? appearance;
+    delete look.__appearance;
+    // As wide as its widest option, as a browser's is: each is there, one line high and nothing tall, under the one that shows.
+    // In its own font, which what's measured needs said, with what CSS leaves to what it's in (`font: inherit`, as Bootstrap's
+    // is) from there, and as tall as its line height says.
+    const fontAround = useContext(InheritedFont);
+    const size = look.fontSize ?? fontAround?.fontSize;
+    const lineHeight = look.lineHeight ?? (typeof look.__lineScale === 'number' && typeof size === 'number' ? look.__lineScale * size : fontAround?.lineHeight);
+    const font = finalFont({
+        fontSize: size,
+        fontFamily: look.fontFamily ?? fontAround?.fontFamily,
+        fontWeight: look.fontWeight ?? fontAround?.fontWeight,
+        fontStyle: look.fontStyle ?? fontAround?.fontStyle,
+    });
+    const lined = typeof lineHeight === 'number' ? { ...font, lineHeight } : font;
+    // One in an optgroup is measured four spaces in, as Chromium indents it under the group's label.
+    const grouped = fromComponents && fromPage !== null ? [] : gathered.grouped;
+    const widths = options.map((option, at) => make('text', { key: 'width-' + at, ...font, noWrap: true, keepWords: true, height: 0, opacity: 0 }, (grouped[at] === true ? '    ' : '') + option));
+    // What it draws by itself isn't the page's text: its options are (see `pageTree`).
+    const label = make('group', { key: '__drawnOnlyLabel', inert: true, grow: 1 }, make('text', { key: 'shown', ...lined, ellipsis: true }, options[index] ?? ''), ...widths);
+    // What a browser draws by itself, unless the CSS says it'll draw its own.
+    const arrow = shown === 'none' ? null : make('text', { key: '__drawnOnlyArrow', inert: true, fontSize: 10, opacity: 0.7 }, '▾');
+    // Chooses an option, as the person did: the page hears `input` and then `change` on the element, whose `value` is the new one
+    // by then, and React's `onChange` hears the `change`. Choosing what's chosen already says nothing.
+    const choose = (at) => {
+        if (at === index || at < 0 || at >= values.length || off[at] === true) {
+            return;
+        }
+        const element = pageHandleOf(key, 'select');
+        const live = element?.__live;
+        if (live === undefined || typeof globalThis.Event !== 'function') {
+            if (given === undefined) {
+                setOwnValue(values[at]);
+            }
+            changed?.(changeEvent(values[at]));
+            return;
+        }
+        live.pendingValue = values[at];
+        for (const type of ['input', 'change']) {
+            const made = new globalThis.Event(type, { bubbles: true, cancelable: false });
+            made.isTrusted = true;
+            dispatchOn(element, made);
+        }
+    };
+    // What it was given, which isn't drawn (an `<option>` isn't by itself, see `Styled`) but is in the page, under it, for
+    // `select.options` and the rest.
+    const given_ = Children.toArray(children).filter((child) => isValidElement(child));
+    const kept = given_.length === 0 ? null : make('group', { key: 'options', overlay: 'fill', inert: true, opacity: 0 }, ...given_);
+    // What's been typed, and when, for choosing by it: see `typeAhead`.
+    const typed = useRef({ text: '', at: 0 });
+    // The option that typing finds, which starts with what's been typed in the last second, from `at`; the same letter again goes
+    // on to the next one that starts with it, round to the first, as Chromium's type-ahead does. `at` if none does.
+    const typeAhead = (char, at) => {
+        const now = Date.now();
+        const was = typed.current;
+        was.text = now - was.at > 1000 ? char : was.text + char;
+        was.at = now;
+        const text = was.text.toLowerCase();
+        const repeated = [...text].every((one) => one === text[0]);
+        const prefix = repeated ? text[0] : text;
+        const from = repeated ? at + 1 : at;
+        for (let step = 0; step < values.length; step += 1) {
+            const one = (from + step) % values.length;
+            if (off[one] !== true && options[one].toLowerCase().startsWith(prefix)) {
+                return one;
+            }
+        }
+        return at;
+    };
+    // The next one that can be chosen from `at`, going `step`, or `at` if there's none.
+    const next = (at, step) => {
+        for (let one = at + step; one >= 0 && one < values.length; one += step) {
+            if (off[one] !== true) {
+                return one;
+            }
+        }
+        return at;
+    };
+    // Where the keys take what's chosen, or what's lit in the open list, from `at`: undefined for a key that doesn't.
+    const moved = (name, at) => {
+        const step = name === 'down' || name === 'right' ? 1 : name === 'up' || name === 'left' ? -1 : 0;
+        if (step !== 0) {
+            return next(at, step);
+        }
+        if (name === 'home' || name === 'end') {
+            return name === 'home' ? next(-1, 1) : next(values.length, -1);
+        }
+        const char = name.startsWith('shift+') ? name.slice(6) : name;
+        return [...char].length === 1 && char.trim() !== '' ? typeAhead(char, at) : undefined;
+    };
+    // The option lit in the open list, which Enter chooses.
+    const [lit, setLit] = useState(index);
+    const close = () => setOpen(false);
+    const openList = () => {
+        setLit(index);
+        setOpen(true);
+    };
+    // A press anywhere but on it closes the list with nothing chosen, as a browser's does.
+    useEffect(() => {
+        if (!open || typeof globalThis.addEventListener !== 'function') {
+            return undefined;
+        }
+        const element = pageHandleOf(key, 'select');
+        const away = (event) => {
+            if (element === undefined || !(event.target === element || element.contains?.(event.target) === true)) {
+                close();
+            }
+        };
+        globalThis.addEventListener('pointerdown', away, true);
+        return () => globalThis.removeEventListener('pointerdown', away, true);
+    }, [open]);
+    const onKeyPress = (key) => {
+        const name = String(key).toLowerCase();
+        if (disabled === true || values.length === 0) {
+            return false;
+        }
+        if (open) {
+            // The list has the keyboard while it's open, and the select keeps it, as a browser's does.
+            if (name === 'escape') {
+                close();
+            } else if (name === 'enter' || name === 'alt+down' || name === 'alt+up' || name === 'f4' || name === 'tab' || name === 'shift+tab') {
+                close();
+                choose(lit);
+                return name !== 'tab' && name !== 'shift+tab';
+            } else {
+                const at = moved(name, lit);
+                if (at !== undefined) {
+                    setLit(at);
+                }
+            }
+            return true;
+        }
+        if (name === 'alt+down' || name === 'alt+up' || name === 'f4' || name === 'space') {
+            openList();
+            return true;
+        }
+        const at = moved(name, index);
+        if (at === undefined) {
+            return false;
+        }
+        choose(at);
+        return true;
+    };
+    const onClick = (event) => {
+        pageClick?.(event);
+        if (open) {
+            close();
+        } else {
+            openList();
+        }
+    };
+    // The open list, below it, as wide as it at least, with what's chosen and what's lit marked. It isn't the page's (see
+    // `pageTree`), and doesn't take the keyboard: the select keeps it.
+    const menu = open
+        ? make(
+              'group',
+              { key: '__drawnOnlyMenu', overlay: 'below', minWidth: 120, padding: 4, background: '#ffffff', color: '#1f2328', borderColor: '#d0d7de', borderWidth: 1, radius: 4, shadowBlur: 12, shadowY: 4, shadowColor: '#00000033' },
+              options.map((option, at) =>
+                  make('group', { key: 'option-' + at, paddingX: 8, paddingY: 4, focusable: false, opacity: off[at] === true ? 0.5 : undefined, background: at === lit ? '#0969da' : at === index ? '#0000000f' : undefined, onHoverChange: off[at] === true ? undefined : (hovered) => { if (hovered) { setLit(at); } }, onClick: off[at] === true ? undefined : () => { close(); choose(at); } }, make('text', { key: 'text', color: at === lit ? '#ffffff' : undefined }, option)),
+              ),
+          )
+        : null;
+    // Enter and Space aren't clicks on it, as they are on a button: they're its own keys (see `onKeyPress`).
+    return make('button', { direction: 'row', align: 'center', gap: 4, cursor: 'default', ...look, disabled, onClick, onKeyPress, keyClicks: false }, label, arrow, menu, kept);
+}
+
+/// `<select>` as a page has it: an element of the page as any other is (see `Styled`), which keeps what's chosen in it when nothing
+/// says what its value is, starting with the option that says it's `selected`, or the first that can be chosen, as in a browser.
+function PageSelect(given) {
+    const said = given;
+    const [ownValue, setOwnValue] = useState(() => {
+        if (given.defaultValue !== undefined) {
+            return String(given.defaultValue);
+        }
+        const options = gatherOptions(given.children);
+        const chosen = options.selected.indexOf(true);
+        const at = chosen >= 0 ? chosen : options.off.indexOf(false);
+        return at >= 0 ? options.values[at] : undefined;
+    });
+    if (given.value === undefined) {
+        const changed = given.onChange;
+        given = {
+            ...given,
+            value: ownValue ?? '',
+            __setValue: setOwnValue,
+            onChange: (event) => {
+                setOwnValue(event.target.value);
+                changed?.(event);
+            },
+        };
+        givenBy.set(given, said);
+    }
+    return make(plainDomElement('select'), given);
+}
+PageSelect.__webTag = 'select';
+PageSelect.__webField = true;
+
+/// An `<option>` drawn by itself, outside a page, which is nothing: its `<select>` draws it (see `Select`).
+function Option() {
+    return null;
+}
+
+/// `<input>`, which is one of a few things depending on its `type`.
+const NO_HANDLERS = { hover() {}, press() {}, focus() {}, within() {} };
+Select.__webTag = 'select';
+Select.__webField = true;
+
+/// What CSS says a field looks like, from its classes and the rules for its tag. A page's fields don't take how the text around
+/// them is written unless CSS says they do, as `* { font: inherit }` does.
+function useFieldLook(tag, className, style, given = {}) {
+    usePage();
+    const fontAbove = useContext(InheritedFont);
+    const owners = useRulesAbove();
+    // Where it is among what's around it, for `a + b` and `a ~ b`: see `withNth`.
+    const nthAround = useContext(NthContext);
+    const nth = given.__nth !== undefined ? given.__nth : nthAround;
+    const disabled = given.disabled === true;
+    // What the browser and the kind of element say, then what the page's rules say, its rules about one class among them, in the
+    // cascade's order, then what's been made as a class, as a styled component's is, as `Styled` has it, then its `style`, all
+    // as they were written, and only then worked out together, so that what its size and its padding come to are worked out
+    // with each other wherever each was said, as `box-sizing` needs. Its classes went in before the page's rules once, which
+    // put Tailwind's `textarea { font-size: 100% }` over shadcn's `text-sm` on it.
+    const raw = { ...browserLook(tag, given.type, disabled), ...dirLook(given.dir), ...tagLook('*'), ...tagLook(tag) };
+    const parts = {};
+    const me = { tag, id: given.id, classes: classesOf(className), props: given, state: 0, nth, prevs: nth?.prevs, kind: 'component' };
+    fromAbove(owners, me, raw, parts, true, () => {
+        for (const name of me.classes) {
+            const record = madeClasses.get(name);
+            if (record !== undefined) {
+                if (record.compiled !== null && record.compiled !== undefined) {
+                    applyCompiled(record.compiled, me, raw, parts);
+                }
+                mergeLook(raw, record.extra);
+            }
+        }
+    });
+    delete raw.__nth;
+    if (style !== null && style !== undefined) {
+        Object.assign(raw, inlineLook(style));
+    }
+    // What it says is `inherit`, as Bulma's `* { box-sizing: inherit }` does, is what it's in says.
+    withInherited(raw, useContext(ParentLook));
+    // What it says with `var()`, from its own variables and those around it, as Mantine's `border: 1px solid var(--input-bd)`.
+    withElementVariables(raw, useContext(InheritedVariables), true);
+    // A text size that's a share of what's around it is that share of what's around it, before the rest is worked out from it.
+    resolveRelative(raw, typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 16);
+    const look = settleElement(raw);
+    if (look.__hidden === true) {
+        // It stays there, for what's looking for it, and has no room and can't be seen.
+        Object.assign(look, { width: 0, height: 0, opacity: 0, inert: true });
+    }
+    for (const key of ['__hidden', '__scroll', '__scrollAlways', '__overflowX', '__overflowY', '__case', 'className', 'webBase']) {
+        delete look[key];
+    }
+    for (const name of FONT_PROPS) {
+        if (name in look && look[name] === undefined && fontAbove !== null && fontAbove[name] !== undefined) {
+            look[name] = fontAbove[name];
+        }
+    }
+    if (typeof look.__lineScale === 'number' && typeof look.fontSize === 'number') {
+        look.lineHeight = look.__lineScale * look.fontSize;
+    }
+    delete look.__lineScale;
+    for (const one of typeof className === 'string' ? className.split(/\s+/) : []) {
+        mergeParts(parts, madeClasses.get(one)?.parts);
+    }
+    return { look, parts };
+}
+
+let nextDomKey = 0;
+
+/// How what something's in lays out what's in it: `'block'`, one under another as wide as it is, or `'flex'`, as a flex box or a
+/// grid does, which stretches what's in it its own way.
+const FlowContext = createContext('block');
+FlowContext.Provider.displayName = 'FlowContext';
+
+/// What sits on a line by itself in a page, as big as what's in it, rather than as wide as what it's in.
+const INLINE_BOXES = new Set(['button', 'input', 'select', 'textarea', 'img', 'svg', 'video', 'canvas', 'iframe', 'progress', 'meter']);
+
+/// Keeps something that sits on a line from being stretched across a block it's in, as a page has it. In a flex box or a grid, it's
+/// stretched as those do. `layout.rs` does the same for what `Styled` makes.
+function fitInFlow(look, tag, flow, around = undefined) {
+    // What goes on a line is as wide as it is, as a span with a border or a background shows.
+    const inline = look.__inline ?? (INLINE_BOXES.has(tag) || (INLINE_TEXT_TAGS.has(tag) && look.__block !== true && look.position !== 'absolute'));
+    delete look.__inline;
+    if (inline && flow === 'block' && look.width === undefined && look.display === undefined) {
+        look.fitWidth = true;
+        // Where it is on its line, which is as the text of what it's in is aligned, `around`.
+        look.alignSelf ??= around === 'center' ? 'center' : around === 'right' ? 'end' : 'start';
+    }
+}
+
+/// Each element in `children` with this context around it, one by one, so that they stay where they are among what's around them.
+/// One around all of them would hold them in a box of their own.
+function eachWithin(context, value, children) {
+    return slotted(children).map((child) =>
+        isValidElement(child) ? make(context.Provider, { key: child.key ?? undefined, value }, child) : child,
+    );
+}
+
+/// What a part of a table says about how it's laid out, which is done in Rust: see `table.rs` in rsui-layout. Each column is as
+/// wide as what's widest in it in any row, wherever the rows come from, and each row is as tall as what's tallest in it.
+function tableLook(look, props) {
+    const part = look.tablePart;
+    if (part === 'table') {
+        if (look.__borderCollapse === true) {
+            look.tableCollapse = true;
+        } else {
+            // What's between cells is between them and the table's edges too.
+            const spacing = look.__borderSpacing ?? 0;
+            look.columnGap = spacing;
+            look.rowGap = spacing;
+            for (const side of SIDES) {
+                look['padding' + side] = (look['padding' + side] ?? 0) + spacing;
+            }
+        }
+        // With `table-layout: fixed`, columns are as wide as its `<col>`s or its first row say, rather than as what's in them,
+        // which only means something when it's said how wide the table is.
+        if (look.__tableLayout === 'fixed' && look.width !== undefined) {
+            look.tableFixed = true;
+        }
+        if (look.width === undefined) {
+            look.fitWidth = true;
+            look.alignSelf ??= 'start';
+        }
+    } else if (part === 'cell') {
+        for (const [name, said] of [['colSpan', props.colSpan], ['rowSpan', props.rowSpan]]) {
+            const count = Number(said);
+            if (said !== undefined && Number.isFinite(count)) {
+                look[name] = Math.max(0, Math.floor(count));
+            }
+        }
+        // What's in a cell is in the middle of it, top to bottom, unless `vertical-align` says otherwise.
+        look.justify = { start: 'start', end: 'end' }[look.__lineAlign] ?? 'center';
+        delete look.__lineAlign;
+    }
+}
+
+/// The form something's in, as `{ run, fields, ... }` (see `formSending`), for its buttons and its fields' Enter, and for what's
+/// in it to say what it has. It's react-dom's, so that `useFormStatus` reads the same.
+const FormContext = require('react-dom').__FormStatus;
+
+/// What a form's `onSubmit` is given, which says whether `preventDefault()` was called, and what sent it.
+function submitEvent(submitter = null, form = null) {
+    const target = form ?? {};
+    const event = {
+        type: 'submit',
+        target,
+        currentTarget: target,
+        submitter,
+        nativeEvent: null,
+        defaultPrevented: false,
+        cancelable: true,
+        bubbles: true,
+        preventDefault() {
+            event.defaultPrevented = true;
+        },
+        isDefaultPrevented: () => event.defaultPrevented,
+        stopPropagation() {},
+        isPropagationStopped: () => false,
+        persist() {},
+    };
+    event.nativeEvent = event;
+    return event;
+}
+
+/// Whether this sends the form it's in when it's clicked, which a button does unless it says it's only a button.
+function sendsForm(tag, props) {
+    return (tag === 'button' && (props.type ?? 'submit') === 'submit') || (tag === 'input' && (props.type === 'submit' || props.type === 'image'));
+}
+
+/// What a form's Enter sends it as: the first of its buttons that sends it.
+const DEFAULT_BUTTON = 'button:not([type="button"]):not([type="reset"]), input[type="submit"], input[type="image"]';
+
+/// The form that a button or a field with `form="id"` belongs to, wherever it is, as the DOM's form owner is: the `<form>` with
+/// that id, or none.
+function formById(id) {
+    const element = page.getElementById?.(String(id));
+    return element?.__live?.tag === 'form' ? element.__live.sending ?? null : null;
+}
+
+/// What a form's Enter sends it as: the first button in the page, in order, that sends it, whether it's in it or names it with
+/// `form`, as a browser has it.
+function defaultButtonOf(formElement) {
+    if (formElement === null || formElement === undefined) {
+        return null;
+    }
+    const id = formElement.getAttribute?.('id');
+    if (typeof id !== 'string' || id === '') {
+        return formElement.querySelector(DEFAULT_BUTTON) ?? null;
+    }
+    for (const one of page.querySelectorAll(DEFAULT_BUTTON)) {
+        const named = one.getAttribute('form');
+        if (named !== null ? named === id : one.closest('form') === formElement) {
+            return one;
+        }
+    }
+    return null;
+}
+
+/// Whether this puts back what the form it's in started with when it's clicked.
+const resetsForm = (tag, props) => (tag === 'button' || tag === 'input') && props.type === 'reset';
+
+const NOT_SENDING = Object.freeze({ pending: false, data: null, method: null, action: null });
+
+/// What a form is, for what's in it: what sends it, the fields that say what it sends, and how it's doing, which `useFormStatus`
+/// reads with `subscribe` and `status`. It's made once for each form, and what it does is brought up to date as it's drawn.
+function formSending() {
+    const listeners = new Set();
+    const sending = {
+        run: null,
+        reset: null,
+        fields: new Set(),
+        status: NOT_SENDING,
+        subscribe(listener) {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+        },
+        getStatus: () => sending.status,
+        setStatus(status) {
+            sending.status = status;
+            for (const listener of [...listeners]) {
+                listener();
+            }
+        },
+    };
+    return sending;
+}
+
+/// Has a field say what it gives the form it's in, as `{ name, disabled, entries(), reset() }`, for as long as it's there, which is
+/// what `FormData` reads, in the order they came. `entries()` is each name and value it gives, which a box that isn't ticked
+/// gives none of.
+function useFormField(field) {
+    const form = useContext(FormContext);
+    const held = useRef(null);
+    held.current = field;
+    useEffect(() => {
+        if (form === null || form.fields === undefined) {
+            return undefined;
+        }
+        const one = { get: () => held.current };
+        form.fields.add(one);
+        return () => form.fields.delete(one);
+    }, [form]);
+}
+
+/// What a field of a page has to say, as a form's `elements` gives it.
+function fieldElement(field) {
+    const entries = field.entries();
+    return {
+        name: field.name ?? '',
+        type: field.type ?? 'text',
+        disabled: field.disabled === true,
+        value: field.value ?? entries[0]?.[1] ?? '',
+        checked: field.checked === true,
+        defaultValue: field.defaultValue ?? '',
+    };
+}
+
+/// What a form's fields say, with what sent it, as `new FormData(form, submitter)` has it.
+function fillFormData(data, sending, submitter) {
+    for (const one of sending.fields) {
+        const field = one.get();
+        if (field.disabled === true || typeof field.name !== 'string' || field.name === '') {
+            continue;
+        }
+        for (const [name, value] of field.entries()) {
+            data.append(name, value);
+        }
+    }
+    const said = submitter?.__live?.given ?? submitter;
+    if (typeof said?.name === 'string' && said.name !== '') {
+        data.append(said.name, String(said.value ?? ''));
+    }
+    return data;
+}
+
+/// What sends a form, as a browser does with what React 19 adds: `onSubmit` hears it, and unless that calls `preventDefault()`, a
+/// function given as the form's `action`, or as `formAction` on what sent it, is called with what the form's fields say, as a
+/// transition. The form says it's pending, for `useFormStatus`, until that's done, and then its fields that keep what's typed
+/// start again, as React has them. A form with `method="dialog"` closes the dialog it's in instead, with what sent it as what
+/// that gives back.
+function sendForm(sending, props, closes, formElement, submitter, heard = true) {
+    const said = submitter?.__live?.given ?? null;
+    // A browser checks what's in the form first, unless it or what sent it says not to: each control that isn't valid hears
+    // `invalid`, the first that nothing stopped gets the keyboard, and nothing's sent (an `<input type=email>` holding "bad").
+    const validates = props.noValidate !== true && props.noValidate !== '' && said?.formNoValidate !== true && said?.formNoValidate !== '';
+    if (heard && validates && formElement?.__live !== undefined && !checkControls(formElement, true)) {
+        // What's in it has been used from now on, for `:user-invalid`.
+        for (const one of formElement.querySelectorAll?.('input, select, textarea') ?? []) {
+            fieldInteracted(one.__live);
+        }
+        return;
+    }
+    if (heard && formElement?.__live !== undefined) {
+        // The page hears `submit` on the form, as a `SubmitEvent` that goes down from `window` and back up, with React's
+        // `onSubmit` hearing it where its root is, as in a browser, and anything along the way can say not to send it.
+        let made;
+        try {
+            const { SubmitEvent } = require('rsui/dom-events');
+            made = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter ?? null });
+        } catch {
+            made = undefined;
+        }
+        if (made !== undefined) {
+            made.isTrusted = true;
+            if (!dispatchOn(formElement, made)) {
+                return;
+            }
+        } else {
+            const event = submitEvent(submitter, formElement);
+            props.onSubmit?.(event);
+            if (event.defaultPrevented) {
+                return;
+            }
+        }
+    } else if (heard) {
+        const event = submitEvent(submitter, formElement);
+        props.onSubmit?.(event);
+        if (event.defaultPrevented) {
+            return;
+        }
+    }
+    if (closes !== null) {
+        closeDialog(closes, said?.value === undefined ? undefined : String(said.value));
+        return;
+    }
+    const action = typeof said?.formAction === 'function' ? said.formAction : props.action;
+    if (typeof action !== 'function') {
+        if (typeof action === 'string' && action !== '') {
+            notHere('Sending a form to ' + action);
+        }
+        return;
+    }
+    const data = fillFormData(new globalThis.FormData(), sending, submitter);
+    const status = { pending: true, data, method: String(props.method ?? 'get').toLowerCase(), action };
+    sending.setStatus(status);
+    const done = (succeeded) => {
+        if (sending.status === status) {
+            sending.setStatus(NOT_SENDING);
+        }
+        if (succeeded) {
+            sending.reset?.();
+        }
+    };
+    React.startTransition(() => {
+        let result;
+        try {
+            result = action(data);
+        } catch (error) {
+            done(false);
+            throw error;
+        }
+        if (result !== null && typeof result?.then === 'function') {
+            return result.then(
+                () => done(true),
+                (error) => {
+                    done(false);
+                    throw error;
+                },
+            );
+        }
+        done(true);
+        return result;
+    });
+}
+
+/// What `ref` on an element of a page holds: something to focus it with, and what code tends to ask an element. It gives back the key
+/// the element needs for that, if it has a `ref`.
+function useDomRef(ref, always = false, live = null, tag = 'div', had = undefined) {
+    // An element code made keeps the key it had, as it's drawn by a `Styled` or without one (see `drawNative`), so that what the page
+    // finds it by is the same whichever draws it, and while one gives way to the other.
+    // Kept on what it's for, when it's given that, as both of what use this do, rather than in a memo of its own.
+    const key = live === null ? useMemo(() => had ?? '__dom' + nextDomKey++, []) : (live.pageKey ??= had ?? '__dom' + nextDomKey++);
+    // A ref's given its element as layout effects run, as React gives it, before anything's drawn and before what's around it.
+    useLayoutEffect(() => {
+        if (ref === null || ref === undefined) {
+            return undefined;
+        }
+        // Code that holds an element may ask where it is, which is answered from where it was last laid out, even while the
+        // tree's changing.
+        keepLaidOut();
+        // What code tends to do to an element, which comes to nothing here, apart from focusing it and what an event says about it.
+        const kept = live ?? {};
+        kept.domKey = key;
+        const handle = handleOf(kept, tag, true);
+        // What a ref holds says where it is as it was last laid out, which is kept for it from now on.
+        handle.__placedByKey = true;
+        const forget = () => {
+            if (handles.get(key) === handle) {
+                handles.delete(key);
+            }
+        };
+        // As React 19 has it: a function's given the element, and what it gives back, if that's a function, is what's called
+        // when it goes or the ref changes. Otherwise it's given null then, as an object's `current` is set to.
+        const detach = attachRef(ref, handle);
+        return () => {
+            forget();
+            detach?.();
+        };
+    }, ref === null || ref === undefined ? NO_REF : [ref]);
+    return always || (ref !== null && ref !== undefined) ? key : undefined;
+}
+
+/// What `useDomRef`'s effect depends on with no ref, which almost every element has, one list for all of them: it does nothing then,
+/// whichever of `null` and `undefined` it was.
+const NO_REF = Object.freeze([null]);
+
+/// What gives each field the keyboard, by what it was given, for a label that's clicked.
+const focusers = new WeakMap();
+/// Inputs with no text to keep.
+const NO_TEXT_TYPES = new Set(['checkbox', 'radio', 'file', 'hidden', 'submit', 'button', 'reset', 'image', 'color']);
+/// What a field was given by what wrapped it, as `Input` does, by what it gave the field.
+const givenBy = new WeakMap();
+const FIELD_TAGS = new Set(['input', 'textarea', 'select']);
+
+/// An `<input>`, as a page has it: what CSS says about it as it is, hovered, focused or checked, and parts like `::after`
+/// included, as for any other element. A checkbox that nothing says is checked or not keeps that itself, as in a browser.
+function Input(given) {
+    const said = given;
+    const box = given.type === 'checkbox';
+    const [own, setOwn] = useState(given.defaultChecked === true);
+    const [ownValue, setOwnValue] = useState(given.defaultValue);
+    const radio = given.type === 'radio' && given.checked === undefined;
+    // An uncontrolled radio is checked until another of the same name is, as in a browser.
+    useEffect(() => {
+        if (!radio || given.name === undefined) {
+            return undefined;
+        }
+        const group = radioGroups.get(given.name) ?? new Set();
+        radioGroups.set(given.name, group);
+        const uncheck = () => setOwn(false);
+        group.add(uncheck);
+        return () => group.delete(uncheck);
+    }, [radio, given.name]);
+    if (radio) {
+        const changed = given.onChange;
+        const check = () => {
+            for (const other of radioGroups.get(given.name) ?? []) {
+                other();
+            }
+            setOwn(true);
+            changed?.(changeEvent(true, { name: said.name, type: 'radio', value: said.value === undefined || said.value === null ? 'on' : String(said.value) }));
+        };
+        given = { ...given, checked: own, __setChecked: setOwn, onChange: () => check() };
+    }
+    if (!box && !radio && given.value === undefined && given.type !== 'range' && !NO_TEXT_TYPES.has(given.type)) {
+        // A field that nothing says the value of keeps what's typed in it, as in a browser, however often what's around it renders.
+        const changed = given.onChange;
+        given = {
+            ...given,
+            value: ownValue ?? '',
+            __setValue: setOwnValue,
+            onChange: (event) => {
+                setOwnValue(event.target.value);
+                changed?.(event);
+            },
+        };
+    }
+    if (given.type === 'range' && given.value === undefined) {
+        const changed = given.onChange;
+        given = {
+            ...given,
+            value: ownValue,
+            onChange: (event) => {
+                setOwnValue(event.target.value);
+                changed?.(event);
+            },
+        };
+    }
+    if (box && given.checked === undefined) {
+        const changed = given.onChange;
+        const toggle = (checked) => {
+            setOwn(checked);
+            changed?.(changeEvent(checked, { name: said.name, type: 'checkbox', value: said.value === undefined || said.value === null ? 'on' : String(said.value) }));
+        };
+        // For a label around it, which can't see what it keeps.
+        ownToggles.set(said, () => (said.disabled === true ? undefined : toggle(!own)));
+        given = { ...given, checked: own, __setChecked: setOwn, onChange: (event) => toggle(event.target.checked) };
+    }
+    // What it gives the form it's in, as a browser has it: a box only when it's ticked, and a button only when it's what sent it.
+    const type = String(said.type ?? 'text').toLowerCase();
+    const ticks = type === 'checkbox' || type === 'radio';
+    const sends = type === 'submit' || type === 'button' || type === 'reset' || type === 'image' || type === 'file';
+    const shownValue = given.value;
+    const shownChecked = given.checked === true;
+    useFormField({
+        name: said.name,
+        type,
+        disabled: said.disabled === true,
+        checked: shownChecked,
+        value: ticks ? String(said.value ?? 'on') : String(shownValue ?? ''),
+        defaultValue: said.defaultValue === undefined ? '' : String(said.defaultValue),
+        entries: () => (sends || (ticks && !shownChecked) ? [] : [[String(said.name), ticks ? String(said.value ?? 'on') : String(shownValue ?? '')]]),
+        reset: () => {
+            setOwn(said.defaultChecked === true);
+            setOwnValue(said.defaultValue);
+        },
+    });
+    const { defaultChecked: _checked, ...rest } = given;
+    if (given.__setChecked !== undefined) {
+        // Its `checked` attribute is what it started with, as React writes `defaultChecked`, rather than what it is now.
+        rest.__defaultChecked = said.defaultChecked === true;
+    }
+    if (rest.type === 'range') {
+        delete rest.defaultValue;
+    }
+    if (type === 'hidden') {
+        // It's only a value for its form, and isn't shown, as a browser's `input[type=hidden] { display: none }` has it.
+        rest.hidden = true;
+    }
+    givenBy.set(rest, said);
+    return make(plainDomElement('input'), rest);
+}
+
+/// Whether the `<details>` something's in is open, and what opens or closes it.
+const DetailsContext = createContext(null);
+DetailsContext.Provider.displayName = 'DetailsContext';
+
+/// `<details>`: its `<summary>`, and what else is in it only while it's open, which clicking the summary changes, as a browser has it.
+function Details({ open, onToggle, children, ...rest }) {
+    const [shown, setShown] = useState(open === true);
+    useEffect(() => setShown(open === true), [open]);
+    const toggle = () => {
+        const next = !shown;
+        setShown(next);
+        onToggle?.({ type: 'toggle', target: { open: next }, currentTarget: { open: next }, preventDefault() {}, stopPropagation() {} });
+    };
+    const all = Children.toArray(children);
+    const isSummary = (child) => isValidElement(child) && (child.type === Summary || tagOf(child) === 'summary');
+    const summary = all.find(isSummary) ?? make(Summary, { key: 'summary' }, 'Details');
+    const rest_ = all.filter((child) => !isSummary(child));
+    return make(
+        DetailsContext.Provider,
+        { value: { open: shown, toggle } },
+        make(plainDomElement('details'), { ...rest, open: shown || undefined }, summary, ...(shown ? rest_ : [])),
+    );
+}
+
+/// `<summary>`: what it says, after a triangle that points down while what it's in is open and across while it isn't, as
+/// `list-style-type: disclosure-closed` in the browser's own CSS has it, which a page's can take away. Clicking it opens or closes
+/// what it's in.
+function Summary({ onClick, ...rest }) {
+    const details = useContext(DetailsContext);
+    const click = (event) => {
+        onClick?.(event);
+        details?.toggle();
+    };
+    return make(plainDomElement('summary'), { ...rest, onClick: click, __disclosure: details?.open === true });
+}
+
+// `<dialog>`, as a page has it. It's there while it's closed, as it is on a page, so that a `ref` to it, or `getElementById`,
+// finds something to call `showModal()` on, and it's only drawn while it's open. `showModal()` puts it on top of everything, as a
+// page's top layer has it, over its `::backdrop`, which is rsui's own dialog: it has the keyboard to itself, which goes back to
+// where it was once it closes. Escape is its `cancel`, which closes it unless `preventDefault()` says not to, and pressing
+// what's behind it does nothing, as on a page.
+
+/// What a form with `method="dialog"` closes.
+const DialogContext = createContext(null);
+DialogContext.Provider.displayName = 'DialogContext';
+
+/// The dialogs open with `showModal()`, the last on top.
+const modalDialogs = [];
+
+/// An event for something that happened to an element of a page by itself, as a dialog's `close` and `cancel` are.
+function elementEvent(type, target, cancelable = false) {
+    const event = Object.create(rsui.__newEventBase());
+    Object.assign(event, { type, target, currentTarget: target, srcElement: target, bubbles: false, cancelable, defaultPrevented: false });
+    event.preventDefault = () => {
+        if (cancelable) {
+            event.defaultPrevented = true;
+        }
+    };
+    event.isDefaultPrevented = () => event.defaultPrevented;
+    // It isn't going anywhere, so there's nothing for Rust to be told about stopping it.
+    event.stopPropagation = () => {
+        event.__stopped = true;
+    };
+    event.stopImmediatePropagation = () => {
+        event.__stopped = true;
+        event.__immediate = true;
+    };
+    event.nativeEvent = event;
+    return event;
+}
+
+/// Tells a dialog's handler for `type`, and whatever's listening on it, about what's happened to it, and says whether it's
+/// been told not to do what it would.
+function tellDialog(dialog, type, cancelable) {
+    const handle = dialog.handle;
+    const event = elementEvent(type, handle, cancelable);
+    const handler = dialog.props?.[type === 'close' ? 'onClose' : 'onCancel'];
+    try {
+        handler?.(event);
+    } catch (error) {
+        console.error(error);
+    }
+    dispatchOn(handle, event);
+    return !event.defaultPrevented;
+}
+
+/// Says that escape cancels the dialog on top, for as long as there's one.
+function escapeCancels(event) {
+    if (event.key !== 'Escape' || event.defaultPrevented || modalDialogs.length === 0) {
+        return;
+    }
+    event.preventDefault();
+    const top = modalDialogs[modalDialogs.length - 1];
+    if (tellDialog(top, 'cancel', true)) {
+        closeDialog(top);
+    }
+}
+
+function openDialog(dialog, modal) {
+    if (dialog.open && dialog.modal === modal) {
+        return;
+    }
+    if (dialog.open && !dialog.modal && modal) {
+        // As a browser says, a dialog that's open can't become one that takes over.
+        throw Object.assign(new Error("showModal() can't be called on a dialog that's already open"), { name: 'InvalidStateError' });
+    }
+    dialog.open = true;
+    dialog.modal = modal;
+    if (modal) {
+        modalDialogs.push(dialog);
+        if (modalDialogs.length === 1) {
+            listenOn('document', 'keydown', escapeCancels);
+        }
+    }
+    dialog.redraw?.();
+}
+
+/// Closes a dialog, with what it gives back if that's said, and says so to its `onClose` once what's running now has finished,
+/// as a page does.
+function closeDialog(dialog, returnValue) {
+    if (!dialog.open) {
+        return;
+    }
+    if (returnValue !== undefined && returnValue !== null) {
+        dialog.returnValue = String(returnValue);
+    }
+    dialog.open = false;
+    dialog.modal = false;
+    const at = modalDialogs.indexOf(dialog);
+    if (at >= 0) {
+        modalDialogs.splice(at, 1);
+        if (modalDialogs.length === 0) {
+            unlistenOn('document', 'keydown', escapeCancels);
+        }
+    }
+    dialog.redraw?.();
+    setTimeout(() => tellDialog(dialog, 'close', false), 0);
+}
+
+let keepingLaidOut = false;
+function keepLaidOut() {
+    if (!keepingLaidOut) {
+        keepingLaidOut = true;
+        rsuiHostMethods.keepLaidOut();
+    }
+}
+
+/// What a `<dialog>`'s `ref` holds, which is what a page's has: `showModal()`, `show()`, `close()`, `open` and `returnValue`.
+function dialogHandle(dialog) {
+    const live = { domKey: '__dom' + nextDomKey++ };
+    const handle = handleOf(live, 'dialog', true);
+    Object.defineProperties(handle, {
+        open: {
+            get: () => dialog.open,
+            set: (open) => (open ? openDialog(dialog, false) : closeDialog(dialog)),
+            enumerable: true,
+            configurable: true,
+        },
+        returnValue: {
+            get: () => dialog.returnValue,
+            set: (value) => {
+                dialog.returnValue = String(value);
+            },
+            enumerable: true,
+            configurable: true,
+        },
+    });
+    handle.showModal = () => openDialog(dialog, true);
+    handle.show = () => openDialog(dialog, false);
+    handle.close = (returnValue) => closeDialog(dialog, returnValue);
+    handle.requestClose = (returnValue) => {
+        if (dialog.open && tellDialog(dialog, 'cancel', true)) {
+            closeDialog(dialog, returnValue);
+        }
+    };
+    return { live, handle };
+}
+
+const keepRef = () => {};
+
+function PageDialog(given) {
+    const { open, onClose: _onClose, onCancel: _onCancel, ref, children, ...rest } = given;
+    const [, setDrawn] = useState(0);
+    const dialog = useMemo(() => {
+        const made = { open: open === true, modal: false, returnValue: '', said: open, props: null, redraw: null, handle: null, live: null };
+        const { live, handle } = dialogHandle(made);
+        made.handle = handle;
+        made.live = live;
+        return made;
+    }, []);
+    dialog.props = given;
+    dialog.redraw = () => setDrawn((drawn) => drawn + 1);
+    // `open` as it's given is the attribute, which opens it as one that doesn't take over, or closes it, when it changes.
+    if (dialog.said !== open) {
+        dialog.said = open;
+        if (open === true && !dialog.open) {
+            dialog.open = true;
+            dialog.modal = false;
+        } else if (open !== true && dialog.open) {
+            closeDialog(dialog);
+        }
+    }
+    dialog.live.given = rest;
+    const handle = handleOf(dialog.live, 'dialog', true);
+    useLayoutEffect(() => attachRef(ref, handle), [ref]);
+    // It's found by its `id` while it's there, open or not.
+    const id = typeof rest.id === 'string' ? rest.id : undefined;
+    useEffect(() => {
+        if (id === undefined) {
+            return undefined;
+        }
+        idElements.set(id, handle);
+        return () => {
+            if (idElements.get(id) === handle) {
+                idElements.delete(id);
+            }
+        };
+    }, [id]);
+    // Gone from the page, it's closed.
+    useEffect(() => () => closeDialog(dialog), []);
+    if (!dialog.open) {
+        return null;
+    }
+    return make(
+        plainDomElement('dialog'),
+        { ...rest, open: true, __modal: dialog.modal, __handle: handle, ref: keepRef },
+        make(DialogContext.Provider, { value: dialog }, children),
+    );
+}
+
+/// What a dialog that takes over is drawn in: the whole window, as `::backdrop` says, with the dialog in the middle of it.
+function topLayer(shown, backdrop) {
+    const behind = backdrop?.background ?? backdrop?.backgroundColor;
+    return make(
+        'dialog',
+        { key: '__topLayer', overlay: 'fill', align: 'center', justify: 'center', background: behind === undefined ? '#0000001a' : behind },
+        shown,
+    );
+}
+
+/// A bar for how far along something is, as `<progress>` and `<meter>` are drawn by a browser: a rounded track, filled as far
+/// as `fraction` from the left in `color`, in the element `tag` is, which is as big as the browser's CSS and the page's say.
+function Bar({ tag, fraction, color, edge, ...rest }) {
+    const filled = Math.min(1, Math.max(0, fraction));
+    const round = 3.5;
+    const fill = filled > 0
+        ? make(domElement('div'), {
+              key: 'fill',
+              style: {
+                  position: 'absolute',
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: `${filled * 100}%`,
+                  background: color,
+                  borderRadius: filled >= 1 ? round : `${round}px 0 0 ${round}px`,
+              },
+          })
+        : null;
+    const track = make(
+        domElement('div'),
+        { key: 'track', style: { position: 'relative', flexGrow: 1, height: 7, boxSizing: 'border-box', borderRadius: round, background: '#efefef', border: `1px solid ${edge}` } },
+        fill,
+    );
+    return make(plainDomElement(tag), rest, track);
+}
+
+/// A `<progress>` that CSS draws itself, with `appearance: none`, as Pico's is: its bar as `::-webkit-progress-bar` says and how
+/// far along it is as `::-webkit-progress-value` says, over what the element itself draws. How far along it is is green where
+/// that says nothing, as a browser's own CSS has it; its bar's grey isn't, as a page's `background` there, which takes it away, as
+/// Pico's `background: 0 0` does, says nothing here.
+function pageBar(fraction, parts) {
+    const bar = settleElement({ ...parts['-webkit-progress-bar'] });
+    const value = settleElement({ background: '#008000', ...parts['-webkit-progress-value'] });
+    delete bar.__appearance;
+    delete value.__appearance;
+    const fill = make('group', { key: 'value', ...value, position: 'absolute', left: 0, top: 0, bottom: 0, width: undefined, height: undefined, right: (1 - fraction) * 100 + '%', inert: true });
+    return make('group', { key: 'bar', ...bar, position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, width: undefined, height: undefined, inert: true }, fill);
+}
+
+/// `<canvas>`: what's drawn on it is `rsui/canvas`'s, which is only loaded once a page has one, and it's shown as a picture of what
+/// that's drawn, at the size its `width` and `height` say unless CSS says otherwise. Code that sets `style` on it, as chart.js does,
+/// has that drawn too, as on any element.
+function PageCanvas(given) {
+    const [, redraw] = useState(0);
+    const kept = useRef(null);
+    const pack = canvasPack();
+    if (kept.current === null) {
+        // One code made with `document.createElement()` is drawn with what it has drawn on it already.
+        const made = given.__handle?.__canvas;
+        kept.current = made ?? new pack.CanvasState(pack.attributeSize(given.width, 300), pack.attributeSize(given.height, 150), null);
+        kept.current.redraw = () => redraw((n) => n + 1);
+    }
+    const state = kept.current;
+    state.given(given.width, given.height);
+    const { ref, style, width: _width, height: _height, ...rest } = given;
+    let attached = state.refs.get(ref);
+    if (attached === undefined) {
+        attached = (element) => {
+            if (element !== null) {
+                pack.attach(element, state);
+            }
+            return attachRef(ref, element);
+        };
+        state.refs.clear();
+        state.refs.set(ref, attached);
+    }
+    return make(plainDomElement('canvas'), { ...rest, style, width: state.width, height: state.height, src: state.source(), fit: 'fill', __canvas: state, ref: attached });
+}
+PageCanvas.__webTag = 'canvas';
+PageCanvas.__webStyled = true;
+
+/// What draws on a canvas, loaded the first time it's wanted.
+function canvasPack() {
+    return require('rsui/canvas');
+}
+
+// A page's DOM as code changes it, and editing it: `dom.js` and `editing.js`, each loaded the first time it's wanted.
+
+let domLoaded = null;
+let editingLoaded = null;
+
+/// What `dom.js` and `editing.js` use of this.
+const domHooks = {
+    get document() {
+        return page;
+    },
+    domElement: (tag) => domElement(tag),
+    /// Whether plain elements code made are drawn without a `Styled` of their own: see `drawNative`.
+    get nativeElements() {
+        return nativeOn();
+    },
+    drawNative: (node, props, kids, render, propsOf) => drawNative(node, props, kids, render, propsOf),
+    moveDrawn: (parent, child, before) => moveDrawn(parent, child, before),
+    forgetNative: (node) => forgetNative(node),
+    hostedNative: (node) => node.__nativeLive !== undefined && node.__nativeLive.parent !== undefined,
+    prototypeFor: (tag) => prototypeFor(tag),
+    get elementClasses() {
+        return elementClasses;
+    },
+    listenOnElement: (element, type, listener, options) => listenOnElement(element, type, listener, options),
+    unlistenOnElement: (element, type, listener, options) => unlistenOnElement(element, type, listener, options),
+    isInlineTag: (tag) => INLINE_TEXT_TAGS.has(String(tag)),
+    afterLayout(run) {
+        afterLayout.add(run);
+        lookForResizes();
+    },
+    /// A `style` as every element has one: see `PageStyleDeclaration`.
+    styleFor: (owner) => styleFor(owner),
+    /// The text of what React drew in a page's element, as it was laid out.
+    drawnText: (element) => textInside(element),
+    /// Which tree the window has now, which is a different number when anything in it's changed.
+    treeNow: () => rsuiHostMethods.treeNow(),
+    /// What's told after the page has rendered again, and when the window's changed size, for what watches what React draws.
+    onPageRendered: (listener) => renderListeners.add(listener),
+    get resizeListeners() {
+        return resizeListeners;
+    },
+    listenOn: (where, type, listener, options) => listenOn(where, type, listener, options),
+    unlistenOn: (where, type, listener, options) => unlistenOn(where, type, listener, options),
+    /// Sends an event along the page, as any element's or the document's is sent.
+    dispatch: (target, event) => (target === page || target === body || target === documentElement ? dispatchOnPage(target, event) : dispatchOn(target, event)),
+    /// Gives the keyboard to an element, or takes it away, as `focus()` and `blur()` do, for what can have it.
+    moveFocus: (next) => moveFocus(next),
+    focusNode(node, options) {
+        if (canFocus(node)) {
+            moveFocus(node, true, options);
+        }
+    },
+    blurNode(node) {
+        if (focusedElement === node) {
+            moveFocus(null, false);
+        }
+    },
+    /// Where an element made by code is drawn, as it was last laid out.
+    rectOfOwn(node) {
+        const key = node.__domKey;
+        if (key === undefined) {
+            return null;
+        }
+        const shape = pageLives.get(key)?.deref();
+        if (shape?.svgOf !== undefined) {
+            return svgShapeRect(shape);
+        }
+        const box = pageChain(rsuiHostMethods.chainOf(key))?.at(-1);
+        if (box === undefined) {
+            return null;
+        }
+        const [x, y, width, height] = box.slice(6, 10);
+        return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON: () => ({ x, y, width, height, top: y, right: x + width, bottom: y + height, left: x }) };
+    },
+    editingGeometry: null,
+    editingChanged: () => editingPack(),
+};
+
+/// One of what `dom.js` says about where a node is among others, for a page's element.
+function domTree(element, name) {
+    const pack = domPack();
+    const said = Object.getOwnPropertyDescriptor(pack.nodeMethods, name) ?? Object.getOwnPropertyDescriptor(pack.elementMethods, name);
+    return said.get.call(element);
+}
+
+/// Sets one of those, as `textContent` is set.
+function domTreeSet(element, name, value) {
+    const pack = domPack();
+    const said = Object.getOwnPropertyDescriptor(pack.nodeMethods, name) ?? Object.getOwnPropertyDescriptor(pack.elementMethods, name);
+    said.set.call(element, value);
+}
+
+/// Whether this is a node code made, which `rsui/dom` has, rather than an element React drew.
+const isOwnNode = (node) => domLoaded !== null && node !== null && typeof node === 'object' && node.__own === true;
+
+/// Whether this is rsui's own `text` that a page's words are put in, in their font (see `withFont`), which is no element of the
+/// page: what's in it is what's in the page's element it's in. A page's tags written as JSX, as `<b>`, are elements of the page.
+function onlyHoldsText(value) {
+    return value !== null && typeof value === 'object' && value.type === 'text' && Array.isArray(value.kids) && value.props?.domKey === undefined && !nativeHostsProps.has(value.props);
+}
+
+/// What React gave an element to draw, with its text as the Text nodes it has now say, in the order `drawnChildren` found them.
+function withCodeText(children, texts) {
+    let at = 0;
+    const walk = (value) => {
+        if (typeof value === 'string' || typeof value === 'number') {
+            if (String(value) === '') {
+                return value;
+            }
+            const node = texts[at];
+            at += 1;
+            return node === undefined ? value : node.__data;
+        }
+        if (Array.isArray(value)) {
+            return value.map(walk);
+        }
+        if (onlyHoldsText(value)) {
+            // What's in one of rsui's own, which a page's text is drawn in: see `drawnChildren`.
+            return { ...value, kids: value.kids.map(walk) };
+        }
+        return value;
+    };
+    return walk(children);
+}
+
+/// What React drew in a page's element, as the DOM has it: the elements, from the tree as it is now, and the text React gave it,
+/// as Text nodes, each the same one for as long as it's there, as React keeps a text node and changes what it says.
+function drawnChildren(handle) {
+    if (handle.__replaced === true) {
+        return [];
+    }
+    const live = handle.__live;
+    if (live?.children === undefined || live.children === null || live.children === false) {
+        // React gave it nothing, so all that's in it is what code put there, without asking the tree.
+        return [];
+    }
+    // A literal's Text node comes from React's value below. Looking up the whole
+    // rendered tree cannot add an element unless a portal or recorded DOM move
+    // also contributes children; imperative __kids are appended by dom.js itself.
+    const literalText = (typeof live.children === 'string' || typeof live.children === 'number')
+        && (live.portalKids?.size ?? 0) === 0 && live.domOrder === undefined;
+    const kids = literalText ? [] : drawnElementsOf(handle);
+    let texts = handle.__texts;
+    if (texts === undefined) {
+        texts = [];
+        Object.defineProperty(handle, '__texts', { value: texts, enumerable: false, configurable: true, writable: true });
+    }
+    const out = [];
+    let elements = 0;
+    let made = 0;
+    const text = (data) => {
+        let node = texts[made];
+        if (node === undefined) {
+            node = domPack().makeText(data);
+            Object.defineProperty(node, '__parent', { value: handle, enumerable: false, configurable: true, writable: true });
+            node.__drawn = true;
+            texts[made] = node;
+        } else if (node.__given !== data) {
+            // What React gives it now, which goes over what code did to it, as React setting a text node's data does.
+            node.__data = data;
+        }
+        node.__given = data;
+        made += 1;
+        out.push(node);
+    };
+    const element = () => {
+        const child = kids[elements];
+        elements += 1;
+        // What code made is in what code put in it, after this.
+        if (child !== undefined && child.live.handle?.__own !== true) {
+            const found = handleOf(child.live, child.live.tag);
+            // Where it is is asked of the tree, as it was found there.
+            found.__placedByKey = true;
+            out.push(found);
+        }
+    };
+    const walk = (value) => {
+        if (value === null || value === undefined || typeof value === 'boolean') {
+            return;
+        }
+        if (typeof value === 'string' || typeof value === 'number') {
+            if (String(value) !== '') {
+                text(String(value));
+            }
+        } else if (Array.isArray(value)) {
+            value.forEach(walk);
+        } else if (typeof value === 'object' && value.type === globalThis.__Fragment) {
+            walk(value.props?.children);
+        } else if (onlyHoldsText(value)) {
+            walk(value.kids);
+        } else if (value === live.children && typeof value === 'object' && typeof value.type === 'function' && value.type.__webText === true
+            && kids.length === 0) {
+            // A component that gives back only text, as TanStack's `flexRender` does for a header that's a string, is all that's in
+            // it: its text is a Text node of this, as on a page, which is what's drawn in it.
+            const drawn = textInside(handle);
+            if (drawn !== '') {
+                text(drawn);
+            }
+        } else if (typeof value === 'object' && (value.type === 'br' || value.type?.__webTag === 'br')) {
+            // A line break is drawn as part of the text it's in, so it's no element there, but it is one in the DOM.
+            let made = breaks[broken];
+            if (made === undefined) {
+                made = domPack().makeElement('br');
+                Object.defineProperty(made, '__parent', { value: handle, enumerable: false, configurable: true, writable: true });
+                made.__drawn = true;
+                breaks[broken] = made;
+            }
+            broken += 1;
+            out.push(made);
+        } else {
+            element();
+        }
+    };
+    let breaks = handle.__breaks;
+    if (breaks === undefined) {
+        breaks = [];
+        Object.defineProperty(handle, '__breaks', { value: breaks, enumerable: false, configurable: true, writable: true });
+    }
+    let broken = 0;
+    walk(live?.children);
+    while (elements < kids.length) {
+        element();
+    }
+    texts.length = made;
+    if (live?.domOrder !== undefined) {
+        return movedNow(live, out);
+    }
+    return out;
+}
+
+/// DOM child reads need current ownership/order, not the rectangles recorded in
+/// the page snapshot. A geometry-only change can keep that topology while every
+/// returned handle still refreshes its own chain on a later geometry read. Do
+/// not advance the native pageTree anchor or reuse this for general nodeOf.
+function drawnElementsOf(handle) {
+    const key = handle.__domKey;
+    if (key === undefined) return [];
+    const tree = pageNow !== null && rsuiHostMethods.pageTreeContentKept?.() === true ? pageNow : pageTree();
+    return tree?.byKey.get(key)?.children ?? [];
+}
+
+/// What's in a page's element, in the order code has just moved it to, before the page has been drawn in that order: see
+/// `moveDrawn`. Text stays where it is, and the elements go round it.
+function movedNow(live, out) {
+    if (rsuiHostMethods.treeNow() !== live.domOrderTree) {
+        live.domOrder = undefined;
+        return out;
+    }
+    const where = new Map(live.domOrder.map((key, at) => [key, at]));
+    const elements = out.filter((one) => one.__domKey !== undefined && where.has(one.__domKey));
+    elements.sort((a, b) => where.get(a.__domKey) - where.get(b.__domKey));
+    let next = 0;
+    return out.map((one) => (one.__domKey !== undefined && where.has(one.__domKey) ? elements[next++] : one));
+}
+
+// What code moves of what React drew. On a page, code can move an element React put in another to somewhere else among what's
+// in that one, as cmdk sorts its items with `appendChild()`, and react-dom leaves it there until it changes what's there: then
+// what it moves (by its own reckoning) or puts in, and what had nothing drawn and has again, goes before the next of the rest
+// after it, or at the end (`getHostSibling` in react-dom), and what's left stays where code left it.
+// Here what's moved is what React gave the nearest component that the element and where it goes have in common, by its key: what
+// a page's element was given, by the key `slotted` gives it (`codeOrder` on the element), or what another component gave back,
+// as cmdk's group gives its items inside a context's provider (`componentOrders`, drawn by Rust in that order, each where React
+// had it: see `__Reordered` in layer.js). `keptOrder` works out the order from there on.
+
+/// Whether code has ever moved what React drew, after which a page's element that comes or goes says so: see `drawnCameOrWent`.
+let movedDrawn = false;
+
+/// The order code left what a component gave back in, by component.
+const componentOrders = new WeakMap();
+
+/// Moves `child`, an element React drew, before `before`, or to the end, among what React drew in `parent`, which it's in, as
+/// `insertBefore()` and `appendChild()` do. Says whether it did; what's moved anywhere else stays where React put it.
+function moveDrawn(parent, child, before) {
+    const live = parent?.__live;
+    const childLive = child?.__live;
+    if (live === undefined || childLive === undefined || parent.__own === true || child.__own === true || live.reactKids === undefined
+        || typeof live.redraw !== 'function' || live.instance === undefined) {
+        return false;
+    }
+    const pack = domPack();
+    const from = pack.parentOf(child);
+    if (from === null || from === undefined || from.__live !== live) {
+        return false;
+    }
+    // What it goes next to: what it goes before, which is the next element React drew from there on, as what code put in it
+    // comes after all of those, or for the end, the last of them.
+    const kids = pack.childList(parent);
+    const drawn = (one) => one?.__live !== undefined && one.__own !== true && one.nodeType === 1;
+    let next = null;
+    if (before !== null && before !== undefined) {
+        let at = kids.indexOf(before);
+        if (at < 0 && before.__domKey !== undefined) {
+            at = kids.findIndex((one) => one?.__domKey === before.__domKey);
+        }
+        if (at < 0) {
+            return false;
+        }
+        while (at < kids.length && !drawn(kids[at])) {
+            at += 1;
+        }
+        next = kids[at] ?? null;
+    }
+    const beside = next ?? kids.findLast((one) => drawn(one) && one.__live !== childLive) ?? null;
+    if (beside === null || beside.__live === childLive) {
+        return true;
+    }
+    // The components each is drawn by, from the one just inside `parent`'s own to the element's own, the first of which they share.
+    const down = (one) => {
+        const out = [];
+        for (let at = one.instance; at !== null && at !== undefined; at = at.parent) {
+            if (at === live.instance) {
+                return out.reverse();
+            }
+            out.push(at);
+        }
+        return null;
+    };
+    const mine = down(childLive);
+    const theirs = down(beside.__live);
+    if (mine === null || theirs === null) {
+        return false;
+    }
+    let shared = 0;
+    while (shared < mine.length && shared < theirs.length && mine[shared] === theirs[shared]) {
+        shared += 1;
+    }
+    if (shared === mine.length || shared === theirs.length) {
+        return false;
+    }
+    const owner = shared === 0 ? live.instance : mine[shared - 1];
+    const box = orderBox(live, owner);
+    if (box === null) {
+        return false;
+    }
+    const childKey = box.keyOf(mine[shared]);
+    const beforeKey = next === null ? null : box.keyOf(theirs[shared]);
+    if (childKey === undefined || beforeKey === undefined || beforeKey === childKey) {
+        return childKey !== undefined && beforeKey === childKey;
+    }
+    const held = box.held;
+    const shown = held.codeOrder ?? box.keys;
+    const moved = shown.filter((key) => key !== childKey);
+    const at = beforeKey === null ? -1 : moved.indexOf(beforeKey);
+    moved.splice(at < 0 ? moved.length : at, 0, childKey);
+    if (sameKeys(moved, shown)) {
+        return true;
+    }
+    held.reactKeys ??= box.keys;
+    held.codeOrder = moved;
+    movedDrawn = true;
+    // The DOM says so at once, as a page's does, until the page is drawn in that order: see `drawnChildren`.
+    const order = kids.filter((one) => drawn(one) && one.__live !== childLive).map((one) => one.__domKey);
+    const into = next === null ? -1 : order.indexOf(next.__domKey);
+    order.splice(into < 0 ? order.length : into, 0, child.__domKey);
+    live.domOrder = order;
+    live.domOrderTree = rsuiHostMethods.treeNow();
+    if (held === live) {
+        live.redraw();
+    } else {
+        componentOrders.set(owner, held);
+        rsui.__reorderOutput(owner, held.reorder);
+    }
+    return true;
+}
+
+/// What keeps the order code left what `owner` gave in, in the page's element `live`: the element itself, when `owner` is its own
+/// component, or what's kept for a component in it. With the keys of what it gave, and which of those a component just inside it is.
+function orderBox(live, owner) {
+    if (owner === live.instance) {
+        const slots = slotted(live.reactKids).filter(isValidElement);
+        return { held: live, keys: slots.map((one) => one.key), keyOf: (instance) => slotOf(live, instance, slots) };
+    }
+    const output = owner.output;
+    if (!Array.isArray(output)) {
+        return null;
+    }
+    let held = componentOrders.get(owner);
+    if (held === undefined) {
+        held = { codeOrder: undefined, reactKeys: undefined, absent: undefined, given: output, live, reorder: undefined };
+        held.reorder = (now) => reorderedOutput(owner, held, now);
+    }
+    const keys = output.map(outputKey);
+    return { held, keys, keyOf: (instance) => keys[outputIndex(output, instance)] };
+}
+
+/// What tells apart each of what a component gave back, as React does: its key, or where it is.
+const outputKey = (one, at) => (isValidElement(one) && one.key !== null && one.key !== undefined ? '$' + one.key : '#' + at);
+
+/// Where what drew `instance` is in what a component gave back: what it was given, or something given the same.
+function outputIndex(output, instance) {
+    const given = instance.props;
+    let at = output.findIndex((one) => isValidElement(one) && one.props === given);
+    if (at < 0 && given !== null && typeof given === 'object') {
+        const same = [];
+        output.forEach((one, index) => {
+            if (isValidElement(one) && one.type === instance.type && one.props !== null && typeof one.props === 'object' && sameGiven(one.props, given)) {
+                same.push(index);
+            }
+        });
+        at = same.length === 1 ? same[0] : -1;
+    }
+    return at;
+}
+
+/// What a component gave back, in the order code left it in (see `keptOrder`), for Rust to draw in that order, each where React has
+/// it, so that nothing in it starts again.
+function reorderedOutput(owner, held, output) {
+    const was = held.given;
+    held.given = output;
+    if (!Array.isArray(output) || !Array.isArray(was)) {
+        componentOrders.delete(owner);
+        return output;
+    }
+    const keys = output.map(outputKey);
+    const wasKeys = was.map(outputKey);
+    const order = keptOrder(held, keys, drawnKeys(held.live, owner, (instance) => wasKeys[outputIndex(was, instance)]));
+    if (order === undefined) {
+        componentOrders.delete(owner);
+        return output;
+    }
+    const where = new Map(keys.map((key, at) => [key, at]));
+    return { type: globalThis.__Reordered, key: null, props: null, kids: output, order: order.map((key) => where.get(key)) };
+}
+
+/// Which of what `owner` gave back has an element drawn in the page's element `live` now, by their keys (`keyOf` a component just
+/// inside `owner`), or null when that can't be told.
+function drawnKeys(live, owner, keyOf) {
+    const handle = live.handle;
+    if (handle === undefined || handle === null) {
+        return null;
+    }
+    const out = new Set();
+    for (const one of domPack().childList(handle)) {
+        const childLive = one?.__live;
+        if (childLive === undefined || one.__own === true || one.nodeType !== 1) {
+            continue;
+        }
+        let at = childLive.instance;
+        while (at !== null && at !== undefined && at.parent !== owner && at !== live.instance) {
+            at = at.parent;
+        }
+        if (at !== null && at !== undefined && at !== live.instance) {
+            const key = keyOf(at);
+            if (key !== undefined) {
+                out.add(key);
+            }
+        }
+    }
+    return out;
+}
+
+/// Tells what keeps an order code left that a page's element just inside it came or went, as react-dom puts what had nothing
+/// drawn and has again before the next of the rest: see `keptOrder`.
+function drawnCameOrWent(live) {
+    for (let at = live.instance?.parent; at !== null && at !== undefined; at = at.parent) {
+        const held = componentOrders.get(at);
+        if (held !== undefined) {
+            rsui.__reorderOutput(at, held.reorder);
+        }
+        const element = at.__pageLive;
+        if (element !== undefined) {
+            if (element.codeOrder !== undefined) {
+                element.redraw?.();
+            }
+            return;
+        }
+    }
+}
+
+/// Which of what React gave an element (`slots`, by their keys) `instance` is, a component just inside that element's own: by
+/// where it is (`Place`), what it was given, or something given the same.
+function slotOf(live, instance, slots) {
+    const props = instance.props;
+    const place = props?.__nth instanceof Place ? props.__nth : props?.value instanceof Place ? props.value : undefined;
+    const told = live.nthKept?.current;
+    if (place !== undefined && told instanceof Map) {
+        for (const [key, value] of told) {
+            if (value === place && slots.some((one) => one.key === key)) {
+                return key;
+            }
+        }
+    }
+    // What a context is handed down in around one of them (a `Place`, or what it's laid out in: see `eachWithin`), has that one as
+    // what's in it.
+    const wrapped = instance.type?.context !== undefined && isValidElement(props?.children);
+    const given = wrapped ? props.children.props : props;
+    for (const one of slots) {
+        if (one.props === given) {
+            return one.key;
+        }
+    }
+    // It wasn't drawn again, as what it was given is the same as before, which is a new object each time.
+    const type = wrapped ? props.children.type : instance.type;
+    const same = given === null || typeof given !== 'object' ? []
+        : slots.filter((one) => one.type === type && one.props !== null && typeof one.props === 'object' && sameGiven(withoutNth(one.props), withoutNth(given)));
+    return same.length === 1 ? same[0].key : undefined;
+}
+
+function withoutNth(props) {
+    if (props.__nth === undefined) {
+        return props;
+    }
+    const { __nth: _nth, ...rest } = props;
+    return rest;
+}
+
+function sameKeys(one, other) {
+    if (one.length !== other.length) {
+        return false;
+    }
+    for (let at = 0; at < one.length; at += 1) {
+        if (one[at] !== other[at]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// What React gave a page's element now, in the order code left it in (see `keptOrder`), with what it gave last time (`was`), whose
+/// components are what's drawn now. Text stays where React has it, and the elements go round it.
+function codeOrdered(live, kids, was) {
+    const slots = slotted(kids);
+    const keys = [];
+    const byKey = new Map();
+    for (const one of slots) {
+        if (isValidElement(one) && !byKey.has(one.key)) {
+            keys.push(one.key);
+            byKey.set(one.key, one);
+        }
+    }
+    const wasSlots = slotted(was).filter(isValidElement);
+    const order = keptOrder(live, keys, drawnKeys(live, live.instance, (instance) => slotOf(live, instance, wasSlots)));
+    if (order === undefined) {
+        return kids;
+    }
+    let next = 0;
+    return slots.map((one) => (isValidElement(one) ? byKey.get(order[next++]) ?? one : one));
+}
+
+/// The order code left what React gave something in (`held.codeOrder`), now that React gives it `keys`, of which `drawn` have an
+/// element drawn, as react-dom would leave it: what React moved, by its own reckoning, or put in, and what had nothing drawn and
+/// has now, goes before the next after it in React's order of what stays, or at the end; what's gone goes. Undefined once that's
+/// React's own order, which it is from then on.
+function keptOrder(held, keys, drawn) {
+    const order = held.codeOrder;
+    if (order === undefined) {
+        return undefined;
+    }
+    const before = held.reactKeys;
+    const placed = new Set();
+    if (before !== undefined && !sameKeys(before, keys)) {
+        const was = new Map(before.map((key, at) => [key, at]));
+        let last = 0;
+        for (const key of keys) {
+            const at = was.get(key);
+            if (at === undefined || at < last) {
+                placed.add(key);
+            } else {
+                last = at;
+            }
+        }
+    }
+    const now = new Set(keys);
+    const absent = held.absent;
+    const stays = order.filter((key) => now.has(key) && !placed.has(key) && (drawn === null || drawn.has(key)) && absent?.has(key) !== true);
+    held.absent = drawn === null ? undefined : new Set(keys.filter((key) => !drawn.has(key)));
+    // Each of the rest goes before the next one after it, in React's order, that stays, in React's order among those.
+    const kept = new Set(stays);
+    const goesBefore = new Map();
+    let anchor = null;
+    for (let at = keys.length - 1; at >= 0; at -= 1) {
+        const key = keys[at];
+        if (kept.has(key)) {
+            anchor = key;
+            continue;
+        }
+        let list = goesBefore.get(anchor);
+        if (list === undefined) {
+            list = [];
+            goesBefore.set(anchor, list);
+        }
+        list.unshift(key);
+    }
+    const out = [];
+    for (const key of stays) {
+        out.push(...(goesBefore.get(key) ?? []));
+        out.push(key);
+    }
+    out.push(...(goesBefore.get(null) ?? []));
+    if (sameKeys(out, keys)) {
+        held.codeOrder = undefined;
+        held.reactKeys = undefined;
+        held.absent = undefined;
+        return undefined;
+    }
+    held.codeOrder = out;
+    held.reactKeys = keys;
+    return out;
+}
+
+function domPack() {
+    if (domLoaded === null) {
+        domLoaded = require('rsui/dom');
+        domLoaded.install(domHooks);
+        // What the pointer selected before anything asked: see `pressMaySelect`.
+        if (pressKept !== null) {
+            selectKeptPress();
+        }
+    }
+    return domLoaded;
+}
+
+function editingPack() {
+    if (editingLoaded === null) {
+        const nodes = domPack();
+        editingLoaded = require('rsui/editing');
+        editingLoaded.install(domHooks, nodes);
+        domHooks.editingGeometry = editingLoaded.geometry;
+        // It hears presses itself from now on.
+        unlistenOn('window', 'mousedown', pressMaySelect, PRESS_MAY_SELECT);
+    }
+    return editingLoaded;
+}
+
+/// Whether something an element's in can already be edited, which makes it part of that, rather than an editing host of its own.
+function editableSaidAbove(live) {
+    const handle = live.handle;
+    if (handle === undefined || handle === null || domLoaded === null) {
+        return false;
+    }
+    for (let at = domLoaded.parentOf(handle); at !== null && at !== undefined; at = domLoaded.parentOf(at)) {
+        const said = at.__own === true ? at.getAttribute('contenteditable') : at.__live?.given?.contentEditable;
+        if (said === 'false' || said === false) {
+            return false;
+        }
+        if (said !== null && said !== undefined) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The kinds of `<input>` that are typed in, which show that they have the keyboard however they were given it.
+const TYPED_INPUTS = new Set(['text', 'search', 'url', 'tel', 'email', 'password', 'number', 'date', 'datetime-local', 'month', 'week', 'time']);
+
+/// Whether something's typed in, as a text box is, which `:focus-visible` matches however it was focused.
+function typedIn(own) {
+    const props = own.props ?? {};
+    if (own.tag === 'textarea' || saysEditable(props)) {
+        return true;
+    }
+    return own.tag === 'input' && props.readOnly !== true && TYPED_INPUTS.has(String(props.type ?? 'text').toLowerCase());
+}
+
+/// Whether what an element's given says it can be edited, as `contenteditable` does.
+function saysEditable(props) {
+    const said = props.contentEditable;
+    return said === true || said === 'true' || said === '' || said === 'plaintext-only';
+}
+
+/// `<progress>`: how much of something's done, as `value` out of `max`.
+function Progress({ value, max = 1, ...rest }) {
+    const fraction = value === undefined ? 0 : Number(value) / (Number(max) || 1);
+    // It says its `value` and `max`, as its attributes, which CSS can go by, as Pico's `progress[value]` does.
+    return make(Bar, { ...rest, value, max, tag: 'progress', fraction, color: rest.style?.accentColor ?? BROWSER_BLUE, edge: '#b8b8b8' });
+}
+
+/// `<meter>`: where `value` is between `min` and `max`.
+function Meter({ value = 0, min = 0, max = 1, low: _low, high: _high, optimum: _optimum, ...rest }) {
+    const span = Number(max) - Number(min);
+    const fraction = span > 0 ? (Number(value) - Number(min)) / span : 0;
+    return make(Bar, { ...rest, tag: 'meter', fraction, color: '#107c10', edge: '#cacaca' });
+}
+
+/// What toggles each checkbox that keeps whether it's checked itself, by what it was given, for a label around it.
+const ownToggles = new WeakMap();
+
+/// What unchecks each uncontrolled radio, by the name of its group.
+const radioGroups = new Map();
+
+Details.__webTag = 'details';
+Summary.__webTag = 'summary';
+Progress.__webTag = 'progress';
+Meter.__webTag = 'meter';
+// Each passes what it's given on to the element it makes, which takes where it is among what's around it from that: see `withNth`.
+for (const one of [Details, Summary, Progress, Meter]) {
+    one.__webStyled = true;
+}
+Input.__webTag = 'input';
+Input.__webField = true;
+
+/// Two short strokes going up to the right, a little in from the corner, in grey, as Edge draws a textarea's grip.
+const TEXTAREA_GRIP = "data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3e%3cpath d='M8 1L1 8M8 5L5 8' stroke='%23666' stroke-width='1' fill='none'/%3e%3c/svg%3e";
+
+/// A textarea's own look on top of what CSS says: the grip a browser draws in the corner of one that can be made bigger, unless
+/// `resize: none` says it can't or the page draws a picture there itself, and as wide as `cols` characters of its font (20
+/// unless it says) and a scrollbar when nothing says how wide. A character of a monospace font is 0.55 of its size across.
+function textareaLook(look, cols) {
+    if (look.__resize !== 'none' && look.backgroundImage === undefined && look.backgroundGradient === undefined) {
+        look.backgroundImage = TEXTAREA_GRIP;
+        look.backgroundPosition = 'right 0px bottom 0px';
+        look.backgroundRepeat = 'no-repeat';
+        look.backgroundSize = '10px 10px';
+    }
+    delete look.__resize;
+    if (look.width === undefined) {
+        // That's its content's width, which its padding and border go around, unless `box-sizing: border-box` says the width
+        // has them in it.
+        const size = typeof look.fontSize === 'number' ? look.fontSize : 13.3333;
+        const number = (value) => (typeof value === 'number' ? value : 0);
+        const around = look.__boxSizing === 'border-box'
+            ? number(look.paddingLeft) + number(look.paddingRight) + 2 * number(look.borderWidth)
+            : 0;
+        look.width = (Number(cols ?? 20) * 0.5498 * size) + 17 + around;
+    }
+}
+
+/// `<textarea>`: an element of the page as any other is (see `Styled`), which keeps what's typed in it when nothing says what its
+/// value is, as in a browser, and is one of its form's fields.
+function TextArea(given) {
+    const said = given;
+    const startedWith = given.defaultValue ?? (typeof given.children === 'string' ? given.children : undefined);
+    const [ownValue, setOwnValue] = useState(startedWith);
+    if (given.value === undefined) {
+        const changed = given.onChange;
+        given = {
+            ...given,
+            value: ownValue ?? '',
+            __setValue: setOwnValue,
+            onChange: (event) => {
+                setOwnValue(event.target.value);
+                changed?.(event);
+            },
+        };
+    }
+    const textValue = String(given.value ?? '');
+    useFormField({
+        name: said.name,
+        type: 'textarea',
+        disabled: said.disabled === true,
+        value: textValue,
+        defaultValue: startedWith === undefined ? '' : String(startedWith),
+        entries: () => [[String(said.name), textValue]],
+        reset: () => setOwnValue(startedWith),
+    });
+    // Its text is its value, never what's in it.
+    const { children: _children, ...rest } = given;
+    givenBy.set(rest, said);
+    return make(plainDomElement('textarea'), rest);
+}
+TextArea.__webTag = 'textarea';
+TextArea.__webField = true;
+
+// What CSS says about what's inside something, as `header h3 { ... }`. What it's been given can be gone through right away. What's made
+// inside a component that's in there isn't there yet, so what's still to be matched goes down with context, for styled components and
+// shapes to look at. Each one with something to say is here along with what's been passed through since.
+
+/// What's around something that's in no page, which is still under the page's rules, as everything a browser draws is.
+const PAGE_RULES = Object.freeze([]);
+const NestedRules = createContext(PAGE_RULES);
+NestedRules.Provider.displayName = 'NestedRules';
+const useRulesAbove = () => {
+    const owners = useContext(NestedRules);
+    return owners === PAGE_RULES ? pageOwners() : owners;
+};
+
+/// The page's rules about what's inside it, as what everything in the page gets from above it: with `body` and `html` as the first
+/// of what's above everything, so that `body.dark .x` and `html[data-theme] .x` are about what's inside them. It's the same for as
+/// long as nothing's changed.
+function pageOwners() {
+    const now = workedOut();
+    if (now.owners === undefined) {
+        const complex = pageRules();
+        const chain = pageAncestors();
+        const rules = complex === null ? [] : rulesNow(complex, chain.el);
+        if (rules.length === 0) {
+            now.owners = null;
+        } else {
+            // The same list, with what's in it now, as everything in the page has it from above, so that what isn't about what's
+            // changed isn't drawn again for a new one. What looks at what's in it finds it again then: see `ruleIndex`.
+            if (rules.length !== pageRuleList.length || rules.some((rule, at) => rule !== pageRuleList[at])) {
+                pageRuleList.length = 0;
+                pageRuleList.push(...rules);
+                ruleIndexes.delete(pageRuleList);
+            }
+            pageOwnersKept ??= [{ rules: pageRuleList, above: chain, page: null }];
+            now.owners = pageOwnersKept;
+        }
+    }
+    return now.owners;
+}
+const pageRuleList = [];
+let pageOwnersKept = null;
+/// Where something is among what's around it, for what's about that, as `:last-of-type` is.
+const NthContext = createContext(null);
+NthContext.Provider.displayName = 'NthContext';
+
+// What text gets from what it's in, which CSS does and props don't, apart from its color.
+
+const InheritedFont = createContext(null);
+InheritedFont.Provider.displayName = 'InheritedFont';
+// What Rust needs to work out what's in an element, in `layout.rs`: what only hands something down, which is as inline as what it
+// holds, what a fragment is, and how CSS about a kind of element, some classes and one class is found.
+natives.cssKinds(layout, [NestedRules.Provider, InheritedFont.Provider, FlowContext.Provider, NthContext.Provider], globalThis.__Fragment, tagLook, looksOfClasses, classLook);
+// `__case` is `text-transform`, which what's inside gets too, as CSS has it.
+const FONT_PROPS = ['fontSize', 'fontWeight', 'fontFamily', 'fontStyle', 'textAlign', 'lineHeight', '__lineScale', 'color', '__listStyle', 'keepWords', '__whiteSpace', '__sizeSaid', 'letterSpacing', 'wordSpacing', 'textShadow', 'textIndent', 'textDirection', 'tabularNums', '__case', 'textWrap'];
+const COLOR_KEYS = ['background', 'borderColor', 'borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor', 'shadowColor', 'outlineColor', 'fill', 'stroke', 'hover', 'pressed'];
+
+/// Puts in the color of the text for each color that says it's that.
+function withCurrentColor(look, current) {
+    for (const key of COLOR_KEYS) {
+        if (look[key] === 'currentcolor') {
+            if (current === undefined) {
+                delete look[key];
+            } else {
+                look[key] = current;
+            }
+        }
+    }
+    return look;
+}
+
+/// What text right in something is written with, with the lines it says go under, over or through its text, as a link's
+/// `text-decoration: underline` does when it's laid out as a box of its own, as in a flex box, rather than as a run of text.
+const DECORATION_PROPS = ['underline', 'lineThrough', 'overline', 'decorationStyle', 'decorationColor', 'decorationThickness', 'underlineOffset'];
+function decoratedFont(look, font) {
+    if (look.underline !== true && look.lineThrough !== true && look.overline !== true) {
+        return font;
+    }
+    const out = { ...font };
+    for (const key of DECORATION_PROPS) {
+        if (look[key] !== undefined) {
+            out[key] = look[key];
+        }
+    }
+    return out;
+}
+
+/// What's inside a block that's only things that go along a line, as buttons and links do, rather than one under another.
+const INLINE_TAGS = new Set(['a', 'abbr', 'b', 'button', 'cite', 'code', 'em', 'i', 'img', 'input', 'kbd', 'label', 'mark', 'select', 'small', 'span', 'strong', 'sub', 'sup', 'svg', 'textarea', 'time', 'u', 's']);
+/// What goes along a line of text with it, rather than starting a line of its own.
+const INLINE_TEXT_TAGS = new Set(['span', 'a', 'b', 'i', 'em', 'strong', 'small', 'code', 'u', 's', 'sub', 'sup', 'mark', 'abbr', 'cite', 'kbd', 'time', 'label', 'samp', 'var', 'dfn', 'ins', 'del', 'data', 'output', 'bdi', 'bdo']);
+const BLOCK_TAGS = new Set(['div', 'hgroup', 'search', 'section', 'main', 'nav', 'header', 'footer', 'aside', 'article', 'form', 'fieldset', 'figure', 'li', 'td', 'th', 'dd', 'dt', 'details', 'summary', 'address', 'figcaption']);
+
+/// What's said about fonts in a look, on top of what came from above.
+function fontFrom(look, above) {
+    let out = above;
+    for (const name of FONT_PROPS) {
+        if (look[name] !== undefined && (out === null || out[name] !== look[name])) {
+            out = out === above ? { ...above } : out;
+            out[name] = look[name];
+        }
+    }
+    return out;
+}
+
+/// What's in something, with what it's written in given to what can't get it any other way: text that's right there, and elements.
+function withFont(children, font) {
+    if (font === null) {
+        return children;
+    }
+    if (font.__case !== undefined) {
+        // How text's cased was done to it where it was given, and isn't something text itself is told.
+        font = { ...font };
+        delete font.__case;
+    }
+    if (typeof children === 'string' || typeof children === 'number') {
+        return make('text', finalFont(font), String(children));
+    }
+    if (Array.isArray(children)) {
+        return children.map((child) => withFont(child, font));
+    }
+    if (isValidElement(children) && (children.type === FlowContext.Provider || children.type === FormContext.Provider)) {
+        // What `eachWithin` put around something is only for it to know where it is, and what's in that is written the same.
+        return { ...children, props: { ...children.props, children: withFont(children.props.children, font) } };
+    }
+    if (!isValidElement(children) || typeof children.type !== 'string') {
+        return children;
+    }
+    if (children.type === 'text' || children.type === 'span') {
+        // What it says itself counts, apart from where it's said there's nothing, which is the same as not saying.
+        const merged = { ...font };
+        for (const key of Object.keys(children.props ?? {})) {
+            if (children.props[key] !== undefined) {
+                merged[key] = children.props[key];
+            }
+        }
+        if (children.props?.lineHeight !== undefined) {
+            // It says how far apart its lines are itself.
+            merged.__lineScale = null;
+        }
+        return { ...children, props: finalFont(merged) };
+    }
+    if (children.kids === null || children.kids === undefined || (DOM_TAGS.has(children.type) && !HOST_NAMES.has(children.type))) {
+        // An element of the page is drawn by a `Styled` of its own, which reads how it's written from what it's in and from its
+        // own CSS: its text given this one's font here would keep this one's size and weight, as an `<h1>` beside a `<div>` did.
+        return children;
+    }
+    if (children.type !== 'group' && children.type !== 'button' && children.type !== 'input' && DOM_TAGS.has(children.type)) {
+        // An element of the page works out its own font from what it's in, as `Styled` does, and its text is written in that,
+        // not in this: an `<h1>` that's all there is in a `<div>` is still big and bold.
+        return children;
+    }
+    return { ...children, kids: withFont(children.kids, font) };
+}
+
+/// What's drawn by rsui itself and is also the name of a tag of the page.
+const HOST_NAMES = new Set(['span', 'button', 'input']);
+
+function mergeParts(parts, more) {
+    if (more === null || more === undefined) {
+        return;
+    }
+    for (const name of Object.keys(more)) {
+        parts[name] = { ...parts[name], ...more[name] };
+    }
+}
+
+/// What's said about how something is, as it's kept for it, rather than given to it.
+const STATES = new Set(['hover', 'active', 'focus', 'focus-visible', 'focus-within', 'checked']);
+/// A state of something that comes before what a rule's about, which that something tells what it's in about: see `withNth`.
+const PEER = 16;
+/// With `PEER`: what comes after it passes how it is on to what's inside it, as `.peer:checked + * > .x` asks, which Mantine's
+/// Switch moves its thumb with.
+const DEEP_PEER = 64;
+
+/// Which steps of a rule, between what it belongs to and what it's about, say how something is, as `.group:hover .x` and
+/// `.peer:checked ~ .x` do, which what those steps are about has to keep track of.
+function watchedSteps(steps) {
+    const out = [];
+    for (let at = 1; at < steps.length - 1; at += 1) {
+        if (steps[at].pseudo.some((one) => STATES.has(one.name))) {
+            out.push(at);
+        }
+    }
+    return out;
+}
+
+/// Whether a step is about something, apart from how it is.
+function stepMatchesAnyState(step, own) {
+    const pseudo = step.pseudo.filter((one) => !STATES.has(one.name));
+    return stepMatches(pseudo.length === step.pseudo.length ? step : { ...step, pseudo }, own);
+}
+
+/// What those above say about something, as it is now, put into its look and its parts. It gives back which of its states those care
+/// about, as what they're about, or as something that's in what they're about or after it, with `PEER` if it's what comes before.
+function fromAbove(owners, own, look, parts, classes = false, between = null) {
+    let needs = 0;
+    watched = 0;
+    let paged = false;
+    let keys = null;
+    // The page's own rules are as they are now, rather than as they were when what's around this was drawn, as a rule that
+    // CSS-in-JS has put in while this was being drawn, as emotion's `.css-x::after` is, is this element's the first time it's
+    // drawn, rather than the next time, which would make what's in it different and start again.
+    const page = pageOwners();
+    if (page !== null) {
+        const at = owners === null ? -1 : owners.findIndex((owner) => owner.page === null);
+        if (at < 0) {
+            owners = [page[0], ...(owners ?? [])];
+        } else if (owners[at].rules !== page[0].rules) {
+            owners = owners.map((owner, index) => (index === at ? { ...owner, rules: page[0].rules } : owner));
+        }
+    }
+    if (restyleFresh !== null && owners !== null) {
+        // `RSUI_RESTYLE_CHECK`'s look at everything: what's above it as it is now, from nothing, rather than what's kept.
+        owners = owners.map((owner) => ({ ...owner, rules: owner.page === null ? freshPageRules() : owner.rules, above: freshChain(owner.above) }));
+    }
+    for (const owner of owners ?? []) {
+        const rules = owner.rules;
+        if (owner.page === null) {
+            // The page's own rules, with its rules about one class among them, in the cascade's order.
+            paged = true;
+            const index = ruleIndex(rules);
+            if (index.watched.size > 0) {
+                keys ??= keysOf(own);
+                for (const [rule, at] of candidates(index.watched, keys)) {
+                    const bits = watchedStep(rule, at, own);
+                    watched |= bits;
+                    needs |= bits;
+                }
+            }
+            needs |= indexedRulesOn(index, rules, owner, own, look, parts, classes, between);
+            continue;
+        }
+        if (rules.length <= FEW_RULES) {
+            for (const rule of rules) {
+                const bits = watching(rule, own);
+                watched |= bits;
+                needs |= bits | ruleOn(rule, owner, own, look, parts);
+            }
+            continue;
+        }
+        // Only the rules that could be about it, by what it is, its id, its classes and its attributes, are looked at, in the order
+        // they're in, as the rest can't be.
+        const index = ruleIndex(rules);
+        if (index.watched.size > 0) {
+            keys ??= keysOf(own);
+            for (const [rule, at] of candidates(index.watched, keys)) {
+                const bits = watchedStep(rule, at, own);
+                watched |= bits;
+                needs |= bits;
+            }
+        }
+        needs |= indexedRulesOn(index, rules, owner, own, look, parts, false, null);
+    }
+    if (!paged) {
+        // A page with no rules about more than one class: only those about one, and then what goes after them.
+        if (classes) {
+            mergeLook(look, pageClassesLook(own.classes));
+        }
+        between?.();
+    }
+    return needs;
+}
+
+// Most of what a page's rules say about an element only depends on the element itself, as `.flex` and `.hover\:x:hover` do, and a
+// page has the same classes on element after element. What those come to is found once for each list of classes, kind of element
+// and id, and once more for each state and each of what they read of what the element's given, rather than for every element.
+
+/// What's only about an element itself, apart from what's found out about where it is or what it's in: how it is, as `:hover` is,
+/// and what it's given, which is what each reads of that.
+const SELF_PSEUDO = {
+    hover: [], active: [], focus: [], 'focus-visible': ['type', 'readOnly', 'contentEditable'], 'focus-within': [], checked: ['checked'], disabled: ['disabled'], enabled: ['disabled'],
+    required: ['required'], optional: ['required'], 'read-only': ['readOnly'], 'read-write': ['readOnly'], 'placeholder-shown': ['placeholder', 'value'],
+    empty: [], link: ['href'], 'any-link': ['href'], modal: ['__modal'], open: ['open'], root: [], 'in-range': [], visited: [], target: [],
+    host: [], 'host-context': [], indeterminate: [], 'out-of-range': [], fullscreen: [],
+};
+// `:valid`, `:invalid` and the like aren't among them, as what they say follows from what's set on the element by code
+// (`setCustomValidity()`) and from whether it's been typed in, as well as from what it's given.
+
+/// What of what an element's given a rule reads, if all it's about is the element itself, or `null` if it's about more than that.
+function selfReads(rule) {
+    if (rule.selfReads !== undefined) {
+        return rule.selfReads;
+    }
+    let reads = null;
+    const last = rule.steps[rule.steps.length - 1];
+    if (rule.steps.length === 2 && (last.link ?? 'descendant') === 'descendant' && last.pseudo.every((one) => SELF_PSEUDO[one.name] !== undefined)) {
+        reads = [];
+        for (const one of last.pseudo) {
+            reads.push(...SELF_PSEUDO[one.name]);
+        }
+        for (const attr of last.attrs) {
+            reads.push(attr.name === 'class' ? 'className' : attr.name === 'for' ? 'htmlFor' : attr.name);
+        }
+    }
+    rule.selfReads = reads;
+    return reads;
+}
+
+/// What the page's rules that could be about something with these classes, of this kind and with this id, are, in the order the
+/// cascade puts them in: what says more about what it's for after what says less, and of what says as much, the later in the
+/// sheets after the earlier. The page's rules about one class are among them, as rules about the element alone. Which of them
+/// are about it alone, and what they read of what it's given, are found here too. Kept for each index, by the list of classes,
+/// which is the same list for the same `className`: see `classesOf`. `classes` says whether its rules about one class count.
+const plansOf = new WeakMap();
+function planOf(index, rules, own, classes) {
+    let byClasses = plansOf.get(index);
+    // What's said about one class or kind of element is in them, which can have changed when the rest hasn't.
+    if (byClasses !== undefined && index.plannedAt !== version) {
+        if (RESTYLE_ENV.log) logRestylePlanActivity(index.plannedAt, false);
+        byClasses = undefined;
+    }
+    index.plannedAt = version;
+    if (byClasses === undefined) {
+        byClasses = new WeakMap();
+        plansOf.set(index, byClasses);
+    }
+    let byKind = byClasses.get(own.classes);
+    if (byKind === undefined) {
+        byKind = new Map();
+        byClasses.set(own.classes, byKind);
+    }
+    const kind = (classes ? 'c' : '') + (own.tag ?? '') + '#' + (own.id ?? '');
+    let plan = byKind.get(kind);
+    if (plan === undefined) {
+        if (RESTYLE_ENV.log) logRestylePlanActivity(null, classes);
+        const keys = ['*'];
+        if (own.id !== undefined && own.id !== null) {
+            keys.push('#' + own.id);
+        }
+        for (const name of own.classes) {
+            keys.push('.' + name);
+        }
+        if (own.tag !== null && own.tag !== undefined) {
+            keys.push(own.tag);
+        }
+        const rank = sheetRanks();
+        const items = [];
+        for (const at of new Set(candidates(index.last, keys))) {
+            const rule = rules[at];
+            items.push({ rule, at, weight: (rule.weight ??= specificity(rule.steps)), rank: rank.get(rule.sheet) ?? -1, order: rule.order ?? -1, self: selfReads(rule) !== null });
+        }
+        if (classes) {
+            const seen = new Set();
+            for (const name of own.classes) {
+                if (seen.has(name) || madeClasses.has(name)) {
+                    continue;
+                }
+                seen.add(name);
+                for (const entry of rulesIn('classes', name) ?? []) {
+                    items.push({ rule: classRule(entry), at: -1, weight: 100, rank: rank.get(entry.sheet) ?? -1, order: entry.at, self: true });
+                }
+            }
+        }
+        // What's said about the kind of element is under everything else, unless a rule about more says no more than it does, as
+        // `:where(ul) li` doesn't: then it's put in order with that, again, so that the later of the two goes over the other.
+        if (items.some((item) => item.at >= 0 && item.weight <= 1)) {
+            for (const [tag, weight] of [['*', 0], [own.tag, 1]]) {
+                for (const entry of (tag === null || tag === undefined ? null : rulesIn('tagRules', tag)) ?? []) {
+                    items.push({ rule: tagRule(entry), at: -1, weight, rank: rank.get(entry.sheet) ?? -1, order: entry.at, self: true });
+                }
+            }
+        }
+        // A sort that keeps the order of those it can't tell apart, which is the order the rules were found in.
+        items.sort((x, y) => x.weight - y.weight || x.rank - y.rank || x.order - y.order);
+        const reads = new Set();
+        let others = false;
+        let split = items.length;
+        items.forEach((item, slot) => {
+            if (item.weight > 100 && split === items.length) {
+                split = slot;
+            }
+            if (!item.self) {
+                others = true;
+            } else if (item.at >= 0) {
+                selfReads(item.rule).forEach((name) => reads.add(name));
+            }
+        });
+        // Candidate entries repeat for every class combination. Keep references and dense numeric columns, rather than
+        // one six-property JavaScript object per candidate. The sort's temporary entries are not retained by the plan.
+        plan = {
+            items: items.map((item) => item.rule),
+            at: Float64Array.from(items, (item) => item.at),
+            weight: Float64Array.from(items, (item) => item.weight),
+            rank: Float64Array.from(items, (item) => item.rank),
+            order: Float64Array.from(items, (item) => item.order),
+            self: Uint8Array.from(items, (item) => item.self ? 1 : 0),
+            split,
+            reads: [...reads],
+            others,
+            results: new Map(),
+            apart: [itemsApart(items.slice(0, split)), itemsApart(items.slice(split))],
+        };
+        byKind.set(kind, plan);
+    }
+    return plan;
+}
+
+/// A rule about one class, as an item of a plan, with what it says worked out as everything else is.
+function classRule(entry) {
+    if (entry.declaredAt !== version) {
+        entry.declaredAt = version;
+        entry.rule = { steps: null, part: null, props: lookFrom(entry.declarations) };
+    }
+    return entry.rule;
+}
+
+/// A rule about a kind of element, as an item of a plan, as `tagLook` has it.
+function tagRule(entry) {
+    const rule = classRule(entry);
+    delete rule.props.__hidden;
+    return rule;
+}
+
+/// Whether the items of a plan that are about more than the element itself say nothing that an item about it alone after them says
+/// too, so that what those about it alone come to, together, can be put on first and the rest after it, in order, and come to the
+/// same as each in turn would. What's `!important` is only gone over by something after it that's `!important` too.
+function itemsApart(items) {
+    const later = new Set();
+    const laterImportant = new Set();
+    for (let slot = items.length - 1; slot >= 0; slot -= 1) {
+        const rule = items[slot].rule;
+        const said = rule.part === null ? Object.keys(rule.props).filter((key) => key !== '__important') : ['::' + rule.part];
+        const important = rule.part === null ? rule.props.__important ?? [] : [];
+        if (items[slot].self) {
+            said.forEach((key) => later.add(key));
+            important.forEach((key) => laterImportant.add(key));
+        } else if (said.some((key) => (important.includes(key) ? laterImportant.has(key) : later.has(key)))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// What the items of a plan that are about an element alone come to for it, in two, either side of what says more than one class
+/// does: which of them it fits, what that comes to, put together in order, and which of its states they care about. Kept for each
+/// state and each of what they read.
+function selfResults(plan, owner, own) {
+    let key = (own.state ?? 0) + (own.empty === true ? 'e' : '');
+    for (const name of plan.reads) {
+        const value = own.props?.[name];
+        // What isn't there isn't what's there and empty, as Radix's `data-disabled=""` is, which `[data-disabled]` is about: so
+        // that the item before it, which has none, doesn't have its results kept for it.
+        key += '\u0000' + (value === undefined || value === null ? '\u0001' : typeof value === 'string' ? value : String(value) + typeof value);
+    }
+    let found = plan.results.get(key);
+    if (found === undefined) {
+        const halves = [{ look: {}, parts: {} }, { look: {}, parts: {} }];
+        const fits = [];
+        let needs = 0;
+        plan.items.forEach((rule, slot) => {
+            if (!plan.self[slot]) {
+                fits.push(false);
+                return;
+            }
+            const fit = plan.at[slot] < 0 || ruleMatches(rule.steps, owner.above, own, owner.page);
+            fits.push(fit);
+            if (fit) {
+                putOn(rule, halves[slot < plan.split ? 0 : 1].look, halves[slot < plan.split ? 0 : 1].parts);
+            }
+            if (plan.at[slot] >= 0) {
+                needs |= stateNeeds(rule, owner, own, fit);
+            }
+        });
+        found = { halves, needs, fits };
+        if (plan.results.size > 256) {
+            plan.results.clear();
+        }
+        plan.results.set(key, found);
+    }
+    return found;
+}
+
+/// What a rule says, put into a look, or into a part.
+function putOn(rule, look, parts) {
+    if (rule.part === null) {
+        mergeLook(look, rule.props);
+    } else {
+        parts[rule.part] = { ...parts[rule.part], ...rule.props };
+    }
+}
+
+/// What the page's rules that could be about an element come to for it, put into its look and its parts, in the cascade's order,
+/// with `between` done between what says no more than one class does and what says more, and which of its states they care about.
+function indexedRulesOn(index, rules, owner, own, look, parts, classes, between) {
+    const plan = planOf(index, rules, own, classes);
+    // Rules found by an attribute, as `[data-state=open]` is, are looked at for each element, as what it's given varies.
+    let byAttribute = null;
+    if (index.attributes) {
+        for (const name in own.props ?? {}) {
+            const found = index.last.get('[' + (name === 'className' ? 'class' : name === 'htmlFor' ? 'for' : name));
+            if (found !== undefined) {
+                (byAttribute ??= []).push(...found);
+            }
+        }
+    }
+    const self = plan.items.length === 0 ? null : selfResults(plan, owner, own);
+    let needs = self?.needs ?? 0;
+    if (byAttribute === null) {
+        for (const half of [0, 1]) {
+            const [from, to] = half === 0 ? [0, plan.split] : [plan.split, plan.items.length];
+            if (plan.apart[half]) {
+                // What's about it alone first, all together, and then the rest, as nothing they say is said again after.
+                if (self !== null) {
+                    mergeWeight = half === 0 ? 0 : 101;
+                    mergeLook(look, self.halves[half].look);
+                    mergeWeight = Infinity;
+                    mergeParts(parts, self.halves[half].parts);
+                }
+                // What comes after all of what's about it alone is in the cascade's order after it.
+                let lastSelf = from - 1;
+                for (let slot = from; slot < to; slot += 1) {
+                    if (plan.self[slot]) {
+                        lastSelf = slot;
+                    }
+                }
+                for (let slot = from; slot < to; slot += 1) {
+                    if (!plan.self[slot]) {
+                        mergeInOrder = slot > lastSelf;
+                        needs |= ruleOn(plan.items[slot], owner, own, look, parts);
+                        mergeInOrder = false;
+                    }
+                }
+            } else {
+                mergeInOrder = true;
+                for (let slot = from; slot < to; slot += 1) {
+                    const item = plan.items[slot];
+                    if (plan.self[slot]) {
+                        if (self.fits[slot]) {
+                            mergeWeight = plan.weight[slot];
+                            putOn(item, look, parts);
+                            mergeWeight = Infinity;
+                        }
+                    } else {
+                        needs |= ruleOn(item, owner, own, look, parts);
+                    }
+                }
+                mergeInOrder = false;
+            }
+            if (half === 0) {
+                between?.();
+            }
+        }
+        return needs;
+    }
+    // With rules found by an attribute too, everything in order, with what's about the element alone as it was found.
+    const extra = [...new Set(byAttribute)].map((at) => ({ rule: rules[at], weight: (rules[at].weight ??= specificity(rules[at].steps)), at }));
+    extra.sort((x, y) => x.weight - y.weight || x.at - y.at);
+    let slot = 0;
+    let more = 0;
+    let betweenDone = false;
+    // Each goes in in the cascade's order, so what's said later goes over what waits for a variable before it, whatever it says
+    // about, as sonner's `@media (max-width: 600px) { [data-sonner-toaster] { width: 100% } }` does over its
+    // `[data-sonner-toaster] { width: var(--width) }`.
+    mergeInOrder = true;
+    while (slot < plan.items.length || more < extra.length) {
+        const takeItem = more >= extra.length || (slot < plan.items.length && cascadeBefore(plan, slot, extra[more]));
+        const weight = takeItem ? plan.weight[slot] : extra[more].weight;
+        if (!betweenDone && weight > 100) {
+            betweenDone = true;
+            between?.();
+        }
+        if (takeItem) {
+            const item = plan.items[slot];
+            if (plan.self[slot]) {
+                if (self.fits[slot]) {
+                    mergeWeight = plan.weight[slot];
+                    putOn(item, look, parts);
+                    mergeWeight = Infinity;
+                }
+            } else {
+                needs |= ruleOn(item, owner, own, look, parts);
+            }
+            slot += 1;
+        } else {
+            needs |= ruleOn(extra[more].rule, owner, own, look, parts);
+            more += 1;
+        }
+    }
+    mergeInOrder = false;
+    if (!betweenDone) {
+        between?.();
+    }
+    return needs;
+}
+
+/// Whether an item of a plan comes before a rule found by an attribute, in the cascade's order.
+function cascadeBefore(plan, slot, other) {
+    if (plan.weight[slot] !== other.weight) {
+        return plan.weight[slot] < other.weight;
+    }
+    if (plan.at[slot] >= 0) {
+        return plan.at[slot] < other.at;
+    }
+    const rank = sheetRanks();
+    const otherRank = rank.get(other.rule.sheet) ?? -1;
+    return plan.rank[slot] < otherRank || (plan.rank[slot] === otherRank && plan.order[slot] < (other.rule.order ?? -1));
+}
+
+/// Which of the last element `fromAbove` looked at's states rules about what's inside it or after it care about, as
+/// `.group:hover .x` does: only a change to one of those changes what goes down to what's inside it.
+let watched = 0;
+
+/// How many rules are few enough to look at each of, rather than finding which could be about something first.
+const FEW_RULES = 12;
+
+/// What one rule says about something, if it's about it, put into its look or its parts, and which of its states it's about.
+function ruleOn(rule, owner, own, look, parts) {
+    const last = rule.steps[rule.steps.length - 1];
+    const needs = (rule.needs ??= needsOf(last.pseudo));
+    if (ruleMatches(rule.steps, owner.above, own, owner.page)) {
+        if (rule.part === null) {
+            mergeWeight = rule.weight ??= specificity(rule.steps);
+            mergeLook(look, rule.props);
+            mergeWeight = Infinity;
+        } else {
+            parts[rule.part] = { ...parts[rule.part], ...rule.props };
+        }
+        return needs;
+    }
+    return stateNeeds(rule, owner, own, false);
+}
+
+/// Which of something's states a rule cares about: what it says about how something is only matters to something it would be about
+/// if it were that way, as `.tile:hover` is only about tiles, or that's that way now, so that hovering anything else doesn't draw
+/// it again.
+function stateNeeds(rule, owner, own, fits) {
+    const needs = (rule.needs ??= needsOf(rule.steps[rule.steps.length - 1].pseudo));
+    if (fits || needs === 0 || ((own.state ?? 0) & needs) !== 0) {
+        return needs;
+    }
+    own.anyState ??= { ...own, state: ALL_STATES };
+    return ruleMatches(rule.steps, owner.above, own.anyState, owner.page) ? needs : 0;
+}
+
+/// Every state something can be in, as CSS asks about them.
+const ALL_STATES = HOVER | PRESS | FOCUS | WITHIN | RING;
+
+/// Which of something's states a rule cares about, as what's between what it belongs to and what it's about, as `.group:hover .x`
+/// does, with `PEER` if it's what comes before, as `.peer:checked ~ .x` does.
+function watching(rule, own) {
+    rule.watched ??= watchedSteps(rule.steps);
+    let needs = 0;
+    for (const at of rule.watched) {
+        needs |= watchedStep(rule, at, own);
+    }
+    return needs;
+}
+
+function watchedStep(rule, at, own) {
+    const step = rule.steps[at];
+    if (!stepMatchesAnyState(step, own)) {
+        return 0;
+    }
+    const next = rule.steps[at + 1].link;
+    if (next !== 'adjacent' && next !== 'sibling') {
+        return needsOf(step.pseudo);
+    }
+    return needsOf(step.pseudo) | PEER | (at + 1 < rule.steps.length - 1 ? DEEP_PEER : 0);
+}
+
+/// What a step of a selector is found by: its id, one of its classes, an attribute it asks about, or what kind of element it's
+/// about, or `*` for a step that's about anything.
+function keyOfStep(step) {
+    if (step.id !== null && step.id !== undefined) {
+        return '#' + step.id;
+    }
+    if (step.classes.length > 0) {
+        return '.' + step.classes[0];
+    }
+    if (step.attrs.length > 0) {
+        return '[' + step.attrs[0].name;
+    }
+    return step.tag ?? '*';
+}
+
+/// What something can be found by, as `keyOfStep` has it, each once.
+function keysOf(own) {
+    const keys = new Set(['*']);
+    if (own.id !== undefined && own.id !== null) {
+        keys.add('#' + own.id);
+    }
+    for (const name of own.classes) {
+        keys.add('.' + name);
+    }
+    if (own.tag !== null && own.tag !== undefined) {
+        keys.add(own.tag);
+    }
+    for (const name in own.props ?? {}) {
+        keys.add('[' + (name === 'className' ? 'class' : name === 'htmlFor' ? 'for' : name));
+    }
+    return keys;
+}
+
+/// The rules in a list, by what the step they're about is found by, and the steps whose states something has to keep track of,
+/// by what they're found by. It's worked out once for each list, which is the same list all the way down a page.
+const ruleIndexes = new WeakMap();
+function ruleIndex(rules) {
+    let index = ruleIndexes.get(rules);
+    if (index === undefined) {
+        index = { last: new Map(), watched: new Map() };
+        rules.forEach((rule, at) => {
+            const key = keyOfStep(rule.steps[rule.steps.length - 1]);
+            if (key.startsWith('[')) {
+                index.attributes = true;
+            }
+            const list = index.last.get(key);
+            if (list === undefined) {
+                index.last.set(key, [at]);
+            } else {
+                list.push(at);
+            }
+            rule.watched ??= watchedSteps(rule.steps);
+            for (const step of rule.watched) {
+                const watchKey = keyOfStep(rule.steps[step]);
+                const watching = index.watched.get(watchKey);
+                if (watching === undefined) {
+                    index.watched.set(watchKey, [[rule, step]]);
+                } else {
+                    watching.push([rule, step]);
+                }
+            }
+        });
+        ruleIndexes.set(rules, index);
+    }
+    return index;
+}
+
+/// Everything in an index under any of these keys, each once, as keys are.
+function candidates(index, keys) {
+    let out = null;
+    for (const key of keys) {
+        const found = index.get(key);
+        if (found !== undefined) {
+            out = out === null ? found.slice() : out.concat(found);
+        }
+    }
+    return out ?? [];
+}
+
+/// What goes down from something, which has these rules itself, to what's inside it.
+function passedDown(owners, own, rules) {
+    const on = owners === null ? [] : owners.map((owner) => ({ rules: owner.rules, above: { el: own, up: owner.above }, page: owner.page }));
+    if (rules.length > 0) {
+        on.push({ rules, above: null, page: undefined });
+    }
+    return on.length === 0 ? null : on;
+}
+
+/// The classes a `className` has, with `own` after them, which a styled component has. What's given back isn't to be changed, as
+/// it's kept for the same `className` and `own`, which an element has every time it's drawn, as long classes from tools are.
+const classLists = new Map();
+const classesOf = (name, own) => {
+    const key = own === undefined ? name : name + '\u0000' + own;
+    let classes = classLists.get(key);
+    if (classes === undefined) {
+        classes = typeof name === 'string' ? name.split(/\s+/).filter((one) => one !== '') : [];
+        if (own !== undefined) {
+            classes.push(own);
+        }
+        if (classLists.size > 20000) {
+            classLists.clear();
+        }
+        classLists.set(key, classes);
+    }
+    return classes;
+};
+
+/// What kind of element something is, as CSS knows it.
+function tagOf(element) {
+    const type = element.type;
+    if (typeof type === 'function') {
+        return type.__webTag ?? null;
+    }
+    return element.props?.webTag ?? (typeof type === 'string' ? type : null);
+}
+
+/// What something that's been given is, for checking selectors.
+function describe(element, nth, prevs) {
+    let props = element.props ?? {};
+    const type = element.type;
+    const kids = element.kids ?? props.children;
+    let tag = tagOf(element);
+    let classes = classesOf(props.className, typeof type === 'function' ? type.__webClass : undefined);
+    // A component is the element it was found to make, once that's known (see `learnMadeTag`), as what's beside it asks: shadcn's
+    // FieldDescription's `[[data-variant=legend]+&]` is about the `<legend data-variant>` FieldLegend makes.
+    const made = typeof type === 'function' && type.__webTag === undefined ? renderedMade.get(type) : undefined;
+    if (made !== undefined) {
+        tag = made.tag;
+        props = { ...made.props, ...props };
+        classes = [...new Set([...classesOf(made.props.className), ...classes])];
+    }
+    return {
+        tag,
+        id: props.id ?? props.__id,
+        classes,
+        props,
+        state: 0,
+        nth,
+        prevs,
+        empty: kids === undefined || kids === null || (Array.isArray(kids) && kids.length === 0),
+        kind: typeof type === 'function' ? 'component' : 'element',
+    };
+}
+
+/// What `text-transform` does, which can only be to what's written right there.
+function withCase(children, how) {
+    if (how === 'none') {
+        return children;
+    }
+    if (typeof children === 'string') {
+        switch (how) {
+            case 'uppercase':
+                return children.toUpperCase();
+            case 'lowercase':
+                return children.toLowerCase();
+            default:
+                return children.replace(/(^|\s)(\S)/g, (_, space, letter) => space + letter.toUpperCase());
+        }
+    }
+    if (Array.isArray(children)) {
+        return children.map((child) => withCase(child, how));
+    }
+    return children;
+}
+
+/// Goes through what's been given, putting on what the rules say about each thing, with where each is among the others.
+function applyNested(children, rules, above) {
+    const elements = [];
+    const gather = (value) => {
+        if (Array.isArray(value)) {
+            value.forEach(gather);
+        } else if (isValidElement(value)) {
+            elements.push(value);
+        }
+    };
+    gather(children);
+    const tags = elements.map(tagOf);
+    const typeCounts = new Map();
+    for (const tag of tags) {
+        typeCounts.set(tag, (typeCounts.get(tag) ?? 0) + 1);
+    }
+    const seen = new Map();
+    const before = [];
+    let index = 0;
+    const map = (value) => {
+        if (Array.isArray(value)) {
+            return value.map(map);
+        }
+        if (!isValidElement(value)) {
+            return value;
+        }
+        const tag = tags[index];
+        const typeIndex = seen.get(tag) ?? 0;
+        seen.set(tag, typeIndex + 1);
+        const own = describe(value, { index, count: elements.length, typeIndex, typeCount: typeCounts.get(tag) }, before.slice());
+        index += 1;
+        before.push(own);
+        return applyOne(value, own, rules, above);
+    };
+    return map(children);
+}
+
+function applyOne(element, own, rules, above) {
+    const extra = {};
+    const parts = {};
+    for (const rule of rules) {
+        if (ruleMatches(rule.steps, above, own)) {
+            if (rule.part === null) {
+                mergeLook(extra, rule.props);
+            } else {
+                parts[rule.part] = { ...parts[rule.part], ...rule.props };
+            }
+        }
+    }
+    if (extra.__hidden === true) {
+        return null;
+    }
+    const textCase = extra.__case;
+    delete extra.__hidden;
+    delete extra.__scroll;
+    delete extra.__case;
+    const props = element.props ?? {};
+    const inner = { el: own, up: above };
+    const anything = Object.keys(extra).length > 0 || Object.keys(parts).length > 0;
+    if (own.kind === 'component') {
+        const kids = props.children === undefined ? undefined : applyNested(props.children, rules, inner);
+        const merged = { ...props, children: kids };
+        if (anything) {
+            if (element.type.__webClass !== undefined) {
+                const more = props.__webMore ?? { look: {}, parts: {} };
+                merged.__webMore = { look: { ...extra, ...more.look }, parts: { ...parts, ...more.parts } };
+            } else {
+                const name = classOf({ compiled: null, extra, parts });
+                merged.className = typeof props.className === 'string' ? props.className + ' ' + name : name;
+            }
+        }
+        if (kids === undefined) {
+            delete merged.children;
+        }
+        return { ...element, props: merged };
+    }
+    let kids = element.kids === null || element.kids === undefined ? element.kids : applyNested(element.kids, rules, inner);
+    if (textCase !== undefined && kids !== null && kids !== undefined) {
+        kids = withCase(kids, textCase);
+    }
+    if (parts.before !== undefined || parts.after !== undefined) {
+        kids = withParts(kids ?? undefined, parts.before ?? null, parts.after ?? null);
+    }
+    // What's written on the element itself is what counts, apart from what's only there for the kind of element it is.
+    const settled = settleElement(extra);
+    const merged = { ...settled, ...props };
+    for (const key of props.webBase ?? []) {
+        if (key in settled) {
+            merged[key] = settled[key];
+        }
+    }
+    return { ...element, props: merged, kids };
+}
+
+// `className`
+
+/// What CSS says about these classes, all together. It's the same for the same classes for as long as nothing's changed, so it's
+/// worked out once and isn't to be changed by what asks for it.
+function looksOfClasses(name) {
+    if (typeof name !== 'string' || name === '') {
+        return NO_LOOK;
+    }
+    const sets = workedOut().classSets;
+    let out = sets.get(name);
+    if (out === undefined) {
+        out = lookOfClasses(name);
+        sets.set(name, out);
+    }
+    return out;
+}
+const NO_LOOK = Object.freeze({});
+
+function lookOfClasses(name) {
+    const out = {};
+    const classes = name.split(/\s+/);
+    let paged = false;
+    for (const one of classes) {
+        const record = madeClasses.get(one);
+        if (record !== undefined) {
+            mergeLook(out, record.compiled?.own);
+            mergeLook(out, record.extra);
+        } else if (!paged) {
+            // What the page says about all of them, as the cascade has it: see `pageClassesLook`.
+            paged = true;
+            mergeLook(out, pageClassesLook(classes, name));
+        }
+    }
+    return out;
+}
+
+/// Goes on an element with `{...cls(name)}`, for what CSS says about these classes, and `{...cls(name, 'button')}` for what it says about
+/// that kind of element too, as `button { ... }` does.
+function cls(name, tag, type, disabled = false) {
+    const base = tag === undefined ? {} : { ...browserLook(tag, type, disabled), ...tagLook('*'), ...tagLook(tag) };
+    const out = settleElement({ ...base, ...looksOfClasses(name) });
+    if (name !== undefined) {
+        out.className = name;
+    }
+    const under = Object.keys(base).filter((key) => key in out && !(key in looksOfClasses(name)));
+    if (under.length > 0) {
+        // These are what anything more particular that's said about it goes over, as CSS has it.
+        out.webBase = under;
+    }
+    if (out.__hidden === true) {
+        // It stays there, for what's looking for it, and has no room and can't be seen.
+        Object.assign(out, { width: 0, height: 0, opacity: 0, inert: true });
+    }
+    delete out.__hidden;
+    delete out.__scroll;
+    delete out.__scrollAlways;
+    delete out.__overflowX;
+    delete out.__overflowY;
+    delete out.__case;
+    delete out.__lineScale;
+    return out;
+}
+
+/// Goes on an element's `style`, for a `style` object that's written for the web.
+/// What a `style` object written for the web says, as it is before anything's been worked out from it. `fontSize` is what an `em`
+/// is, if the object doesn't say.
+function inlineLook(given, fontSize = 16) {
+    const size = Number(given.fontSize) || fontSize;
+    let variables = false;
+    for (const name in given) {
+        const value = given[name];
+        if (name.startsWith('--') || (typeof value === 'string' && value.includes('var(') && namesIn(value).some((one) => elementVariables.has(one)))) {
+            variables = true;
+            break;
+        }
+    }
+    if (!variables) {
+        return natives.cssInline(given, size, remSize, declaring);
+    }
+    // Variables it sets are the element's own, for what's in it and for the rules on it, as on a page, and what uses one that an
+    // element can set is worked out again for each, as `declareBlock` has it.
+    const plain = {};
+    const own = [];
+    for (const name of Object.keys(given)) {
+        const value = given[name];
+        if (!name.startsWith('--')) {
+            plain[name] = value;
+        } else if (value !== undefined && value !== null && value !== false) {
+            own.push([name, String(value)]);
+        }
+    }
+    const look = natives.cssInline(plain, size, remSize, declaring);
+    for (const [name, value] of own) {
+        look[name] = value;
+        elementSets(name);
+    }
+    const was = declaring.warn;
+    declaring.warn = () => {};
+    try {
+        for (const name of Object.keys(plain)) {
+            const value = plain[name];
+            if (typeof value === 'string' && value.includes('var(') && namesIn(value).some((one) => elementVariables.has(one))) {
+                const css = name.replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase());
+                look['__var ' + css] = { value, fontSize: size, made: natives.cssInline({ [name]: value }, size, remSize, declaring) };
+            }
+        }
+    } finally {
+        declaring.warn = was;
+    }
+    look.__vars = true;
+    return look;
+}
+
+/// Says that an element sets this variable itself, as an inline `style` can. What uses it is worked out again for each element that
+/// has it, which rules already worked out don't know, so the first time a name's seen everything's worked out again, once.
+let elementSetSoon = false;
+function elementSets(name) {
+    if (elementVariables.has(name)) {
+        return;
+    }
+    elementVariables.add(name);
+    // What uses it is worked out for each element from now on, which is only what's about what uses it.
+    restyle.variables.add(name);
+    if (!elementSetSoon) {
+        elementSetSoon = true;
+        queueMicrotask(() => {
+            elementSetSoon = false;
+            declared += 1;
+            restyled();
+        });
+    }
+}
+
+function webStyle(given) {
+    if (given === null || given === undefined) {
+        return undefined;
+    }
+    const out = settleElement(inlineLook(given));
+    delete out.__hidden;
+    delete out.__scroll;
+    delete out.__case;
+    return out;
+}
+
+// styled-components, and what comes with it
+
+const ThemeContext = createContext(undefined);
+ThemeContext.Provider.displayName = 'ThemeContext';
+
+function ThemeProvider({ theme, children }) {
+    const above = useContext(ThemeContext);
+    const value = typeof theme === 'function' ? theme(above) : theme;
+    return make(ThemeContext.Provider, { value }, children);
+}
+
+const useTheme = () => useContext(ThemeContext);
+
+function withTheme(Inner) {
+    return (props) => make(Inner, { ...props, theme: useContext(ThemeContext) });
+}
+
+let nextClass = 1;
+let nextName = 1;
+
+/// A `css` template and what's in it, as text, for these props.
+function textOf(strings, values, props) {
+    let out = strings[0];
+    for (let at = 0; at < values.length; at += 1) {
+        out += valueText(values[at], props) + strings[at + 1];
+    }
+    return out;
+}
+
+/// What `textOf` is given in place of props when there are none yet, as for a styled component's look before it's drawn: what
+/// works something out from the props isn't called, and what it would have said is `GUESSED`, which `withoutGuessed` leaves out.
+const GUESSING = Object.freeze({ theme: Object.freeze({}) });
+const GUESSED = '__rsui_said_by_props__';
+
+/// CSS as it's read, without what has `GUESSED` in it.
+function withoutGuessed(block) {
+    return {
+        ...block,
+        declarations: block.declarations.filter(([name, value]) => !name.includes(GUESSED) && !value.includes(GUESSED)),
+        rules: block.rules.filter((rule) => !rule.selector.includes(GUESSED)).map((rule) => ({ ...rule, block: rule.block === undefined || rule.block === null ? rule.block : withoutGuessed(rule.block) })),
+    };
+}
+
+function valueText(value, props) {
+    if (value === null || value === undefined || value === false || value === true) {
+        return '';
+    }
+    if (typeof value === 'function' && value.__webClass === undefined && props === GUESSING) {
+        return GUESSED;
+    }
+    if (typeof value === 'function') {
+        // A component's what a selector means by it, and anything else works it out from the props.
+        return value.__webClass !== undefined ? '.' + value.__webClass : valueText(value(props), props);
+    }
+    if (Array.isArray(value)) {
+        return value.map((one) => valueText(one, props)).join('');
+    }
+    if (typeof value === 'object') {
+        if (value.__webCss === true) {
+            return textOf(value.strings, value.values, props);
+        }
+        // Only a plain object is a style object. Anything else says what it is as text, as a color made by a library does.
+        const kind = Object.getPrototypeOf(value);
+        if (kind === Object.prototype || kind === null) {
+            return objectCss(value);
+        }
+    }
+    return String(value);
+}
+
+function objectCss(value) {
+    return Object.keys(value)
+        .map((name) => (name.startsWith('--') ? name : name.replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase())) + ':' + value[name] + ';')
+        .join('');
+}
+
+function css(strings, ...values) {
+    return Array.isArray(strings) && strings.raw !== undefined
+        ? { __webCss: true, strings, values, toString: () => textOf(strings, values, {}) }
+        : { __webCss: true, strings: [objectCss(strings)], values: [], toString: () => objectCss(strings) };
+}
+
+/// Keyframes made in code, as `keyframes\`from { opacity: 0 } to { opacity: 1 }\``, which go by the name this gives back.
+function keyframes(strings, ...values) {
+    const name = 'rsui-keyframes-' + nextName++;
+    const text = Array.isArray(strings) && strings.raw !== undefined ? textOf(strings, values, {}) : String(strings);
+    addKeyframes(name, readCss(text));
+    return { __webCss: true, strings: [name], values: [], toString: () => name, getName: () => name };
+}
+// What moves by itself: CSS's `transition` and `animation`, which rsui's runtime plays. See `motion.rs` in `rsui-runtime`.
+
+/// What a page's `@keyframes` say, by name: each keyframe's offsets, from 0 to 1, and what it says there.
+const keyframesByName = new Map();
+const viewportKeyframes = new Set();
+
+/// Keeps what a `@keyframes` rule says, as `@keyframes enter { from { opacity: 0 } to { opacity: 1 } }`.
+function addKeyframes(selector, block) {
+    const name = selector.replace(/^@(-webkit-|-moz-|-o-|-ms-)?keyframes\s+/i, '').trim().replace(/^["']|["']$/g, '');
+    const frames = [];
+    for (const rule of block.rules) {
+        const offsets = rule.selector
+            .split(',')
+            .map((part) => {
+                const one = part.trim().toLowerCase();
+                return one === 'from' ? 0 : one === 'to' ? 1 : one.endsWith('%') ? parseFloat(one) / 100 : NaN;
+            })
+            .filter((offset) => offset >= 0 && offset <= 1);
+        if (offsets.length > 0) {
+            frames.push({ offsets, declarations: rule.block.declarations });
+        }
+    }
+    const was = keyframesByName.get(name);
+    if (was === undefined || JSON.stringify(was) !== JSON.stringify(frames)) {
+        // What plays it, which nothing says, is drawn again.
+        restyleAll('@keyframes ' + name);
+    }
+    keyframesByName.set(name, frames);
+    if (frames.some((frame) => frame.declarations.some(([, value]) => usesViewportUnits(value)))) {
+        viewportKeyframes.add(name);
+    } else {
+        viewportKeyframes.delete(name);
+    }
+}
+
+const SIDES = ['Top', 'Right', 'Bottom', 'Left'];
+/// What each CSS property that can move becomes: each prop as written here, as rsui has it, its kind, which is `n` for a
+/// number, `c` for a color, `s` for text with numbers in it or `h` for a list of shadows, and the CSS longhands it stands for,
+/// which are what `transitionrun`, `transitionstart`, `transitionend` and `transitioncancel` say, one each, as a browser's do:
+/// `border-color` moving is its four `border-*-color` longhands moving.
+const MOVING = {
+    opacity: [['opacity', 'opacity', 'n', ['opacity']]],
+    background: [['background', 'background', 'c', ['background-color']]],
+    'background-color': [['background', 'background', 'c', ['background-color']]],
+    color: [['color', 'text_color', 'c', ['color']]],
+    'border-color': [['borderColor', 'border_color', 'c', SIDES.map((side) => 'border-' + side.toLowerCase() + '-color')],
+        ...SIDES.map((side) => ['border' + side + 'Color', 'border_' + side.toLowerCase() + '_color', 'c', ['border-' + side.toLowerCase() + '-color']])],
+    transform: [['transform', 'transform', 's', ['transform']]],
+    // A share of what it's in, as `width: var(--progress-section-size)` comes to (`80%`), is `width_percent` (see `props.rs`).
+    width: [['width', 'width', 'n', ['width']], ['__widthShare', 'width_percent', 'n', ['width']]],
+    height: [['height', 'height', 'n', ['height']], ['__heightShare', 'height_percent', 'n', ['height']]],
+    'min-width': [['minWidth', 'min_width', 'n', ['min-width']]],
+    'max-width': [['maxWidth', 'max_width', 'n', ['max-width']]],
+    'min-height': [['minHeight', 'min_height', 'n', ['min-height']]],
+    'max-height': [['maxHeight', 'max_height', 'n', ['max-height']]],
+    top: [['top', 'top', 'n', ['top']]],
+    right: [['right', 'right', 'n', ['right']]],
+    bottom: [['bottom', 'bottom', 'n', ['bottom']]],
+    left: [['left', 'left', 'n', ['left']]],
+    padding: SIDES.map((side) => ['padding' + side, 'padding_' + side.toLowerCase(), 'n', ['padding-' + side.toLowerCase()]]),
+    margin: SIDES.map((side) => ['margin' + side, 'margin_' + side.toLowerCase(), 'n', ['margin-' + side.toLowerCase()]]),
+    'border-radius': [['radius', 'corner_radius', 'n', ['border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius']]],
+    'font-size': [['fontSize', 'font_size', 'n', ['font-size']]],
+    'letter-spacing': [['letterSpacing', 'letter_spacing', 'n', ['letter-spacing']]],
+    'word-spacing': [['wordSpacing', 'word_spacing', 'n', ['word-spacing']]],
+    // The whole list, as `declare.rs` writes it for every `box-shadow`, so that a focus ring's spread and color grow together and
+    // a list goes to a longer one (see `shadows_between` in motion.rs).
+    'box-shadow': [['shadows', 'shadows', 'h', ['box-shadow']]],
+    // What's drawn moves, and what's told is CSS's own `outline-width`, which `outline: none` doesn't change (`cssOutlineWidth`).
+    'outline-width': [['outlineWidth', 'outline_width', 'n', ['-']], ['cssOutlineWidth', 'css_outline_width', 'n', ['outline-width']]],
+    'outline-color': [['outlineColor', 'outline_color', 'c', ['outline-color']]],
+    'outline-offset': [['outlineOffset', 'outline_offset', 'n', ['outline-offset']]],
+    // In pixels, as `0px 0px`, which moves as text with numbers in it does: a striped, animated Progress's stripes.
+    'background-position': [['backgroundPosition', 'background_position', 's', ['background-position']]],
+};
+MOVING.outline = [...MOVING['outline-color'], ...MOVING['outline-width'], ...MOVING['outline-offset']];
+for (const side of SIDES) {
+    MOVING['padding-' + side.toLowerCase()] = [['padding' + side, 'padding_' + side.toLowerCase(), 'n', ['padding-' + side.toLowerCase()]]];
+    MOVING['margin-' + side.toLowerCase()] = [['margin' + side, 'margin_' + side.toLowerCase(), 'n', ['margin-' + side.toLowerCase()]]];
+    MOVING['border-' + side.toLowerCase() + '-color'] = [['border' + side + 'Color', 'border_' + side.toLowerCase() + '_color', 'c', ['border-' + side.toLowerCase() + '-color']]];
+}
+// What's said by where it is in the writing, as Mantine's Switch has its thumb's `transition: inset-inline-start 150ms`, is
+// the side it comes to in text that runs left to right, as `declare.rs` has `inset-inline-start` say `left`.
+MOVING.inset = [...MOVING.top, ...MOVING.right, ...MOVING.bottom, ...MOVING.left];
+for (const [logical, start, end] of [['inline', 'Left', 'Right'], ['block', 'Top', 'Bottom']]) {
+    const [startName, endName] = [start.toLowerCase(), end.toLowerCase()];
+    MOVING['inset-' + logical + '-start'] = MOVING[startName];
+    MOVING['inset-' + logical + '-end'] = MOVING[endName];
+    MOVING['inset-' + logical] = [...MOVING[startName], ...MOVING[endName]];
+    for (const box of ['margin', 'padding']) {
+        MOVING[box + '-' + logical + '-start'] = MOVING[box + '-' + startName];
+        MOVING[box + '-' + logical + '-end'] = MOVING[box + '-' + endName];
+        MOVING[box + '-' + logical] = [...MOVING[box + '-' + startName], ...MOVING[box + '-' + endName]];
+    }
+}
+/// Each prop that can move, by how it's written here.
+const MOVING_PROPS = new Map(Object.values(MOVING).flat().map((entry) => [entry[0], entry]));
+/// What a shape's parts say that moves, which moves the whole shape's layers.
+const SHAPE_MOVING = new Set(['all', 'fill', 'stroke', 'stroke-width', 'stroke-dasharray', 'stroke-dashoffset']);
+
+/// Splits a CSS list at its top-level commas, leaving those in parentheses, as `cubic-bezier(0, 0, 1, 1)` has.
+function topLevel(text, by) {
+    const out = [];
+    let depth = 0;
+    let from = 0;
+    for (let at = 0; at < text.length; at += 1) {
+        const c = text[at];
+        if (c === '(') {
+            depth += 1;
+        } else if (c === ')') {
+            depth -= 1;
+        } else if (depth === 0 && (by === ',' ? c === ',' : /\s/.test(c))) {
+            out.push(text.slice(from, at).trim());
+            from = at + 1;
+        }
+    }
+    out.push(text.slice(from).trim());
+    return out.filter((part) => part !== '');
+}
+
+/// A time in seconds, from `0.3s` or `300ms`, or `undefined` if it isn't one.
+function secondsOf(text) {
+    if (typeof text !== 'string') {
+        return undefined;
+    }
+    const found = /^(-?[0-9]*\.?[0-9]+)(m?s)$/i.exec(text.trim());
+    return found === null ? undefined : Number(found[1]) / (found[2].toLowerCase() === 'ms' ? 1000 : 1);
+}
+
+const EASINGS = new Set(['linear', 'ease', 'ease-in', 'ease-out', 'ease-in-out', 'step-start', 'step-end']);
+const isEasing = (word) => EASINGS.has(word) || /^(cubic-bezier|steps)\(/.test(word);
+
+/// What `transition` says, as a list of what moves and how: `[{ property, duration, delay, easing }]`, with the parts said by
+/// themselves, as `transition-duration` is, going over it.
+function transitionsOf(look) {
+    const out = [];
+    for (const one of topLevel(look.__transition ?? '', ',')) {
+        const rule = { property: 'all', duration: 0, delay: 0, easing: 'ease' };
+        let times = 0;
+        for (const word of topLevel(one, ' ')) {
+            const seconds = secondsOf(word);
+            if (seconds !== undefined) {
+                rule[times++ === 0 ? 'duration' : 'delay'] = seconds;
+            } else if (isEasing(word)) {
+                rule.easing = word;
+            } else {
+                rule.property = word.toLowerCase();
+            }
+        }
+        out.push(rule);
+    }
+    const parts = look.__transitionParts ?? {};
+    // A list that's empty, as a `var()` that's nothing gives, isn't one, and says nothing.
+    const list = (name) => {
+        const values = parts[name] === undefined ? [] : topLevel(parts[name], ',');
+        return values.length === 0 ? undefined : values;
+    };
+    const properties = list('transition-property');
+    if (properties !== undefined) {
+        out.length = 0;
+        for (const property of properties) {
+            out.push({ property: property.toLowerCase(), duration: 0, delay: 0, easing: 'ease' });
+        }
+    }
+    for (const [name, key, read] of [['transition-duration', 'duration', secondsOf], ['transition-delay', 'delay', secondsOf], ['transition-timing-function', 'easing', (word) => word]]) {
+        const values = list(name);
+        if (values !== undefined) {
+            out.forEach((rule, at) => {
+                const value = read(values[at % values.length]);
+                if (value !== undefined) {
+                    rule[key] = value;
+                }
+            });
+        }
+    }
+    // What takes no time is still said, as long as it's about something by name: a transition that's on its way goes on when
+    // only its duration changes, as Mantine's FloatingIndicator has it, setting `transition-duration: 0ms` once it's moving.
+    return out.filter((rule) => rule.property !== 'none' && (rule.duration > 0 || rule.property !== 'all'));
+}
+
+/// What `animation` says: `{ name, duration, delay, times, direction, fill, easing }`, with the parts said by themselves going over it.
+function animationOf(look) {
+    const out = { name: 'none', duration: 0, delay: 0, times: '1', direction: 'normal', fill: 'none', easing: 'ease' };
+    const first = topLevel(look.__animation ?? '', ',')[0] ?? '';
+    let times = 0;
+    for (const word of topLevel(first, ' ')) {
+        const seconds = secondsOf(word);
+        if (seconds !== undefined) {
+            out[times++ === 0 ? 'duration' : 'delay'] = seconds;
+        } else if (isEasing(word)) {
+            out.easing = word;
+        } else if (word === 'infinite' || /^[0-9]*\.?[0-9]+$/.test(word)) {
+            out.times = word === 'infinite' ? 'inf' : word;
+        } else if (['normal', 'reverse', 'alternate', 'alternate-reverse'].includes(word)) {
+            out.direction = word;
+        } else if (['none', 'forwards', 'backwards', 'both'].includes(word) && out.name !== 'none') {
+            out.fill = word;
+        } else if (!['running', 'paused', 'initial', 'inherit'].includes(word)) {
+            out.name = word.replace(/^["']|["']$/g, '');
+        }
+    }
+    const parts = look.__animationParts ?? {};
+    const one = (name) => (parts[name] === undefined ? undefined : topLevel(parts[name], ',')[0]);
+    out.name = one('animation-name') ?? out.name;
+    out.duration = secondsOf(one('animation-duration') ?? '') ?? out.duration;
+    out.delay = secondsOf(one('animation-delay') ?? '') ?? out.delay;
+    const count = one('animation-iteration-count');
+    if (count !== undefined) {
+        out.times = count === 'infinite' ? 'inf' : count;
+    }
+    out.direction = one('animation-direction') ?? out.direction;
+    out.fill = one('animation-fill-mode') ?? out.fill;
+    out.easing = one('animation-timing-function') ?? out.easing;
+    return out;
+}
+
+/// A color as rsui keeps it: red, green, blue and alpha in one number.
+function colorNumber(text) {
+    let hex = color(String(text));
+    if (hex === undefined) {
+        return undefined;
+    }
+    hex = hex.slice(1);
+    if (hex.length <= 4) {
+        hex = [...hex].map((digit) => digit + digit).join('');
+    }
+    if (hex.length === 6) {
+        hex += 'ff';
+    }
+    return parseInt(hex, 16) >>> 0;
+}
+
+/// A value as `motion.rs` reads it, for its kind.
+function motionValue(kind, value, entry = '') {
+    if (kind === 'n') {
+        return typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined;
+    }
+    if (kind === 'c') {
+        const number = colorNumber(value);
+        return number === undefined ? undefined : String(number);
+    }
+    if (kind === 'h') {
+        // A line each in `shadows`, which a keyframe's line can't have, so they're `;` between there (see `Plan::parse`).
+        return typeof value === 'string' ? value.replace(/\n/g, ';') : undefined;
+    }
+    if (typeof value !== 'string' || value.includes('\n')) {
+        return undefined;
+    }
+    // A place's bare `0` is `0px`, so `0 0` and `40px 0` are the same words, with numbers that move between them.
+    return entry === 'background_position' ? value.replace(/(^|\s)(-?[0-9.]+)(?=\s|$)/g, '$1$2px') : value;
+}
+
+/// Turns what CSS says moves into the props rsui's runtime plays: `transitions` and `animation`.
+function motionProps(look, variables = null) {
+    if (look.__transition !== undefined || look.__transitionParts !== undefined) {
+        const lines = [];
+        for (const rule of transitionsOf(look)) {
+            const entries = rule.property === 'all' ? [...MOVING_PROPS.values()] : MOVING[rule.property] ?? [];
+            for (const [, name, kind, longhands] of entries) {
+                lines.push(`${name} ${kind} ${rule.duration} ${rule.delay} ${rule.easing}|${longhands.join(',')}`);
+            }
+        }
+        if (lines.length > 0) {
+            look.transitions = lines.join('\n');
+        }
+    }
+    delete look.__transition;
+    delete look.__transitionParts;
+    if (look.__animation !== undefined || look.__animationParts !== undefined) {
+        const plan = animationOf(look);
+        const frames = keyframesByName.get(plan.name);
+        if (frames !== undefined && plan.duration > 0) {
+            const lines = [`${plan.duration} ${plan.delay} ${plan.times} ${plan.direction} ${plan.fill} ${plan.easing}`];
+            for (const frame of frames) {
+                // What a keyframe says with a page's variables in it, as Mantine's `background-position: calc(2.5rem *
+                // var(--mantine-scale)) 0`, is what they stand for.
+                const declarations = frame.declarations.map((one) => (one[1].includes('var(') ? [one[0], withVariables(one[1], 0, variables), ...one.slice(2)] : one));
+                const said = natives.cssDeclare(declarations, 16, remSize, declaring, true);
+                for (const key of Object.keys(said)) {
+                    const entry = MOVING_PROPS.get(key);
+                    const value = entry === undefined ? undefined : motionValue(entry[2], said[key], entry[1]);
+                    if (value !== undefined) {
+                        for (const offset of frame.offsets) {
+                            lines.push(`${offset} ${entry[1]} ${entry[2]} ${value}`);
+                        }
+                    }
+                }
+                // What a keyframe says isn't moved, as `transform: none`, comes through `cssDeclare` as `none`, which is what
+                // nothing moved is.
+            }
+            if (lines.length > 1) {
+                look.animation = lines.join('\n');
+            }
+        }
+    }
+    delete look.__animation;
+    delete look.__animationParts;
+}
+
+const NO_MOTION = [undefined, undefined];
+
+/// A `transform` as `getComputedStyle()` says it: `none`, or the matrix it comes to, `matrix(a, b, c, d, e, f)` for what stays flat
+/// and `matrix3d(...)` otherwise, each number to 6 significant figures as Chromium writes them. Shares in `translate` are of the
+/// element's own box.
+function computedTransform(text, element) {
+    if (typeof text !== 'string' || text.trim() === '' || text.trim() === 'none') {
+        return 'none';
+    }
+    // Shares are of its own box, as it's laid out, whatever it's transformed by.
+    let size = null;
+    const box = () => (size ??= layoutBoxOf(element));
+    const m = transformMatrixOf(text, () => box().width, () => box().height);
+    if (m === null) {
+        // What isn't known (a `calc()` this doesn't work out) is said as it was given.
+        return text;
+    }
+    const said = (value) => {
+        const rounded = Number(value.toPrecision(6));
+        return String(Object.is(rounded, -0) ? 0 : rounded);
+    };
+    const twoD = m[2] === 0 && m[3] === 0 && m[6] === 0 && m[7] === 0 && m[8] === 0 && m[9] === 0 && m[10] === 1 && m[11] === 0 && m[14] === 0 && m[15] === 1;
+    return twoD ? `matrix(${[m[0], m[1], m[4], m[5], m[12], m[13]].map(said).join(', ')})` : `matrix3d(${m.map(said).join(', ')})`;
+}
+
+/// The matrix a `transform` comes to, column-major 4x4 as DOMMatrix's m11..m44 go (`[m11, m12, m13, m14, m21, ...]`), with shares
+/// of `width()` and `height()` (only asked when there's a share), or null for what isn't known.
+function transformMatrixOf(text, width, height) {
+    const length = (word, along) => {
+        const size = () => (along === 'x' ? width() : along === 'y' ? height() : 0);
+        if (word.startsWith('calc(')) {
+            return calcLength(word, size()) ?? 0;
+        }
+        const value = Number.parseFloat(word);
+        if (!Number.isFinite(value)) {
+            return 0;
+        }
+        if (word.endsWith('%')) {
+            return (value / 100) * size();
+        }
+        if (word.endsWith('rem')) {
+            return value * remSize;
+        }
+        if (word.endsWith('em')) {
+            return value * 16;
+        }
+        if (word.endsWith('vw')) {
+            return (value / 100) * (globalThis.innerWidth ?? 0);
+        }
+        if (word.endsWith('vh')) {
+            return (value / 100) * (globalThis.innerHeight ?? 0);
+        }
+        return value;
+    };
+    const angle = (word) => {
+        const value = Number.parseFloat(word);
+        if (!Number.isFinite(value)) {
+            return 0;
+        }
+        if (word.endsWith('grad')) {
+            return (value * Math.PI) / 200;
+        }
+        if (word.endsWith('rad')) {
+            return value;
+        }
+        if (word.endsWith('turn')) {
+            return value * 2 * Math.PI;
+        }
+        return (value * Math.PI) / 180;
+    };
+    // A scale is a number or a share.
+    const factor = (word, otherwise) => {
+        if (word === undefined) {
+            return otherwise;
+        }
+        const value = Number.parseFloat(word);
+        return !Number.isFinite(value) ? otherwise : word.trim().endsWith('%') ? value / 100 : value;
+    };
+    const flat = (a, b, c, d, e, f) => [a, b, 0, 0, c, d, 0, 0, 0, 0, 1, 0, e, f, 0, 1];
+    let matrix = flat(1, 0, 0, 1, 0, 0);
+    for (const [name, args] of transformSteps(text)) {
+        const number = (at, otherwise = 0) => (args[at] === undefined ? otherwise : Number.parseFloat(args[at]));
+        let step;
+        switch (name.toLowerCase()) {
+            case 'matrix':
+                step = flat(...[0, 1, 2, 3, 4, 5].map((at) => number(at)));
+                break;
+            case 'matrix3d':
+                step = Array.from({ length: 16 }, (_, at) => number(at));
+                break;
+            case 'translate':
+                step = flat(1, 0, 0, 1, length(args[0] ?? '0', 'x'), length(args[1] ?? '0', 'y'));
+                break;
+            case 'translatex':
+                step = flat(1, 0, 0, 1, length(args[0] ?? '0', 'x'), 0);
+                break;
+            case 'translatey':
+                step = flat(1, 0, 0, 1, 0, length(args[0] ?? '0', 'y'));
+                break;
+            case 'translatez':
+                step = flat(1, 0, 0, 1, 0, 0);
+                step[14] = length(args[0] ?? '0', 'z');
+                break;
+            case 'translate3d':
+                step = flat(1, 0, 0, 1, length(args[0] ?? '0', 'x'), length(args[1] ?? '0', 'y'));
+                step[14] = length(args[2] ?? '0', 'z');
+                break;
+            case 'scale':
+                step = flat(factor(args[0], 1), 0, 0, factor(args[1], factor(args[0], 1)), 0, 0);
+                break;
+            case 'scalex':
+                step = flat(factor(args[0], 1), 0, 0, 1, 0, 0);
+                break;
+            case 'scaley':
+                step = flat(1, 0, 0, factor(args[0], 1), 0, 0);
+                break;
+            case 'scalez':
+                step = flat(1, 0, 0, 1, 0, 0);
+                step[10] = factor(args[0], 1);
+                break;
+            case 'scale3d':
+                step = flat(factor(args[0], 1), 0, 0, factor(args[1], 1), 0, 0);
+                step[10] = factor(args[2], 1);
+                break;
+            case 'rotate':
+            case 'rotatez': {
+                const turn = angle(args[0] ?? '0');
+                step = flat(Math.cos(turn), Math.sin(turn), -Math.sin(turn), Math.cos(turn), 0, 0);
+                break;
+            }
+            case 'rotatex': {
+                const turn = angle(args[0] ?? '0');
+                step = [1, 0, 0, 0, 0, Math.cos(turn), Math.sin(turn), 0, 0, -Math.sin(turn), Math.cos(turn), 0, 0, 0, 0, 1];
+                break;
+            }
+            case 'rotatey': {
+                const turn = angle(args[0] ?? '0');
+                step = [Math.cos(turn), 0, -Math.sin(turn), 0, 0, 1, 0, 0, Math.sin(turn), 0, Math.cos(turn), 0, 0, 0, 0, 1];
+                break;
+            }
+            case 'skew':
+                step = flat(1, Math.tan(angle(args[1] ?? '0')), Math.tan(angle(args[0] ?? '0')), 1, 0, 0);
+                break;
+            case 'skewx':
+                step = flat(1, 0, Math.tan(angle(args[0] ?? '0')), 1, 0, 0);
+                break;
+            case 'skewy':
+                step = flat(1, Math.tan(angle(args[0] ?? '0')), 0, 1, 0, 0);
+                break;
+            case 'perspective': {
+                const depth = length(args[0] ?? '0', 'z');
+                step = flat(1, 0, 0, 1, 0, 0);
+                if (depth > 0) {
+                    step[11] = -1 / depth;
+                }
+                break;
+            }
+            default:
+                return null;
+        }
+        matrix = multiplyMatrices(matrix, step);
+    }
+    return matrix;
+}
+
+/// `a` after `b`, as column-major 4x4 matrices: what `b` does is done first.
+function multiplyMatrices(a, b) {
+    const out = new Array(16).fill(0);
+    for (let column = 0; column < 4; column++) {
+        for (let row = 0; row < 4; row++) {
+            let sum = 0;
+            for (let k = 0; k < 4; k++) {
+                sum += a[k * 4 + row] * b[column * 4 + k];
+            }
+            out[column * 4 + row] = sum;
+        }
+    }
+    return out;
+}
+
+/// Where in a box `transform-origin` is, from its top left, as `[x, y]`: keywords, shares of the box, or lengths.
+function transformOriginIn(text, width, height) {
+    const words = typeof text === 'string' && text.trim() !== '' ? text.trim().split(/\s+/) : [];
+    const place = (word, size) => {
+        switch (word) {
+            case 'left': case 'top': return 0;
+            case 'right': case 'bottom': return size;
+            case 'center': case undefined: return size / 2;
+            default: {
+                const value = Number.parseFloat(word);
+                if (!Number.isFinite(value)) {
+                    return size / 2;
+                }
+                return word.endsWith('%') ? (value / 100) * size : word.endsWith('rem') ? value * remSize : value;
+            }
+        }
+    };
+    // `top` or `bottom` first, or `left` or `right` second, is said the other way round.
+    const swapped = words[0] === 'top' || words[0] === 'bottom' || words[1] === 'left' || words[1] === 'right';
+    const [across, down] = swapped ? [words[1], words[0]] : [words[0], words[1]];
+    return [place(across, width), place(down, height)];
+}
+
+/// Keeps what animation an element plays, from `animationOf`, or null for none, for `getComputedStyle()` to say, and tells what's
+/// listening that one's started, or that one that hadn't finished has stopped, as a page does once the style has changed: Radix's
+/// Presence reads `animationName` as a dialog closes, and keeps it until `animationend` says that animation's done.
+function animationChanged(live, tag, plan) {
+    const name = plan === null || plan.name === 'none' ? undefined : plan.name;
+    const was = live.animationName;
+    live.animationName = name;
+    live.animationDuration = name === undefined ? undefined : plan.duration + 's';
+    live.animationTimes = name === undefined ? undefined : plan.times === 'inf' ? Infinity : Number(plan.times) || 1;
+    if (name === was || !hearsMotion(live)) {
+        return;
+    }
+    // What was running when this task started changing it, which is what a page compares with at its next style recalc: an
+    // animation taken away and put back before then, as Radix Collapsible does with `animation-name: none` to measure, was never
+    // stopped, and says nothing.
+    if (live.animationBefore === undefined) {
+        live.animationBefore = { running: live.animationRunning, starting: live.animationStarting };
+        setTimeout(() => {
+            const before = live.animationBefore;
+            live.animationBefore = undefined;
+            const now = live.animationRunning;
+            // What's been taken out of the page by then says nothing to it, as a closed menu with no animation out doesn't.
+            if (before.running !== undefined && before.running !== now && (live.handle == null || inPageNow(live.handle))) {
+                motionEvent(live, tag, 'animationcancel', { animationName: before.running });
+            }
+            if (now !== undefined && now === before.running && before.starting !== now) {
+                // The same one as before, still going: nothing's started.
+                live.animationStarting = undefined;
+            }
+            animationStarted(live, tag);
+        }, 0);
+    }
+    live.animationRunning = name;
+    live.animationStarting = name;
+    if (name === undefined) {
+        motionSettled(live);
+    }
+}
+
+/// Whether anything hears an element's animations and transitions start and end.
+function hearsMotion(live) {
+    const given = live.given;
+    return live.motionListened === true || motionHeardAbove || typeof given?.onAnimationStart === 'function' || typeof given?.onAnimationEnd === 'function';
+}
+
+/// Says the animation that's starting has, if that hasn't been said.
+function animationStarted(live, tag) {
+    const name = live.animationStarting;
+    if (name !== undefined) {
+        live.animationStarting = undefined;
+        motionEvent(live, tag, 'animationstart', { animationName: name });
+    }
+}
+
+/// Says an element's animation has finished, after saying it started if that's still to come, as it is when nothing moves and it
+/// ends as soon as it starts.
+function motionEnded(live, tag) {
+    animationStarted(live, tag);
+    const name = live.animationRunning ?? live.animationName;
+    live.animationRunning = undefined;
+    motionSettled(live);
+    if (name !== undefined) {
+        // How long it took, as a page's `animationend` says, in seconds.
+        motionEvent(live, tag, 'animationend', { animationName: name, elapsedTime: Number.parseFloat(live.animationDuration ?? '0') || 0 });
+    }
+}
+
+/// The web's event classes (`rsui/dom-events`), with the page's globals made first: what's in it extends the page's `Event`,
+/// which only `rsui/dom-globals` makes, so loading it before them (an `animationstart` on a page that hadn't touched `document`)
+/// left every event class without one, and the first focus after threw.
+function domEvents() {
+    void globalThis.Event;
+    return require('rsui/dom-events');
+}
+
+/// Sends an `AnimationEvent` or `TransitionEvent` to an element, as a page does: to it and up through what it's in.
+function motionEvent(live, tag, type, init) {
+    let event = null;
+    try {
+        const events = domEvents();
+        const Kind = type.startsWith('animation') ? events.AnimationEvent : events.TransitionEvent;
+        event = new Kind(type, { bubbles: true, cancelable: type !== 'animationend' && type !== 'transitionend', elapsedTime: 0, pseudoElement: '', ...init });
+    } catch {
+        // Where there are no page's events to send, as in an app that isn't a page (no `Event`), React's prop hears it as it is.
+        const made = Object.assign(asWeb(undefined, type, live, tag), { elapsedTime: 0, pseudoElement: '' }, init);
+        try {
+            live.given?.[REACT_HEARS[type]]?.(made);
+        } catch (error) {
+            console.error(error);
+        }
+        return;
+    }
+    event.isTrusted = true;
+    try {
+        dispatchOn(handleOf(live, tag), event);
+    } catch (error) {
+        console.error(error);
+    }
+}
+
+/// What `motionProps` would put on a look, as `[transitions, animation]`, for `layout.rs` to put on it where `settle` has it.
+function motionOf(look, variables = null) {
+    if (look.__transition === undefined && look.__transitionParts === undefined && look.__animation === undefined && look.__animationParts === undefined) {
+        return NO_MOTION;
+    }
+    const said = { __transition: look.__transition, __transitionParts: look.__transitionParts, __animation: look.__animation, __animationParts: look.__animationParts };
+    motionProps(said, variables);
+    return [said.transitions, said.animation];
+}
+
+/// How a shape's parts' transitions move its layers: `{ duration, delay, easing }` for the longest, or `undefined`.
+function shapeMoves(look) {
+    let longest;
+    for (const rule of transitionsOf(look)) {
+        if (SHAPE_MOVING.has(rule.property) && rule.duration > 0 && (longest === undefined || rule.duration + rule.delay > longest.duration + longest.delay)) {
+            longest = rule;
+        }
+    }
+    return longest;
+}
+
+/// What's in what's told where it is among the rest, which is what's looked at of it on a block's lines.
+const heldInNth = (child) => (isValidElement(child) && child.type === NthContext.Provider ? Children.toArray(child.kids ?? child.props?.children)[0] : child);
+/// Whether what goes on a block's lines is known to go along a line or not before it's drawn: a page's element, or a component found
+/// to make one.
+const knownFlow = (one) => isValidElement(one)
+    && (typeof one.type !== 'function' || one.type.__webStyled === true || one.type.__webField === true || one.type.__webText === true || one.type.__webInline === true
+        || (one.type.__webInlineOf !== undefined && one.type.__webInlineOf(one.props) === true));
+/// A component it isn't known of yet, which is all there is in it.
+const unknownFlow = (one) => isValidElement(one) && typeof one.type === 'function' && one.type.__webFlowSeen === undefined
+    && one.type.__webStyled !== true && one.type.__webField !== true && one.type.context === undefined && one.type !== globalThis.__Fragment;
+
+/// The marker before an item of a list, as `list-style-type` says (`said.style`), and what's in it beside that, or what's in it as it
+/// is if it has none.
+function withListMarker(children, said, index, font) {
+    const marker = listMarker(said.style, index);
+    if (marker === null) {
+        return children;
+    }
+    const inside = Children.toArray(children);
+    const flowing = inside.length > 0 && (natives.cssChildren(layout, inside, TEXT_KINDS) & 2) !== 0;
+    // What goes along a line is on one, which the marker is beside rather than on.
+    const content = flowing ? [make('text', { key: '__content' }, ...inside)] : Children.toArray(intoLines(inside, true, font));
+    const shape = markerShape(said.style, said.look, said.above);
+    // Just before the item, as wide as it needs to be: a box that ends where the item starts, with the marker at its end.
+    const drawn = shape ?? make('text', { key: '__marker', position: 'absolute', left: -MARKER_ROOM, width: MARKER_ROOM, top: 0, textAlign: 'right', noWrap: true, inert: true, whiteSpace: 'pre' }, marker.replace(/ $/, ' '));
+    return [drawn, ...content];
+}
+
+/// What a selector for a styled component is, for what's been told about it in plain text.
+function makeStyled(target, settings = {}) {
+    const attrs = settings.attrs ?? [];
+    function tagged(strings, ...values) {
+        const own = 'rsui-sc-' + nextClass++;
+        // What this has come to before, as most of them only ever come to one or two.
+        const made = new Map();
+        let madeAt = -1;
+        function Styled(given) {
+            if (addedCss.length > 0) {
+                workedOut();
+            }
+            // What CSS says, as it was when this was drawn, which it's drawn again once it isn't, as `usePage` has it: see below.
+            const seen = version;
+            // What it is on the page, kept from one drawing to the next, which what's set on it with `setAttribute()` and the like is
+            // kept on, and which is what draws it again when CSS changes, as it's in `listeners` (see `restyled`) while it's there. That
+            // takes nothing more than what it has already, where `usePage` would keep a state, two refs and an effect of its own.
+            const live = useRef(null);
+            // The page's variables it reads from here on, which it's drawn again for when one changes.
+            variableReader = live;
+            live.pageVarsRead = null;
+            useLayoutEffect(() => {
+                listeners.add(live);
+                if (movedDrawn) {
+                    drawnCameOrWent(live);
+                }
+                if (live.domKey !== undefined) {
+                    // It's on the page from now, before Rust has it, as what React's put in is: see `inPageNow`.
+                    mountedNotDrawn.add(live.domKey);
+                }
+                // It could have changed between drawing it and getting here.
+                if (live.seen !== version || live.flowSeen !== flowVersion) {
+                    live.redraw();
+                }
+                return () => {
+                    listeners.delete(live);
+                    if (movedDrawn) {
+                        drawnCameOrWent(live);
+                    }
+                    mountedNotDrawn.delete(live.domKey);
+                    if (focusedElement !== null) {
+                        focusTakenOut(live);
+                    }
+                    forgetNotShown(live);
+                    forgetSvgParts(live.domKey);
+                    const forgotHas = hasWatched.delete(live);
+                    if (forgotHas) hasRecipesChanged();
+                    if (forgotHas | containerWatched.delete(live)) {
+                        lookForResizes();
+                    }
+                    // What's gone isn't an element of the page any more, even where something's still in the tree under its key, as
+                    // what a component that now renders nothing leaves is.
+                    if (live.domKey !== undefined && live.weak !== undefined && pageLives.get(live.domKey) === live.weak) {
+                        pageLives.delete(live.domKey);
+                        pageNow = null;
+                        if (focusedElement !== null && focusedElement.__domKey === live.domKey) {
+                            // What has the keyboard being taken out loses it there and then, as Chromium says with `blur` and
+                            // `focusout` (to nothing), and `document.activeElement` is `body` until something else is given it, as a
+                            // menu's item is when the menu closes, before Radix gives its trigger the keyboard back.
+                            moveFocus(null, false);
+                        }
+                        if (live.handle != null) {
+                            hoverGone(live.handle);
+                        }
+                    }
+                };
+            }, []);
+            live.seen = seen;
+            live.flowSeen = flowVersion;
+            // Drawn again once for however many times it's asked before it is, as asking twice would flip it back.
+            live.redrawing = false;
+            live.redraw ??= () => {
+                if (live.redrawing !== true) {
+                    live.redrawing = true;
+                    setState((was) => was ^ REDRAWN);
+                }
+            };
+            const theme = useContext(ThemeContext);
+            const owners = useRulesAbove();
+            const fontAbove = useContext(InheritedFont);
+            const variablesAbove = useContext(InheritedVariables);
+            const parentLook = useContext(ParentLook);
+            // Whether this is the legend of the fieldset it's in, or the fieldset whose legend is still to be found.
+            const legendClaim = useContext(FieldsetLegend);
+            const typeTag = typeof (given.as ?? target) === 'string' ? (given.as ?? target) : Styled.__webTag;
+            let ownsLegend = false;
+            if (typeTag === 'legend' && legendClaim !== null && (legendClaim.legend === null || legendClaim.legend === live)) {
+                // What it is says which one it is.
+                legendClaim.legend = live;
+                ownsLegend = true;
+            }
+            // Where it is among what's around it, which what it's in tells it as `__nth` (see `withNth`), or through what's around it.
+            const nthAround = useContext(NthContext);
+            const given_nth = given.__nth !== undefined ? given.__nth : nthAround;
+            const form = useContext(FormContext);
+            const dialogAround = useContext(DialogContext);
+            const given_flow = useContext(FlowContext);
+            // A line of a page is a row, apart from what's on it not getting narrower to fit, as only text wraps there.
+            const onLine = given_flow === 'line';
+            const flow = onLine ? 'row' : given_flow;
+            const nth = given_nth;
+            const [state, setState] = useState(0);
+            const handlers = useMemo(() => makeHandlers(setState), []);
+            // Where each thing in this was last time, for it to be told the same as long as it's the same.
+            const nthKept = useRef(null);
+            // What finds which of what's in it an element is, once code moves one of them: see `slotOf`.
+            live.nthKept = nthKept;
+            // It's about the component it's in, and this is what that component made.
+            if (given_nth !== null && given_nth.owner !== Styled && typeof given_nth.owner === 'function' && given_nth.owner.__webTag === undefined) {
+                given_nth.learn?.(typeof (given.as ?? target) === 'string' ? given.as ?? target : Styled.__webTag ?? null, nthKept, given.className);
+            }
+            let props = { ...given, theme: given.theme ?? theme };
+            delete props.__nth;
+            delete props.__disclosure;
+            for (const attr of attrs) {
+                props = { ...props, ...(typeof attr === 'function' ? attr(props) : attr) };
+            }
+            // What's been set on it with `setAttribute()`, which goes over what it's given.
+            if (live.attributes !== undefined) {
+                props = { ...props, ...live.attributes };
+            }
+            if (madeAt !== version) {
+                made.clear();
+                madeAt = version;
+            }
+            const text = textOf(strings, values, props);
+            live.viewportUnits = usesViewportUnits(text);
+            let compiled = made.get(text);
+            if (compiled === undefined) {
+                compiled = compile(readCss(text));
+                made.set(text, compiled);
+            }
+            // The variables what it says itself uses, which it's drawn again for when one changes.
+            live.ownVars = compiled.varNames ??= text.includes('var(') ? namesIn(text) : null;
+            // `as` on something made from another styled component goes on to that one, so that what both say is kept.
+            const passesAs = typeof target === 'function' && target.__webClass !== undefined;
+            const tag = passesAs ? target : props.as ?? target;
+            const isHost = typeof tag === 'string';
+            const me = {
+                tag: isHost ? tag : Styled.__webTag ?? null,
+                id: props.id,
+                classes: classesOf(props.className, own),
+                props,
+                state,
+                nth,
+                prevs: nth?.prevs,
+                empty: given.children === undefined || given.children === null || given.children === false,
+                kind: 'component',
+                live,
+            };
+            // What it is, for what's drawn again when CSS changes to be only what that's about: see `restyleTouches`.
+            live.me = me;
+            let look = {};
+            const parts = {};
+            let needs = 0;
+            let started = null;
+            if (isHost) {
+                Object.assign(look, browserLook(tag, props.type, props.disabled === true), dirLook(props.dir), tagLook('*'), tagLook(tag));
+                if (hasWatched.size !== 0) {
+                    // What it starts from before the page's rules, for working them out again when `:has()` changes: see `freshLook`.
+                    started = { ...look };
+                }
+                needs |= compiled.needs;
+                for (const name of me.classes) {
+                    const record = madeClasses.get(name);
+                    if (record !== undefined && record.compiled !== null) {
+                        needs |= record.compiled.needs;
+                    }
+                }
+            }
+            // What the page's rules say, its rules about one class among them, in the cascade's order. What a styled component says
+            // itself, and what one has passed on as a class, is a rule about one class that comes after all of the page's, as its
+            // `<style>` would, so it goes over what the page says about one class and under what says more.
+            const passedOn = !isHost ? null : () => {
+                applyCompiled(compiled, me, look, parts);
+                for (const name of me.classes) {
+                    const record = madeClasses.get(name);
+                    if (record !== undefined) {
+                        if (record.compiled !== null) {
+                            applyCompiled(record.compiled, me, look, parts);
+                        }
+                        mergeLook(look, record.extra);
+                        mergeParts(parts, record.parts);
+                    }
+                }
+            };
+            needs |= fromAbove(owners, me, look, parts, isHost, passedOn);
+            // What the page's rules came to, for `freshLook` to compare with what they come to later.
+            const cascaded = started === null ? null : { ...look };
+            let writtenLook = null;
+            // Only the states that rules about what's inside it care about change what goes down to it, so hovering something that
+            // only changes how it looks itself doesn't draw everything inside it again.
+            const passedState = state & (watched | compiled.needs);
+            // What's been set on it with `setAttribute()`, which rules about what's inside it can be about.
+            const attributesSet = live.attributes === undefined ? '' : JSON.stringify(live.attributes);
+            if (given.__webMore !== undefined) {
+                pendingVariableFields.delete(look);
+                Object.assign(look, given.__webMore.look);
+                mergeParts(parts, given.__webMore.parts);
+            }
+            // Only once it's been drawn, which it's been given something by then.
+            const kept = live.given === undefined ? null : live;
+            if (isHost && kept?.cssom != null) {
+                // What React says that's new goes over what code set for it, as React writes it then.
+                const before = kept.styleProp ?? {};
+                const now = props.style !== null && typeof props.style === 'object' ? props.style : {};
+                for (const name of Object.keys(now)) {
+                    if (before[name] !== now[name] && kept.styleDeclaration !== undefined) {
+                        kept.styleDeclaration.__set.delete(kebabOf(name));
+                    }
+                }
+                kept.cssom = kept.styleDeclaration?.__asProps() ?? kept.cssom;
+                kept.cssomRemoved = kept.styleDeclaration?.__removed() ?? kept.cssomRemoved;
+            }
+            if (isHost) {
+                // What React's `style` says, which `element.style` reads, from the first time it's drawn.
+                live.styleProp = props.style !== null && typeof props.style === 'object' ? props.style : null;
+            }
+            let written = isHost && props.style !== null && typeof props.style === 'object' ? props.style : null;
+            if (isHost && kept?.cssom != null) {
+                written = { ...written, ...kept.cssom };
+                for (const name of kept.cssomRemoved ?? []) {
+                    delete written[name];
+                }
+            }
+            live.inlineVars = written === null ? null : inlineVarNames(written);
+            live.viewportUnits ||= written !== null && Object.values(written).some(usesViewportUnits);
+            if (written !== null) {
+                // What CSS gives it to play apart from what's written on it, for `getComputedStyle()` to say once code takes back an
+                // `animation-name` it wrote, before it's drawn again (see `computedAnimationName`).
+                const writesAnimation = written.animationName !== undefined || written.animation !== undefined;
+                live.cssAnimationName = writesAnimation ? animationOf(look).name : undefined;
+                // What's written on the element itself goes over everything CSS says, as on a page.
+                writtenLook = inlineLook(written, typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 16);
+                assignLook(look, writtenLook);
+            } else if (live.cssAnimationName !== undefined) {
+                live.cssAnimationName = undefined;
+            }
+            // `inherit` on what isn't passed down by itself is what the parent says, and what this says goes down to what's in it.
+            // What this read of what's around it, so that it isn't drawn again when only what it didn't read changes: see
+            // `toldChanged` in layer.js.
+            const parentReads = [];
+            withInherited(look, parentLook, parentReads);
+            const lookForInside = isHost && inheritAsked ? keptLookDown(live, { ...look }) : null;
+            if (isHost && tag === 'button') {
+                plainButton(look);
+            }
+            if (isHost && look.cssOutlineWidth === undefined && (needs & RING) !== 0 && (look.__transition !== undefined || look.__transitionParts !== undefined)) {
+                // CSS's `outline-width` where the page doesn't say it, for a transition of it to move and tell, as a browser's
+                // does: its own `:focus-visible { outline: auto 1px }`, or `medium` (3px), which `outline: none` doesn't change, as
+                // shadcn/ui's `transition-all outline-none` buttons have it. It isn't drawn: that's `outlineWidth`, and the ring.
+                look.cssOutlineWidth = (state & FOCUS) !== 0 && ((state & RING) !== 0 || typedIn(me)) ? 1 : 3;
+            }
+            if (props.__modal === true && look.position === 'absolute') {
+                // A dialog that takes over is placed in the window, which is what it's in, and that has it in the middle.
+                for (const side of ['position', 'top', 'right', 'bottom', 'left']) {
+                    delete look[side];
+                }
+            }
+            if (isHost && tag === 'input' && !buttonInput(props)) {
+                ownFieldBorder(look, props.type);
+            }
+            if (isHost && tag === 'textarea') {
+                textareaLook(look, props.cols);
+            }
+            const nthKey = nth === null ? '' : nth.index + '/' + nth.count + '/' + nth.typeIndex + '/' + nth.typeCount + '/' + (nth.peerKey ?? '');
+            const nested = rulesNow(compiled, me);
+            // What's inside it is under it as it is now, whichever time it was drawn, and only what rules ask of what's
+            // around them is a new chain for what's inside, as what's inside is drawn again for that.
+            if (live.chainEl === undefined) {
+                live.chainEl = {};
+                // What it is, as it is now, for `RSUI_RESTYLE_CHECK` to look from: see `freshChain`.
+                Object.defineProperty(live.chainEl, '__live', { value: live, enumerable: false });
+            }
+            const chainEl = live.chainEl;
+            Object.assign(chainEl, me);
+            const chainSaid = chainKey(me, compiled, nested);
+            // What it says itself is made again each time CSS changes, which only what's inside hears about when it has rules for that.
+            const ownRules = compiled.nested.length === 0 ? null : compiled;
+            // And what it says about `:has()` once it's drawn (see `hasDrawn`), as what's inside it can be about it, as
+            // `.x:has(> .on) .y` is.
+            const inner = useMemo(() => passedDown(owners, chainEl, nested), [owners, ownRules, chainSaid, passedState, nthKey, live.hasVersion]);
+            if (RESTYLE_ENV.log) {
+                const deps = [owners, ownRules, chainSaid, passedState, nthKey, fontAbove, variablesAbove, parentLook, given_flow, theme, form];
+                if (live.depsWas !== undefined) {
+                    const which = deps.map((one, at) => (one !== live.depsWas[at] ? at : -1)).filter((at) => at >= 0);
+                    if (which.length > 0) {
+                        console.error('rsui restyle: down from ' + (me.tag ?? '?') + '.' + me.classes.slice(0, 3).join('.') + ' changed ' + which.join(',') + (which.includes(2) ? ' ' + live.chainWas + ' -> ' + chainSaid : ''));
+                    }
+                }
+                live.depsWas = deps;
+                live.chainWas = chainSaid;
+            }
+            // What its look was worked out from, while anything's drawn by what `:has()` says, for `getComputedStyle()` to work it
+            // out again if that's different now (see `freshLook`).
+            live.cascade = started === null ? undefined : { owners, me, isHost, passedOn, started, written: writtenLook, cascaded, epoch: hasEpoch };
+            // What this writes in is what it's been given, unless it says otherwise. What's passed on to another component is only what
+            // this says itself, as that component gets the rest from where it is.
+            const own_look = isHost ? look : { ...look };
+            // What uses the variables it has, and what it sets for what's inside it. Another component works out its own.
+            const varsNote = { names: [], own: null, live };
+            const variablesInside = isHost ? keptVariablesDown(live, withElementVariables(look, variablesAbove, false, varsNote)) : null;
+            live.varsRead = varsNote.names.length > 0 ? varsNote.names : null;
+            if (isHost) {
+                // `::before` and `::after` use its variables too, as Radix's checkbox's `::before { width: var(--checkbox-size) }`
+                // uses what the checkbox sets.
+                for (const name of ['before', 'after']) {
+                    // A universal reset may set dozens of variables on both pseudo-elements without generating either.
+                    // No box exists without content. Keep empty content and deferred content, which can generate a box.
+                    if (parts[name] !== undefined && parts[name].__content === undefined && parts[name]['__var content'] == null) {
+                        delete parts[name];
+                        continue;
+                    }
+                    if (parts[name]?.__vars === true) {
+                        parts[name] = { ...parts[name] };
+                        withElementVariables(parts[name], variablesInside ?? variablesAbove, false, { names: varsNote.names, own: null });
+                    }
+                }
+                // Which of CSS's own `translate`, `rotate` and `scale` it's been given, which is what a transition of the transform
+                // they make is said to be of, as Tailwind 4's `rotate-180` chevron's `transitionrun` says `rotate`.
+                if (look.__translate !== undefined) live.saidTranslate = true;
+                if (look.__rotate !== undefined) live.saidRotate = true;
+                if (look.__scale !== undefined) live.saidScale = true;
+                withTransformParts(look);
+                withoutFlexOnBlock(look);
+                // What's fixed inside something turned, moved or filtered is placed in that, not the window, as CSS has it: the
+                // shadcn sidebar blocks' `position: fixed` sidebars in their `translateZ(0)` frames.
+                if (look.__fixed === true && (variablesAbove?.get?.(FIXED_BOX) === true)) {
+                    look.__fixed = false;
+                    look.__fixedInBox = true;
+                }
+            }
+            // `dir` is `direction`, as a browser's own CSS says (`[dir=rtl] { direction: rtl }`), which anything the page's CSS
+            // says goes over.
+            if (isHost && typeof props.dir === 'string' && look.textDirection === undefined) {
+                const dir = props.dir.toLowerCase();
+                if (dir === 'rtl' || dir === 'ltr') {
+                    look.textDirection = dir;
+                }
+            }
+            // And an element that says `dir` is an isolate, as are `<bdi>`s, with `<bdo>` turning its letters round too
+            // (`[dir] { unicode-bidi: isolate }`, `bdo { unicode-bidi: isolate-override }`), which only does anything to what's
+            // in a line of text. `dir="auto"` goes by its first strong letter.
+            if (isHost && look.unicodeBidi === undefined) {
+                const dir = typeof props.dir === 'string' ? props.dir.toLowerCase() : '';
+                if (dir === 'auto') {
+                    look.unicodeBidi = 'plaintext';
+                } else if (tag === 'bdo') {
+                    look.unicodeBidi = 'isolate-override';
+                } else if (dir === 'rtl' || dir === 'ltr' || tag === 'bdi') {
+                    look.unicodeBidi = 'isolate';
+                }
+            }
+            if (look.unicodeBidi === 'normal') {
+                delete look.unicodeBidi;
+            }
+
+            // How text is written in it, from what it says and what it's in, and what tells whether that's changed: see `layout.rs`.
+            look = natives.cssOwnFont(layout, look, fontAbove, tag, isHost, placing);
+            if (look.__logical === true) {
+                // Which way the text goes is known now, which logical properties' sides depend on.
+                logicalSides(look);
+            }
+            if (look.__case === 'none') {
+                // `text-transform: none` stops what came from above, and passes nothing on.
+                delete look.__case;
+            }
+            // A flex row in right-to-left text is turned around in layout.rs (`text_direction`), once.
+            // A column's (and a block's) start across is at the right where text goes from right to left, so what isn't stretched
+            // across it, as a `w-fit` label, sits at the right.
+            // A grid's columns go from the right too, the first at the right (see `solve_grid`).
+            if (look.textDirection === 'rtl' && (look.display === 'grid'
+                || (!(look.__flex === true && look.direction !== 'column') && (look.direction === undefined || look.direction === 'column')))) {
+                look.crossReverse = true;
+            }
+            const fontKey = placing.fontKey;
+            const font = useMemo(() => fontFrom(look, null), [fontKey]);
+            // What goes down to what's in it, from this component itself rather than from providers around what it makes, which
+            // would be there only when it has something of its own to pass down, and make everything in it start again when that
+            // changes, as a sheet that gains a rule about attributes does. It's on every render, as `provideHere` needs.
+            const passDown = rsui.__provideHere;
+            passDown(InheritedFont, font);
+            passDown(NestedRules, inner);
+            passDown(InheritedVariables, isHost && holdsFixed(look) ? withFixedBox(variablesInside ?? variablesAbove) : variablesInside ?? variablesAbove);
+            passDown(ParentLook, lookForInside ?? parentLook);
+            rsui.__readsHere(InheritedVariables, varsNote);
+            rsui.__readsHere(ParentLook, { props: parentReads, through: lookForInside === null, live });
+            // Where this is among what's around it is only about this, and not what's in it.
+            passDown(NthContext, null);
+            // The same, as what's in it is put into lines, which is worked out once: nothing said about fonts changes in between.
+            let ownFont;
+            const lookFont = () => (ownFont === undefined ? (ownFont = fontFrom(look, null)) : ownFont);
+            // `hidden` is the browser's own `[hidden] { display: none }`, which any `display` the page says goes over. What isn't
+            // shown is still an element of the page, for code that looks for it and refs, and its hooks are the same as when it's
+            // shown, so it goes on as far as the end, where nothing's drawn for it.
+            // An `<option>` and an `<optgroup>` aren't drawn by themselves: the `<select>` they're in draws what's chosen and its
+            // list, as a browser's does. They're still elements of the page, for `select.options` and selectors.
+            const listPart = isHost && (tag === 'option' || tag === 'optgroup');
+            const notShownNow = listPart || look.__hidden === true || (props.hidden === true && look.__hidden !== false);
+            if (notShownNow && !isHost) {
+                return null;
+            }
+            // Text next to text is one piece of it, as a page has it, with its spaces as CSS says.
+            // Text React drew that code has changed since, as an editor typing into it does, shows as code left it.
+            const drawnTexts = live.handle?.__texts;
+            const reactKids = drawnTexts !== undefined && drawnTexts.some((one) => one.__data !== one.__given) ? withCodeText(given.children, drawnTexts) : given.children;
+            // What React gave it, in the order code has moved it to, as cmdk sorts its items with `appendChild()`: see `moveDrawn`.
+            const givenKids = live.codeOrder === undefined ? reactKids : codeOrdered(live, reactKids, live.reactKids);
+            live.reactKids = reactKids;
+            // What code put in it with `appendChild()` and the like comes after what React gave it, as on a page.
+            const ownKids = live.handle?.__kids;
+            const replaced = live.handle?.__replaced === true;
+            // Code said what's in it with `textContent` or `innerHTML`, which took what React drew out.
+            const codeKids = replaced ? domPack().renderKids(live.handle) ?? undefined
+                : ownKids !== undefined && ownKids.length > 0 && live.handle.__own !== true ? domPack().renderKids(live.handle) : null;
+            // What's in it as it comes, if that's one list, which a long one of blocks that came out of what follows as it went in can
+            // be put in as it is: see `keptKids`.
+            const kidsIn = !isHost ? null : codeKids === null ? (givenKids === given.children ? givenKids : null)
+                : replaced || given.children === undefined || given.children === null ? codeKids : null;
+            const keepable = isHost && Array.isArray(kidsIn) && kidsIn.length >= KEPT_FROM && keepsKids(tag, look, nested, parts, nthKept);
+            const keptSaid = keepable ? keptSignature(look, inner, kidsIn) : null;
+            const keptList = keepable ? keptKids(nthKept, kidsIn, keptSaid, tag, inner) : null;
+            const keptNow = keptList !== null;
+            // How spaces in its text were taken, for what's drawn like it without a `Styled` of its own: see `drawNative`.
+            const whiteSpaceSaid = look.__whiteSpace;
+            let children;
+            if (keptNow) {
+                children = keptList;
+            } else {
+                children = isHost ? spacesAsSaid(joinedText(givenKids), look.__whiteSpace) : givenKids;
+                if (replaced) {
+                    children = codeKids;
+                } else if (codeKids !== null) {
+                    children = [...Children.toArray(children ?? []), ...codeKids];
+                }
+            }
+            if (isHost && live.portalKids !== undefined && live.portalKids.size > 0) {
+                // What a portal into it puts there comes after what React gave it, as react-dom appends a portal's children to its
+                // container: Radix Select's chosen item's text in its `SelectValue`.
+                children = [...Children.toArray(children ?? []), ...live.portalKids.values()];
+            }
+            if (isHost && (look.__flex === true || look.display === 'grid') && !keepsSpaces(look.__whiteSpace)) {
+                // Text in a flex box or a grid is a box of its own, with no spaces at its ends, and only spaces is nothing.
+                children = trimmedText(children);
+            }
+            if (nested.length > 0 && children !== undefined) {
+                children = applyNested(children, nested, null);
+            }
+            const { theme: _theme, children: _children, ...rest } = props;
+            if (isHost) {
+                delete rest.style;
+            }
+            if (!isHost) {
+                // Another component gets what this says through its class, which anything written for the web passes on to what it makes.
+                const name = classOf({ compiled, extra: own_look, parts });
+                const passed = { ...rest };
+                for (const key of Object.keys(passed)) {
+                    if (key.startsWith('$')) {
+                        delete passed[key];
+                    }
+                }
+                if (!passesAs) {
+                    delete passed.as;
+                }
+                delete passed.__webMore;
+                passed.className = typeof props.className === 'string' ? props.className + ' ' + name : name;
+                return make(tag, passed, children);
+            }
+            // Whether what's in it goes along a line is about what it was given, before anything's been put around that.
+            // Text with boxes in something that's itself on a line, as a label around a checkbox is, goes along a line too.
+            // Text with only more text in it, as `<sup>` is, is one piece of text, which a line of boxes isn't.
+            // It's worked out in Rust, in `layout.rs`.
+            // A part that's a box goes along the line with the rest, as an inline-block element in it would, so it's in what's
+            // asked about that.
+            const boxParts = partIsBox(parts.before) || partIsBox(parts.after);
+            let along = keptNow ? false : natives.cssChildren(layout, boxParts ? withParts(children, parts.before ?? null, parts.after ?? null, { nth, props }) : children, ALONG, tag);
+            // Which of what follows ran, for what's drawn like it without a `Styled` of its own to do the same: see `drawNative`.
+            const alongFirst = along;
+            let markerSaid;
+            let blockLines = false;
+            let unlike = false;
+            if (parts.before !== undefined || parts.after !== undefined) {
+                const current = look.color ?? fontAbove?.color;
+                for (const name of ['before', 'after']) {
+                    if (parts[name] !== undefined) {
+                        parts[name] = withCurrentColor({ ...parts[name] }, parts[name].color ?? current);
+                    }
+                }
+                children = withParts(children, parts.before ?? null, parts.after ?? null, { nth, props });
+            }
+            if (look.tablePart !== undefined) {
+                tableLook(look, props);
+            }
+            delete look.__borderCollapse;
+            delete look.__borderSpacing;
+            delete look.__tableLayout;
+            // Only what's still a list item has a marker: `display: flex` or `block` on an `<li>` takes it away, as in a browser.
+            const listItem = look.__listItem !== false;
+            delete look.__listItem;
+            if (tag === 'li' && listItem && typeof look.__listStyle === 'string') {
+                markerSaid = { style: look.__listStyle, look: { fontSize: look.fontSize, color: look.color, lineHeight: look.lineHeight }, above: fontAbove };
+                const marked = withListMarker(children, markerSaid, nth?.typeIndex ?? 0, lookFont());
+                if (marked !== children) {
+                    children = marked;
+                    look.position ??= 'relative';
+                }
+            }
+            // A `<summary>`'s triangle, which points down while what it's in is open, unless CSS says it has no marker, as Pico does.
+            if (tag === 'summary' && given.__disclosure !== undefined && listItem && String(look.__listStyle).startsWith('disclosure-')) {
+                const size = typeof look.fontSize === 'number' ? look.fontSize : typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 16;
+                const open = given.__disclosure === true;
+                // As a browser draws it: two thirds of the text's size across, pointing down a little below the top of the line, or
+                // across from near its top, with the text after it.
+                const [width, height, top] = open ? [size * 0.66, size * 0.577, size * 0.31] : [size * 0.577, size * 0.66, size * 0.077];
+                const path = open ? `M0 0H${width}L${width / 2} ${height}Z` : `M0 0L${width} ${height / 2}L0 ${height}Z`;
+                const left = typeof look.paddingLeft === 'number' ? look.paddingLeft : 0;
+                const above = typeof look.paddingTop === 'number' ? look.paddingTop : 0;
+                const triangle = make(
+                    'group',
+                    { key: '__marker', position: 'absolute', left, top: above + top, inert: true },
+                    make(rsui.Svg, { width, height, viewBox: `0 0 ${width} ${height}`, fill: 'currentColor' }, make(rsui.Path, { d: path })),
+                );
+                children = [triangle, ...slotted(children)];
+                look.paddingLeft = left + size * 1.077;
+                look.position ??= 'relative';
+            }
+            // What's in it is told where it is among the rest first, as it is in the page, before it's put on lines with what's around
+            // it, so that `a + b` and Tailwind's `space-y-4` reach a button or an input on a line as they do a block.
+            // What's in a picture is shapes, which are drawn as they are, so they're not told where they are among the others.
+            drawnUnstructured ||= !structural;
+            if ((structural || tag === 'ul' || tag === 'ol') && children !== undefined && tag !== 'svg') {
+                // Through `live.redraw`, which flips the state once however many times it's asked before it's drawn, as two flips
+                // in one go, from this and from CSS changing, would come to nothing.
+                nthKept.redraw ??= () => live.redraw();
+                children = withNth(children, nthKept);
+            }
+            // A block, or text that's a block, as `<p>` and `<legend>` are, with a box of its own on its line in it, as an inline-block
+            // `<span>` with padding is, is put on lines, rather than being one piece of text that runs through that box.
+            let lined = false;
+            if (keptNow) {
+                // What's in it is a list of blocks, which is none of this, as it wasn't last time: see `keptKids`.
+            } else if (((TEXT_TAGS.has(tag) && !INLINE_TEXT_TAGS.has(tag)) || BLOCK_TAGS.has(tag)) && look.display === undefined && look.direction === undefined && look.__flex !== true
+                && children !== undefined && !anyFloats(children, inner) && (natives.cssChildren(layout, children, LINE_BOXES)
+                    // Text with a block in it, as Mantine's `<blockquote>` has its `<cite>`, which is a block by its class, is broken
+                    // around it, as CSS has it, rather than running through it.
+                    || (TEXT_TAGS.has(tag) && natives.cssChildren(layout, children, HOLDS_BLOCK))
+                    || (inner !== null && complexLineBoxes() && Children.toArray(children).some((child) => lineBoxFromAbove(child, inner))))) {
+                lined = true;
+                along = false;
+                children = intoLines(children, true, lookFont());
+            } else if (BLOCK_TAGS.has(tag) && look.display === undefined && look.direction === undefined && children !== undefined) {
+                blockLines = true;
+                const floated = withFloats(children, lookFont(), inner);
+                if (floated !== children) {
+                    // What floats has its own row beside what's after it, so the block isn't a line of its own any more.
+                    along = false;
+                    unlike = true;
+                }
+                children = floated;
+                // What's only inline elements, with no text of its own beside them, as a footer's lone `<small>` is, is on a line too,
+                // as tall as the block's own text would be at least, as CSS has it.
+                // Only page elements, whose kind is known before they're drawn, as a component found later to make something inline
+                // would otherwise be put on a line then, and start again there, apart from a component that's been found to make
+                // something that goes along a line, or only text, as Ant Design's Typography does in its `<div>`. A component that's
+                // all there is in it, and hasn't been drawn yet, is in what's to be its line, which is no box at all until it's found
+                // to go along one, as `display: contents` has it, and from then on, so that it isn't started again for that.
+                const all = floated === children ? slotted(children) : null;
+                const heldIn = heldInNth;
+                const known = knownFlow;
+                const unknown = unknownFlow;
+                const onlyElements = all !== null && all.every((child) => known(heldIn(child)));
+                const single = all !== null && all.length === 1 ? heldIn(all[0]) : null;
+                if (isValidElement(single) && typeof single.type === 'function' && (nthKept.heldLine === true || unknown(single))) {
+                    unlike = true;
+                    nthKept.heldLine = true;
+                    const lined = known(single) ? intoLines(children, true, lookFont()) : children;
+                    children = lined !== children ? lined : [make('group', { key: '__line0', display: 'contents' }, ...eachWithin(FlowContext, 'block', all))];
+                } else if (nthKept.heldLine === true && all !== null) {
+                    unlike = true;
+                    // What was by itself in what's to be its line stays there once more comes beside it, rather than being put
+                    // somewhere else and starting again, as react-select's control would when its menu appears beside it.
+                    const lined = intoLines(children, onlyElements, lookFont());
+                    children = lined !== children ? lined : [make('group', { key: '__line0', display: 'contents' }, ...eachWithin(FlowContext, 'block', all))];
+                } else {
+                    children = intoLines(children, onlyElements, lookFont());
+                }
+            } else if (INLINE_TEXT_TAGS.has(tag) && look.display === undefined && look.__flex !== true && look.direction === undefined && children !== undefined && natives.cssChildren(layout, children, HOLDS_BLOCK)) {
+                // Something on a line with a block in it is broken around that block, and its text is on lines of what it's in, unless
+                // it's a block itself.
+                unlike = true;
+                children = intoLines(children, false, look.__block === true ? lookFont() : fontAbove);
+            }
+            // CSS's `order` is said to layout, which lays a flex box's or grid's items out in it from their own styles, whatever made
+            // them (a component's `order-first` among its siblings too), while they stay in the page in the order they're written.
+            const order = Number(look.__order);
+            if (Number.isFinite(order) && order !== 0) {
+                look.order = order;
+            }
+            delete look.__order;
+            const instance = rsui.__instanceNow?.();
+            if (instance !== null && instance !== undefined) {
+                instance.__pageLive = live;
+                live.instance = instance;
+            }
+            if (renderListeners.size > 0) {
+                pageRendered();
+            }
+            live.given = rest;
+            // What React gave it to have in it, which is what the DOM says is in it, in the order code moved it to: see `drawnChildren`.
+            const domKids = givenKids === reactKids ? given.children : givenKids;
+            live.children = live.portalKids !== undefined && live.portalKids.size > 0
+                ? [...Children.toArray(domKids ?? []), ...live.portalKids.values()]
+                : domKids;
+            // What can be edited takes the keyboard, which `editing.js` hears about as the page's focus moves: see `moveFocus`.
+            const editableHost = isHost && saysEditable(rest) && editableSaidAbove(live) !== true;
+            if (editableHost) {
+                rest.tabIndex ??= 0;
+            }
+            const host = { ...hostProps(tag, pictureSize(tag, rest, look, fontAbove)), ...eventProps(rest, needs, handlers, tag, live, look.__scroll !== undefined) };
+            if (tag === 'a' && typeof rest.href === 'string') {
+                // A link goes where it says once what's listening has heard about it, unless something said not to.
+                const clicked = host.onClick;
+                host.onClick = (event) => {
+                    clicked?.(event);
+                    if (event?.defaultPrevented !== true) {
+                        followLink(rest.href);
+                    }
+                };
+            }
+            if (typeof host.onClick === 'function') {
+                host.onClick = webClick(host.onClick, live, tag);
+            }
+            if ((tag === 'input' || tag === 'textarea') && typeof host.onChange === 'function') {
+                host.onChange = fieldChange(host.onChange, live, tag);
+            }
+            if (tag === 'input' || tag === 'textarea') {
+                hearSelecting();
+            }
+            if (tag === 'img') {
+                imageEvents(props, live);
+            }
+            if (tag === 'input' && String(props.type).toLowerCase() === 'radio') {
+                // The arrow keys go to the next or the one before of the radios it's with, and pick it, as in a browser.
+                const pressed = host.onKeyPress;
+                host.onKeyPress = (key) => {
+                    if (pressed?.(key)) {
+                        return true;
+                    }
+                    const step = { right: 1, down: 1, left: -1, up: -1 }[String(key).toLowerCase()];
+                    return step !== undefined && moveRadio(handleOf(live, tag), step);
+                };
+            }
+            if (form !== null && tag === 'input' && props.type !== 'checkbox' && props.type !== 'radio') {
+                // Enter in a field sends the form it's in, as a browser has it.
+                const pressed = host.onKeyPress;
+                host.onKeyPress = (key) => {
+                    const stopped = pressed?.(key);
+                    if (!stopped && String(key).toLowerCase() === 'enter') {
+                        // As if its first button that sends it were clicked, and not at all if that can't be, as a browser has it.
+                        // The page hears a `click` on that button (detail 0), which is what sends the form, unless something says
+                        // not to.
+                        const button = defaultButtonOf(form.element?.());
+                        if (button === null) {
+                            form.run?.(null);
+                        } else if (button.getAttribute('disabled') === null) {
+                            if (button.__live !== undefined && typeof button.click === 'function') {
+                                button.click();
+                            } else {
+                                form.run?.(null);
+                            }
+                        }
+                    }
+                    return stopped;
+                };
+            }
+            const field = isHost && FIELD_TAGS.has(tag);
+            if (field) {
+                withInput(host, rest);
+            }
+            live.current = field ? { value: props.value, set: props.__setValue, setChecked: props.__setChecked } : null;
+            live.pendingValue = undefined;
+            live.pendingChecked = undefined;
+            if (given.__handle !== undefined) {
+                // What it is was made before it was drawn, as a dialog's is, which is there while it's closed.
+                live.handle = given.__handle;
+            }
+            // Every element of the page has a key of its own, by which what a selector asks about it is found: see `pageTree`.
+            const domKey = useDomRef(isHost ? props.ref : null, isHost, live, tag, given.__handle?.__own === true ? given.__handle.__domKey : undefined);
+            live.domKey = domKey;
+            // Where it's drawn from, for what it's in before it's drawn (see `parentElement`).
+            live.instance = rsui.__instanceNow?.() ?? undefined;
+            if (notShownNow) {
+                keepNotShown(live);
+                // Which is said to be `display: block`, as a browser says of its options.
+                live.listPart = listPart || undefined;
+                // An option's text is its, though it isn't drawn: `option.text` and `textContent` say it.
+                live.text = tag === 'option' ? Children.toArray(given.children).filter((one) => typeof one === 'string' || typeof one === 'number').join('') : undefined;
+            } else {
+                forgetNotShown(live);
+            }
+            if (given.__handle?.__own === true && domKey !== undefined) {
+                // An element code made is what events on what's drawn of it happen to, and where it's asked to be.
+                const node = given.__handle;
+                node.__domKey = domKey;
+                node.__placedByKey = true;
+                Object.defineProperty(node, '__live', { value: live, enumerable: false, configurable: true });
+                handles.set(domKey, node);
+            }
+            if (globalThis.__rsuiDomTags === true && isHost) {
+                // Which element of the page each node is, by its kind, for tools that compare a page with a browser's.
+                // Only when they ask.
+                host.domTag = tag;
+            }
+            live.tag = tag;
+            live.state = state;
+            if ((needs & PEER) !== 0 && nth?.report !== undefined) {
+                // What comes after this asks how it is, which it says once it's drawn, if that's anything other than how it starts.
+                // With what code has set on it with `setAttribute()`, as Mantine's checkbox sets `data-indeterminate` for
+                // `[data-indeterminate] + .icon` to show its mark.
+                const how = { state: state & ~REDRAWN, checked: props.checked === true, attributes: attributesSet, deep: (needs & DEEP_PEER) !== 0 };
+                const said = how.state + '/' + how.checked + '/' + attributesSet;
+                if (live.peerSaid !== said && (live.peerSaid !== undefined || how.state !== 0 || how.checked || attributesSet !== '')) {
+                    queueMicrotask(() => nth.report(how));
+                }
+                live.peerSaid = said;
+            }
+            if (domKey !== undefined) {
+                live.weak ??= new WeakRef(live);
+                // A native template can hand the same DOM key back to a Styled.
+                // Its new live owner must not inherit the old selector descriptors.
+                if (pageLives.get(domKey) !== live.weak) pageNow = null;
+                pageLives.set(domKey, live.weak);
+                if (props.ref !== null && props.ref !== undefined) {
+                    host.key = domKey;
+                } else {
+                    // A field's own key is what's around it gave it, and it's found by this to give it the keyboard.
+                    host.domKey = domKey;
+                }
+            }
+            if (field) {
+                // A label for it gives it the keyboard, as in a browser.
+                // It's the pointer's, as a browser's label gives it (`FocusType::kMouse`), so it shows no ring by itself.
+                focusers.set(givenBy.get(given) ?? given, () => rsui.focus(domKey, false));
+            }
+            if (tag === 'form') {
+                // Its buttons and its fields send it, which is what its `onSubmit` and `action` are for: see `sendForm`.
+                // Made once it's found to be one, as almost nothing is.
+                const sending = (live.sending ??= formSending());
+                const closes = props.method === 'dialog' ? dialogAround : null;
+                live.sending = sending;
+                sending.element = () => handleOf(live, 'form');
+                sending.run = (submitter = null) => sendForm(sending, props, closes, handleOf(live, 'form'), submitter);
+                sending.reset = () => {
+                    // The form hears it first, as on a page, and putting its fields back is what it does unless that says not to.
+                    const event = submitEvent(null, handleOf(live, 'form'));
+                    event.type = 'reset';
+                    delete event.submitter;
+                    props.onReset?.(event);
+                    if (event.defaultPrevented) {
+                        return;
+                    }
+                    for (const one of sending.fields) {
+                        one.get().reset?.();
+                    }
+                };
+                delete host.onSubmit;
+                delete host.action;
+                children = eachWithin(FormContext, sending, children);
+            } else if ((form !== null || typeof props.form === 'string') && sendsForm(tag, props) && props.disabled !== true) {
+                // It sends the form it's in, or the one its `form` names, wherever that is.
+                const clicked = host.onClick;
+                host.onClick = (event, ...rest) => {
+                    const result = clicked?.(event, ...rest);
+                    if (event?.defaultPrevented !== true) {
+                        (typeof props.form === 'string' ? formById(props.form) : form)?.run?.(handleOf(live, tag));
+                    }
+                    return result;
+                };
+            } else if ((form !== null || typeof props.form === 'string') && resetsForm(tag, props) && props.disabled !== true) {
+                const clicked = host.onClick;
+                host.onClick = (event, ...rest) => {
+                    const result = clicked?.(event, ...rest);
+                    if (event?.defaultPrevented !== true) {
+                        (typeof props.form === 'string' ? formById(props.form) : form)?.reset?.();
+                    }
+                    return result;
+                };
+            }
+            if (look.__case !== undefined && children !== undefined) {
+                const said = children;
+                children = withCase(children, look.__case);
+                // The DOM's text is what was written, which `textContent` gives, and only what's shown is cased, as `innerText` is.
+                live.uncased = typeof said === 'string' && typeof children === 'string' && said !== children ? { shown: children, said } : undefined;
+            } else if (live.uncased !== undefined) {
+                live.uncased = undefined;
+            }
+            const scroll = look.__scroll;
+            // What its `overflow` says each way, for `getComputedStyle()` (see `overflowOf`), which nothing draws.
+            live.overflow = look.__overflowX === undefined && look.__overflowY === undefined ? undefined : [look.__overflowX, look.__overflowY];
+            delete look.__overflowX;
+            delete look.__overflowY;
+            if (look.display === undefined && look.direction === undefined && along) {
+                // One after another along a line, as what's in a line of a page does, which `cssPlace` says how.
+                children = spacesBetween(slotted(children));
+            }
+            // Text that has a block in it is broken around it, as CSS has it, so it's as wide as what it's in, as a block is.
+            const blockInside = INLINE_TEXT_TAGS.has(tag) && look.__inline === undefined && natives.cssChildren(layout, children, BLOCK_CHILD);
+            const current = look.color ?? fontAbove?.color;
+            // A keyframe's variables are what they are on the element itself, as Radix's accordion's `height:
+            // var(--radix-accordion-content-height)` is what it sets on the content it opens.
+            const [transitions, moving] = motionOf(look, ownVariables(variablesInside, variablesAbove));
+            // What isn't shown (`display: none`) plays no animation, as on a page: it starts once it's shown.
+            const animation = notShownNow ? undefined : moving;
+            // What animation it plays, for `getComputedStyle()` and `animationend` to say, and to say it's started or been
+            // stopped: only what Rust plays, as what it doesn't would never end.
+            animationChanged(live, tag, animation !== undefined && tag !== 'fieldset' ? animationOf(look) : null);
+            const em = declaring.em !== '';
+            // What CSS says about the shapes in it, by their ids, which goes over what they say themselves, as it does on a page.
+            // The rules that reach what's inside it are this one's, as `[data-x] .curve` reaches a `<circle class="curve">` in it, and
+            // so are the variables it sets.
+            const shapeParts = tag === 'svg' ? shapePartsOf(inner, variablesInside ?? variablesAbove) : undefined;
+            if (tag === 'svg') {
+                // What its shapes use isn't known here.
+                rsui.__readsHere(InheritedVariables, null);
+            }
+            if (tag === 'svg') {
+                // What CSS says about how it's drawn goes over what it says itself, as SVG's presentation attributes are only what
+                // CSS starts from: Mantine's star is `fill="none"`, and filled by `.m_5662a89a[data-filled] { fill: ... }`.
+                for (const key of SHAPE_LOOKS) {
+                    if (look[key] !== undefined && host[key] !== undefined) {
+                        delete host[key];
+                    }
+                }
+            }
+            // Where it goes in what it's in, and what's only worked out once everything's been said, which is the props it's made with:
+            // see `layout.rs`. A fieldset's legend takes some of its look first.
+            const fieldset = tag === 'fieldset';
+            // Text that's inline, on a line or by itself in a block, rather than a box of its own on its line, a block, or what's in
+            // a flex box or a grid, which is a block there.
+            const inlineArea = INLINE_TEXT_TAGS.has(tag) && (onLine || given_flow === 'block') && look.__lineBox !== true && look.__flex !== true && look.display !== 'grid' && look.__block !== true
+                && look.__inline !== false && look.position !== 'absolute' && look.position !== 'fixed';
+            if (tag === 'legend' && ownsLegend && look.width === undefined) {
+                // A fieldset's legend is as wide as what's in it unless it says, even as a block, as a browser has it, as MUI's
+                // notched outline's is.
+                look.fitWidth = true;
+            }
+            // What it is, which the components that gave back only it learn: see `learnMadeTag`.
+            if (hasAsked) {
+                learnMadeTag(tag, given);
+            }
+            // Whether it sits on a line, which what made it learns: see `learnFlow`.
+            if (look.position !== 'absolute' && look.position !== 'fixed') {
+                learnFlow(look.__inline === true || (look.__inline === undefined && look.__block !== true && (INLINE_BOXES.has(tag) || INLINE_TEXT_TAGS.has(tag))));
+            }
+            // Whether it's a container that `@container` asks about, which what's inside it looks for: see `containerMatches`.
+            if (look.__containerType !== undefined || live.containerType !== undefined) {
+                live.containerType = look.__containerType;
+                live.containerNames = typeof look.__containerName === 'string' && look.__containerName !== 'none' ? look.__containerName.split(/\s+/).filter((one) => one !== '') : [];
+            }
+            delete look.__containerType;
+            delete look.__containerName;
+            let out = fieldset
+                ? natives.cssPlace(layout, look, tag, flow, onLine, along, blockInside, fontAbove?.textAlign, current, placing)
+                : natives.cssPlace(layout, look, tag, flow, onLine, along, blockInside, fontAbove?.textAlign, current, placing, host, transitions, animation, em, shapeParts);
+            // What it's drawn with and what moves it, for what code stops with its `style` before it's drawn again (see `stillForReads`).
+            live.placedOut = out;
+            live.placedAnimation = animation;
+            if (live.stillSaid === true) {
+                live.stillSaid = false;
+            }
+            if (look.__visibility !== undefined) {
+                // Drawn as nothing, which can't be clicked (see `layout.rs`), and said as what it was, for `getComputedStyle()`.
+                out[LOOK_VISIBILITY] = String(look.__visibility);
+            }
+            if (isHost && !fieldset) {
+                // What's placed by itself in an element that isn't positioned is placed from the nearest one around it that is, as
+                // on a page: Mantine's modal overlay is `position: absolute; inset: 0` in a root that isn't, in a box that's
+                // `position: relative`. Which of what's placed by itself is the page's, rather than rsui's own, as a list's
+                // marker is, is said too, as what's positioned, from which they're placed: see `passes_absolutes` in rsui-layout.
+                const position = look.position;
+                out.staticBox = (position === undefined || position === 'static') && look.transform === undefined && look.__scroll === undefined;
+            }
+            // How this lays out what's in it, for what's in it to know, which is only said when it changes. With no box of its own, as
+            // `display: contents` says, what's in it is part of what it's in, and nothing of its box is drawn.
+            const contents = look.display === 'contents';
+            const inside = contents ? given_flow : placing.inside;
+            if (contents) {
+                out = withoutBox(out);
+            }
+            // What's in it is told, from this rather than from providers around each of them, which would be there only while it's
+            // different from what this was told, and make what's in it start again when that changes: see `provideHere`.
+            rsui.__provideHere(FlowContext, inside);
+            for (const name of ['before', 'after']) {
+                if (parts[name] !== undefined) {
+                    withCurrentColor(parts[name], parts[name].color ?? current);
+                }
+            }
+            if (fieldset) {
+                children = withLegend(out, children);
+                out = natives.cssHost(layout, out, host, tag, transitions, animation, em, shapeParts);
+            }
+            live.look = out;
+            if (tag === 'svg') {
+                // What's in the picture is elements of the page too, which code looks for, though they're drawn as one picture.
+                out.__elements = (found) => keepSvgElements(live, found);
+            }
+            if (inlineArea) {
+                // Its box is as tall as its font makes it, as CSS's inline box is, wherever its lines are: see `inline_area` in
+                // rsui-text.
+                out.inlineArea = true;
+            }
+            if (lined) {
+                out.__lined = true;
+            }
+            if (keepable && !keptNow) {
+                // What came out is what went in, so it can be kept: see `keptKids`.
+                nthKept.kids = !along && !lined && Array.isArray(children) && sameList(kidsIn, children) && keptType(kidsIn, keptSaid)
+                    && (natives.cssChildren(layout, kidsIn, TEXT_KINDS) & 1) === 0 ? { list: kidsIn, said: keptSaid } : undefined;
+            } else if (!keepable) {
+                nthKept.kids = undefined;
+            }
+            // How many of what's in it are the blocks that were kept, which are as they are from here on.
+            const keptCount = keptNow ? children.length : 0;
+            if (editableHost) {
+                // What can be edited has its caret and what's selected drawn over it: see `editing.js`.
+                const handle = live.handle ?? handleOf(live, tag, true);
+                children = [...(keptNow ? children : Children.toArray(children ?? [])), editingPack().hostExtras(handle)];
+                if (out.position === undefined || out.position === 'static') {
+                    out.position = 'relative';
+                }
+            }
+            if (tag === 'input' && buttonInput(out)) {
+                // A button, with its value as its text, which is written as what it's in says, as a `<button>`'s is.
+                children = buttonInputText(out);
+            }
+            // A list of blocks has no text of its own, so what's drawn for it doesn't depend on what's in it.
+            const type = keptNow ? hostType(tag, out, undefined) : hostType(tag, out, children);
+            // Text that's right in something gets how it's written from that, as it does in CSS, whatever that something is.
+            if (font !== null && typeof type === 'string' && type !== 'text' && type !== 'span' && type !== 'input') {
+                // Its lines through or under text are drawn on the text right in it too, as CSS has them go to what's inside, when
+                // it's a box of its own in a flex box or a grid, as Mantine's `Anchor` in a `Group` is.
+                const lined = given_flow === 'block' || given_flow === 'line' ? font : decoratedFont(out, font);
+                children = keptNow ? [...children.slice(0, keptCount), ...withFont(children.slice(keptCount), lined)] : withFont(children, lined);
+            }
+            if (scroll !== undefined) {
+                // What scrolls says when it's scrolled, and goes where code says: see `scrollTo`.
+                Object.assign(out, scrollProps(live));
+            }
+            // What's in it that's as it was is the same elements as last time, which aren't drawn again, as React has it.
+            children = sameElements(nthKept.children, children);
+            nthKept.children = children;
+            if (RESTYLE_ENV.check) {
+                restyleSigned(live, out, type, font, children, given, state);
+            }
+            if (live.nativeKids === true) {
+                // What's in it that's drawn without a `Styled` of its own reads what this passes down without watching it, and is drawn
+                // again from here when that changes: see `drawNative`.
+                tellNativeKids(live, [inner === PAGE_RULES ? pageOwners() : inner, font, variablesInside ?? variablesAbove, lookForInside ?? parentLook, inside, theme, version, declared, form, kindsForgotten]);
+            }
+            if (given.__nativeProbe !== undefined) {
+                // What it passes down goes into what's made of it, which isn't told when that changes.
+                rsui.__readsHere(InheritedVariables, null);
+                rsui.__readsHere(ParentLook, null);
+                // What this comes to, for what's like it to be drawn the same without a `Styled` of its own, if nothing here depends
+                // on more than its tag, class, style and attributes, what's in it, and what's above it: see `drawNative`.
+                // In parts, as one long condition is nested too deeply for a debug build's stack to compile.
+                const plainHost = isHost && !keptNow && !keepable && !editableHost && !notShownNow && nested.length === 0 && Object.keys(parts).length === 0;
+                const plainLook = scroll === undefined && needs === 0 && !lined && !unlike && !blockInside && look.__case === undefined && transitions === undefined;
+                const plainPlace = animation === undefined && (given_nth === null || (tag === 'li' && !structural)) && form === null && look.__flex !== true;
+                const plainKind = look.display !== 'grid' && look.tablePart === undefined && props.__modal !== true && !fieldset && tag !== 'svg';
+                const plainKids = codeKids === null && givenKids === given.children && given.__webMore === undefined && kept?.cssom == null;
+                const plain = plainHost && plainLook && plainPlace && plainKind && plainKids;
+                given.__nativeProbe(plain ? nativeTemplate(tag, type, out, children, given.children, nth?.typeIndex ?? 0, {
+                    whiteSpace: whiteSpaceSaid,
+                    along: alongFirst,
+                    spaced: look.display === undefined && look.direction === undefined,
+                    blocks: BLOCK_TAGS.has(tag) && look.display === undefined && look.direction === undefined,
+                    marker: markerSaid,
+                    lineFont: lookFont(),
+                    font,
+                    inner,
+                    down: [inner === PAGE_RULES ? pageOwners() : inner, font, variablesInside ?? variablesAbove, lookForInside ?? parentLook, inside, theme, version, declared, null, kindsForgotten],
+                    value: props.value,
+                }) : null);
+            }
+            let shown = makeHost(tag, out, children, scroll, parts, keptNow ? type : undefined);
+            if (tag === 'fieldset') {
+                live.legendClaim ??= { legend: null };
+                shown = make(FieldsetLegend.Provider, { value: live.legendClaim }, shown);
+            }
+            if (props.__modal === true) {
+                shown = topLayer(shown, parts.backdrop);
+            }
+            if (notShownNow) {
+                // What's in an `<optgroup>` is its options, which are elements of the page too. Otherwise nothing's drawn for
+                // what isn't shown, but it's still where it is among what's around it, as it is in a page's DOM: Radix's hidden
+                // tab panels are between the shown one and the others, not after them. It takes no room and no pointer.
+                if (tag === 'optgroup') {
+                    return Children.toArray(given.children).filter((one) => isValidElement(one));
+                }
+                return isHost && live.domKey !== undefined
+                    ? make('group', { domKey: live.domKey, overlay: 'fill', inert: true,
+                        ...(typeof rest.className === 'string' ? { class: rest.className } : null),
+                        ...(typeof rest.id === 'string' ? { domId: rest.id } : null) })
+                    : null;
+            }
+            return shown;
+        }
+        Styled.__webClass = own;
+        // What its CSS says before anything's been given to it, for what's around it to know where it goes, as whether it's placed
+        // by itself. It's nothing if what it says depends on what it's given.
+        let firstLook;
+        Styled.__webLook = () => {
+            if (firstLook === undefined) {
+                try {
+                    // As styled-components has it, what works something out from the props is only asked once there are some, so
+                    // what that says is left out, rather than being worked out from nothing.
+                    firstLook = compile(withoutGuessed(readCss(textOf(strings, values, GUESSING)))).own;
+                } catch {
+                    firstLook = null;
+                }
+            }
+            return firstLook;
+        };
+        Styled.__webTag = typeof target === 'string' ? target : target.__webTag;
+        // That it takes where it is as `__nth` itself: see `withNth`.
+        Styled.__webStyled = true;
+        // What draws an element isn't rendered again when it's given the same things (see `JsProps` in bridge.rs).
+        Styled.__rsuiShallow = true;
+        // What a shape in a picture is, which a picture draws as it is, as it can't be put together from components.
+        Styled.__shape = Styled.__webTag === 'svg' ? undefined : SVG_TAGS[Styled.__webTag];
+        Styled.__webInline = typeof target === 'string' && INLINE_TEXT_TAGS.has(target);
+        Styled.displayName = 'styled(' + (typeof target === 'string' ? target : target.displayName ?? target.name ?? 'Component') + ')';
+        // What an element's selector says, when it's written in a template.
+        Styled.toString = () => '.' + own;
+        return Styled;
+    }
+    tagged.attrs = (attr) => makeStyled(target, { ...settings, attrs: [...attrs, attr] });
+    tagged.withConfig = () => tagged;
+    return tagged;
+}
+
+// Page elements code made, drawn without a `Styled` of their own. Most of what an editor makes is paragraphs, headings
+// and the marks in them, each drawn the same as every other one with the same tag, class, style, attributes and kinds of things in
+// it, under the same things above it. So the first of each kind is a `Styled`, told to say what it came to (its host's props, what
+// it passes down, and which of the steps it puts what's in it through ran), and the rest are made from that, with what's in them
+// put through the same steps: their host element, their key, and what's kept for the page to find them by. Anything that doesn't
+// fit is a `Styled` as before. It's on unless `RSUI_NATIVE_ELEMENTS=0`, or the page says `globalThis.__rsuiNativeElements = false`,
+// as a test comparing the two does.
+
+const NATIVE_FROM_ENV = (() => {
+    try {
+        return globalThis.process?.env?.RSUI_NATIVE_ELEMENTS !== '0';
+    } catch {
+        return true;
+    }
+})();
+const nativeOn = () => NATIVE_FROM_ENV && globalThis.__rsuiNativeElements !== false;
+/// What's drawn this way, by its own component: blocks of text, and what holds blocks.
+const NATIVE_BLOCKS = new Set(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'li', 'div']);
+/// What's drawn this way inside one of those as a host element with no component of its own, or by its own component.
+const NATIVE_INLINE = new Set(['span', 'strong', 'em', 'b', 'i', 'u', 's', 'code', 'sub', 'sup', 'mark']);
+const NATIVE_PROPS = /^(key|__handle|className|style|dir|data-[a-z0-9-]+)$/;
+const NO_PARTS = Object.freeze({});
+/// What each kind of plain element came to, by what tells them apart, each with what was above it then.
+const nativeTemplates = new Map();
+/// What's drawn this way that watches what's above it itself, which is drawn again when the page's CSS changes, as a `Styled` is.
+/// What's in a `Styled` or in another of these is drawn again by that, and isn't here.
+const nativeWatching = new Set();
+let nativeListening = false;
+
+/// What tells kinds of plain element apart: their tag, class, style, attributes, and the kinds of things in them, in order (text,
+/// with `<br>`s, as `t`, and elements as `i` if they go along a line and `b` if not, as `OwnInline` and `OwnElement` are).
+function nativeSignature(tag, props, kids) {
+    let said = tag + '|' + (props.className ?? '') + '|' + (props.dir ?? '') + '|';
+    let count = 0;
+    let last = '';
+    for (const kid of kids) {
+        const one = kid.nodeType === 3 || kid.localName === 'br' ? 't' : isInlineTag(kid.localName) ? 'i' : 'b';
+        if (one === 't' && last === 't') {
+            continue;
+        }
+        last = one;
+        said += one;
+        if ((count += 1) > 8) {
+            said += '+';
+            break;
+        }
+    }
+    if (props.style !== undefined) {
+        said += '|' + JSON.stringify(props.style);
+    }
+    for (const name in props) {
+        if (name.charCodeAt(0) === 100 && name.startsWith('data-')) {
+            said += '|' + name + '=' + props[name];
+        }
+    }
+    return said;
+}
+
+const isInlineTag = (tag) => INLINE_TEXT_TAGS.has(tag);
+
+/// Whether what an element made by code has is only what a kind of plain element is told apart by. An `<li>` can say its number too.
+function plainNativeProps(props, tag) {
+    for (const name in props) {
+        if (!NATIVE_PROPS.test(name) && !(name === 'value' && tag === 'li')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const findNative = (signature, above) => {
+    const list = nativeTemplates.get(signature);
+    if (list === undefined) {
+        return undefined;
+    }
+    for (const one of list) {
+        if (sameSaid(one.above, above)) {
+            return one;
+        }
+    }
+    return undefined;
+};
+
+/// What a `Styled` told to say what it comes to came to (see `Styled`), or null if what's like it can't be drawn from that: if it has
+/// anything of its own, or putting what's in it through the same steps doesn't come to what it did.
+function nativeTemplate(tag, type, out, children, given, index, how) {
+    if (type !== 'text' && type !== 'group' && type !== 'span' && type !== 'item') {
+        return null;
+    }
+    const kept = {};
+    for (const name of Object.keys(out)) {
+        if (name === 'domKey' || name === 'key' || name === 'value') {
+            continue;
+        }
+        if (typeof out[name] === 'function') {
+            return null;
+        }
+        kept[name] = out[name];
+    }
+    if (out.value !== how.value) {
+        return null;
+    }
+    const template = { ...how, type, out: kept, host: undefined, given: undefined };
+    const again = nativeChildren(tag, given, template, index);
+    return again !== null && again[1] === type && sameTree(again[0], children) ? template : null;
+}
+
+/// Whether two things to draw are the same: text, lists, and elements of the same kind with the same key, props and what's in them.
+function sameTree(a, b) {
+    if (a === b) {
+        return true;
+    }
+    if (Array.isArray(a) || Array.isArray(b)) {
+        return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((one, at) => sameTree(one, b[at]));
+    }
+    if (!isValidElement(a) || !isValidElement(b) || a.type !== b.type || a.key !== b.key) {
+        return false;
+    }
+    const [x, y] = [a.props ?? NO_LOOK, b.props ?? NO_LOOK];
+    const names = Object.keys(x);
+    if (names.length !== Object.keys(y).length) {
+        return false;
+    }
+    for (const name of names) {
+        if (name === 'children' ? !sameTree(x.children, y.children) : !(name in y) || !(Object.is(x[name], y[name]) || samePlain(x[name], y[name]))) {
+            return false;
+        }
+    }
+    return sameTree(a.kids ?? undefined, b.kids ?? undefined);
+}
+
+/// Plain values that are the same, as the fonts and strut of a line are, made again each time.
+function samePlain(a, b) {
+    if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) {
+        return false;
+    }
+    const names = Object.keys(a);
+    return names.length === Object.keys(b).length && names.every((name) => Object.is(a[name], b[name]) || samePlain(a[name], b[name]));
+}
+
+/// What's in an element drawn from what a `Styled` like it came to, put through the steps that `Styled` put what was in that through,
+/// in the same order: its spaces as CSS says, its list marker, the lines of a block, spaces between what goes along a line, and its
+/// font. With what it's drawn as, or null if it doesn't come to the same as that did, for it to be drawn as a `Styled` itself.
+function nativeChildren(tag, said, template, index) {
+    let children = spacesAsSaid(joinedText(said), template.whiteSpace);
+    if (natives.cssChildren(layout, children, ALONG, tag) !== template.along) {
+        return null;
+    }
+    if (template.marker !== undefined) {
+        children = withListMarker(children, template.marker, index, template.lineFont);
+    }
+    if (structural && children !== undefined && slotted(children).some(isValidElement)) {
+        // What's in it would be told where it is among the rest.
+        return null;
+    }
+    if (template.blocks && children !== undefined) {
+        if (withFloats(children, template.lineFont, template.inner) !== children) {
+            return null;
+        }
+        const all = slotted(children);
+        const single = all.length === 1 ? heldInNth(all[0]) : null;
+        if (isValidElement(single) && typeof single.type === 'function' && unknownFlow(single)) {
+            return null;
+        }
+        children = intoLines(children, all.every((child) => knownFlow(heldInNth(child))), template.lineFont);
+    }
+    if (template.spaced && template.along) {
+        children = spacesBetween(slotted(children));
+    }
+    const type = hostType(tag, template.out, children);
+    if (template.font !== null && typeof type === 'string' && type !== 'text' && type !== 'span' && type !== 'input') {
+        children = withFont(children, template.font);
+    }
+    return [children, type];
+}
+
+/// The host props of everything of a kind drawn this way, one object for all of them, as `makeHost` would leave them: its key on the
+/// page goes in the element's own key (see `nativeHost`), which is how Rust finds one by it too (`dom_key` in geometry.rs), so nothing
+/// in them is any one element's, and `makeHost` has nothing to take out of them or add.
+function nativeHostProps(template) {
+    let props = template.host;
+    if (props === undefined) {
+        // Which are these, as they don't say whose they are: an element of the page drawn this way is one, as one with a `domKey` is.
+        // See `onlyHoldsText`.
+        const { __lined: _lined, __id: id, __for: _for, __appearance: _appearance, __formName: _formName, __label: label, __scrollAlways: _always,
+            __overflowX: _overflowX, __overflowY: _overflowY, __scrollbarWidth: _width, __scrollbarColor: _color, __scrollbarThumb: _thumb, __scrollbarTrack: _track, ...rest } = template.out;
+        if (typeof id === 'string' && id !== '') {
+            rest.domId = id;
+        }
+        if (label !== undefined) {
+            rest.name = label;
+            rest.quietName = true;
+        }
+        props = template.host = rest;
+        nativeHostsProps.add(props);
+    }
+    return props;
+}
+
+const nativeHostsProps = new WeakSet();
+
+/// The host element of one drawn this way, with its key on the page as its own key.
+function nativeHost(tag, template, value, children, domKey) {
+    let props = nativeHostProps(template);
+    if (value !== undefined) {
+        props = { ...props, value };
+        nativeHostsProps.add(props);
+    }
+    const host = makeHost(tag, props, children, undefined, NO_PARTS);
+    host.key = domKey;
+    return host;
+}
+
+/// Its key, and what the page finds it by, kept from one drawing to the next.
+function nativeLiveOf(node, props, template) {
+    let live = node.__nativeLive;
+    if (live === undefined) {
+        // With every property it gets here from the start, as adding one past what an object was made with doubles its room.
+        live = { domKey: node.__domKey ?? '__dom' + nextDomKey++, tag: node.localName, state: 0, handle: node, given: undefined, look: undefined, parent: undefined, inline: undefined, weak: undefined, nativeDown: undefined };
+        live.weak = new WeakRef(live);
+        Object.defineProperty(node, '__nativeLive', { value: live, enumerable: false, configurable: true, writable: true });
+    }
+    const domKey = live.domKey;
+    const { key: _key, style: _style, __handle: _handle, ...given } = props;
+    // What it was given is what everything of its kind was, as that's what its kind is told by, so they share one: see `sameGiven`.
+    const shared = template.given;
+    if (shared === undefined) {
+        template.given = given;
+        live.given = given;
+    } else {
+        live.given = sameGiven(shared, given) ? shared : given;
+    }
+    live.look = template.out;
+    if (node.__domKey !== domKey || node.__live !== live) {
+        node.__domKey = domKey;
+        node.__placedByKey = true;
+        Object.defineProperty(node, '__live', { value: live, enumerable: false, configurable: true });
+    }
+    handles.set(domKey, node);
+    if (pageLives.get(domKey) !== live.weak) {
+        pageLives.set(domKey, live.weak);
+        pageNow = null;
+    }
+    return live;
+}
+
+/// Whether two elements were given the same, by what each was given.
+function sameGiven(one, other) {
+    const names = Object.keys(one);
+    if (names.length !== Object.keys(other).length) {
+        return false;
+    }
+    for (const name of names) {
+        if (!Object.is(one[name], other[name]) || !(name in other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether a code-made element can be drawn as a host element in what it's in, with no component of its own: an inline element with
+/// only what tells kinds apart, and only text and more of the same in it.
+function hostableInline(node, propsOf) {
+    if (node.nodeType !== 1 || !NATIVE_INLINE.has(node.localName) || node.__probed === version) {
+        return null;
+    }
+    const props = propsOf(node);
+    if (!plainNativeProps(props, node.localName)) {
+        return null;
+    }
+    for (const kid of node.__kids) {
+        if (kid.nodeType !== 3 && kid.localName !== 'br' && hostableInline(kid, propsOf) === null) {
+            return null;
+        }
+    }
+    return props;
+}
+
+/// What's in a plain element drawn this way, with each plain inline element in it that a kind was found for, below what this passes
+/// down, drawn as a host element in it rather than by its own component. Anything else is left as it is, and draws itself.
+function withHosted(children, down, owner, render, propsOf, hosted) {
+    const visit = (one, flow) => {
+        if (Array.isArray(one)) {
+            let changed = false;
+            const out = one.map((child) => {
+                const now = visit(child, flow);
+                changed ||= now !== child;
+                return now;
+            });
+            return changed ? out : one;
+        }
+        if (!isValidElement(one)) {
+            return one;
+        }
+        if (one.type === FlowContext.Provider) {
+            // What's on a line is told so, which the kind of what's in it is found under.
+            const inside = one.props?.children;
+            const now = visit(inside, one.props.value);
+            return now === inside ? one : isValidElement(now) && typeof now.type === 'string' ? now : { ...one, props: { ...one.props, children: now } };
+        }
+        const node = one.props?.node;
+        if (node !== undefined && node.__own === true && one.type?.__webInline === true) {
+            return hostInline(node, flow === undefined ? down : withFlow(down, flow), owner, render, propsOf, hosted) ?? one;
+        }
+        if (typeof one.type === 'string' && one.kids !== undefined && one.kids !== null) {
+            // Something a step put around what's in it, as a line or a list item's content is.
+            const kids = visit(one.kids, flow);
+            return kids === one.kids ? one : { ...one, kids };
+        }
+        return one;
+    };
+    return visit(children, undefined);
+}
+
+const withFlow = (down, flow) => (down[4] === flow ? down : down.map((value, at) => (at === 4 ? flow : value)));
+
+/// A plain inline element drawn as a host element in what it's in, with what's in it the same way, or null if no kind of it is known
+/// below what that passes down, for it to be drawn by its own component, and find out. What changes in it draws what it's in again.
+function hostInline(kid, down, owner, render, propsOf, hosted) {
+    const props = hostableInline(kid, propsOf);
+    if (props === null) {
+        return null;
+    }
+    const entry = findNative(nativeSignature(kid.localName, props, kid.__kids), down);
+    if (entry === undefined || entry.template === null) {
+        return null;
+    }
+    const template = entry.template;
+    const kids = kid.__kids;
+    const said = kids.length === 0 ? undefined : kids.length === 1 ? render(kids[0]) : kids.map(render);
+    const made = nativeChildren(kid.localName, said, template, 0);
+    if (made === null) {
+        return null;
+    }
+    const live = nativeLiveOf(kid, props, template);
+    live.parent = owner;
+    kid.__redraw = owner.__redraw;
+    hosted.push(kid);
+    // What `render` made for it to be drawn by its own component isn't drawn, and goes, as it'd be kept for as long as the node is.
+    kid.__drawnAs = null;
+    const children = withHosted(made[0], template.down, owner, render, propsOf, hosted);
+    return nativeHost(kid.localName, template, undefined, children, live.domKey);
+}
+
+/// What a plain element made by code is drawn as, without a `Styled`: its host element, or what finds out what that is (a `Styled`
+/// told to say), or undefined if it isn't plain, for it to be drawn as before.
+function drawNative(node, props, kids, render, propsOf) {
+    const tag = node.localName;
+    const inline = NATIVE_INLINE.has(tag);
+    if ((!inline && !NATIVE_BLOCKS.has(tag)) || node.__probed === version || !plainNativeProps(props, tag)) {
+        return undefined;
+    }
+    if (inline ? hostableInline(node, propsOf) === null : kids.length >= KEPT_FROM && tag === 'div') {
+        // An inline element has only text and plain inline elements in it, drawn in it. A long list is kept as it is by a `Styled`.
+        return undefined;
+    }
+    for (const kid of kids) {
+        if (kid.nodeType !== 3 && kid.nodeType !== 1) {
+            return undefined;
+        }
+    }
+    if (addedCss.length > 0) {
+        workedOut();
+    }
+    // What's above it, as a `Styled` reads it. What's drawn in a `Styled`, or in another of these, is drawn again by that when what it
+    // passes down changes (see `tellNativeKids`), so it reads that without watching it, as watching it costs a place in a list on each
+    // of them for each of these. Anything else watches it, as a `Styled` does.
+    const instance = rsui.__instanceNow?.();
+    const parentLive = instance?.parent?.__pageLive;
+    const told = tag !== 'li' && parentLive !== undefined && parentLive.handle === node.__parent;
+    const read = told ? rsui.__contextNow : useContext;
+    const owners = read(NestedRules);
+    const above = [owners === PAGE_RULES ? pageOwners() : owners, read(InheritedFont), read(InheritedVariables), read(ParentLook), read(FlowContext), read(ThemeContext), version, declared, read(FormContext), kindsForgotten];
+    const nth = read(NthContext);
+    if (above[8] !== null || (nth !== null && tag !== 'li')) {
+        return undefined;
+    }
+    if (told) {
+        parentLive.nativeKids = true;
+        parentLive.nativeDown ??= above;
+    }
+    const signature = nativeSignature(tag, props, kids);
+    const entry = findNative(signature, above);
+    if (entry === undefined) {
+        // The first like it is a `Styled`, which says what it comes to, and what's in it says what it comes to in that. It stays one
+        // for as long as the page's CSS is what it was, and is drawn from what another like it says after that: see `tellNativeKids`.
+        node.__probed = version;
+        forgetNative(node);
+        const toldBack = (template) => {
+            const list = nativeTemplates.get(signature) ?? [];
+            // What was there for things above it that aren't any more goes, as the page's CSS changing leaves those behind.
+            const now = list.filter((one) => one.above[6] === version && one.above[7] === declared && !sameSaid(one.above, above));
+            now.push({ above, template });
+            nativeTemplates.set(signature, now);
+        };
+        return make(domElement(tag), { ...props, __nativeProbe: toldBack }, ...kids.map(render));
+    }
+    const template = entry.template;
+    if (template === null) {
+        return undefined;
+    }
+    const said = kids.length === 0 ? undefined : kids.length === 1 ? render(kids[0]) : kids.map(render);
+    const made = nativeChildren(tag, said, template, nth?.typeIndex ?? 0);
+    if (made === null) {
+        return undefined;
+    }
+    if (!told) {
+        nativeWatching.add(node);
+        if (!nativeListening) {
+            nativeListening = true;
+            subscribe(() => {
+                for (const one of [...nativeWatching]) {
+                    one.__redraw?.();
+                }
+            });
+        }
+    } else {
+        nativeWatching.delete(node);
+    }
+    const live = nativeLiveOf(node, props, template);
+    live.parent = undefined;
+    if (instance !== null && instance !== undefined) {
+        instance.__pageLive = live;
+    }
+    if (renderListeners.size > 0) {
+        pageRendered();
+    }
+    if (nth !== null) {
+        // Where it is among what's around it is learned from it, as it is from a `Styled`: see `learnTag`.
+        nth.learn?.(tag, live, props.className);
+    }
+    const hosted = [];
+    const children = withHosted(made[0], template.down, node, render, propsOf, hosted);
+    // What was drawn in it this way before that isn't now is let go of.
+    for (const kid of live.inline ?? []) {
+        if (!hosted.includes(kid) && kid.__nativeLive?.parent === node) {
+            forgetNative(kid);
+        }
+    }
+    live.inline = hosted.length === 0 ? undefined : hosted;
+    if (kids.some((kid) => kid.nodeType === 1 && kid.localName !== 'br' && !hosted.includes(kid))) {
+        // What's in it that draws itself is given what this passes down, as a `Styled` gives it, and is drawn again when that changes.
+        const down = template.down;
+        const passDown = rsui.__provideHere;
+        passDown(InheritedFont, down[1]);
+        passDown(NestedRules, template.inner);
+        passDown(InheritedVariables, down[2]);
+        passDown(ParentLook, down[3]);
+        passDown(NthContext, null);
+        passDown(FlowContext, down[4]);
+        tellNativeKids(live, down);
+    }
+    return nativeHost(tag, template, props.value, children, live.domKey);
+}
+
+/// What's in something drawn by code that's drawn without a `Styled` of its own is drawn again when what that passes down to it
+/// changes, as it doesn't watch it: see `drawNative`.
+function tellNativeKids(live, down) {
+    const was = live.nativeDown;
+    live.nativeDown = down;
+    if (was === undefined || sameSaid(was, down)) {
+        return;
+    }
+    for (const kid of live.handle?.__kids ?? []) {
+        // What was drawn as a `Styled` to find out what its kind came to, before the page's CSS changed, is drawn again too, to be drawn
+        // from what another like it comes to now, rather than staying a `Styled` for good.
+        if ((kid.__nativeLive !== undefined && kid.__nativeLive.parent === undefined) || (kid.__probed !== undefined && kid.__probed !== version)) {
+            kid.__redraw?.();
+        }
+    }
+}
+
+/// Lets go of what's kept for a plain element drawn without a `Styled`, once it's gone or drawn as one, and of what's in it that was
+/// drawn with it.
+function forgetNative(node) {
+    const live = node.__nativeLive;
+    if (live === undefined) {
+        return;
+    }
+    nativeWatching.delete(node);
+    node.__nativeLive = undefined;
+    forgetSvgParts(live.domKey);
+    if (pageLives.get(live.domKey) === live.weak) {
+        pageLives.delete(live.domKey);
+        pageNow = null;
+    }
+    if (handles.get(live.domKey) === node) {
+        handles.delete(live.domKey);
+    }
+    if (live.parent !== undefined && node.__redraw === live.parent.__redraw) {
+        node.__redraw = undefined;
+    }
+    for (const kid of live.inline ?? []) {
+        if (kid.__nativeLive?.parent === node) {
+            forgetNative(kid);
+        }
+    }
+}
+
+/// What's drawn of a box, and where it's placed by itself, which something with no box, as `display: contents` says, doesn't have.
+const BOX_DRAWN = /^(background|border|shadow|corner|outline|opacity|transform|translate|rotate|scale|clip|filter|position$|top$|right$|bottom$|left$|zIndex$)/;
+
+function withoutBox(props) {
+    const out = {};
+    for (const key of Object.keys(props)) {
+        if (!BOX_DRAWN.test(key)) {
+            out[key] = props[key];
+        }
+    }
+    return out;
+}
+
+/// Where `cssPlace` says how what it's placed lays out what's in it.
+const placing = { inside: 'block' };
+
+/// What changes the states a styled component keeps track of, which are only kept for what something says about them.
+/// `next`, with each part of it that says the same as what's in `last` being that, so that what React's given is the same element
+/// it was, which it doesn't draw again: elements of the same kind, with the same key and the same props, and what's in them the same.
+function sameElements(last, next) {
+    if (last === next || last === undefined) {
+        return next;
+    }
+    if (Array.isArray(next)) {
+        if (!Array.isArray(last) || last.length !== next.length) {
+            return next;
+        }
+        let all = true;
+        const out = next.map((one, at) => {
+            const kept = sameElements(last[at], one);
+            all &&= kept === last[at];
+            return kept;
+        });
+        return all ? last : out;
+    }
+    if (next === null || typeof next !== 'object' || last === null || typeof last !== 'object' || next.type === undefined
+        || last.type !== next.type || last.key !== next.key) {
+        return next;
+    }
+    if (sameElements(last.kids ?? undefined, next.kids ?? undefined) !== (last.kids ?? undefined)) {
+        return next;
+    }
+    const [a, b] = [last.props ?? NO_LOOK, next.props ?? NO_LOOK];
+    if (a === b) {
+        return last;
+    }
+    // A component that isn't an element's, or `memo`'s, is rendered again given an object, or a function, as React has it, which
+    // may say something else now (see `JsProps` in bridge.rs), so it isn't kept.
+    const shallow = typeof next.type !== 'function' || next.type.__rsuiShallow === true;
+    let count = 0;
+    for (const name in b) {
+        count += 1;
+        const value = b[name];
+        const same = name === 'children'
+            ? sameElements(a.children, value) === a.children
+            : Object.is(a[name], value) && name in a && (shallow || value === null || (typeof value !== 'object' && typeof value !== 'function'));
+        if (!same) {
+            return next;
+        }
+    }
+    for (const _ in a) {
+        count -= 1;
+    }
+    return count === 0 ? last : next;
+}
+
+// A block with a long list in it of what code made, as an editor's root is with a document of thousands of paragraphs, comes out
+// of what `Styled` does with what's in an element as it went in, when each of them is a block: nothing's put on lines, floats, or
+// is told where it is. What's in it then is kept, and the next time it's drawn, if only some of them have been put in or taken
+// out, and what's put in is blocks of the same kind, which `layout.rs` says go nowhere else, it's what it was given as it is, without
+// going through each of them again. What tells where things are among the rest (`withNth`), what goes down from above
+// (`applyNested`), and anything with parts (`::before`, `::after`) or a box of its own around the rest (a list's items, a
+// summary, a fieldset, a form) aren't kept.
+
+/// How long a list has to be before it's kept.
+const KEPT_FROM = 64;
+
+function forgetKinds() {
+    kindsForgotten += 1;
+    natives.cssForget(layout);
+}
+
+/// Whether a host made for `tag` with this look can keep what's in it.
+function keepsKids(tag, look, nested, parts, kept) {
+    return BLOCK_TAGS.has(tag) && !TEXT_TAGS.has(tag) && tag !== 'li' && tag !== 'summary' && tag !== 'details' && tag !== 'form' && tag !== 'fieldset'
+        && !structural && nested.length === 0 && parts.before === undefined && parts.after === undefined && look.display === undefined
+        && look.direction === undefined && look.__flex !== true && look.tablePart === undefined && look.__case === undefined && kept.heldLine !== true;
+}
+
+/// Everything apart from what's in it that what `Styled` does with that depends on, which has to be the same for what was kept to
+/// be used: the rules that go down to it, what CSS says, and what's been learned about the kind of thing that's in it.
+function keptSignature(look, inner, kids) {
+    const type = isValidElement(kids[0]) ? kids[0].type : undefined;
+    const flow = typeof type === 'function' ? [type.__webFlowSeen, type.__webInline, type.__webText, type.__webStyled, type.__webField, type.__webTag] : [];
+    return [look.__whiteSpace, inner, version, declared, kindsForgotten, ofType, complexFloats(), complexLineBoxes(), flowLearnedCount, type, ...flow];
+}
+
+function sameSaid(a, b) {
+    return a.length === b.length && a.every((one, at) => Object.is(one, b[at]));
+}
+
+/// Whether two lists have the same things in them, in the same order.
+function sameList(a, b) {
+    if (a.length !== b.length) {
+        return false;
+    }
+    for (let at = 0; at < a.length; at += 1) {
+        if (a[at] !== b[at]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether everything in a list is an element of the kind `said` was worked out for, with a key of its own.
+function keptType(list, said) {
+    const type = said[8];
+    if (typeof type !== 'function') {
+        return false;
+    }
+    for (const one of list) {
+        if (!isValidElement(one) || one.type !== type || one.key === null || one.key === undefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// What's in a block, as what was kept for it, when only some of it has been put in or taken out since, or `null`. What's the same
+/// at its start and its end is found by looking at each, which is all it costs: what's between is what's new, which is looked at
+/// as `Styled` would.
+function keptKids(kept, kids, said, tag, inner) {
+    const last = kept.kids;
+    if (last === undefined || !sameSaid(last.said, said)) {
+        return null;
+    }
+    const old = last.list;
+    if (old === kids) {
+        return kids;
+    }
+    const most = Math.min(old.length, kids.length);
+    let start = 0;
+    while (start < most && old[start] === kids[start]) {
+        start += 1;
+    }
+    let end = 0;
+    while (end < most - start && old[old.length - 1 - end] === kids[kids.length - 1 - end]) {
+        end += 1;
+    }
+    const added = kids.slice(start, kids.length - end);
+    if (added.length > 0) {
+        if (!keptType(added, said) || natives.cssChildren(layout, added, ALONG, tag) || anyFloats(added, inner)
+            || natives.cssChildren(layout, added, LINE_BOXES) || (inner !== null && complexLineBoxes() && added.some((child) => lineBoxFromAbove(child, inner)))
+            || (natives.cssChildren(layout, added, TEXT_KINDS) & 1) !== 0 || (natives.cssChildren(layout, added, LINES, false) ?? []).some((one) => one === true)) {
+            return null;
+        }
+    }
+    last.list = kids;
+    return kids;
+}
+
+function makeHandlers(setState) {
+    return new StateHandlers(setState);
+}
+
+/// What sets each bit of a `Styled`'s state that Rust says, as whether it's hovered: each made the first time it's asked for, the
+/// same one after that, as most of a page's elements have no CSS about any of them, and are never given one.
+class StateHandlers {
+    constructor(setState) {
+        this.setState = setState;
+        this.made = null;
+    }
+    of(bit, at) {
+        const made = (this.made ??= [undefined, undefined, undefined, undefined, undefined]);
+        const setState = this.setState;
+        return (made[at] ??= (on) => setState((was) => (on ? was | bit : was & ~bit)));
+    }
+    get hover() {
+        return this.of(HOVER, 0);
+    }
+    get press() {
+        return this.of(PRESS, 1);
+    }
+    get focus() {
+        return this.of(FOCUS, 2);
+    }
+    get within() {
+        return this.of(WITHIN, 3);
+    }
+    get ring() {
+        return this.of(RING, 4);
+    }
+}
+
+// Events as a page has them. Rust sends each from the root down to what it happened to and back up, to whatever offers to
+// hear it, and says what's on the way there; see `app_events.rs` in rsui and `event_value` in `bridge.rs`. Each element
+// with a handler or a `ref` has a handle, kept here by its key for as long as it's there, so that what an event happened to
+// is the same as what a `ref` holds. Anything else it happened to is made up from what the tree says about it.
+
+/// Each element's handle, by its key.
+const handles = new Map();
+/// What a tag is, for something with no handle, by what it is in the tree.
+const ROLE_TAGS = { group: 'DIV', text: 'SPAN', button: 'BUTTON', link: 'A', text_input: 'INPUT', checkbox: 'INPUT', list: 'UL', list_item: 'LI', image: 'IMG', dialog: 'DIALOG', menu: 'MENU', menu_item: 'LI', scroll: 'DIV', window: 'BODY' };
+
+// What elements are, as a page has them, so that `node instanceof HTMLElement` and the like say what they would, which code that's
+// written for a page checks before it does anything with one. Each element's handle is one of these.
+
+class PageEventTarget {
+    addEventListener(type, listener, options) {
+        listenOnElement(this, String(type), listener, options);
+    }
+    removeEventListener(type, listener, options) {
+        unlistenOnElement(this, String(type), listener, options);
+    }
+    dispatchEvent(event) {
+        return dispatchOn(this, event);
+    }
+}
+class PageNode extends PageEventTarget {}
+const NODE_CONSTANTS = { ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16 };
+// On each node too, as `node.TEXT_NODE` is asked.
+Object.assign(PageNode, NODE_CONSTANTS);
+Object.assign(PageNode.prototype, NODE_CONSTANTS);
+class PageElement extends PageNode {}
+class PageHTMLElement extends PageElement {}
+
+/// The form a field is in, or the one its `form` attribute names, as `input.form` is, or null.
+function formOf(element) {
+    const said = givenAttribute(element, 'form');
+    if (typeof said === 'string' && said !== '') {
+        const named = globalThis.document?.getElementById?.(said) ?? null;
+        return named?.localName === 'form' ? named : null;
+    }
+    return element.closest?.('form') ?? null;
+}
+class PageSVGElement extends PageElement {}
+class PageDocument extends PageNode {}
+// What's in a shadow root is never here, as nothing makes one, but code checks for it, as Ant Design's `instanceof ShadowRoot` does.
+class PageDocumentFragment extends PageNode {}
+class PageShadowRoot extends PageDocumentFragment {}
+/// Each kind of element a page has its own class for, by its tag, and the name it goes by.
+const ELEMENT_CLASSES = { fieldset: 'HTMLFieldSetElement', input: 'HTMLInputElement', textarea: 'HTMLTextAreaElement', button: 'HTMLButtonElement', a: 'HTMLAnchorElement', img: 'HTMLImageElement', canvas: 'HTMLCanvasElement', video: 'HTMLVideoElement', dialog: 'HTMLDialogElement', select: 'HTMLSelectElement', option: 'HTMLOptionElement', optgroup: 'HTMLOptGroupElement', form: 'HTMLFormElement', div: 'HTMLDivElement', span: 'HTMLSpanElement', li: 'HTMLLIElement', ul: 'HTMLUListElement', table: 'HTMLTableElement', tr: 'HTMLTableRowElement', td: 'HTMLTableCellElement', th: 'HTMLTableCellElement', label: 'HTMLLabelElement', p: 'HTMLParagraphElement', output: 'HTMLOutputElement' };
+const elementClasses = { EventTarget: PageEventTarget, Node: PageNode, Element: PageElement, HTMLElement: PageHTMLElement, SVGElement: PageSVGElement, Document: PageDocument,
+    DocumentFragment: PageDocumentFragment, ShadowRoot: PageShadowRoot };
+for (const name of new Set(Object.values(ELEMENT_CLASSES))) {
+    elementClasses[name] = class extends PageHTMLElement {};
+}
+
+/// What a field shows, as `value` says: what code last set, until it's drawn again, or what it was drawn with.
+function fieldValueOf(element) {
+    const live = element.__live;
+    if (live === undefined) {
+        return element.__ownValue ?? '';
+    }
+    if (live.tag === 'input' && /^(checkbox|radio)$/i.test(String(live.given?.type ?? ''))) {
+        // A box's value is what it stands for, as Checkbox.Group and Radio.Group read from the event, and not whether it's ticked,
+        // which is `checked`: "on" if it's given none.
+        const said = live.attributes?.value ?? live.given?.value ?? live.given?.defaultValue;
+        return said === undefined || said === null ? 'on' : String(said);
+    }
+    const value = live.pendingValue ?? live.current?.value ?? live.given?.value ?? live.given?.defaultValue;
+    return value === undefined || value === null ? '' : String(value);
+}
+
+for (const name of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement']) {
+    Object.defineProperty(elementClasses[name].prototype, 'value', {
+        get() {
+            return fieldValueOf(this);
+        },
+        set(value) {
+            const text = value === null || value === undefined ? '' : String(value);
+            const live = this.__live;
+            if (live === undefined) {
+                this.__ownValue = text;
+                return;
+            }
+            live.pendingValue = text;
+            live.current?.set?.(text);
+            if (this.__valueAtFocus !== undefined) {
+                // What code puts in it isn't a change it's sent `change` for.
+                this.__valueAtFocus = text;
+            }
+            // Code setting what's in it puts the caret at the end, as in a browser.
+            this.__selection = { start: text.length, end: text.length, direction: 'forward', value: text, rustAt: rsuiHostMethods.fieldSelection?.()?.[3] ?? 0 };
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+
+/// An `<output>`'s value is the text in it, and setting it puts that text in it, as the DOM has it.
+Object.defineProperty(elementClasses.HTMLOutputElement.prototype, 'value', {
+    get() {
+        return this.textContent ?? '';
+    },
+    set(value) {
+        this.textContent = value === null || value === undefined ? '' : String(value);
+    },
+    enumerable: true,
+    configurable: true,
+});
+
+// Constraint validation on each control, as a browser has it: see `controlValidity`.
+for (const name of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement']) {
+    Object.defineProperties(elementClasses[name].prototype, Object.getOwnPropertyDescriptors({
+        get validity() {
+            return controlValidity(this) ?? { valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false,
+                rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false, valid: true };
+        },
+        get willValidate() {
+            return controlValidity(this) !== null;
+        },
+        get validationMessage() {
+            return validationMessageOf(this);
+        },
+        setCustomValidity(message) {
+            const text = String(message ?? '');
+            if ((this.__customValidity ?? '') !== text) {
+                this.__customValidity = text;
+                // What CSS says about whether it's valid follows.
+                if (validityAsked) {
+                    this.__live?.redraw?.();
+                }
+            }
+        },
+        checkValidity() {
+            const validity = controlValidity(this);
+            if (validity === null || validity.valid) {
+                return true;
+            }
+            dispatchOn(this, new globalThis.Event('invalid', { bubbles: false, cancelable: true }));
+            return false;
+        },
+        reportValidity() {
+            const validity = controlValidity(this);
+            if (validity === null || validity.valid) {
+                return true;
+            }
+            if (dispatchOn(this, new globalThis.Event('invalid', { bubbles: false, cancelable: true }))) {
+                reportInvalid(this);
+            }
+            return false;
+        },
+    }));
+}
+
+/// The kinds of `<input>` that have a caret code can ask about, as a browser has them: the others say `null`.
+const SELECTABLE_TYPES = new Set(['text', 'search', 'url', 'tel', 'password']);
+function hasSelection(element) {
+    const live = element.__live;
+    if ((live?.tag ?? element.localName) === 'textarea') {
+        return true;
+    }
+    return SELECTABLE_TYPES.has(String(live?.attributes?.type ?? live?.given?.type ?? 'text').toLowerCase());
+}
+
+/// Where the caret and what's selected are in a field, as `selectionStart`, `selectionEnd` and `selectionDirection` say. The caret
+/// itself is Rust's; what's kept here is where code last put it, and once what's in the field has changed since, just after what
+/// changed, which is where typing or deleting leaves it. Before either, it's at the end.
+function selectionOf(element) {
+    const value = fieldValueOf(element);
+    let kept = element.__selection;
+    // Where Rust has the caret, for the field that has the keyboard, once it's moved since code last put it somewhere.
+    const rust = rsuiHostMethods.fieldSelection?.();
+    const key = element.__live?.domKey ?? element.__domKey;
+    if (rust !== undefined && key !== undefined && rust[0] === key && (kept?.rustAt ?? 0) < rust[3]) {
+        const [anchor, caret] = [unitsAt(value, rust[1]), unitsAt(value, rust[2])];
+        if (anchor !== undefined && caret !== undefined) {
+            kept = { start: Math.min(anchor, caret), end: Math.max(anchor, caret), direction: caret < anchor ? 'backward' : 'forward', value, rustAt: rust[3] };
+            element.__selection = kept;
+            return kept;
+        }
+    }
+    if (kept === undefined) {
+        return { start: value.length, end: value.length, direction: 'forward' };
+    }
+    if (kept.value !== value) {
+        const before = kept.value;
+        const most = Math.min(before.length, value.length);
+        let same = 0;
+        while (same < most && before.charCodeAt(same) === value.charCodeAt(same)) {
+            same += 1;
+        }
+        let after = 0;
+        while (after < most - same && before.charCodeAt(before.length - 1 - after) === value.charCodeAt(value.length - 1 - after)) {
+            after += 1;
+        }
+        const at = value.length - after;
+        kept = { start: at, end: at, direction: 'forward', value, rustAt: kept.rustAt };
+        element.__selection = kept;
+    }
+    return kept;
+}
+
+/// Where a byte of UTF-8 is in text, in the UTF-16 units a page counts in, or `undefined` if the text isn't that long or it's
+/// partway through a character.
+function unitsAt(text, byte) {
+    let bytes = 0;
+    let units = 0;
+    for (const character of text) {
+        if (bytes >= byte) {
+            break;
+        }
+        const code = character.codePointAt(0);
+        bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+        units += character.length;
+    }
+    return bytes === byte ? units : undefined;
+}
+
+/// What `setSelectionRange()` does: keeps where code put it, and if the field has the keyboard, moves its caret there.
+function setFieldSelection(element, start, end, direction) {
+    const value = fieldValueOf(element);
+    const place = (at) => Math.min(Math.max(0, Math.trunc(Number(at)) || 0), value.length);
+    const to = place(end ?? start);
+    const from = Math.min(place(start), to);
+    // Chromium says `forward` for a selection without a direction, on Windows.
+    const way = direction === 'backward' ? 'backward' : 'forward';
+    const before = element.__selection;
+    // What Rust says it has from before this isn't where it is any more, until it says so again.
+    element.__selection = { start: from, end: to, direction: way, value, rustAt: rsuiHostMethods.fieldSelection?.()?.[3] ?? 0 };
+    // Selecting some of it, where something else was, is said with `select`, once what's running now has finished, as a
+    // browser does.
+    if (from !== to && (before === undefined || before.start !== from || before.end !== to || before.value !== value)) {
+        selectHeard(element);
+    }
+    if (before === undefined || before.start !== from || before.end !== to || before.direction !== way || before.value !== value) {
+        selectionChanged(element);
+    }
+    if (focusedElement === element) {
+        const key = element.__live?.domKey ?? element.__domKey;
+        if (key !== undefined) {
+            // From where it's held to where the caret is, which is the start if it was selected backwards.
+            const [anchor, caret] = way === 'backward' ? [to, from] : [from, to];
+            rsuiHostMethods.selectText?.(key, anchor, caret);
+        }
+    }
+}
+
+for (const name of ['HTMLInputElement', 'HTMLTextAreaElement']) {
+    const proto = elementClasses[name].prototype;
+    for (const [prop, part] of [['selectionStart', 'start'], ['selectionEnd', 'end'], ['selectionDirection', 'direction']]) {
+        Object.defineProperty(proto, prop, {
+            get() {
+                if (!hasSelection(this)) {
+                    return null;
+                }
+                const said = selectionOf(this)[part];
+                // A browser on Windows says a selection that goes neither way goes forward, as Edge and Chrome do.
+                return said === 'none' ? 'forward' : said;
+            },
+            set(value) {
+                if (!hasSelection(this)) {
+                    return;
+                }
+                const now = selectionOf(this);
+                if (part === 'start') {
+                    setFieldSelection(this, value, Math.max(Number(value) || 0, now.end), now.direction);
+                } else if (part === 'end') {
+                    setFieldSelection(this, Math.min(now.start, Number(value) || 0), value, now.direction);
+                } else {
+                    setFieldSelection(this, now.start, now.end, value);
+                }
+            },
+            enumerable: true,
+            configurable: true,
+        });
+    }
+    Object.defineProperty(proto, 'setSelectionRange', {
+        value: function setSelectionRange(start, end, direction) {
+            if (hasSelection(this)) {
+                setFieldSelection(this, start, end, direction);
+            }
+        },
+        writable: true,
+        configurable: true,
+    });
+    Object.defineProperty(proto, 'setRangeText', {
+        value: function setRangeText(replacement, start, end, mode = 'preserve') {
+            const value = fieldValueOf(this);
+            const now = selectionOf(this);
+            const from = Math.min(Math.max(0, start ?? now.start), value.length);
+            const to = Math.min(Math.max(from, end ?? now.end), value.length);
+            const text = String(replacement);
+            this.value = value.slice(0, from) + text + value.slice(to);
+            const grown = text.length - (to - from);
+            const after = from + text.length;
+            if (mode === 'select') {
+                setFieldSelection(this, from, after);
+            } else if (mode === 'start') {
+                setFieldSelection(this, from, from);
+            } else if (mode === 'end') {
+                setFieldSelection(this, after, after);
+            } else {
+                const moved = (at) => (at <= from ? at : at >= to ? at + grown : from);
+                setFieldSelection(this, moved(now.start), moved(now.end), now.direction);
+            }
+        },
+        writable: true,
+        configurable: true,
+    });
+}
+
+/// Says some of a field's text has been selected, with `select` at it, which goes up through what it's in, once what's running now
+/// has finished, and once for however many times that's happened by then, as a browser does.
+function selectHeard(element) {
+    if (element.__selectDue === true) {
+        return;
+    }
+    element.__selectDue = true;
+    setTimeout(() => {
+        element.__selectDue = false;
+        let made;
+        try {
+            made = new globalThis.Event('select', { bubbles: true, cancelable: false });
+            made.isTrusted = true;
+        } catch {
+            return;
+        }
+        dispatchOn(element, made);
+    }, 0);
+}
+
+/// What `select()` does to a field: all of it, as `setSelectionRange(0, length)`.
+function selectField(element) {
+    if (hasSelection(element) && /^(input|textarea)$/.test(element.__live?.tag ?? element.localName ?? '')) {
+        setFieldSelection(element, 0, fieldValueOf(element).length);
+    }
+}
+Object.defineProperty(elementClasses.HTMLInputElement.prototype, 'checked', {
+    get() {
+        const live = this.__live;
+        return live?.pendingChecked ?? live?.given?.checked ?? live?.given?.defaultChecked ?? this.__ownChecked ?? false;
+    },
+    set(on) {
+        if (this.__live === undefined) {
+            this.__ownChecked = !!on;
+        } else {
+            this.__live.pendingChecked = !!on;
+            // One that keeps whether it's checked itself keeps what code set, as a browser's does once it's been set (its
+            // dirtiness), rather than going back to `defaultChecked` when it's drawn again.
+            this.__live.current?.setChecked?.(!!on);
+            const given = this.__live.given ?? {};
+            if (on && String(given.type ?? '').toLowerCase() === 'radio' && typeof given.name === 'string' && given.name !== '') {
+                // Checking a radio unchecks the others of its group, as a browser does, those in the same form with the same name.
+                const form = this.closest?.('form') ?? null;
+                for (const other of (form ?? page).querySelectorAll('input[type=radio]')) {
+                    if (other !== this && other.__live?.given?.name === given.name && (other.closest?.('form') ?? null) === form && other.checked) {
+                        other.__live.pendingChecked = false;
+                        other.__live.current?.setChecked?.(false);
+                    }
+                }
+            }
+        }
+    },
+    enumerable: true,
+    configurable: true,
+});
+for (const name of ['type', 'name', 'placeholder', 'disabled', 'readOnly', 'required', 'min', 'max', 'step', 'maxLength', 'pattern']) {
+    Object.defineProperty(elementClasses.HTMLInputElement.prototype, name, {
+        get() {
+            const said = this.__live?.given?.[name];
+            if (name === 'type') {
+                return String(said ?? 'text').toLowerCase();
+            }
+            if (name === 'disabled' || name === 'readOnly' || name === 'required') {
+                return said === true || said === '';
+            }
+            return said === undefined ? '' : said;
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+
+/// What an element was given, or had set on it since, by a name React or an attribute has for it.
+function givenAttribute(element, prop) {
+    const live = element.__live;
+    return live?.attributes?.[prop] ?? live?.given?.[prop];
+}
+for (const [name, kind] of [['hidden', 'flag'], ['title', 'text'], ['lang', 'text'], ['dir', 'text'], ['accessKey', 'text'], ['draggable', 'flag'],
+    ['spellcheck', 'flag'], ['translate', 'flag'], ['inert', 'flag'], ['role', 'text'], ['slot', 'text']]) {
+    Object.defineProperty(PageHTMLElement.prototype, name, {
+        get() {
+            const said = givenAttribute(this, name === 'spellcheck' ? 'spellCheck' : name);
+            return kind === 'flag' ? said === true || said === '' || said === 'true' : said === undefined || said === null ? '' : String(said);
+        },
+        set(value) {
+            const live = this.__live;
+            if (live !== undefined) {
+                setAttributeOn(live, name, kind === 'flag' ? (value ? '' : null) : String(value));
+            }
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+Object.defineProperty(PageHTMLElement.prototype, 'tabIndex', {
+    get() {
+        const said = givenAttribute(this, 'tabIndex');
+        if (said !== undefined && said !== null && !Number.isNaN(Number(said))) {
+            return Number(said);
+        }
+        const tag = this.__live?.tag ?? this.localName;
+        return FOCUS_TAGS.has(tag) || (tag === 'a' && givenAttribute(this, 'href') !== undefined) ? 0 : -1;
+    },
+    set(value) {
+        if (this.__live !== undefined) {
+            setAttributeOn(this.__live, 'tabIndex', String(value));
+        }
+    },
+    enumerable: true,
+    configurable: true,
+});
+// ARIA's attributes as properties, as ARIA 1.2 reflects them: `ariaDisabled` is the `aria-disabled` attribute, or `null` without
+// one. react-resizable-panels takes a separator whose `ariaDisabled` isn't `null` to be disabled, so none could be dragged.
+for (const name of ['atomic', 'autoComplete', 'brailleLabel', 'brailleRoleDescription', 'busy', 'checked', 'colCount', 'colIndex', 'colIndexText', 'colSpan',
+    'current', 'description', 'disabled', 'expanded', 'hasPopup', 'hidden', 'invalid', 'keyShortcuts', 'label', 'level', 'live', 'modal',
+    'multiLine', 'multiSelectable', 'orientation', 'placeholder', 'posInSet', 'pressed', 'readOnly', 'relevant', 'required',
+    'roleDescription', 'rowCount', 'rowIndex', 'rowIndexText', 'rowSpan', 'selected', 'setSize', 'sort', 'valueMax', 'valueMin',
+    'valueNow', 'valueText']) {
+    const attribute = 'aria-' + name.toLowerCase();
+    Object.defineProperty(PageElement.prototype, 'aria' + name[0].toUpperCase() + name.slice(1), {
+        get() {
+            return typeof this.getAttribute === 'function' ? this.getAttribute(attribute) : null;
+        },
+        set(value) {
+            if (value === null || value === undefined) {
+                this.removeAttribute?.(attribute);
+            } else {
+                this.setAttribute?.(attribute, String(value));
+            }
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+// What's moving on an element, as CSS's animations and transitions are: each as a `CSSAnimation` or `CSSTransition` that's running,
+// with what it is, how many times it goes, and `finished`, which is once it's said it's ended. What isn't heard starting and ending
+// (see `hearsMotion`) isn't known to be moving, and what waits for that, as Headless UI does before it takes something away, goes
+// straight on.
+PageElement.prototype.getAnimations = function getAnimations() {
+    return movingOn(this.__live, this);
+};
+
+/// What's moving on an element whose drawing is `live`: see `getAnimations`.
+function movingOn(live, element) {
+    const out = [];
+    if (live === undefined || live === null) {
+        return out;
+    }
+    if (live.animationRunning !== undefined) {
+        out.push(cssMotion(live, element, 'CSSAnimation', live.animationRunning));
+    }
+    for (const prop of live.transitionsRunning ?? []) {
+        out.push(cssMotion(live, element, 'CSSTransition', prop));
+    }
+    return out;
+}
+
+/// One animation or transition that's running, as `getAnimations()` gives it.
+function cssMotion(live, element, kind, name) {
+    const finished = new Promise((resolve) => (live.motionWaiters ??= []).push(resolve));
+    const times = kind === 'CSSAnimation' ? live.animationTimes ?? 1 : 1;
+    const motion = {
+        id: '',
+        playState: 'running',
+        pending: false,
+        currentTime: null,
+        startTime: null,
+        playbackRate: 1,
+        finished,
+        ready: Promise.resolve(),
+        effect: {
+            target: element,
+            getComputedTiming: () => ({ iterations: times, duration: Number.parseFloat(live.animationDuration ?? '0') * 1000 || 0 }),
+            getTiming: () => ({ iterations: times }),
+        },
+        cancel() {},
+        finish() {},
+        pause() {},
+        play() {},
+        reverse() {},
+        commitStyles() {},
+        persist() {},
+        addEventListener() {},
+        removeEventListener() {},
+    };
+    finished.then(() => {
+        motion.playState = 'finished';
+    });
+    if (kind === 'CSSAnimation') {
+        motion.animationName = name;
+    } else {
+        motion.transitionProperty = name;
+    }
+    const made = globalThis[kind];
+    if (typeof made === 'function') {
+        Object.setPrototypeOf(motion, made.prototype);
+    }
+    return motion;
+}
+
+/// Says to what's waiting for what's moving on an element to finish that it has, once nothing is.
+function motionSettled(live) {
+    if (live.animationRunning === undefined && (live.transitionsRunning?.size ?? 0) === 0 && live.motionWaiters !== undefined) {
+        const waiting = live.motionWaiters;
+        live.motionWaiters = undefined;
+        for (const resolve of waiting) {
+            resolve();
+        }
+    }
+}
+
+/// Everything that's moving on the page, as `document.getAnimations()` says.
+function movingOnPage() {
+    const out = [];
+    for (const weak of pageLives.values()) {
+        const live = weak.deref();
+        if (live !== undefined && (live.animationRunning !== undefined || (live.transitionsRunning?.size ?? 0) > 0)) {
+            out.push(...movingOn(live, handleOf(live, live.tag)));
+        }
+    }
+    return out;
+}
+Object.defineProperty(PageHTMLElement.prototype, 'isContentEditable', {
+    get() {
+        const said = givenAttribute(this, 'contentEditable');
+        return said === true || said === '' || said === 'true' || said === 'plaintext-only';
+    },
+    configurable: true,
+});
+Object.defineProperty(PageHTMLElement.prototype, 'offsetParent', {
+    get() {
+        // The same until the tree, or where things are in it, changes, which is when what's positioned around it could: floating-ui
+        // asks it several times for each popover on every frame of scrolling, which went up through everything above it each time.
+        const tree = this.__domKey !== undefined && this.__placedByKey === true ? rsuiHostMethods.chainsNow() : undefined;
+        if (tree !== undefined && this.__offsetParentAt === tree) {
+            return this.__offsetParentWas;
+        }
+        const found = offsetParentOf(this);
+        if (tree !== undefined) {
+            this.__offsetParentAt = tree;
+            this.__offsetParentWas = found;
+        }
+        return found;
+    },
+    configurable: true,
+});
+/// What's positioned around an element, which is what its place is said from, as on a page.
+function offsetParentOf(element) {
+    // What's `position: fixed` (an overlay of the window by now, see `fixed` in layout.rs) has none, as in a browser, and is
+    // positioned for what's in it.
+    const fixed = (look) => look?.position === undefined && FIXED_OVERLAYS.has(look?.overlay);
+    if (fixed(element.__live?.look)) {
+        return null;
+    }
+    for (let at = element.parentElement; at !== null && at !== undefined; at = at.parentElement) {
+        if (at === body) {
+            return body;
+        }
+        const position = at.__live?.look?.position;
+        if ((position !== undefined && position !== 'static') || fixed(at.__live?.look)) {
+            return at;
+        }
+        // What's moved by a `transform` holds what's placed in it, and is what it's placed from, as Chromium has it.
+        const transform = lookOfLive(at.__live)?.transform ?? at.__live?.given?.style?.transform;
+        if (typeof transform === 'string' && transform !== '' && transform !== 'none') {
+            return at;
+        }
+        if (/^(td|th|table)$/.test(at.__live?.tag ?? '')) {
+            return at;
+        }
+    }
+    return body;
+}
+for (const tag of ['HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLButtonElement']) {
+    Object.defineProperty(elementClasses[tag].prototype, 'form', {
+        get() {
+            return formOf(this);
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+
+// What CSS asks about constraint validation (see `controlValidity`): `:valid` and `:invalid` of a field as it holds what it does,
+// of a form and a fieldset by what's in them, and `:user-valid` and `:user-invalid` once it's been used: what someone changed in
+// it is done with (`change`), a box clicked, or its form not sent for what's in it.
+
+/// Whether the page's CSS has asked whether a field's valid, which makes what changes that draw it again.
+let validityAsked = false;
+
+/// Whether a field says something of itself, as an attribute that's there (`required=""`) or a prop that's true.
+function saysFlag(value) {
+    return value === true || value === '';
+}
+
+/// Says a field's been used, which `:user-invalid` and `:user-valid` wait for.
+function fieldInteracted(live) {
+    if (live === undefined || live.userInteracted === true) {
+        return;
+    }
+    live.userInteracted = true;
+    if (validityAsked) {
+        live.redraw?.();
+    }
+}
+
+/// Whether CSS's `:valid` (`want` true) or `:invalid` (false) is about what's being matched, which it is only for what's checked:
+/// a field, by what it holds as it's drawn, and a form or a fieldset found in the page, by what's in it. `user` is `:user-valid`
+/// and `:user-invalid`, which wait until it's been used.
+function validityMatches(own, want, user) {
+    validityAsked = true;
+    const tag = own.tag;
+    const live = own.live ?? own.node?.live;
+    if (tag === 'form' || tag === 'fieldset') {
+        if (user || own.node === undefined || live === undefined) {
+            // What's in it is only known once it's drawn: while it's drawn, it's said to be valid.
+            return want && !user;
+        }
+        const element = handleOf(live, tag);
+        const invalid = Array.from(element.querySelectorAll?.('input, select, textarea') ?? []).some((one) => controlValidity(one)?.valid === false);
+        return want ? !invalid : invalid;
+    }
+    if (!FIELD_TAGS.has(tag) || (user && live?.userInteracted !== true)) {
+        return false;
+    }
+    const validity = controlValidity(own.node !== undefined && live !== undefined ? handleOf(live, tag) : drawnField(own, live));
+    return validity !== null && validity.valid === want;
+}
+
+/// A field being drawn, as `controlValidity` asks about one: what it's given now, which is what it holds as it's drawn, with what
+/// code said of it (`setCustomValidity()`) and where it is from the page.
+function drawnField(own, live) {
+    const given = own.props ?? {};
+    const handle = live?.handle ?? null;
+    return {
+        __live: { tag: own.tag, given, userEdited: live?.userEdited },
+        value: given.value ?? given.defaultValue ?? '',
+        checked: (live?.pendingChecked ?? given.checked ?? given.defaultChecked) === true,
+        __customValidity: handle?.__customValidity,
+        closest: (selector) => handle?.closest?.(selector) ?? null,
+    };
+}
+/// A `<select>`'s options, in order, as elements of the page (see `Select`): those right in it and those in its optgroups.
+function optionsOf(select) {
+    return Array.from(select.querySelectorAll?.('option') ?? []);
+}
+
+/// The `<select>` an `<option>` is in, if it's in one.
+function selectOf(option) {
+    const select = option.closest?.('select') ?? null;
+    return select === null || select === option ? null : select;
+}
+
+Object.defineProperties(elementClasses.HTMLSelectElement.prototype, {
+    // What's chosen is the first option whose value is the select's, as a browser keeps one chosen: -1 if none is.
+    selectedIndex: {
+        get() {
+            const value = this.value;
+            return optionsOf(this).findIndex((one) => one.value === value);
+        },
+        set(index) {
+            const option = optionsOf(this)[Number(index)];
+            this.value = option === undefined ? '' : option.value;
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    options: {
+        get() {
+            const list = optionsOf(this);
+            list.item = (index) => list[Number(index)] ?? null;
+            list.namedItem = (name) => list.find((one) => one.id === String(name) || one.getAttribute('name') === String(name)) ?? null;
+            Object.defineProperty(list, 'selectedIndex', { get: () => this.selectedIndex, set: (index) => { this.selectedIndex = index; } });
+            return list;
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    selectedOptions: {
+        get() {
+            const option = optionsOf(this)[this.selectedIndex];
+            return option === undefined ? [] : [option];
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    length: {
+        get() {
+            return optionsOf(this).length;
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    type: {
+        get() {
+            return this.hasAttribute?.('multiple') ? 'select-multiple' : 'select-one';
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    item: {
+        value(index) {
+            return optionsOf(this)[Number(index)] ?? null;
+        },
+        writable: true,
+        configurable: true,
+    },
+    namedItem: {
+        value(name) {
+            return this.options.namedItem(name);
+        },
+        writable: true,
+        configurable: true,
+    },
+});
+
+Object.defineProperties(elementClasses.HTMLOptionElement.prototype, {
+    // Its text with its spaces as a browser shows them, which is its value and its label when it says neither.
+    text: {
+        get() {
+            return String(this.textContent ?? '').replace(/\s+/g, ' ').trim();
+        },
+        set(text) {
+            this.textContent = String(text);
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    value: {
+        get() {
+            const said = this.getAttribute('value');
+            return said === null ? this.text : said;
+        },
+        set(value) {
+            this.setAttribute('value', String(value));
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    label: {
+        get() {
+            const said = this.getAttribute('label');
+            return said === null || said === '' ? this.text : said;
+        },
+        set(label) {
+            this.setAttribute('label', String(label));
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    index: {
+        get() {
+            const select = selectOf(this);
+            return select === null ? 0 : optionsOf(select).indexOf(this);
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    selected: {
+        get() {
+            const select = selectOf(this);
+            return select === null ? this.defaultSelected : select.selectedIndex === this.index;
+        },
+        set(on) {
+            const select = selectOf(this);
+            if (on && select !== null) {
+                select.value = this.value;
+            }
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    defaultSelected: {
+        get() {
+            return this.getAttribute('selected') !== null;
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    disabled: {
+        get() {
+            return this.getAttribute('disabled') !== null || this.parentElement?.localName === 'optgroup' && this.parentElement.getAttribute('disabled') !== null;
+        },
+        set(on) {
+            if (on) {
+                this.setAttribute('disabled', '');
+            } else {
+                this.removeAttribute('disabled');
+            }
+        },
+        enumerable: true,
+        configurable: true,
+    },
+    form: {
+        get() {
+            return selectOf(this)?.form ?? null;
+        },
+        enumerable: true,
+        configurable: true,
+    },
+});
+
+for (const [tags, props] of [
+    [['HTMLAnchorElement'], ['href', 'target', 'rel', 'download', 'hreflang', 'type']],
+    [['HTMLImageElement'], ['src', 'alt', 'srcset', 'sizes', 'crossOrigin', 'loading', 'decoding', 'referrerPolicy']],
+    [['HTMLLabelElement'], ['htmlFor']],
+    [['HTMLButtonElement', 'HTMLSelectElement', 'HTMLTextAreaElement'], ['name', 'disabled', 'type', 'autofocus', 'required', 'placeholder', 'rows', 'cols', 'multiple', 'size']],
+    [['HTMLFormElement'], ['name', 'target', 'enctype', 'noValidate', 'autocomplete']],
+    [['HTMLDialogElement'], ['open']],
+]) {
+    for (const tag of tags) {
+        for (const name of props) {
+            if (Object.getOwnPropertyDescriptor(elementClasses[tag].prototype, name) !== undefined) {
+                continue;
+            }
+            Object.defineProperty(elementClasses[tag].prototype, name, {
+                get() {
+                    const said = givenAttribute(this, name);
+                    if (['disabled', 'autofocus', 'required', 'multiple', 'noValidate', 'open'].includes(name)) {
+                        return said === true || said === '';
+                    }
+                    if (name === 'type' && tag === 'HTMLButtonElement') {
+                        return String(said ?? 'submit').toLowerCase();
+                    }
+                    if (name === 'href' && typeof said === 'string') {
+                        try {
+                            return new URL(said, globalThis.location?.href ?? 'file:///').href;
+                        } catch {
+                            return said;
+                        }
+                    }
+                    return said === undefined || said === null ? '' : said;
+                },
+                set(value) {
+                    if (this.__live !== undefined) {
+                        setAttributeOn(this.__live, name, value === false || value === null ? null : String(value));
+                    }
+                },
+                enumerable: true,
+                configurable: true,
+            });
+        }
+    }
+}
+
+/// What an element of this kind is an instance of: the global class, if there is one, which is what `instanceof` looks at.
+function prototypeFor(tag) {
+    const name = SVG_TAGS[tag] !== undefined ? 'SVGElement' : ELEMENT_CLASSES[tag] ?? 'HTMLElement';
+    const made = globalThis[name] ?? elementClasses[name];
+    return typeof made === 'function' ? made.prototype : PageHTMLElement.prototype;
+}
+
+/// What's been given to `addEventListener` on elements, by element, and then by kind of event, each with whether it's for the
+/// way down and whether it's only for once.
+const elementListeners = new WeakMap();
+
+function listenOnElement(element, type, listener, options) {
+    if (listener === null || listener === undefined) {
+        return;
+    }
+    const capture = options === true || options?.capture === true;
+    let kinds = elementListeners.get(element);
+    if (kinds === undefined) {
+        kinds = new Map();
+        elementListeners.set(element, kinds);
+    }
+    const list = kinds.get(type) ?? [];
+    if (list.some((one) => one.listener === listener && one.capture === capture)) {
+        return;
+    }
+    list.push({ listener, capture, once: options?.once === true });
+    kinds.set(type, list);
+    options?.signal?.addEventListener?.('abort', () => unlistenOnElement(element, type, listener, options));
+    elementListened(type, 1);
+    // The pointer coming over it or leaving it is told by what it's drawn with, which has to be drawn again to say so, the first
+    // time something listens, as Floating UI's `useHover` does for a tooltip.
+    const live = element.__live;
+    if (HOVER_TYPES.has(type) && live !== undefined && live.nativeHover !== true) {
+        live.nativeHover = true;
+        live.redraw?.();
+    }
+    // What's listening for an animation or a transition to start or end is told, as Radix's Presence waits for `animationend` of
+    // a closing dialog's `animate-out` before it takes it away: Rust only says it's ended for what's drawn to hear that.
+    if (MOTION_TYPES.has(type) && live !== undefined && live.motionListened !== true) {
+        live.motionListened = true;
+        live.redraw?.();
+    }
+}
+
+/// What's heard as an animation or a transition starts or ends.
+const MOTION_TYPES = new Set(['animationstart', 'animationend', 'animationcancel', 'animationiteration', 'transitionend', 'transitionstart', 'transitionrun', 'transitioncancel']);
+
+/// What's heard as the pointer comes over something, or leaves it.
+const HOVER_TYPES = new Set(['mouseenter', 'mouseleave', 'pointerenter', 'pointerleave', 'mouseover', 'mouseout', 'pointerover', 'pointerout']);
+
+function unlistenOnElement(element, type, listener, options) {
+    const capture = options === true || options?.capture === true;
+    const list = elementListeners.get(element)?.get(type);
+    if (list === undefined) {
+        return;
+    }
+    const at = list.findIndex((one) => one.listener === listener && one.capture === capture);
+    if (at >= 0) {
+        list.splice(at, 1);
+        elementListened(type, -1);
+    }
+}
+
+/// Runs what's listening on `element` for this event, on the way down if `capture` says so, and on the way back up otherwise,
+/// or both when it's what the event happened to. Says whether anything said nothing further along should hear it.
+function heardBy(element, event, capture) {
+    const list = elementListeners.get(element)?.get(event.type);
+    if (list === undefined || list.length === 0) {
+        return false;
+    }
+    event.currentTarget = element;
+    for (const one of list.slice()) {
+        if (capture !== null && one.capture !== capture) {
+            continue;
+        }
+        if (one.once) {
+            unlistenOnElement(element, event.type, one.listener, one);
+        }
+        try {
+            if (typeof one.listener === 'function') {
+                one.listener.call(element, event);
+            } else {
+                one.listener.handleEvent?.(event);
+            }
+        } catch (error) {
+            console.error(error);
+        }
+        if (event.__immediate === true) {
+            break;
+        }
+    }
+    return event.__stopped === true;
+}
+
+/// Which of React's props hear each kind of event, as React's root hears them on the way down (with `Capture`) and back up.
+const REACT_HEARS = {
+    click: 'onClick', dblclick: 'onDoubleClick', auxclick: 'onAuxClick', contextmenu: 'onContextMenu', mousedown: 'onMouseDown', mouseup: 'onMouseUp',
+    mousemove: 'onMouseMove', mouseover: 'onMouseOver', mouseout: 'onMouseOut', pointerdown: 'onPointerDown', pointerup: 'onPointerUp',
+    pointermove: 'onPointerMove', pointerover: 'onPointerOver', pointerout: 'onPointerOut', pointercancel: 'onPointerCancel',
+    gotpointercapture: 'onGotPointerCapture', lostpointercapture: 'onLostPointerCapture', keydown: 'onKeyDown', keyup: 'onKeyUp', keypress: 'onKeyPress',
+    input: 'onInput', beforeinput: 'onBeforeInput', change: 'onChange', submit: 'onSubmit', reset: 'onReset', invalid: 'onInvalid', focusin: 'onFocus',
+    focusout: 'onBlur', wheel: 'onWheel', touchstart: 'onTouchStart', touchmove: 'onTouchMove', touchend: 'onTouchEnd', touchcancel: 'onTouchCancel',
+    dragstart: 'onDragStart', drag: 'onDrag', dragend: 'onDragEnd', dragenter: 'onDragEnter', dragleave: 'onDragLeave', dragover: 'onDragOver',
+    drop: 'onDrop', copy: 'onCopy', cut: 'onCut', paste: 'onPaste', compositionstart: 'onCompositionStart', compositionupdate: 'onCompositionUpdate',
+    compositionend: 'onCompositionEnd', select: 'onSelect', animationstart: 'onAnimationStart', animationend: 'onAnimationEnd',
+    animationiteration: 'onAnimationIteration', transitionend: 'onTransitionEnd', transitionstart: 'onTransitionStart', transitionrun: 'onTransitionRun',
+    transitioncancel: 'onTransitionCancel',
+};
+/// What React only gives to what an event happened to, as these don't go up.
+const REACT_HEARS_HERE = {
+    mouseenter: 'onMouseEnter', mouseleave: 'onMouseLeave', pointerenter: 'onPointerEnter', pointerleave: 'onPointerLeave', scroll: 'onScroll',
+    scrollend: 'onScrollEnd', load: 'onLoad', error: 'onError', toggle: 'onToggle', cancel: 'onCancel', close: 'onClose',
+};
+
+/// The event as React gives it to a prop: the same event, with what's hearing it, and React's own ways of asking about it.
+function reactEvent(event, current, type) {
+    const synthetic = Object.create(event);
+    Object.defineProperties(synthetic, {
+        currentTarget: { value: current, writable: true, configurable: true },
+        nativeEvent: { value: event, configurable: true },
+        type: { value: type, writable: true, configurable: true },
+        defaultPrevented: { get: () => event.defaultPrevented === true, configurable: true },
+    });
+    synthetic.preventDefault = () => event.preventDefault?.();
+    synthetic.stopPropagation = () => event.stopPropagation?.();
+    synthetic.isDefaultPrevented = () => event.defaultPrevented === true;
+    synthetic.isPropagationStopped = () => event.__stopped === true;
+    synthetic.persist = () => {};
+    return synthetic;
+}
+
+/// The props an element of the page was given, which are what React has for it.
+const reactPropsOf = (element) => element?.__live?.given ?? null;
+
+/// Runs one of React's props on this element for this event, if it has it, and says whether anything stopped it going further.
+function runReact(element, event, name, type = event.type) {
+    const run = reactPropsOf(element)?.[name];
+    if (typeof run !== 'function') {
+        return event.__stopped === true;
+    }
+    try {
+        run(reactEvent(event, element, type));
+    } catch (error) {
+        console.error(error);
+    }
+    return event.__stopped === true;
+}
+
+/// What a field's `onChange` hears this event as too, as React has it: typing for text, a click for a box, and a change for a select.
+function alsoChange(element, type) {
+    const tag = element?.__live?.tag;
+    const kind = String(reactPropsOf(element)?.type ?? '').toLowerCase();
+    if (tag === 'input' && (kind === 'checkbox' || kind === 'radio')) {
+        return type === 'click';
+    }
+    if (tag === 'input' || tag === 'textarea') {
+        return type === 'input';
+    }
+    return tag === 'select' && type === 'change';
+}
+
+/// What an event goes through on its way to an element and back, nearest last: the elements it's in, then the element. For
+/// React's props, `react` says, that's through what a portal's written in, as React has it, rather than `body`.
+function elementsAlong(element, react = false) {
+    if (isOwnNode(element) || (domLoaded !== null && element?.__parent !== undefined && element?.__live === undefined)) {
+        // A node code made, or a Text node, is where the DOM has it, drawn or not: see `pathTo` in `dom.js`.
+        return domLoaded.pathTo(element).filter((one) => one !== body && one !== documentElement);
+    }
+    // Where it is now, by its key, as what an event last found may be from before, or there may never have been one.
+    const key = element?.__domKey;
+    const said = key === undefined ? undefined : rsuiHostMethods.chainOf(key);
+    if (react && said !== undefined && outOfPortal(said) !== said) {
+        const whole = said.filter((entry, at) => at === 0 || !onlyLaysOut(entry));
+        const along = [];
+        for (let at = 1; at < whole.length - 1; at += 1) {
+            const one = chainElement(whole, at);
+            if (one !== null) {
+                along.push(one);
+            }
+        }
+        // The element itself is where the DOM has it.
+        const own = pageChain(said);
+        element.__chain = own;
+        element.__index = own.length - 1;
+        along.push(element);
+        return along;
+    }
+    const now = pageChain(said);
+    if (now !== undefined) {
+        element.__chain = now;
+        element.__index = now.length - 1;
+    }
+    const chain = element?.__chain;
+    if (chain === undefined || element.__index === undefined) {
+        return [element];
+    }
+    const along = [];
+    for (let at = 1; at < element.__index; at += 1) {
+        const one = chainElement(chain, at);
+        if (one !== null && !onlyLaysOut(chain[at])) {
+            along.push(one);
+        }
+    }
+    along.push(element);
+    return along;
+}
+
+/// Runs what `document` or `window` has listening for this event, on the way down or back up.
+function heardAt(where, event, capture) {
+    const list = documentListeners.get(event.type) ?? [];
+    for (const one of list.slice()) {
+        if (one.where !== where || one.capture !== capture) {
+            continue;
+        }
+        event.currentTarget = where === 'window' ? globalThis : page;
+        if (one.once) {
+            unlistenOn(where, event.type, one.listener, one);
+        }
+        try {
+            if (typeof one.listener === 'function') {
+                one.listener.call(event.currentTarget, event);
+            } else {
+                one.listener.handleEvent?.(event);
+            }
+        } catch (error) {
+            console.error(error);
+        }
+        if (event.__immediate === true) {
+            break;
+        }
+    }
+    return event.__stopped === true;
+}
+
+/// What `element.dispatchEvent(event)` does, as on a page: down from `window` and `document` through what it's in to it, and back
+/// up if it bubbles, with React's props hearing it where React's root is, between what's on the elements and `document`. Then what
+/// a browser does by itself for a click that nothing said not to, like ticking a box or sending a form. It says whether nothing did.
+function dispatchOn(element, event) {
+    if (event === null || typeof event !== 'object' || typeof event.type !== 'string') {
+        throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
+    }
+    const type = event.type;
+    const along = elementsAlong(element);
+    try {
+        event.target = element;
+        event.__path = [...along].reverse().concat([body, documentElement, page, globalThis]);
+    } catch {
+        // An event that's already been sent keeps what it was sent to.
+    }
+    event.__stopped = false;
+    event.__immediate = false;
+    if (event.isTrusted === true && (type === 'input' || type === 'change' || type === 'click')) {
+        userChanged(element, type);
+    }
+    // What the page's listeners hear but React doesn't, as `change` as a field loses the keyboard: see `changedSinceFocus`.
+    const hears = event.__domOnly === true ? undefined : REACT_HEARS[type];
+    const reactAlong = hears === undefined ? along : elementsAlong(element, true);
+    const change = event.__domOnly !== true && alsoChange(element, type);
+    // What a box shows changes as it's clicked, before anything hears about it, and back if something says not to.
+    // Only a click that's a `MouseEvent` does what a click does (a browser's activation behaviour): `new Event('click')`, as Radix's
+    // hidden form input is sent after its `checked` is set, ticks nothing and sends nothing.
+    const activation = type === 'click' && mouseClick(event);
+    const toggles = activation && element?.__live?.tag === 'input' && /^(checkbox|radio)$/i.test(String(reactPropsOf(element)?.type ?? ''));
+    let wasChecked = null;
+    if (toggles) {
+        wasChecked = element.checked === true;
+        element.__live.pendingChecked = String(reactPropsOf(element)?.type).toLowerCase() === 'radio' ? true : !wasChecked;
+    }
+    const go = () => {
+        event.eventPhase = 1;
+        if (heardAt('window', event, true) || heardAt('document', event, true)) {
+            return;
+        }
+        if (hears !== undefined) {
+            for (const one of reactAlong) {
+                if (runReact(one, event, hears + 'Capture', type)) {
+                    return;
+                }
+            }
+        }
+        for (const one of along.slice(0, -1)) {
+            if (heardBy(one, event, true)) {
+                return;
+            }
+        }
+        event.eventPhase = 2;
+        if (heardBy(element, event, true) || heardBy(element, event, false)) {
+            return;
+        }
+        if (!event.bubbles) {
+            const here = REACT_HEARS_HERE[type] ?? hears;
+            if (here !== undefined) {
+                runReact(element, event, here, type);
+            }
+            if (change) {
+                runReact(element, event, 'onChange', 'change');
+            }
+            return;
+        }
+        event.eventPhase = 3;
+        for (const one of along.slice(0, -1).reverse()) {
+            if (heardBy(one, event, false)) {
+                return;
+            }
+        }
+        // React's props hear it where its root is, all the way up, and then a field's `onChange` hears it as an event of its own,
+        // which what stopped the first doesn't stop.
+        let stoppedInReact = false;
+        if (hears !== undefined) {
+            for (const one of [...reactAlong].reverse()) {
+                if (runReact(one, event, hears, type)) {
+                    stoppedInReact = true;
+                    break;
+                }
+            }
+        }
+        if (change) {
+            const was = event.__stopped;
+            event.__stopped = false;
+            runReact(element, event, 'onChange', 'change');
+            event.__stopped = was || event.__stopped;
+        }
+        if (stoppedInReact || event.__stopped === true || heardAt('document', event, false)) {
+            return;
+        }
+        heardAt('window', event, false);
+    };
+    go();
+    event.eventPhase = 0;
+    event.currentTarget = null;
+    const done = event.defaultPrevented !== true;
+    if (toggles && !done) {
+        element.__live.pendingChecked = wasChecked;
+    }
+    if (done && activation) {
+        activate(element, event);
+    }
+    return done;
+}
+
+/// What someone doing something to a field means for checking it: what they type is held to `minlength` and `maxlength`, and once
+/// what they've changed is done with (`change`), or a box has been clicked, it's been used, for `:user-invalid`.
+function userChanged(element, type) {
+    const live = element?.__live;
+    const tag = live?.tag;
+    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
+        return;
+    }
+    if (type === 'input' && live.userEdited !== true) {
+        live.userEdited = true;
+        const given = live.given ?? {};
+        if (validityAsked && (given.minLength !== undefined || given.maxLength !== undefined)) {
+            live.redraw?.();
+        }
+    }
+    const box = tag === 'input' && /^(checkbox|radio)$/i.test(String(live.given?.type ?? ''));
+    if (type === 'change' || (type === 'click' && box)) {
+        fieldInteracted(live);
+    }
+}
+
+/// Whether an event is a mouse's (or pointer's) click, which is what a browser's activation behaviour follows, rather than an
+/// `Event` that only says `click`.
+function mouseClick(event) {
+    try {
+        return event instanceof require('rsui/dom-events').MouseEvent;
+    } catch {
+        return true;
+    }
+}
+
+/// What has the keyboard, as `document.activeElement` says: known the moment it's given, before Rust has given it, as on a page.
+let focusedElement = null;
+/// What Rust has said has lost the keyboard, until it says what has it now: see `onFocus` in `eventProps`.
+let focusLeaving = null;
+/// What code last gave the keyboard to, by its key, and when, until Rust says it has it: Rust saying something else has it before
+/// then is about what code gave it to before, as React Aria's button and then its list are given it one after the other.
+let focusAsked = { key: undefined, at: -Infinity };
+const FOCUS_TAGS = new Set(['input', 'textarea', 'select', 'button', 'iframe']);
+
+/// Whether an element can have the keyboard: a field or a button that can be used, a link, or something with a `tabIndex`.
+function canFocus(element) {
+    const live = element?.__live;
+    const given = live?.given ?? {};
+    if (live === undefined || given.disabled === true) {
+        return false;
+    }
+    const tag = live.tag;
+    return FOCUS_TAGS.has(tag) || (tag === 'a' && typeof given.href === 'string') || given.tabIndex !== undefined || given.tabindex !== undefined
+        || saysEditable(given) || tag === 'summary';
+}
+
+function focusEvent(type, related, bubbles) {
+    const { FocusEvent } = domEvents();
+    const made = new FocusEvent(type, { bubbles, composed: true, relatedTarget: related, view: globalThis });
+    // It's the browser's own.
+    made.isTrusted = true;
+    return made;
+}
+
+const TEXT_FIELD_TAGS = new Set(['input', 'textarea']);
+
+/// A field that's losing the keyboard with something other in it than when it got it is sent `change`, before `blur`, as in a
+/// browser. React's `onChange` heard each change as it was typed, as React's own does, so it doesn't hear this one.
+function changedSinceFocus(field) {
+    const was = field.__valueAtFocus;
+    field.__valueAtFocus = undefined;
+    if (was === undefined || !TEXT_FIELD_TAGS.has(field.__live?.tag) || /^(checkbox|radio)$/i.test(String(reactPropsOf(field)?.type ?? ''))) {
+        return;
+    }
+    if (fieldValueOf(field) === was || typeof globalThis.Event !== 'function') {
+        return;
+    }
+    const made = new globalThis.Event('change', { bubbles: true, cancelable: false });
+    made.isTrusted = true;
+    made.__domOnly = true;
+    dispatchOn(field, made);
+}
+
+/// Gives the keyboard to `next`, or to nothing, telling what had it that it's gone, and then what has it, as a page does: `blur`
+/// and `focusout`, then `focus` and `focusin`. Rust is told too, unless it's what said. Editing, once it's loaded, is told in
+/// between, as the caret's in place by the time `focus` is heard.
+/// `options` are `focus()`'s: `focusVisible` says whether it shows that it has the keyboard (`:focus-visible`), rather than
+/// that following how the keyboard was last moved, which Rust works out (`script_ring` in app.rs).
+function moveFocus(next, tellRust = true, options = undefined) {
+    flushLostFocus();
+    const before = focusedElement;
+    if (before === next) {
+        return;
+    }
+    focusedElement = next;
+    if (before !== null) {
+        changedSinceFocus(before);
+        dispatchOn(before, focusEvent('blur', next, false));
+        dispatchOn(before, focusEvent('focusout', next, true));
+    }
+    if (focusedElement === next) {
+        editingLoaded?.focusMoved(next);
+    }
+    if (next !== null && focusedElement === next) {
+        // The keyboard back on a page Tab took it out of: the window hears it first, as in Chromium, whatever gave it.
+        keyboardBackInPage();
+        if (TEXT_FIELD_TAGS.has(next.__live?.tag)) {
+            next.__valueAtFocus = fieldValueOf(next);
+        }
+        dispatchOn(next, focusEvent('focus', before, false));
+        dispatchOn(next, focusEvent('focusin', before, true));
+    }
+    if (tellRust && next !== null && focusedElement === next) {
+        const key = next.__live?.domKey ?? next.__domKey;
+        if (key !== undefined) {
+            focusAsked = { key, at: performance.now() };
+            const visible = options !== null && typeof options === 'object' ? options.focusVisible : undefined;
+            const preventScroll = options !== null && typeof options === 'object' && Boolean(options.preventScroll);
+            rsui.focus(key, visible === undefined ? undefined : Boolean(visible), preventScroll);
+        }
+    }
+}
+
+/// What had the keyboard when it was taken out of the page, which still has to hear that it's lost it (see `focusTakenOut`).
+let lostFocus = null;
+
+/// Whether Tab has taken the keyboard out of the page, past its last stop or before its first, as a browser gives it to its own
+/// toolbar then (Rust's `keyboard_left`): the window has heard `blur`, and `document.hasFocus()` is false, until the keyboard's
+/// given to something on the page again, by Tab, a press or code, which the window hears as `focus` first.
+let keyboardOut = false;
+
+/// Rust says Tab took the keyboard out of the page: once what had it has heard `blur` and `focusout` (which `onFocus` waits for
+/// what's running now to finish to send), the window hears `blur`, as on a page.
+function keyboardLeftPage() {
+    setTimeout(() => {
+        flushLostFocus();
+        if (focusedElement !== null || keyboardOut) {
+            return;
+        }
+        keyboardOut = true;
+        tellWindow(focusEvent('blur', null, false));
+    }, 0);
+}
+
+/// The keyboard's back on the page, as Rust says after a press on it, or as something on it is given it.
+function keyboardBackInPage() {
+    if (keyboardOut) {
+        keyboardOut = false;
+        tellWindow(focusEvent('focus', null, false));
+    }
+}
+
+/// What had the keyboard hears `blur` and `focusout`, once it's been taken out of the page, as on a page, where the focus goes
+/// back to `body` then: a remounted element (another key, or another tag) is a new element that doesn't have it.
+function focusTakenOut(live) {
+    const had = focusedElement;
+    if (had === null || live.domKey === undefined || (had.__domKey ?? had.__live?.domKey) !== live.domKey) {
+        return;
+    }
+    focusedElement = null;
+    lostFocus = had;
+    editingLoaded?.focusMoved(null);
+    // Once React's done putting in what replaces it, unless the keyboard's given to something before then, which hears it first.
+    queueMicrotask(flushLostFocus);
+}
+
+function flushLostFocus() {
+    const had = lostFocus;
+    if (had === null) {
+        return;
+    }
+    lostFocus = null;
+    dispatchOn(had, focusEvent('blur', null, false));
+    dispatchOn(had, focusEvent('focusout', null, true));
+}
+
+/// What has the keyboard now, which is nothing once it's no longer on the page.
+function activeElementNow() {
+    // A control that's been disabled while it had the focus has lost it, with nothing said, as a browser's focus fixup has it:
+    // Embla's Next button at the last slide.
+    if (focusedElement !== null && (!inPageNow(focusedElement) || disabledNow(focusedElement))) {
+        focusedElement = null;
+    }
+    return focusedElement ?? body;
+}
+
+/// Whether a field or button a page drew says it's disabled now.
+function disabledNow(element) {
+    const tag = element?.__live?.tag;
+    return typeof tag === 'string' && FOCUS_TAGS.has(tag) && tag !== 'iframe' && reactPropsOf(element)?.disabled === true;
+}
+
+/// What `document.dispatchEvent()` and `body`'s do: down through `window` and `document`, and back up.
+function dispatchOnPage(target, event) {
+    try {
+        event.target = target;
+        event.__path = target === page ? [page, globalThis] : [target, ...(target === body ? [documentElement] : []), page, globalThis];
+    } catch {
+        // It keeps what it was first sent to.
+    }
+    event.__stopped = false;
+    event.__immediate = false;
+    event.eventPhase = 1;
+    // What listens on `body` and `<html>` is kept with what listens on `document` (see `listensAsDocument`), and hears what's sent
+    // to them that doesn't go up, as Radix's `pointerDownOutside` is, sent to what a press outside a modal menu landed on, which is
+    // `<html>` while `body` is `pointer-events: none`.
+    const own = target === page || target === body || target === documentElement;
+    if (!heardAt('window', event, true)) {
+        event.eventPhase = target === page ? 2 : 1;
+        if (!heardAt('document', event, true) && (event.bubbles || own)) {
+            // At itself for what's sent to it that doesn't go up, and going back up otherwise, as on a page.
+            event.eventPhase = own && !event.bubbles ? 2 : target === page ? 2 : 3;
+            if (!heardAt('document', event, false) && event.bubbles) {
+                event.eventPhase = 3;
+                heardAt('window', event, false);
+            }
+        }
+    }
+    event.eventPhase = 0;
+    event.currentTarget = null;
+    return event.defaultPrevented !== true;
+}
+
+/// What a click a label passes on to what it's for says of the click it came from, as a browser's: how many clicks it was, where,
+/// and with which buttons and keys, as a browser's simulated click has it (`detail` 1 and then 2 for a double click on a label).
+/// Nothing, for `element.click()` from code.
+function clickFrom(from) {
+    if (from === null || typeof from !== 'object' || typeof from.detail !== 'number') {
+        return {};
+    }
+    const said = {};
+    for (const name of ['detail', 'screenX', 'screenY', 'clientX', 'clientY', 'button', 'buttons', 'ctrlKey', 'shiftKey', 'altKey', 'metaKey']) {
+        if (from[name] !== undefined) {
+            said[name] = from[name];
+        }
+    }
+    return said;
+}
+
+/// What a control of a form says about whether what's in it may be sent, as a browser's constraint validation has it, from what
+/// it was given (`required`, `type`, `pattern`, `minLength`, `maxLength`, `min`, `max`) and what code said with
+/// `setCustomValidity()`: `{ valid, valueMissing, typeMismatch, ... }`, or null for what isn't checked (a button, a hidden or
+/// disabled field, a readonly one).
+const EMAIL = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+const UNCHECKED_TYPES = new Set(['hidden', 'button', 'submit', 'reset', 'image']);
+/// The kinds of `<input>` that `maxlength` and `minlength` hold to.
+const TEXT_LENGTH_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
+
+function controlValidity(element) {
+    const live = element?.__live;
+    const tag = live?.tag;
+    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
+        return null;
+    }
+    const given = live.given ?? {};
+    const type = tag === 'input' ? String(given.type ?? 'text').toLowerCase() : tag;
+    const flag = (value) => value === true || value === '';
+    if (UNCHECKED_TYPES.has(type) || flag(given.disabled) || (tag !== 'select' && flag(given.readOnly)) || element.closest?.('fieldset[disabled]')) {
+        return null;
+    }
+    const value = type === 'checkbox' || type === 'radio' ? '' : String(element.value ?? '');
+    const out = { valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false,
+        rangeOverflow: false, stepMismatch: false, badInput: false, customError: false, valid: true };
+    if (flag(given.required)) {
+        if (type === 'checkbox') {
+            out.valueMissing = element.checked !== true;
+        } else if (type === 'radio') {
+            const name = given.name;
+            const form = element.closest?.('form') ?? null;
+            const group = name === undefined ? [element] : [...(form ?? page).querySelectorAll('input[type=radio]')].filter((one) => one.__live?.given?.name === name);
+            out.valueMissing = !group.some((one) => one.checked === true);
+        } else {
+            out.valueMissing = value === '';
+        }
+    }
+    if (value !== '') {
+        if (type === 'email') {
+            const all = flag(given.multiple) ? value.split(',').map((one) => one.trim()) : [value];
+            out.typeMismatch = all.some((one) => !EMAIL.test(one));
+        } else if (type === 'url') {
+            try {
+                new URL(value);
+            } catch {
+                out.typeMismatch = true;
+            }
+        }
+        if (typeof given.pattern === 'string' && given.pattern !== '' && type !== 'number') {
+            try {
+                out.patternMismatch = !new RegExp('^(?:' + given.pattern + ')$', 'u').test(value);
+            } catch {
+                // A pattern that isn't one checks nothing, as in a browser.
+            }
+        }
+        if (type === 'number' || type === 'range') {
+            const number = Number(value);
+            if (Number.isNaN(number)) {
+                out.badInput = true;
+            } else {
+                out.rangeUnderflow = given.min !== undefined && given.min !== '' && number < Number(given.min);
+                out.rangeOverflow = given.max !== undefined && given.max !== '' && number > Number(given.max);
+            }
+        }
+    }
+    if (live.userEdited === true && (tag === 'textarea' || TEXT_LENGTH_TYPES.has(type))) {
+        // Only what someone typed is held to `maxlength` and `minlength`, as a browser has it: code can put more or less in.
+        const most = Number(given.maxLength ?? given.maxlength);
+        const least = Number(given.minLength ?? given.minlength);
+        out.tooLong = Number.isInteger(most) && most >= 0 && value.length > most;
+        out.tooShort = Number.isInteger(least) && least >= 0 && value !== '' && value.length < least;
+    }
+    out.customError = typeof element.__customValidity === 'string' && element.__customValidity !== '';
+    out.valid = !Object.entries(out).some(([key, one]) => key !== 'valid' && one === true);
+    return out;
+}
+
+/// What a browser says of a control that isn't valid, for `validationMessage` (Chromium's words for the commonest).
+function validationMessageOf(element) {
+    const validity = controlValidity(element);
+    if (validity === null || validity.valid) {
+        return '';
+    }
+    if (validity.customError) {
+        return element.__customValidity;
+    }
+    const type = String(element.__live?.given?.type ?? '').toLowerCase();
+    if (validity.valueMissing) {
+        return type === 'checkbox' ? 'Please check this box if you want to proceed.' : type === 'radio' ? 'Please select one of these options.'
+            : element.__live?.tag === 'select' ? 'Please select an item in the list.' : 'Please fill out this field.';
+    }
+    if (validity.typeMismatch) {
+        return type === 'email' ? 'Please enter an email address.' : 'Please enter a URL.';
+    }
+    if (validity.patternMismatch) {
+        return 'Please match the requested format.';
+    }
+    if (validity.rangeUnderflow || validity.rangeOverflow) {
+        return 'Value must be in range.';
+    }
+    return 'Please enter a valid value.';
+}
+
+/// The controls a form has, in page order: those in it with no `form` of their own, and those anywhere whose `form` names it.
+function formControls(formElement) {
+    const id = formElement.getAttribute?.('id');
+    return [...page.querySelectorAll('input, textarea, select')].filter((one) => {
+        const named = one.getAttribute('form');
+        return named !== null ? typeof id === 'string' && named === id : one.closest('form') === formElement;
+    });
+}
+
+/// `checkValidity()` and `reportValidity()` of a form, and what sending it checks first: each control that isn't valid hears
+/// `invalid` (which can be stopped), and with `report` the first that wasn't stopped gets the keyboard.
+/// Gives a control that isn't valid the keyboard, to say what's wrong with it, as Chromium does: brought into view at its nearest
+/// edge first if it isn't, rather than to the middle, as focusing it alone would.
+function reportInvalid(element) {
+    scrollIntoView(element, { block: 'nearest', inline: 'nearest' });
+    element.focus?.();
+}
+
+function checkControls(formElement, report) {
+    let valid = true;
+    let first = null;
+    for (const control of formControls(formElement)) {
+        const validity = controlValidity(control);
+        if (validity === null || validity.valid) {
+            continue;
+        }
+        valid = false;
+        if (dispatchOn(control, new globalThis.Event('invalid', { bubbles: false, cancelable: true })) && first === null) {
+            first = control;
+        }
+    }
+    if (report && first !== null) {
+        reportInvalid(first);
+    }
+    return valid;
+}
+
+/// What a browser does by itself once a click's been heard and nothing said not to: a link goes where it says, a button sends its
+/// form, and a label clicks what it's for.
+function activate(element, event) {
+    const live = element?.__live;
+    const tag = live?.tag ?? String(element?.localName ?? '');
+    const given = live?.given ?? {};
+    if (tag === 'a' && typeof given.href === 'string') {
+        followLink(given.href);
+        return;
+    }
+    if ((tag === 'button' || tag === 'input') && given.disabled !== true && sendsForm(tag, given)) {
+        const form = typeof given.form === 'string' ? page.getElementById?.(given.form) : element.closest?.('form');
+        if (form !== null && form !== undefined) {
+            if (String(given.type ?? '').toLowerCase() === 'reset') {
+                form.reset?.();
+            } else {
+                form.requestSubmit?.(element);
+            }
+        }
+        return;
+    }
+    if (tag === 'label') {
+        const control = typeof given.htmlFor === 'string' ? page.getElementById(given.htmlFor) : element.querySelector?.('input, textarea, select, button');
+        if (control !== null && control !== undefined && control !== element && labelable(control)) {
+            control.focus?.();
+            clickFromLabel(control, event);
+        }
+    }
+}
+
+/// The click a label passes on to what it's for, which says how many clicks in a row the label's was, as a browser's does.
+function clickFromLabel(control, event) {
+    const detail = Number(event?.detail ?? 0);
+    if (detail > 0 && control.__live !== undefined && control.__live.given?.disabled !== true) {
+        const { MouseEvent } = domEvents();
+        dispatchOn(control, new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: globalThis, detail }));
+    } else {
+        control.click?.();
+    }
+}
+
+/// What an arrow key does on a radio: the keyboard goes to the next one of its name in its form, or the one before, skipping
+/// those that can't be used and going round, and that one's picked. Says whether there was one to go to.
+function moveRadio(element, step) {
+    const name = element.name;
+    if (typeof name !== 'string' || name === '') {
+        return false;
+    }
+    const form = element.form ?? null;
+    const all = [...(page.querySelectorAll?.('input') ?? [])].filter((one) =>
+        String(one.type).toLowerCase() === 'radio' && one.name === name && (one.form ?? null) === form && (one === element || !one.disabled));
+    const at = all.indexOf(element);
+    if (at < 0 || all.length < 2) {
+        return false;
+    }
+    const next = all[(at + step + all.length) % all.length];
+    next.focus();
+    if (!next.checked) {
+        next.click();
+    }
+    return true;
+}
+
+/// What `rsui.focus()` is given to take the keyboard from what has it: `App::NO_FOCUS`.
+const NO_FOCUS = '__rsui_no_focus';
+
+/// Elements of a page by their `id`, while they're there, as far as they're known here.
+const idElements = new Map();
+
+/// The handle for an element of a page, made the first time it's wanted, and found by its key from then on.
+function handleOf(live, tag, keep = false) {
+    if (live.handle == null) {
+        const key = live.domKey;
+        const upper = String(tag ?? 'div').toUpperCase();
+        live.handle = {
+            ...fakeElement(),
+            tagName: upper,
+            nodeName: upper,
+            localName: String(tag ?? 'div'),
+            focus(options) {
+                if (canFocus(this)) {
+                    moveFocus(this, true, options);
+                }
+            },
+            blur() {
+                if (focusedElement === this) {
+                    moveFocus(null, false);
+                    // Rust's keyboard leaves it too, so keys go to the page rather than to it, as after a page's `blur()`.
+                    rsui.focus(NO_FOCUS);
+                }
+            },
+            select() {
+                selectField(this);
+            },
+            ...pointerCaptureMethods,
+            __domKey: key,
+        };
+        const handle = live.handle;
+        handle.addEventListener = (type, listener, options) => listenOnElement(handle, String(type), listener, options);
+        handle.removeEventListener = (type, listener, options) => unlistenOnElement(handle, String(type), listener, options);
+        handle.dispatchEvent = (event) => dispatchOn(handle, event);
+        handle.click = (from) => {
+            if (live.given?.disabled === true) {
+                return;
+            }
+            const { MouseEvent } = domEvents();
+            dispatchOn(handle, new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: globalThis, ...clickFrom(from) }));
+        };
+        Object.setPrototypeOf(handle, prototypeFor(String(tag ?? 'div')));
+        Object.defineProperty(handle, '__live', { value: live, enumerable: false, configurable: true });
+        handle.setAttribute = (name, value) => setAttributeOn(live, String(name), String(value));
+        handle.removeAttribute = (name) => setAttributeOn(live, String(name), null);
+        handle.toggleAttribute = (name, force) => {
+            const on = force ?? handle.getAttribute(name) === null;
+            setAttributeOn(live, String(name), on ? '' : null);
+            return on;
+        };
+        Object.defineProperties(live.handle, chainProps);
+        Object.defineProperty(handle, '__drawnChildren', { value: () => drawnChildren(handle), enumerable: false, configurable: true });
+        const style = styleFor({
+            live,
+            changed: () => {
+                live.cssom = style.__asProps?.() ?? null;
+                live.cssomRemoved = style.__removed?.() ?? null;
+                stillForReads(live, style);
+                live.redraw?.();
+            },
+        });
+        Object.defineProperty(handle, 'style', {
+            get: () => style,
+            set: (text) => {
+                style.cssText = text;
+            },
+            enumerable: true,
+            configurable: true,
+        });
+        live.styleDeclaration = style;
+        if (String(tag).toLowerCase() === 'form') {
+            Object.defineProperties(handle, formProps);
+        }
+    }
+    if (live.domKey !== undefined && keep) {
+        handles.set(live.domKey, live.handle);
+    }
+    // What it says about itself is as it was last given, unless it's a node code made, which says that itself.
+    const given = live.given;
+    const handle = live.handle;
+    // Worked out again only when it's been given something else, or code has changed what it says since: floating-ui asks for
+    // what each element above a popover is in on every frame of scrolling, which comes here for each.
+    const kept = handle.__saidFrom;
+    if (given !== undefined && handle.__own !== true
+        && !(kept !== undefined && kept.given === given && kept.className === handle.className && kept.id === handle.id && kept.dataset === handle.dataset)) {
+        handle.className = typeof given.className === 'string' ? given.className : '';
+        handle.id = typeof given.id === 'string' ? given.id : '';
+        const dataset = {};
+        for (const name in given) {
+            // As react-dom writes them: a `data-` prop that's null, undefined, a function or a symbol isn't an attribute.
+            const value = given[name];
+            if (name.startsWith('data-') && value !== undefined && value !== null && typeof value !== 'function' && typeof value !== 'symbol') {
+                dataset[datasetName(name.slice(5))] = String(value);
+            }
+        }
+        handle.dataset = dataset;
+        handle.__saidFrom = { given, className: handle.className, id: handle.id, dataset };
+    }
+    return handle;
+}
+
+/// What's along the way to something, from what Rust says, leaving out what's only there to lay things out, as `findTargets`
+/// does for an event.
+function pageChain(said) {
+    if (said === undefined) {
+        return undefined;
+    }
+    return outOfPortal(said).filter((entry, at) => at === 0 || !onlyLaysOut(entry));
+}
+
+/// Whether this, along what's in the tree, is what a portal into `body` put what's in it in (see `__pagePortal` in `layer.js`).
+const isPortal = (entry) => typeof entry?.[11] === 'string' && entry[11].startsWith('__portal');
+/// And what a portal into a fragment that isn't in the page put what's in it in (see `FragmentPortal` in `layer.js`).
+const isFragment = (entry) => entry?.[11] === '__fragment';
+
+/// What's along the way to something, as the DOM has it: what's in a portal into `body` is in `body`, rather than in what it's
+/// written in, which is only where it's drawn from.
+function outOfPortal(said) {
+    for (let at = said.length - 1; at > 0; at -= 1) {
+        if (isPortal(said[at])) {
+            return [said[0], ...said.slice(at + 1)];
+        }
+    }
+    return said;
+}
+
+/// The attribute each of React's props is, where that isn't its name in lower case, as react-dom writes them.
+const PROP_ATTRIBUTES = { className: 'class', htmlFor: 'for', tabIndex: 'tabindex', readOnly: 'readonly', contentEditable: 'contenteditable',
+    spellCheck: 'spellcheck', autoComplete: 'autocomplete', maxLength: 'maxlength', minLength: 'minlength', autoCapitalize: 'autocapitalize',
+    accessKey: 'accesskey', colSpan: 'colspan', rowSpan: 'rowspan', crossOrigin: 'crossorigin', encType: 'enctype', formAction: 'formaction',
+    noValidate: 'novalidate', inputMode: 'inputmode', enterKeyHint: 'enterkeyhint', httpEquiv: 'http-equiv', acceptCharset: 'accept-charset',
+    defaultValue: 'value', defaultChecked: 'checked', srcSet: 'srcset', useMap: 'usemap', dateTime: 'datetime', referrerPolicy: 'referrerpolicy' };
+/// What react-dom doesn't write as an attribute.
+const NOT_ATTRIBUTES = new Set(['children', 'key', 'ref', 'dangerouslySetInnerHTML', 'suppressContentEditableWarning', 'suppressHydrationWarning',
+    'autoFocus', 'innerHTML', 'defaultSelected']);
+/// What an SVG element's props are written as with a `-`, as react-dom does: `strokeWidth` as `stroke-width`. The rest keep their case,
+/// as `viewBox` does.
+const SVG_DASHED = /^(stroke|fill|clip|font|text|stop|flood|lighting|marker|color|dominant|alignment|baseline|glyph|image|letter|word|writing|shape|pointer|paint|vector|enable|horiz|vert|underline|overline|strikethrough|unicode|units|x|v)[A-Z]/;
+
+/// An element's attributes as a page has them, each `[name, value]`, in the order it was given them, from what React gave it and
+/// what's been set on it since.
+function elementAttributes(element) {
+    const live = element.__live;
+    if (live === undefined) {
+        const out = [];
+        if (element.id) {
+            out.push(['id', String(element.id)]);
+        }
+        if (element.className) {
+            out.push(['class', String(element.className)]);
+        }
+        for (const [name, value] of Object.entries(element.dataset ?? {})) {
+            out.push(['data-' + name.replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase()), String(value)]);
+        }
+        return out;
+    }
+    const svg = SVG_TAGS[live.tag] !== undefined;
+    const named = new Map();
+    const take = (prop, value) => {
+        if (NOT_ATTRIBUTES.has(prop) || prop.startsWith('__') || /^on[A-Z]/.test(prop) || typeof value === 'function') {
+            return;
+        }
+        // react-dom writes `defaultChecked` and `defaultValue` as attributes of an `<input>` only: on a `<label>` they're nothing.
+        if ((prop === 'defaultChecked' || prop === 'defaultValue') && live.tag !== 'input') {
+            return;
+        }
+        let name = PROP_ATTRIBUTES[prop] ?? prop;
+        if (name === prop && !name.includes('-')) {
+            name = svg ? (SVG_DASHED.test(name) ? name.replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase()) : name) : name.toLowerCase();
+        }
+        if (prop === 'value' || prop === 'checked') {
+            // What a field shows now isn't its attribute, which is what it started with.
+            if (named.has(name)) {
+                return;
+            }
+        }
+        if (prop === 'checked' && live.given?.__setChecked !== undefined) {
+            // One that keeps whether it's checked itself has the attribute only if it started checked: see `getAttribute`.
+            value = live.given.__defaultChecked === true ? '' : undefined;
+        }
+        const spelled = name.startsWith('aria-') || name.startsWith('data-') || name === 'draggable' || name === 'spellcheck' || name === 'contenteditable';
+        if (value === undefined || value === null || (value === false && !spelled)) {
+            named.delete(name);
+            return;
+        }
+        if (prop === 'style') {
+            if (typeof value === 'object') {
+                const text = Object.entries(value).filter(([, one]) => one !== undefined && one !== null && one !== '' && typeof one !== 'boolean')
+                    .map(([key, one]) => (key.startsWith('--') ? key : key.replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase())) + ': '
+                        + (typeof one === 'number' && one !== 0 && !UNITLESS_STYLE.has(key) ? one + 'px' : String(one)) + ';').join(' ');
+                if (text !== '') {
+                    named.set('style', text);
+                }
+            }
+            return;
+        }
+        if (typeof value === 'object') {
+            return;
+        }
+        named.set(name, value === true ? (spelled ? 'true' : '') : String(value));
+    };
+    // React gives a `<select>` and a `<textarea>` their `value` as what they hold, never as an attribute (see `getAttribute`).
+    const holds = live.tag === 'select' || live.tag === 'textarea';
+    for (const [prop, value] of Object.entries(live.given ?? {})) {
+        if (!(holds && (prop === 'value' || prop === 'defaultValue'))) {
+            take(prop, value);
+        }
+    }
+    for (const [prop, value] of Object.entries(live.attributes ?? {})) {
+        if (value === undefined) {
+            named.delete(PROP_ATTRIBUTES[prop] ?? prop.toLowerCase());
+        } else {
+            take(prop, value);
+        }
+    }
+    const css = element.style?.cssText;
+    if (typeof css === 'string' && css !== '' && live.cssom != null) {
+        named.set('style', css);
+    }
+    if (live.tag === 'input' || live.tag === 'textarea') {
+        // A field's `value` attribute is what `getAttribute` says it is: its default, not what's typed in it.
+        const said = element.getAttribute('value');
+        if (said === null) {
+            named.delete('value');
+        } else {
+            named.set('value', said);
+        }
+    }
+    if (live.tag === 'option' && !named.has('selected')) {
+        // The option a `<select>`'s `defaultValue` chooses is marked `selected`, as react-dom does as it's first drawn.
+        const select = selectOf(element);
+        const start = select?.__live?.given?.defaultValue;
+        if (start !== undefined && start !== null && optionsOf(select).find((one) => one.value === String(start)) === element) {
+            named.set('selected', '');
+        }
+    }
+    return [...named];
+}
+/// What a number in `style` is said in as it is, rather than in pixels, as react-dom has it.
+const UNITLESS_STYLE = new Set(['opacity', 'zIndex', 'fontWeight', 'lineHeight', 'flex', 'flexGrow', 'flexShrink', 'order', 'zoom', 'gridRow',
+    'gridColumn', 'gridRowStart', 'gridRowEnd', 'gridColumnStart', 'gridColumnEnd', 'columnCount', 'tabSize', 'orphans', 'widows', 'scale',
+    'aspectRatio', 'animationIterationCount', 'fillOpacity', 'strokeOpacity', 'strokeWidth', 'stopOpacity', 'floodOpacity']);
+
+/// Brings what an element with a handle knows about where it is up to date with where it was last laid out, and says whether
+/// it's shown at all.
+function placed(element, always = false) {
+    const key = element?.__domKey;
+    if (key === undefined || (element.__placedByKey !== true && !always)) {
+        // What an event found is where the event says.
+        return element?.__chain !== undefined;
+    }
+    // What was found is still so while the tree, and where everything in it is, are the same: `parentElement` asks this of each
+    // element above one, and `getComputedStyle()` and `getBoundingClientRect()` go up through all of those. A chain given to it
+    // since, as finding it with `querySelector()` gives one, is asked about again: that one can be from a tree that's changed
+    // since it was laid out, with nothing laid out in it.
+    const now = rsuiHostMethods.chainsNow();
+    if (element.__placedAt === now && element.__chain === element.__placedChain) {
+        return element.__placedWas;
+    }
+    const chain = pageChain(rsuiHostMethods.chainOf(key));
+    // Asking for the chain can itself lay out a changed tree. Stamp the result
+    // with the generation after that read, not the stale one from before it.
+    const measuredAt = rsuiHostMethods.chainsNow();
+    element.__placedAt = measuredAt;
+    element.__placedWas = chain !== undefined;
+    if (chain === undefined) {
+        element.__placedChain = element.__chain;
+        return false;
+    }
+    element.__placedChain = chain;
+    // Which tree and layout it's from, for what's above it, which is found from it (see `chainElement`).
+    chain.__at = measuredAt;
+    element.__chain = chain;
+    element.__index = chain.length - 1;
+    return true;
+}
+
+/// What Rust last said for each key, when asked one of the things about the tree that only change with it and where everything
+/// in it is (`scrollOf`, `pageChainOf`), for as long as `chainsNow` says those are the same. floating-ui asks them of every
+/// element above each popover, on every scroll.
+const askedOfTreeNow = { at: -1, said: new Map() };
+
+function askedOfTree(name, key) {
+    const now = rsuiHostMethods.chainsNow();
+    if (askedOfTreeNow.at !== now) {
+        askedOfTreeNow.at = now;
+        askedOfTreeNow.said.clear();
+    }
+    const id = name + ' ' + key;
+    if (askedOfTreeNow.said.has(id)) {
+        return askedOfTreeNow.said.get(id);
+    }
+    const said = rsuiHostMethods[name](key);
+    askedOfTreeNow.said.set(id, said);
+    return said;
+}
+
+/// What each element above this one is drawn with, nearest first, as going up `parentElement` until `body` finds them, at most
+/// this many, without making each element: `undefined` for one that isn't drawn by the page, and `null` for all of them if the
+/// element doesn't know where it is.
+function livesAbove(element, most) {
+    if (element?.__domKey !== undefined) {
+        placed(element);
+    }
+    const chain = element?.__chain;
+    const index = element?.__index;
+    if (chain === undefined || index === undefined) {
+        return null;
+    }
+    const lives = [];
+    for (let at = index - 1; at > 0 && lives.length < most; at -= 1) {
+        const key = chain[at]?.[0];
+        // What's only there for rsui to lay things out with, which `parentElement` goes past.
+        if (key == null) {
+            continue;
+        }
+        const handle = handles.get(key);
+        lives.push(handle !== undefined ? handle.__live : pageLives.get(key)?.deref());
+    }
+    return lives;
+}
+
+/// An element from what's along the way to it, which is the last of that.
+const lastOf = (chain) => (chain === undefined || chain.length < 2 ? null : chainElement(chain, chain.length - 1));
+
+/// Each element of a page that's been drawn, by its key, as what it was last drawn with, for what a selector asks about it:
+/// what it was given, and how it is. It's held weakly, as it's what the element keeps, and goes once that's gone.
+const pageLives = new Map();
+
+/// What's told after the page has rendered again, which is only ever what watches it, as `ResizeObserver` does.
+const renderListeners = new Set();
+let renderTold = false;
+function pageRendered() {
+    if (renderTold) {
+        return;
+    }
+    renderTold = true;
+    queueMicrotask(() => {
+        renderTold = false;
+        for (const listener of renderListeners) {
+            listener();
+        }
+    });
+}
+
+/// Elements of the page that aren't shown, as `display: none` has it, by their key, each with where it goes: the key of the
+/// element that's drawn around it, if any is. Nothing's drawn for them, so the tree Rust has doesn't have them, and they're put
+/// into the page's tree from here.
+const notShownLives = new Map();
+
+/// What an element that isn't drawn (yet, or at all, as an `<option>`) is in: the nearest element of the page around it in what
+/// React drew, as a page has it the moment React puts it in. Radix asks its trigger's `closest('form')` straight after it's put
+/// in, to know whether it needs a hidden `<select>` for the form.
+/// Whether an element that isn't in the drawn page (yet) is what a selector says, by what it is itself (its tag, id, classes and
+/// attributes): what's about where it is can't be known, and isn't.
+function unplacedMatches(element, selector) {
+    const live = element.__live;
+    if (live === undefined || live.tag === undefined || !listeners.has(live)) {
+        return false;
+    }
+    const node = { entry: [live.domKey, 'group', undefined, undefined, undefined, '', 0, 0, 0, 0, undefined, live.domKey], key: live.domKey, live, parent: null,
+        children: NO_PAGE_KIDS, index: 0, own: null, textFrom: 0, textTo: 0 };
+    try {
+        return nodeMatches(node, selector);
+    } catch {
+        return false;
+    }
+}
+
+/// The text in what React gave an element, as its Text nodes would have it.
+function givenText(children) {
+    if (typeof children === 'string' || typeof children === 'number') {
+        return String(children);
+    }
+    if (Array.isArray(children)) {
+        return children.map(givenText).join('');
+    }
+    if (isValidElement(children)) {
+        return givenText(children.kids ?? children.props?.children);
+    }
+    return '';
+}
+
+function mountedParent(element) {
+    // Once it's taken out it's in nothing.
+    if (element.__live === undefined || !listeners.has(element.__live)) {
+        return null;
+    }
+    let around = element.__live?.instance?.parent ?? null;
+    while (around !== null && around !== undefined && around.__pageLive?.domKey === undefined) {
+        around = around.parent;
+    }
+    const live = around?.__pageLive;
+    if (live === undefined || live === element.__live) {
+        return null;
+    }
+    return live.handle ?? handleOf(live, live.tag);
+}
+
+function keepNotShown(live) {
+    // What it's in is the nearest element of the page that's drawn, found up through the components around it.
+    let around = rsui.__instanceNow?.()?.parent ?? null;
+    while (around !== null && around !== undefined && around.__pageLive?.domKey === undefined) {
+        around = around.parent;
+    }
+    const parentKey = around?.__pageLive?.domKey;
+    if (live.parentKey !== parentKey) {
+        live.parentKey = parentKey;
+        // A hidden element can move to another parent without changing the
+        // rendered tree, which the native content comparison cannot observe.
+        pageNow = null;
+    }
+    live.notShown = true;
+    if (notShownLives.get(live.domKey) !== live) {
+        notShownLives.set(live.domKey, live);
+        pageNow = null;
+    }
+}
+
+function forgetNotShown(live) {
+    if (live === null || live === undefined || live.notShown !== true) {
+        return;
+    }
+    live.notShown = false;
+    if (notShownLives.get(live.domKey) === live) {
+        notShownLives.delete(live.domKey);
+        pageNow = null;
+    }
+}
+
+/// A portal into an element of the page: what's in it is drawn in that element, after what React gave it (see `portalKids`), with the
+/// context of where it's drawn rather than where it's written, which is what a portal of text, as Radix Select's value, needs.
+function ElementPortal({ container, children }) {
+    const id = useRef(null);
+    id.current ??= {};
+    useLayoutEffect(() => {
+        const live = container.__live;
+        live.portalKids ??= new Map();
+        live.portalKids.set(id.current, children);
+        live.redraw?.();
+    }, [container, children]);
+    useLayoutEffect(() => () => {
+        const live = container.__live;
+        if (live.portalKids?.delete(id.current) === true) {
+            live.redraw?.();
+        }
+    }, [container]);
+    return null;
+}
+
+/// Where a shape in an `<svg>` is in the window, as `getBoundingClientRect()` says it: the box around its geometry (not its stroke),
+/// from the svg's `viewBox` to where the svg is, centred as `preserveAspectRatio`'s default has it. A `<g>` is the box around what's
+/// in it. Nothing for what has no geometry.
+function svgPartRect(live) {
+    const none = { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({ x: 0, y: 0, width: 0, height: 0 }) };
+    const svgKey = String(live.domKey).split(':')[0];
+    const parts = svgParts.get(svgKey) ?? [];
+    const svgLive = pageLives.get(svgKey)?.deref();
+    const svg = handles.get(svgKey) ?? (svgLive === undefined ? undefined : handleOf(svgLive, 'svg'));
+    if (svg === undefined) {
+        return none;
+    }
+    // Where it is is asked of the tree, as it's found by its key, rather than where an event last found it.
+    svg.__placedByKey = true;
+    const at = parts.indexOf(live);
+    const within = (one) => {
+        // Itself, and what's in it, by the parts that say they're in it.
+        const out = [one];
+        for (const other of parts) {
+            if (other !== one && out.some((part) => other.parentKey === part.domKey)) {
+                out.push(other);
+            }
+        }
+        return out;
+    };
+    let box = null;
+    for (const part of at < 0 ? [] : within(live)) {
+        const own = shapeBox(part.tag, part.given ?? {});
+        if (own !== null) {
+            box = box === null ? own : [Math.min(box[0], own[0]), Math.min(box[1], own[1]), Math.max(box[2], own[2]), Math.max(box[3], own[3])];
+        }
+    }
+    if (box === null) {
+        return none;
+    }
+    const outer = svg.getBoundingClientRect();
+    const view = String(svg.__live?.given?.viewBox ?? '').trim().split(/[\s,]+/).map(Number);
+    let [scaleX, scaleY, offsetX, offsetY] = [1, 1, 0, 0];
+    if (view.length === 4 && view.every(Number.isFinite) && view[2] > 0 && view[3] > 0) {
+        const scale = Math.min(outer.width / view[2], outer.height / view[3]);
+        scaleX = scale;
+        scaleY = scale;
+        offsetX = (outer.width - view[2] * scale) / 2 - view[0] * scale;
+        offsetY = (outer.height - view[3] * scale) / 2 - view[1] * scale;
+    }
+    const x = outer.x + offsetX + box[0] * scaleX;
+    const y = outer.y + offsetY + box[1] * scaleY;
+    const width = (box[2] - box[0]) * scaleX;
+    const height = (box[3] - box[1]) * scaleY;
+    return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON: () => ({ x, y, width, height }) };
+}
+
+/// The box around a shape's geometry in its svg's units, `[left, top, right, bottom]`, or null for what has none.
+function shapeBox(tag, given) {
+    const number = (value) => {
+        const read = Number.parseFloat(value);
+        return Number.isFinite(read) ? read : 0;
+    };
+    const points = [];
+    switch (tag) {
+        case 'circle': {
+            const [cx, cy, r] = [number(given.cx), number(given.cy), number(given.r)];
+            return r > 0 ? [cx - r, cy - r, cx + r, cy + r] : null;
+        }
+        case 'ellipse': {
+            const [cx, cy, rx, ry] = [number(given.cx), number(given.cy), number(given.rx), number(given.ry)];
+            return rx > 0 && ry > 0 ? [cx - rx, cy - ry, cx + rx, cy + ry] : null;
+        }
+        case 'rect': {
+            const [x, y, width, height] = [number(given.x), number(given.y), number(given.width), number(given.height)];
+            return width > 0 && height > 0 ? [x, y, x + width, y + height] : null;
+        }
+        case 'line':
+            points.push([number(given.x1), number(given.y1)], [number(given.x2), number(given.y2)]);
+            break;
+        case 'polyline':
+        case 'polygon': {
+            const values = String(given.points ?? '').trim().split(/[\s,]+/).filter((one) => one !== '').map(Number);
+            for (let index = 0; index + 1 < values.length; index += 2) {
+                points.push([values[index], values[index + 1]]);
+            }
+            break;
+        }
+        case 'path':
+            pathPoints(String(given.d ?? ''), points);
+            break;
+        default:
+            return null;
+    }
+    if (points.length === 0) {
+        return null;
+    }
+    const xs = points.map((point) => point[0]);
+    const ys = points.map((point) => point[1]);
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+/// The points along a path's data, with its curves and arcs followed closely enough for the box around them.
+function pathPoints(data, points) {
+    const tokens = data.match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) ?? [];
+    let at = 0;
+    let [x, y, startX, startY] = [0, 0, 0, 0];
+    let command = '';
+    let [lastControlX, lastControlY, lastKind] = [0, 0, ''];
+    const next = () => Number(tokens[at++]);
+    const hasNumber = () => at < tokens.length && !/[a-zA-Z]/.test(tokens[at]);
+    const STEPS = 16;
+    const cubic = (x1, y1, x2, y2, x3, y3) => {
+        for (let step = 1; step <= STEPS; step += 1) {
+            const t = step / STEPS;
+            const u = 1 - t;
+            points.push([u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3]);
+        }
+    };
+    const quadratic = (x1, y1, x2, y2) => {
+        for (let step = 1; step <= STEPS; step += 1) {
+            const t = step / STEPS;
+            const u = 1 - t;
+            points.push([u * u * x + 2 * u * t * x1 + t * t * x2, u * u * y + 2 * u * t * y1 + t * t * y2]);
+        }
+    };
+    const arc = (rx, ry, turn, large, sweep, toX, toY) => {
+        // From its end points to its centre, as SVG's implementation notes have it, then along it.
+        rx = Math.abs(rx);
+        ry = Math.abs(ry);
+        if (rx === 0 || ry === 0 || (toX === x && toY === y)) {
+            points.push([toX, toY]);
+            return;
+        }
+        const phi = (turn * Math.PI) / 180;
+        const [cos, sin] = [Math.cos(phi), Math.sin(phi)];
+        const dx = (x - toX) / 2;
+        const dy = (y - toY) / 2;
+        const x1 = cos * dx + sin * dy;
+        const y1 = -sin * dx + cos * dy;
+        const grow = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
+        if (grow > 1) {
+            rx *= Math.sqrt(grow);
+            ry *= Math.sqrt(grow);
+        }
+        const sign = large === sweep ? -1 : 1;
+        const top = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+        const factor = sign * Math.sqrt(Math.max(0, top / (rx * rx * y1 * y1 + ry * ry * x1 * x1)));
+        const cx1 = (factor * rx * y1) / ry;
+        const cy1 = (-factor * ry * x1) / rx;
+        const cx = cos * cx1 - sin * cy1 + (x + toX) / 2;
+        const cy = sin * cx1 + cos * cy1 + (y + toY) / 2;
+        const angle = (ux, uy, vx, vy) => Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+        const start = angle(1, 0, (x1 - cx1) / rx, (y1 - cy1) / ry);
+        let delta = angle((x1 - cx1) / rx, (y1 - cy1) / ry, (-x1 - cx1) / rx, (-y1 - cy1) / ry);
+        if (!sweep && delta > 0) {
+            delta -= 2 * Math.PI;
+        } else if (sweep && delta < 0) {
+            delta += 2 * Math.PI;
+        }
+        const steps = 32;
+        for (let step = 1; step <= steps; step += 1) {
+            const theta = start + (delta * step) / steps;
+            const ex = rx * Math.cos(theta);
+            const ey = ry * Math.sin(theta);
+            points.push([cos * ex - sin * ey + cx, sin * ex + cos * ey + cy]);
+        }
+    };
+    while (at < tokens.length) {
+        if (/[a-zA-Z]/.test(tokens[at])) {
+            command = tokens[at++];
+        } else if (command === '') {
+            return;
+        }
+        const relative = command === command.toLowerCase();
+        const [baseX, baseY] = relative ? [x, y] : [0, 0];
+        let kind = command.toUpperCase();
+        switch (kind) {
+            case 'M':
+                x = baseX + next();
+                y = baseY + next();
+                [startX, startY] = [x, y];
+                points.push([x, y]);
+                // Pairs after a move are lines.
+                command = relative ? 'l' : 'L';
+                break;
+            case 'L':
+                x = baseX + next();
+                y = baseY + next();
+                points.push([x, y]);
+                break;
+            case 'H':
+                x = baseX + next();
+                points.push([x, y]);
+                break;
+            case 'V':
+                y = (relative ? y : 0) + next();
+                points.push([x, y]);
+                break;
+            case 'C': {
+                const [x1, y1, x2, y2, x3, y3] = [baseX + next(), baseY + next(), baseX + next(), baseY + next(), baseX + next(), baseY + next()];
+                cubic(x1, y1, x2, y2, x3, y3);
+                [lastControlX, lastControlY, x, y] = [x2, y2, x3, y3];
+                break;
+            }
+            case 'S': {
+                const [x1, y1] = lastKind === 'C' ? [2 * x - lastControlX, 2 * y - lastControlY] : [x, y];
+                const [x2, y2, x3, y3] = [baseX + next(), baseY + next(), baseX + next(), baseY + next()];
+                cubic(x1, y1, x2, y2, x3, y3);
+                [lastControlX, lastControlY, x, y] = [x2, y2, x3, y3];
+                kind = 'C';
+                break;
+            }
+            case 'Q': {
+                const [x1, y1, x2, y2] = [baseX + next(), baseY + next(), baseX + next(), baseY + next()];
+                quadratic(x1, y1, x2, y2);
+                [lastControlX, lastControlY, x, y] = [x1, y1, x2, y2];
+                break;
+            }
+            case 'T': {
+                const [x1, y1] = lastKind === 'Q' ? [2 * x - lastControlX, 2 * y - lastControlY] : [x, y];
+                const [x2, y2] = [baseX + next(), baseY + next()];
+                quadratic(x1, y1, x2, y2);
+                [lastControlX, lastControlY, x, y] = [x1, y1, x2, y2];
+                kind = 'Q';
+                break;
+            }
+            case 'A': {
+                const [rx, ry, turn, large, sweep] = [next(), next(), next(), next() !== 0, next() !== 0];
+                const [toX, toY] = [baseX + next(), baseY + next()];
+                arc(rx, ry, turn, large, sweep, toX, toY);
+                [x, y] = [toX, toY];
+                break;
+            }
+            case 'Z':
+                [x, y] = [startX, startY];
+                break;
+            default:
+                return;
+        }
+        lastKind = kind;
+        if (kind === 'Z' && hasNumber()) {
+            // Numbers after a close with no command: not a path.
+            return;
+        }
+        if (Number.isNaN(x) || Number.isNaN(y)) {
+            return;
+        }
+    }
+}
+
+/// What's in each `<svg>` of the page, by the svg's key, as elements that aren't drawn by themselves, as they're one picture.
+const svgParts = new Map();
+/// Refs of parts of a picture that are given their elements once what's rendering now has (see `keepSvgElements`).
+const svgRefsWaiting = [];
+function attachSvgRefsWaiting() {
+    let thrown = null;
+    for (const attach of svgRefsWaiting.splice(0)) {
+        try {
+            attach();
+        } catch (error) {
+            thrown ??= { error };
+        }
+    }
+    if (thrown !== null) {
+        throw thrown.error;
+    }
+}
+rsui.__beforeLayout = attachSvgRefsWaiting;
+
+function keepSvgElements(live, found) {
+    const key = live.domKey;
+    if (key === undefined || found === undefined) {
+        return;
+    }
+    const before = svgParts.get(key) ?? [];
+    // Refs are given their elements once every ref that's let go of has been, as React's commit detaches refs before it attaches
+    // any: a part that's moved along, as a circle does once the tooltip it's in has put its own box in before it, is a new
+    // element here, and its ref, the same as it had, would otherwise be given null after it was given the new one.
+    const attaches = [];
+    const now = found.map((one, at) => {
+        // The same element as last time, where it's the same kind in the same place, so that what code holds is still it.
+        const kept = before[at]?.tag === one.tag ? before[at] : { domKey: key + ':' + at, tag: one.tag, state: 0, look: {}, current: null };
+        const { children, ref, ...given } = one.props ?? {};
+        kept.given = given;
+        // Its ref is given its element, as React gives a ref its element before layout effects run: recharts' z-index layers are
+        // `<g ref>`s it portals its bars into once they've said what they are, so no bar was drawn.
+        if (kept.refHeld?.ref !== ref) {
+            letGoOfSvgRef(kept);
+            if (ref !== undefined && ref !== null) {
+                const held = { ref, detach: undefined, gone: false, given: false };
+                kept.refHeld = held;
+                const attach = () => {
+                    if (!held.gone && !held.given) {
+                        held.given = true;
+                        held.detach = attachRef(ref, handleOf(kept, kept.tag, true));
+                    }
+                };
+                attaches.push(attach);
+            }
+        }
+        kept.text = typeof children === 'string' || typeof children === 'number' ? String(children) : Array.isArray(children)
+            ? children.filter((part) => typeof part === 'string' || typeof part === 'number').join('') : '';
+        kept.parentKey = one.parent < 0 ? key : key + ':' + one.parent;
+        // The `<svg>` it's drawn in, where its box is worked out from: see `svgShapeRect`.
+        kept.svgOf = key;
+        kept.notShown = true;
+        // It's drawn, as a piece of the picture its `<svg>` is: see `svgPartBox`.
+        kept.svgPart = key;
+        kept.weak ??= new WeakRef(kept);
+        return kept;
+    });
+    for (const one of before) {
+        if (!now.includes(one)) {
+            letGoOfSvgRef(one);
+        }
+    }
+    // Making an element can load `rsui/dom-globals` for the first time, which is done once what's rendering now is, from where
+    // the stack is short: before the commit's layout effects (`__beforeLayout`), as effects can need it there (Mantine's
+    // `Tooltip.Floating`, round each of RingProgress's circles, listens on it from an effect). Otherwise it's now, as recharts'
+    // layers are rendered in an update whose layout effects run before anything queued.
+    for (const attach of attaches) {
+        if (domGlobalsMade) {
+            attach();
+        } else {
+            if (svgRefsWaiting.length === 0) {
+                // In case nothing's committed after this, as when what rendered it is thrown away.
+                queueMicrotask(attachSvgRefsWaiting);
+            }
+            svgRefsWaiting.push(attach);
+        }
+    }
+    for (const one of before.slice(now.length)) {
+        notShownLives.delete(one.domKey);
+        pageLives.delete(one.domKey);
+    }
+    for (const one of now) {
+        pageLives.set(one.domKey, one.weak);
+        notShownLives.set(one.domKey, one);
+    }
+    svgParts.set(key, now);
+    pageNow = null;
+}
+
+/// Where a piece of an `<svg>` is in the window, as `getBoundingClientRect()` says: the box around its shape (not its stroke), in
+/// the `<svg>`'s own units taken to where the `<svg>` is through its `viewBox`, centred and kept in proportion as
+/// `preserveAspectRatio`'s default has it. A group is the box around what's in it. Null for what has no shape it can say.
+function svgPartBox(part) {
+    const svgLive = pageLives.get(part.svgPart)?.deref();
+    if (svgLive === undefined) {
+        return null;
+    }
+    const own = svgShapeBox(part);
+    if (own === null) {
+        return null;
+    }
+    const svg = handleOf(svgLive, 'svg').getBoundingClientRect();
+    const given = svgLive.given ?? {};
+    const view = String(given.viewBox ?? '').trim().split(/[\s,]+/).map(Number);
+    let [viewX, viewY, viewWidth, viewHeight] = view.length === 4 && view.every(Number.isFinite) && view[2] > 0 && view[3] > 0
+        ? view : [0, 0, svg.width, svg.height];
+    const scale = viewWidth > 0 && viewHeight > 0 ? Math.min(svg.width / viewWidth, svg.height / viewHeight) : 1;
+    const left = svg.x + (svg.width - viewWidth * scale) / 2 - viewX * scale;
+    const top = svg.y + (svg.height - viewHeight * scale) / 2 - viewY * scale;
+    const [x0, y0, x1, y1] = own;
+    return [left + x0 * scale, top + y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale];
+}
+
+/// The box around a piece of an `<svg>`'s shape, in the `<svg>`'s units, as [left, top, right, bottom], or null.
+function svgShapeBox(part) {
+    const given = part.given ?? {};
+    const number = (name) => {
+        const value = Number.parseFloat(given[name]);
+        return Number.isFinite(value) ? value : 0;
+    };
+    switch (part.tag) {
+        case 'path':
+            return pathBox(String(given.d ?? ''));
+        case 'circle': {
+            const [x, y, r] = [number('cx'), number('cy'), number('r')];
+            return [x - r, y - r, x + r, y + r];
+        }
+        case 'ellipse': {
+            const [x, y, rx, ry] = [number('cx'), number('cy'), number('rx'), number('ry')];
+            return [x - rx, y - ry, x + rx, y + ry];
+        }
+        case 'rect':
+            return [number('x'), number('y'), number('x') + number('width'), number('y') + number('height')];
+        case 'line':
+            return pointsBox([[number('x1'), number('y1')], [number('x2'), number('y2')]]);
+        case 'polyline':
+        case 'polygon': {
+            const values = String(given.points ?? '').trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+            const points = [];
+            for (let at = 0; at + 1 < values.length; at += 2) {
+                points.push([values[at], values[at + 1]]);
+            }
+            return pointsBox(points);
+        }
+        case 'g': {
+            let box = null;
+            for (const other of svgParts.get(part.svgPart) ?? []) {
+                if (other.parentKey === part.domKey) {
+                    const inside = svgShapeBox(other);
+                    if (inside !== null) {
+                        box = box === null ? inside : [Math.min(box[0], inside[0]), Math.min(box[1], inside[1]), Math.max(box[2], inside[2]), Math.max(box[3], inside[3])];
+                    }
+                }
+            }
+            return box;
+        }
+        default:
+            return null;
+    }
+}
+
+function pointsBox(points) {
+    if (points.length === 0) {
+        return null;
+    }
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const [x, y] of points) {
+        x0 = Math.min(x0, x);
+        y0 = Math.min(y0, y);
+        x1 = Math.max(x1, x);
+        y1 = Math.max(y1, y);
+    }
+    return [x0, y0, x1, y1];
+}
+
+/// The box around what a path's `d` draws: its ends and corners, and its curves and arcs as many points along them, which is
+/// within a hundredth of a unit of where they turn back for anything an icon draws.
+function pathBox(d) {
+    const tokens = d.match(/[a-zA-Z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
+    const points = [];
+    let at = 0;
+    let command = '';
+    let [x, y, startX, startY] = [0, 0, 0, 0];
+    // The control point a smooth curve reflects, for `S` and `T`.
+    let [lastControlX, lastControlY, lastKind] = [0, 0, ''];
+    const number = () => Number(tokens[at++]);
+    // An arc's flags are a digit each, which can be written together and with what follows, as `0 01-8.9 0` (lucide's smile).
+    const flag = () => {
+        const token = tokens[at] ?? '';
+        if (token.length > 1 && (token[0] === '0' || token[0] === '1')) {
+            tokens[at] = token.slice(1);
+            return Number(token[0]);
+        }
+        at += 1;
+        return Number(token);
+    };
+    const has = () => at < tokens.length && !/^[a-zA-Z]$/.test(tokens[at]);
+    const STEPS = 24;
+    const cubic = (x1, y1, x2, y2, ex, ey) => {
+        for (let step = 1; step <= STEPS; step++) {
+            const t = step / STEPS;
+            const u = 1 - t;
+            points.push([u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * ex, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * ey]);
+        }
+    };
+    const quadratic = (x1, y1, ex, ey) => {
+        for (let step = 1; step <= STEPS; step++) {
+            const t = step / STEPS;
+            const u = 1 - t;
+            points.push([u * u * x + 2 * u * t * x1 + t * t * ex, u * u * y + 2 * u * t * y1 + t * t * ey]);
+        }
+    };
+    const arc = (rx, ry, turn, large, sweep, ex, ey) => {
+        // From its ends to its centre, as SVG's appendix F.6.5 says.
+        rx = Math.abs(rx);
+        ry = Math.abs(ry);
+        if (rx === 0 || ry === 0 || (x === ex && y === ey)) {
+            points.push([ex, ey]);
+            return;
+        }
+        const phi = (turn * Math.PI) / 180;
+        const [cos, sin] = [Math.cos(phi), Math.sin(phi)];
+        const dx = (x - ex) / 2;
+        const dy = (y - ey) / 2;
+        const x1 = cos * dx + sin * dy;
+        const y1 = -sin * dx + cos * dy;
+        const grow = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
+        if (grow > 1) {
+            rx *= Math.sqrt(grow);
+            ry *= Math.sqrt(grow);
+        }
+        const top = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+        const bottom = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+        const factor = (large === sweep ? -1 : 1) * Math.sqrt(Math.max(0, top / bottom));
+        const cx1 = (factor * rx * y1) / ry;
+        const cy1 = (-factor * ry * x1) / rx;
+        const cx = cos * cx1 - sin * cy1 + (x + ex) / 2;
+        const cy = sin * cx1 + cos * cy1 + (y + ey) / 2;
+        const angle = (ux, uy, vx, vy) => {
+            const turned = Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+            return turned;
+        };
+        const start = angle(1, 0, (x1 - cx1) / rx, (y1 - cy1) / ry);
+        let span = angle((x1 - cx1) / rx, (y1 - cy1) / ry, (-x1 - cx1) / rx, (-y1 - cy1) / ry);
+        if (!sweep && span > 0) {
+            span -= 2 * Math.PI;
+        } else if (sweep && span < 0) {
+            span += 2 * Math.PI;
+        }
+        const steps = STEPS * 2;
+        for (let step = 1; step <= steps; step++) {
+            const a = start + (span * step) / steps;
+            points.push([cx + rx * Math.cos(a) * cos - ry * Math.sin(a) * sin, cy + rx * Math.cos(a) * sin + ry * Math.sin(a) * cos]);
+        }
+    };
+    while (at < tokens.length) {
+        if (/^[a-zA-Z]$/.test(tokens[at])) {
+            command = tokens[at++];
+        } else if (command === '') {
+            break;
+        }
+        const relative = command === command.toLowerCase();
+        const [baseX, baseY] = relative ? [x, y] : [0, 0];
+        let kind = command.toUpperCase();
+        let [controlX, controlY] = [x, y];
+        if (kind === 'Z') {
+            [x, y] = [startX, startY];
+            points.push([x, y]);
+            lastKind = 'Z';
+            continue;
+        }
+        if (!has()) {
+            break;
+        }
+        switch (kind) {
+            case 'M':
+                x = baseX + number();
+                y = baseY + number();
+                [startX, startY] = [x, y];
+                points.push([x, y]);
+                // Pairs after a move are lines.
+                command = relative ? 'l' : 'L';
+                break;
+            case 'L':
+                x = baseX + number();
+                y = baseY + number();
+                points.push([x, y]);
+                break;
+            case 'H':
+                x = baseX + number();
+                points.push([x, y]);
+                break;
+            case 'V':
+                y = (relative ? y : 0) + number();
+                points.push([x, y]);
+                break;
+            case 'C': {
+                const [x1, y1, x2, y2, ex, ey] = [baseX + number(), baseY + number(), baseX + number(), baseY + number(), baseX + number(), baseY + number()];
+                cubic(x1, y1, x2, y2, ex, ey);
+                [controlX, controlY, x, y] = [x2, y2, ex, ey];
+                break;
+            }
+            case 'S': {
+                const [x1, y1] = lastKind === 'C' || lastKind === 'S' ? [2 * x - lastControlX, 2 * y - lastControlY] : [x, y];
+                const [x2, y2, ex, ey] = [baseX + number(), baseY + number(), baseX + number(), baseY + number()];
+                cubic(x1, y1, x2, y2, ex, ey);
+                [controlX, controlY, x, y] = [x2, y2, ex, ey];
+                break;
+            }
+            case 'Q': {
+                const [x1, y1, ex, ey] = [baseX + number(), baseY + number(), baseX + number(), baseY + number()];
+                quadratic(x1, y1, ex, ey);
+                [controlX, controlY, x, y] = [x1, y1, ex, ey];
+                break;
+            }
+            case 'T': {
+                const [x1, y1] = lastKind === 'Q' || lastKind === 'T' ? [2 * x - lastControlX, 2 * y - lastControlY] : [x, y];
+                const [ex, ey] = [baseX + number(), baseY + number()];
+                quadratic(x1, y1, ex, ey);
+                [controlX, controlY, x, y] = [x1, y1, ex, ey];
+                break;
+            }
+            case 'A': {
+                const [rx, ry, turn] = [number(), number(), number()];
+                const large = flag();
+                const sweep = flag();
+                const [ex, ey] = [baseX + number(), baseY + number()];
+                arc(rx, ry, turn, large !== 0, sweep !== 0, ex, ey);
+                [x, y] = [ex, ey];
+                break;
+            }
+            default:
+                return pointsBox(points);
+        }
+        [lastControlX, lastControlY, lastKind] = [controlX, controlY, kind];
+    }
+    return pointsBox(points);
+}
+
+/// Lets go of what was in an `<svg>` that's gone, which would otherwise be found in `body` as `<path>`s of nothing.
+/// What a part of a picture's ref holds is let go of, as React gives a ref `null`, or calls what its function gave back.
+function letGoOfSvgRef(kept) {
+    const held = kept.refHeld;
+    if (held === undefined) {
+        return;
+    }
+    kept.refHeld = undefined;
+    held.gone = true;
+    if (typeof held.detach === 'function') {
+        held.detach();
+    }
+}
+
+/// Lets go of what was in an `<svg>` that's gone, which would otherwise stay in the page with nothing it's in, as children of the
+/// page itself.
+function forgetSvgParts(key) {
+    const parts = key === undefined ? undefined : svgParts.get(key);
+    if (parts === undefined) {
+        return;
+    }
+    svgParts.delete(key);
+    for (const one of parts) {
+        letGoOfSvgRef(one);
+        notShownLives.delete(one.domKey);
+        if (pageLives.get(one.domKey) === one.weak) {
+            pageLives.delete(one.domKey);
+        }
+    }
+    pageNow = null;
+}
+
+/// Where a shape in an `<svg>` is in the window, as `getBoundingClientRect()` says: the box around its geometry (not its stroke),
+/// in the picture's units, and those mapped by its `viewBox` onto the `<svg>`'s box, centred and as big as fits, as
+/// `preserveAspectRatio`'s default has it. A group's box is round what's in it. One with nothing to measure is empty, where the
+/// picture starts.
+function svgShapeRect(kept) {
+    const svg = pageLives.get(kept.svgOf)?.deref();
+    let outer;
+    if (svg !== undefined) {
+        // The `<svg>` itself, which says where it is as it was last laid out.
+        const handle = handles.get(kept.svgOf) ?? handleOf(svg, 'svg');
+        handle.__placedByKey = true;
+        outer = handle.getBoundingClientRect();
+    }
+    const empty = (x, y) => ({ x, y, left: x, top: y, right: x, bottom: y, width: 0, height: 0, toJSON: () => ({ x, y, width: 0, height: 0 }) });
+    if (outer === undefined) {
+        return empty(0, 0);
+    }
+    const number = (value) => {
+        const read = Number.parseFloat(String(value));
+        return Number.isFinite(read) ? read : undefined;
+    };
+    const given = svg.given ?? {};
+    const view = typeof given.viewBox === 'string' ? given.viewBox.trim().split(/[\s,]+/).map(Number) : null;
+    let scaleX = 1;
+    let scaleY = 1;
+    let fromX = outer.x;
+    let fromY = outer.y;
+    if (view !== null && view.length === 4 && view.every(Number.isFinite) && view[2] > 0 && view[3] > 0) {
+        const scale = Math.min(outer.width / view[2], outer.height / view[3]);
+        scaleX = scale;
+        scaleY = scale;
+        fromX = outer.x + (outer.width - view[2] * scale) / 2 - view[0] * scale;
+        fromY = outer.y + (outer.height - view[3] * scale) / 2 - view[1] * scale;
+    }
+    const box = svgShapeBoxIn(kept, svgParts.get(kept.svgOf) ?? [], number);
+    if (box === null) {
+        return empty(fromX, fromY);
+    }
+    const x = fromX + box[0] * scaleX;
+    const y = fromY + box[1] * scaleY;
+    const width = (box[2] - box[0]) * scaleX;
+    const height = (box[3] - box[1]) * scaleY;
+    return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON: () => ({ x, y, width, height }) };
+}
+
+/// The box round a shape's geometry in its picture's units, as `[left, top, right, bottom]`, or nothing.
+function svgShapeBoxIn(kept, parts, number) {
+    const given = kept.given ?? {};
+    const points = [];
+    const at = (x, y) => {
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+            points.push([x, y]);
+        }
+    };
+    switch (kept.tag) {
+        case 'path':
+            pathPointsTo(String(given.d ?? ''), at);
+            break;
+        case 'circle':
+        case 'ellipse': {
+            const cx = number(given.cx) ?? 0;
+            const cy = number(given.cy) ?? 0;
+            const rx = number(kept.tag === 'circle' ? given.r : given.rx) ?? 0;
+            const ry = number(kept.tag === 'circle' ? given.r : given.ry) ?? rx;
+            at(cx - rx, cy - ry);
+            at(cx + rx, cy + ry);
+            break;
+        }
+        case 'rect': {
+            const x = number(given.x) ?? 0;
+            const y = number(given.y) ?? 0;
+            at(x, y);
+            at(x + (number(given.width) ?? 0), y + (number(given.height) ?? 0));
+            break;
+        }
+        case 'line':
+            at(number(given.x1) ?? 0, number(given.y1) ?? 0);
+            at(number(given.x2) ?? 0, number(given.y2) ?? 0);
+            break;
+        case 'polyline':
+        case 'polygon': {
+            const list = String(given.points ?? '').trim().split(/[\s,]+/).map(Number);
+            for (let one = 0; one + 1 < list.length; one += 2) {
+                at(list[one], list[one + 1]);
+            }
+            break;
+        }
+        case 'g': {
+            for (const part of parts) {
+                if (part.parentKey === kept.domKey) {
+                    const inner = svgShapeBoxIn(part, parts, number);
+                    if (inner !== null) {
+                        at(inner[0], inner[1]);
+                        at(inner[2], inner[3]);
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    if (points.length === 0) {
+        return null;
+    }
+    const xs = points.map((point) => point[0]);
+    const ys = points.map((point) => point[1]);
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+/// The points along a path's `d` that its box is round: where each piece starts and ends, and points along each curve and arc
+/// close enough together that the box round them is the curve's to well within a pixel.
+function pathPointsTo(d, at) {
+    const tokens = d.match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) ?? [];
+    let index = 0;
+    let command = '';
+    let x = 0;
+    let y = 0;
+    let startX = 0;
+    let startY = 0;
+    let lastControl = null;
+    const STEPS = 24;
+    const read = () => Number(tokens[index++]);
+    const cubic = (x1, y1, x2, y2, ex, ey) => {
+        for (let step = 1; step <= STEPS; step += 1) {
+            const t = step / STEPS;
+            const u = 1 - t;
+            at(u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * ex, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * ey);
+        }
+    };
+    const quadratic = (x1, y1, ex, ey) => {
+        for (let step = 1; step <= STEPS; step += 1) {
+            const t = step / STEPS;
+            const u = 1 - t;
+            at(u * u * x + 2 * u * t * x1 + t * t * ex, u * u * y + 2 * u * t * y1 + t * t * ey);
+        }
+    };
+    // An arc as SVG says it, from where it is to (ex, ey), turned into its centre and angles (SVG 1.1, appendix F.6.5).
+    const arc = (rx, ry, turn, large, sweep, ex, ey) => {
+        rx = Math.abs(rx);
+        ry = Math.abs(ry);
+        if (rx === 0 || ry === 0 || (x === ex && y === ey)) {
+            at(ex, ey);
+            return;
+        }
+        const phi = (turn * Math.PI) / 180;
+        const cos = Math.cos(phi);
+        const sin = Math.sin(phi);
+        const dx = (x - ex) / 2;
+        const dy = (y - ey) / 2;
+        const x1 = cos * dx + sin * dy;
+        const y1 = -sin * dx + cos * dy;
+        const grow = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
+        if (grow > 1) {
+            rx *= Math.sqrt(grow);
+            ry *= Math.sqrt(grow);
+        }
+        const top = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+        const factor = (large === sweep ? -1 : 1) * Math.sqrt(Math.max(0, top / (rx * rx * y1 * y1 + ry * ry * x1 * x1)));
+        const cx1 = (factor * rx * y1) / ry;
+        const cy1 = (-factor * ry * x1) / rx;
+        const cx = cos * cx1 - sin * cy1 + (x + ex) / 2;
+        const cy = sin * cx1 + cos * cy1 + (y + ey) / 2;
+        const angle = (ux, uy, vx, vy) => {
+            const sign = ux * vy - uy * vx < 0 ? -1 : 1;
+            const dot = (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy));
+            return sign * Math.acos(Math.max(-1, Math.min(1, dot)));
+        };
+        const theta = angle(1, 0, (x1 - cx1) / rx, (y1 - cy1) / ry);
+        let delta = angle((x1 - cx1) / rx, (y1 - cy1) / ry, (-x1 - cx1) / rx, (-y1 - cy1) / ry);
+        if (!sweep && delta > 0) {
+            delta -= 2 * Math.PI;
+        } else if (sweep && delta < 0) {
+            delta += 2 * Math.PI;
+        }
+        const steps = STEPS * 4;
+        for (let step = 1; step <= steps; step += 1) {
+            const a = theta + (delta * step) / steps;
+            at(cx + rx * Math.cos(a) * cos - ry * Math.sin(a) * sin, cy + rx * Math.cos(a) * sin + ry * Math.sin(a) * cos);
+        }
+    };
+    while (index < tokens.length) {
+        if (/^[a-zA-Z]$/.test(tokens[index])) {
+            command = tokens[index++];
+        } else if (command === '') {
+            return;
+        }
+        const relative = command === command.toLowerCase();
+        const ox = relative ? x : 0;
+        const oy = relative ? y : 0;
+        switch (command.toUpperCase()) {
+            case 'M':
+                x = ox + read();
+                y = oy + read();
+                startX = x;
+                startY = y;
+                at(x, y);
+                // Pairs after a move are lines.
+                command = relative ? 'l' : 'L';
+                lastControl = null;
+                break;
+            case 'L':
+                x = ox + read();
+                y = oy + read();
+                at(x, y);
+                lastControl = null;
+                break;
+            case 'H':
+                x = ox + read();
+                at(x, y);
+                lastControl = null;
+                break;
+            case 'V':
+                y = oy + read();
+                at(x, y);
+                lastControl = null;
+                break;
+            case 'C': {
+                const x1 = ox + read(), y1 = oy + read(), x2 = ox + read(), y2 = oy + read(), ex = ox + read(), ey = oy + read();
+                cubic(x1, y1, x2, y2, ex, ey);
+                lastControl = ['C', x2, y2];
+                x = ex;
+                y = ey;
+                break;
+            }
+            case 'S': {
+                const x1 = lastControl?.[0] === 'C' ? 2 * x - lastControl[1] : x;
+                const y1 = lastControl?.[0] === 'C' ? 2 * y - lastControl[2] : y;
+                const x2 = ox + read(), y2 = oy + read(), ex = ox + read(), ey = oy + read();
+                cubic(x1, y1, x2, y2, ex, ey);
+                lastControl = ['C', x2, y2];
+                x = ex;
+                y = ey;
+                break;
+            }
+            case 'Q': {
+                const x1 = ox + read(), y1 = oy + read(), ex = ox + read(), ey = oy + read();
+                quadratic(x1, y1, ex, ey);
+                lastControl = ['Q', x1, y1];
+                x = ex;
+                y = ey;
+                break;
+            }
+            case 'T': {
+                const x1 = lastControl?.[0] === 'Q' ? 2 * x - lastControl[1] : x;
+                const y1 = lastControl?.[0] === 'Q' ? 2 * y - lastControl[2] : y;
+                const ex = ox + read(), ey = oy + read();
+                quadratic(x1, y1, ex, ey);
+                lastControl = ['Q', x1, y1];
+                x = ex;
+                y = ey;
+                break;
+            }
+            case 'A': {
+                const rx = read(), ry = read(), turn = read(), large = read() !== 0, sweep = read() !== 0;
+                const ex = ox + read(), ey = oy + read();
+                arc(rx, ry, turn, large, sweep, ex, ey);
+                x = ex;
+                y = ey;
+                lastControl = null;
+                break;
+            }
+            case 'Z':
+                x = startX;
+                y = startY;
+                lastControl = null;
+                // Numbers after it are a mistake.
+                if (index < tokens.length && !/^[a-zA-Z]$/.test(tokens[index])) {
+                    return;
+                }
+                continue;
+            default:
+                return;
+        }
+        // A number that isn't one ends it, as a browser draws a path up to its first mistake.
+        if (Number.isNaN(x) || Number.isNaN(y)) {
+            return;
+        }
+    }
+}
+
+/// Puts what isn't shown into the page's tree, at the end of what's in what it's in, with nothing to say where it is.
+function withNotShown(tree) {
+    for (const kept of notShownLives.values()) {
+        if (tree.byKey.has(kept.domKey)) {
+            continue;
+        }
+        const parent = (kept.parentKey === undefined ? undefined : tree.byKey.get(kept.parentKey)) ?? tree.root;
+        const given = kept.given ?? {};
+        const entry = [kept.domKey, 'group', typeof given.className === 'string' ? given.className : undefined, typeof given.id === 'string' ? given.id : undefined,
+            undefined, '', 0, 0, 0, 0, undefined, kept.domKey];
+        let textFrom = parent.textTo;
+        let textTo = parent.textTo;
+        if (typeof kept.text === 'string' && kept.text !== '') {
+            textFrom = tree.texts.length;
+            tree.texts.push(kept.text);
+            tree.shown.push(kept.text);
+            textTo = tree.texts.length;
+        }
+        const node = { entry, key: kept.domKey, live: kept, parent, children: NO_PAGE_KIDS, index: parent.children.length, own: null, textFrom, textTo };
+        withPageKid(parent, node);
+        tree.byKey.set(kept.domKey, node);
+        tree.order.push(node);
+    }
+    return tree;
+}
+
+/// What an element of the page with no elements in it has as its children, one list for all of them, and the first put in one is in a
+/// list just as long as that, as most have none or one, and a list that's grown keeps room for more.
+const NO_PAGE_KIDS = Object.freeze([]);
+
+function withPageKid(parent, node) {
+    if (parent.children.length === 0) {
+        parent.children = [node];
+    } else {
+        parent.children.push(node);
+    }
+}
+
+/// The page as it is now, for matching selectors against: each element, in the order they're written, with what it's in, what's
+/// in it, and where it is among that. It's made again only once the tree has changed, which Rust says: see `pageTree` in
+/// `geometry.rs`.
+let pageNow = null;
+
+function pageTree() {
+    // What's laid out is kept from now on, for what code asks about the page, as it asks again.
+    rsuiHostMethods.keepLaidOut();
+    const said = rsuiHostMethods.pageTree(pageNow === null);
+    if (said === undefined) {
+        return pageNow;
+    }
+    if (said.length < 2) {
+        return null;
+    }
+    const root = { entry: said[0], key: undefined, live: null, parent: null, children: NO_PAGE_KIDS, index: 0, own: null, textFrom: 0, textTo: 0 };
+    const byKey = new Map();
+    const order = [];
+    // Each piece of text, in the order it's in on the page, which each element has a run of.
+    const texts = [];
+    // The same as it's shown, which `text-transform` may have cased: see `uncased`.
+    const shown = [];
+    // What's in each portal into `body`, which goes at the end of it, after what the app drew there, in the order they're written.
+    const portals = [];
+    let ordered = order;
+    let at = 2;
+    // How deep in what a control draws by itself it is, as a `<select>`'s chosen text and its list, which isn't the page's text.
+    let drawnOnly = 0;
+    // A `<select>`'s options and optgroups, which aren't drawn, by what they're in: they're put in it in their place, with their
+    // text, so that its `textContent` and `options` have them, rather than at the end with the rest of what isn't shown.
+    let listParts = null;
+    for (const kept of notShownLives.values()) {
+        if (kept.listPart === true && kept.parentKey !== undefined) {
+            listParts ??= new Map();
+            const list = listParts.get(kept.parentKey);
+            if (list === undefined) {
+                listParts.set(kept.parentKey, [kept]);
+            } else {
+                list.push(kept);
+            }
+        }
+    }
+    const withListParts = (node) => {
+        for (const kept of listParts?.get(node.key) ?? []) {
+            if (byKey.has(kept.domKey)) {
+                continue;
+            }
+            const given = kept.given ?? {};
+            const entry = [kept.domKey, 'group', typeof given.className === 'string' ? given.className : undefined, typeof given.id === 'string' ? given.id : undefined,
+                undefined, '', 0, 0, 0, 0, undefined, kept.domKey];
+            const part = { entry, key: kept.domKey, live: kept, parent: node, children: NO_PAGE_KIDS, index: node.children.length, own: null, textFrom: texts.length, textTo: texts.length };
+            withPageKid(node, part);
+            byKey.set(kept.domKey, part);
+            ordered.push(part);
+            if (typeof kept.text === 'string' && kept.text !== '') {
+                texts.push(kept.text);
+                shown.push(kept.text);
+            }
+            withListParts(part);
+            part.textTo = texts.length;
+        }
+    };
+    const visit = (parent) => {
+        const entry = said[at];
+        const count = said[at + 1];
+        at += 2;
+        let node = parent;
+        const key = entry[0];
+        if (typeof entry?.[11] === 'string' && entry[11] === '__fragment') {
+            // What's rendered into a fragment that isn't in the page (see `FragmentPortal` in layer.js) is no part of the document,
+            // but is still what its elements find inside themselves, as Radix Select's closed list's items are for typeahead.
+            const detached = { children: NO_PAGE_KIDS, order: [], parent: null, detached: true };
+            const was = ordered;
+            ordered = detached.order;
+            for (let one = 0; one < count; one += 1) {
+                visit(detached);
+            }
+            ordered = was;
+            return;
+        }
+        if (isPortal(entry)) {
+            const portal = { children: NO_PAGE_KIDS, order: [], parent: null };
+            if (isPortal(entry)) {
+                portals.push(portal);
+            }
+            const was = ordered;
+            ordered = portal.order;
+            for (let one = 0; one < count; one += 1) {
+                visit(portal);
+            }
+            ordered = was;
+            return;
+        }
+        const live = key === undefined ? undefined : pageLives.get(key)?.deref();
+        // Only what's an element of the page is one: the rest is only there to lay out what's in it.
+        if (live !== undefined && !byKey.has(key)) {
+            node = { entry, key, live, parent, children: NO_PAGE_KIDS, index: parent.children.length, own: null, textFrom: texts.length, textTo: texts.length };
+            withPageKid(parent, node);
+            byKey.set(key, node);
+            ordered.push(node);
+        }
+        // A page's element that was given nothing to say, as a slider's thumb, is named by its `aria-label`, which isn't its text.
+        const given = live?.children;
+        const ownDrawing = typeof entry[11] === 'string' && entry[11].startsWith('__drawnOnly');
+        if (ownDrawing) {
+            drawnOnly += 1;
+        }
+        if (entry[1] === 'text' && count === 0 && typeof entry[5] === 'string' && drawnOnly === 0
+            && !(live !== undefined && (given === undefined || given === null || given === false || given === ''))) {
+            const uncased = live?.uncased;
+            texts.push(uncased !== undefined && uncased.shown === entry[5] ? uncased.said : entry[5]);
+            shown.push(entry[5]);
+        }
+        for (let one = 0; one < count; one += 1) {
+            visit(node);
+        }
+        if (ownDrawing) {
+            drawnOnly -= 1;
+        }
+        if (node !== parent) {
+            if (listParts !== null) {
+                withListParts(node);
+            }
+            node.textTo = texts.length;
+        }
+    };
+    for (let one = 0; one < said[1]; one += 1) {
+        visit(root);
+    }
+    for (const portal of portals) {
+        for (const node of portal.children) {
+            node.parent = root;
+            node.index = root.children.length;
+            withPageKid(root, node);
+        }
+        order.push(...portal.order);
+    }
+    root.textTo = texts.length;
+    for (const [key, weak] of pageLives) {
+        if (weak.deref() === undefined) {
+            pageLives.delete(key);
+        }
+    }
+    pageNow = withNotShown({ root, byKey, order, texts, shown, selectorContentVersion: said[0]?.[13] });
+    return pageNow;
+}
+
+/// What an element of the page is, for checking a selector against, as what's drawn is described for CSS (see `describe`), with
+/// where it is among what's around it only worked out if it's asked about.
+const SHARED_SELECTOR_GETTERS = (() => {
+    try { return globalThis.process?.env?.RSUI_SHARED_SELECTOR_GETTERS !== '0'; }
+    catch { return true; }
+})();
+
+// Query descriptors do not escape the matcher. Share structural accessors rather
+// than allocating two closures for every descriptor, including simple id reads.
+class PageSelectorOwn {
+    constructor(node, live, props) {
+        this.tag = live.tag ?? null;
+        this.id = typeof props.id === 'string' ? props.id : undefined;
+        this.classes = classesOf(props.className);
+        this.props = props;
+        this.state = live.state ?? 0;
+        this.empty = node.children.length === 0 && (node.entry[5] === undefined || node.entry[5] === '');
+        this.kind = 'element';
+        this.node = node;
+    }
+    get nth() {
+        const node = this.node;
+        const live = node.live;
+        const siblings = node.parent.children;
+        let [typeIndex, typeCount] = [-1, 0];
+        const owns = [];
+        for (const one of siblings) {
+            if (one.live.tag === live.tag) {
+                if (one === node) typeIndex = typeCount;
+                typeCount += 1;
+            }
+            owns.push(ownOf(one));
+        }
+        return { index: node.index, count: siblings.length, typeIndex, typeCount, siblings: owns };
+    }
+    get prevs() {
+        const node = this.node;
+        const siblings = node.parent.children;
+        const owns = [];
+        for (let at = 0; at < node.index; at++) owns.push(ownOf(siblings[at]));
+        return owns;
+    }
+}
+
+function ownOf(node) {
+    if (node.own !== null && (selectorReading === 0 || node.selectorReadGeneration === selectorReading)) {
+        return node.own;
+    }
+    const live = node.live;
+    const given = live.given ?? {};
+    const props = live.attributes === undefined ? given : { ...given, ...live.attributes };
+    const own = SHARED_SELECTOR_GETTERS ? new PageSelectorOwn(node, live, props) : {
+        tag: live.tag ?? null,
+        id: typeof props.id === 'string' ? props.id : undefined,
+        classes: classesOf(props.className),
+        props,
+        state: live.state ?? 0,
+        empty: node.children.length === 0 && (node.entry[5] === undefined || node.entry[5] === ''),
+        kind: 'element',
+        node,
+        get nth() {
+            const siblings = node.parent.children;
+            let [typeIndex, typeCount] = [-1, 0];
+            const owns = [];
+            for (const one of siblings) {
+                if (one.live.tag === live.tag) {
+                    if (one === node) {
+                        typeIndex = typeCount;
+                    }
+                    typeCount += 1;
+                }
+                owns.push(ownOf(one));
+            }
+            return { index: node.index, count: siblings.length, typeIndex, typeCount, siblings: owns };
+        },
+        get prevs() {
+            const siblings = node.parent.children;
+            const owns = [];
+            for (let at = 0; at < node.index; at++) {
+                owns.push(ownOf(siblings[at]));
+            }
+            return owns;
+        },
+    };
+    node.own = own;
+    node.selectorReadGeneration = selectorReading;
+    return own;
+}
+
+/// Whether something found in the page has what `:has()` says, as it's written relative to it: anywhere in it, right in it with
+/// `>`, or after it with `+` or `~`, each with the rest of the selector as CSS matches it, from there.
+function nodeHas(node, steps) {
+    const link = steps[0].link ?? 'descendant';
+    const anchored = [{ tag: null, id: null, classes: [], attrs: [], pseudo: [{ name: '__node', node, arg: null, list: null }], part: null, link: null, self: false }, { ...steps[0], link }, ...steps.slice(1)];
+    const candidates = [];
+    const gather = (from) => {
+        for (const child of from.children) {
+            candidates.push(child);
+            gather(child);
+        }
+    };
+    if (link === 'adjacent' || link === 'sibling') {
+        for (const sibling of node.parent?.children.slice(node.index + 1) ?? []) {
+            candidates.push(sibling);
+            gather(sibling);
+        }
+    } else {
+        gather(node);
+    }
+    for (const one of candidates) {
+        if (matchAll(anchored, anchored.length - 1, ownOf(one), aboveOf(one))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether an element of the page fits any of a list of selectors. What finds elements in the page goes through each of them with
+/// loops of its own rather than `some` and `map`: each of those is a call back into JavaScript from Rust, which takes a lot of
+/// Rust's stack in a debug build, and `:has(+ .branch .leaf)` nests four of them under a click's handler, which ran out of room
+/// (`RangeError: Maximum call stack size exceeded` in web.rs's `selector_queries_preserve_structure_state_and_identity`).
+function anyMatches(steps, own, above) {
+    for (const one of steps) {
+        if (matchAll(one, one.length - 1, own, above)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// What an element's in, nearest last, as `matchAll` has it: the page, as `html` and `body`, and then each element.
+function aboveOf(node) {
+    const above = [];
+    for (let at = node.parent; at !== null && at.parent !== null; at = at.parent) {
+        above.push(ownOf(at));
+    }
+    above.push({ tag: 'body', id: undefined, classes: [...pageClasses], props: {}, state: 0, nth: null, prevs: [], kind: 'element' });
+    above.push(pageElement());
+    return above.reverse();
+}
+
+/// A selector as it's read for finding elements, kept, as the same few are asked about over and over.
+const querySelectors = new Map();
+
+function querySteps(text) {
+    let steps = querySelectors.get(text);
+    if (steps === undefined) {
+        // Finding something isn't drawing it, so nothing that's asked about here has CSS keep track of where things are.
+        const keeping = [structural, ofType];
+        try {
+            steps = commas(text).map((one) => readSelector(one.trim()));
+        } finally {
+            [structural, ofType] = keeping;
+        }
+        if (steps.length === 0 || steps.some((one) => one === null)) {
+            throw Object.assign(new SyntaxError("'" + text + "' is not a valid selector."), { name: 'SyntaxError' });
+        }
+        querySelectors.set(text, steps);
+    }
+    return steps;
+}
+
+/// The element of the page that's being asked about, as `:scope` says, while a selector's being checked.
+let scopeNode = null;
+
+/// Whether an element of the page fits a selector, with `,` between ones any of which will do, as CSS has it.
+function nodeMatches(node, selector, scope = null) {
+    const own = ownOf(node);
+    const above = aboveOf(node);
+    const was = scopeNode;
+    scopeNode = scope;
+    try {
+        return querySteps(String(selector)).some((steps) => matchAll(steps, steps.length - 1, own, above));
+    } finally {
+        scopeNode = was;
+    }
+}
+
+/// Whether an element of the page is in it now, as `nodeOf` finds it, without making the page again for matching selectors
+/// against, which takes as long as the page is big: `document.activeElement` is asked about all the time while editing.
+function inPageNow(element) {
+    const key = element?.__domKey;
+    if (key === undefined) {
+        return false;
+    }
+    if (notShownLives.has(key)) {
+        return true;
+    }
+    if (pageLives.get(key)?.deref() === undefined) {
+        return false;
+    }
+    if (rsuiHostMethods.hasKey(key)) {
+        mountedNotDrawn.delete(key);
+        return true;
+    }
+    // Put in by React and not drawn yet, as a menu that's just opened is when Radix's FocusScope focuses it in an effect and then
+    // asks `document.activeElement` whether that worked: on a page it's there the moment it's put in.
+    return mountedNotDrawn.has(key);
+}
+
+/// The keys of the page's elements that React's put in and Rust doesn't have yet.
+const mountedNotDrawn = new Set();
+
+/// The element of the page this is, in the tree as it is now, if it's there.
+function nodeOf(element) {
+    const key = element?.__domKey;
+    return key === undefined ? undefined : pageTree()?.byKey.get(key);
+}
+
+/// What a selector can say about an element without what's around it or in it: its states and what it was given. Everything else
+/// that's matched in the page (`:nth-child()`, `:empty`, `:has()`, `:scope` and the like) looks at more of the page than what
+/// it's in.
+const LOOKS_UP_PSEUDO = new Set(['hover', 'active', 'focus', 'focus-visible', 'focus-within', 'checked', 'disabled', 'enabled', 'required',
+    'optional', 'read-only', 'read-write', 'placeholder-shown', 'link', 'any-link', 'modal', 'open', 'root', 'valid', 'user-valid', 'user-invalid', '__container', 'in-range', 'visited',
+    'target', 'host', 'host-context', 'indeterminate', 'invalid', 'out-of-range', 'fullscreen', 'popover-open']);
+
+/// Whether a selector, as `querySteps` reads it, only asks about an element and what it's in, with `>` or a space between its
+/// steps, which `nodeUpOf` can answer, kept for each, as the same few are asked about over and over.
+const looksOnlyUp = new Map();
+
+function onlyLooksUp(selector) {
+    const text = String(selector);
+    let up = looksOnlyUp.get(text);
+    if (up === undefined) {
+        const stepsUp = (steps) => steps.every((step) => {
+            const link = step.link ?? 'descendant';
+            return (link === 'descendant' || link === 'child') && step.pseudo.every((pseudo) => LOOKS_UP_PSEUDO.has(pseudo.name)
+                || (['not', 'is', 'where', 'matches'].includes(pseudo.name) && (pseudo.list ?? []).every((one) => one === null || stepsUp(one))));
+        });
+        try {
+            up = querySteps(text).every(stepsUp);
+        } catch {
+            // What isn't a selector is said to be one where everything's asked about, which is where it's found not to be.
+            up = false;
+        }
+        looksOnlyUp.set(text, up);
+    }
+    return up;
+}
+
+/// The element of the page this is, as `nodeOf` finds it, for matching a selector that only asks about it and what it's in
+/// against (see `onlyLooksUp`). Once the tree's changed, that's only what's along the way to it rather than all of the page made
+/// again, which takes as long as the page is big, and an editor asks `closest()` on every click: each element along the way
+/// is one of the page just as `pageTree` has it, with nothing next to it or in it.
+function nodeUpOf(element, selector) {
+    const key = element?.__domKey;
+    if (key === undefined || notShownLives.has(key) || !onlyLooksUp(selector)) {
+        return nodeOf(element);
+    }
+    if (pageNow !== null && rsuiHostMethods.pageTreeKept()) {
+        const found = nodeOf(element);
+        if (found !== undefined || element.__pageChainWas === undefined) {
+            return found;
+        }
+    }
+    rsuiHostMethods.keepLaidOut();
+    let said = askedOfTree('pageChainOf', key);
+    if (said === undefined) {
+        // While what it's in is drawn again (a component that set state from its ref renders before Rust has its new tree), it's
+        // still where it was last found, as it is in the DOM all along: Radix's `button.closest('form')` in a render asks then.
+        said = element.__pageChainWas;
+        if (said === undefined) {
+            return undefined;
+        }
+    } else {
+        element.__pageChainWas = said;
+    }
+    const chain = outOfPortal(said);
+    let node = { entry: chain[0], key: undefined, live: null, parent: null, children: NO_PAGE_KIDS, index: 0, own: null, textFrom: 0, textTo: 0 };
+    for (let at = 1; at < chain.length; at += 1) {
+        const entry = chain[at];
+        const one = entry[0];
+        const live = one === undefined ? undefined : pageLives.get(one)?.deref();
+        let again = false;
+        for (let above = node; above !== null && !again; above = above.parent) {
+            again = above.key === one;
+        }
+        if (live !== undefined && !again) {
+            node = { entry, key: one, live, parent: node, children: NO_PAGE_KIDS, index: 0, own: null, textFrom: 0, textTo: 0 };
+        }
+    }
+    return node.key === key ? node : undefined;
+}
+
+/// An element of the page from where it is in the tree, as what's along the way to it, which is what an event says.
+function elementOf(node) {
+    const chain = [];
+    for (let at = node; at !== null; at = at.parent) {
+        chain.push(at.entry);
+    }
+    chain.reverse();
+    return chainElement(chain, chain.length - 1);
+}
+
+/// The elements one selector, or several with commas between them, says, in the order they're in on the page, as CSS matches
+/// them, inside `within` if that's said. `first` stops at the first.
+function selected(selector, first, within = null) {
+    const text = String(selector);
+    const steps = querySteps(text);
+    const found = [];
+    // What the page itself is, which is never inside anything, and what's in `<head>`, which comes before what's shown.
+    if (within === null) {
+        for (const one of commas(text)) {
+            const whole = { head, body, html: documentElement, ':root': documentElement }[one.trim().toLowerCase()];
+            if (whole !== undefined && !found.includes(whole)) {
+                found.push(whole);
+            }
+        }
+        found.push(...headSelected(text, first));
+        if (found.length > 0 && first) {
+            return found.slice(0, 1);
+        }
+    }
+    const tree = pageTree();
+    if (tree === null) {
+        return found;
+    }
+    let nodes = tree.order;
+    let scope = null;
+    if (within !== null) {
+        scope = nodeOf(within);
+        if (scope === undefined) {
+            return found;
+        }
+        const inside = [];
+        const gather = (node) => {
+            for (const child of node.children) {
+                inside.push(child);
+                gather(child);
+            }
+        };
+        gather(scope);
+        nodes = inside;
+    }
+    const was = scopeNode;
+    scopeNode = scope;
+    try {
+        for (const node of nodes) {
+            const own = ownOf(node);
+            const above = aboveOf(node);
+            if (anyMatches(steps, own, above)) {
+                found.push(elementOf(node));
+                if (first) {
+                    break;
+                }
+            }
+        }
+    } finally {
+        scopeNode = was;
+    }
+    return found;
+}
+
+/// A color as `getComputedStyle()` says one: `rgb(r, g, b)`, or `rgba(...)` with its alpha.
+function computedColor(value, fallback = 'rgba(0, 0, 0, 0)') {
+    if (typeof value !== 'string') {
+        return fallback;
+    }
+    // A page has few colors, and `getComputedStyle()` says six of them each time, which floating-ui asks of every element above
+    // each popover on every scroll.
+    let said = computedColors.get(value);
+    if (said === undefined) {
+        said = colorAsComputed(value);
+        if (computedColors.size >= 4096) {
+            computedColors.clear();
+        }
+        computedColors.set(value, said);
+    }
+    return said;
+}
+
+/// What `computedColor` has said for each color it was given.
+const computedColors = new Map();
+
+function colorAsComputed(value) {
+    const hex = /^#([0-9a-f]{3,8})$/i.exec(value);
+    if (hex === null) {
+        return value === 'transparent' ? 'rgba(0, 0, 0, 0)' : value;
+    }
+    let digits = hex[1];
+    if (digits.length <= 4) {
+        digits = [...digits].map((one) => one + one).join('');
+    }
+    const [r, g, b] = [0, 2, 4].map((at) => parseInt(digits.slice(at, at + 2), 16));
+    if (digits.length === 8) {
+        const alpha = Math.round((parseInt(digits.slice(6, 8), 16) / 255) * 1000) / 1000;
+        return alpha === 1 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    return `rgb(${r}, ${g}, ${b})`;
+}
+
+/// What's passed down to what's inside, which `getComputedStyle()` looks for above an element when it doesn't say it itself.
+const INHERITED_LOOK = ['color', 'fontSize', 'fontWeight', 'fontFamily', 'fontStyle', 'letterSpacing', 'wordSpacing', 'lineHeight', 'textAlign', 'cursor',
+    '__whiteSpace', '__case', 'underline', 'lineThrough', 'overline'];
+
+/// What an element's CSS came to, with what it doesn't say itself from what it's in, as far up as that goes.
+function lookWithInherited(element) {
+    const own = element?.__live?.look ?? {};
+    const out = { ...own };
+    const lives = livesAbove(element, 64);
+    if (lives !== null) {
+        for (const live of lives) {
+            const look = live?.look;
+            if (look !== undefined) {
+                for (const name of INHERITED_LOOK) {
+                    if (out[name] === undefined && look[name] !== undefined) {
+                        out[name] = look[name];
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    let above = element?.parentElement ?? null;
+    for (let depth = 0; above !== null && above !== undefined && depth < 64; depth += 1) {
+        const look = above.__live?.look;
+        if (look !== undefined) {
+            for (const name of INHERITED_LOOK) {
+                if (out[name] === undefined && look[name] !== undefined) {
+                    out[name] = look[name];
+                }
+            }
+        }
+        if (above === body) {
+            break;
+        }
+        above = above.parentElement;
+    }
+    return out;
+}
+
+/// Whether this is a shape or group inside an `<svg>`, which is drawn with the picture rather than as a box of its own, and is
+/// `inline`, as a browser says of it.
+function svgChild(element) {
+    const tag = element?.__live?.tag;
+    return typeof tag === 'string' && tag !== 'svg' && SVG_TAGS[tag] !== undefined;
+}
+
+/// What `getComputedStyle()` gives for an element of a page: what its CSS came to, as a browser would say it, with what it's in
+/// passing down what it does, and how big it is from where it was laid out.
+function computedStyleOf(element) {
+    if (element === body || element === documentElement) {
+        return wholePageStyle();
+    }
+    const look = lookNow(element);
+    if (element?.__live?.svgPart === true && (look === undefined || look.display === undefined)) {
+        // A shape in an `<svg>` is drawn as part of its picture, not by itself, and is `inline` as a browser says it.
+        return new ComputedStyle(element, { ...(look ?? null), display: 'inline' });
+    }
+    // What `:has()` says now, which can be different from when it was drawn, as what's in it is only known once it's drawn.
+    const fresh = look === undefined ? null : freshLook(element) ?? element.__live.cascade?.fresh ?? null;
+    if (fresh !== null) {
+        const style = new ComputedStyle(element, { ...look, ...fresh });
+        style[COMPUTED_FROM].__fresh = fresh;
+        return style;
+    }
+    if (look === undefined && element?.__chain === undefined) {
+        // An element of the page that isn't drawn, as one whose CSS says `display: none` isn't, says so, as Tailwind's `hidden`
+        // under a `pointer-coarse:inline-block` that doesn't apply.
+        // What's inside an `<svg>` is drawn with the picture rather than as a box of its own, and is `inline`, as a browser says.
+        const tag = element?.__live?.tag;
+        if (typeof tag === 'string' && tag !== 'svg' && SVG_TAGS[tag] !== undefined && notShownLives.has(element.__domKey) !== true) {
+            return new ComputedStyle(element, { display: 'inline' });
+        }
+        return element?.__live !== undefined && element.__live.look === undefined && element.__live.given !== undefined
+            ? new ComputedStyle(element, { display: 'none' })
+            : pageStyle;
+    }
+    return new ComputedStyle(element, look);
+}
+
+/// What `computedStyleOf` gives. Each property is worked out when it's first read: code reads a few of them (Floating UI reads a
+/// handful, of every element above each popover, on every scroll), and making all of them each time, with the element's size and
+/// what it inherits, was most of a scroll's JavaScript. As in a browser, they're the style's prototype's until read.
+class ComputedStyle {
+    constructor(element, look) {
+        // What it's worked out from, kept where nothing that lists its properties sees it.
+        this[COMPUTED_FROM] = { __element: element, __look: look, __all: undefined, __box: undefined };
+    }
+    getPropertyValue(name) {
+        const text = String(name);
+        if (text.startsWith('--')) {
+            return variableValue(text) ?? '';
+        }
+        return this[text.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] ?? '';
+    }
+    getPropertyPriority() {
+        return '';
+    }
+    item(at) {
+        return COMPUTED_NAMES[at] ?? '';
+    }
+}
+
+/// Where a computed style keeps what it's worked out from.
+const COMPUTED_FROM = Symbol('computed from');
+/// What CSS's `visibility` said for an element, kept with what its look came to (which has it as drawn): see `COMPUTED.visibility`.
+const LOOK_VISIBILITY = Symbol('visibility');
+
+/// What the element's CSS came to with what it inherits, worked out once for a computed style, when it's first needed.
+function computedAll(style) {
+    return (style.__all ??= style.__fresh === undefined ? lookWithInherited(style.__element) : { ...lookWithInherited(style.__element), ...style.__fresh });
+}
+
+/// Where the element is as it's laid out (a computed `width` isn't changed by a `scale()`), once for a computed style, when it's
+/// first needed.
+function computedBox(style) {
+    const element = style.__element;
+    return (style.__box ??= typeof element.getBoundingClientRect !== 'function' || element.getBoundingClientRect === chainProps.getBoundingClientRect.value
+        ? clientBoxOf(element, false)
+        : element.getBoundingClientRect());
+}
+
+/// What a page's `position: fixed` comes to (see `fixed` in layout.rs): placed in the window by its own sides (`inset`), or
+/// covering it (`fill`), or at a place in it (`at`, `fixed`).
+const FIXED_OVERLAYS = new Set(['inset', 'fill', 'at', 'fixed']);
+
+/// Where a fixed overlay's left or top edge is in the window, from `overlayX` or `overlayY`, when that's a place from the window's
+/// start (one from its far side is said far below zero: see `FROM_END` in layout.rs), or 0 for one that fills it.
+function overlayPlace(look, key) {
+    if (look?.overlay === 'fill') {
+        return 0;
+    }
+    const at = look?.overlay === 'at' || look?.overlay === 'fixed' ? look[key] : undefined;
+    return typeof at === 'number' && at > -1e5 ? at : undefined;
+}
+
+/// A side of something fixed in the window (`inset`), with a share of the window in pixels, as a browser computes it.
+function insetSide(look, key) {
+    const said = look?.[key];
+    if (look?.overlay !== 'inset' || typeof said !== 'string' || !said.trim().endsWith('%')) {
+        return said;
+    }
+    const [width, height] = globalThis.__rsuiPageSize ?? [800, 600];
+    return (parseFloat(said) * (key === 'left' || key === 'right' ? width : height)) / 100;
+}
+
+/// A length as a computed style says it.
+function computedPx(value, fallback = '0px') {
+    return typeof value === 'number' ? value + 'px' : typeof value === 'string' && value !== '' ? value : fallback;
+}
+
+/// How each property of a computed style is worked out, from the style (see `ComputedStyle`), in the order they were once all made.
+const COMPUTED = {};
+for (const side of SIDES) {
+    const borderOf = (look) => look?.['border' + side + 'Width'] ?? look?.borderWidth ?? 0;
+    COMPUTED['margin' + side] = (style) => computedPx(style.__look?.['margin' + side]);
+    // What's drawn as padding has the border in it, which CSS says apart.
+    COMPUTED['padding' + side] = (style) => {
+        const look = style.__look;
+        const border = borderOf(look);
+        const padding = look?.['padding' + side];
+        return typeof padding === 'number' ? Math.max(0, padding - (typeof border === 'number' ? border : 0)) + 'px' : computedPx(padding);
+    };
+    COMPUTED['border' + side + 'Width'] = (style) => computedPx(borderOf(style.__look));
+    COMPUTED['border' + side + 'Style'] = (style) => {
+        const border = borderOf(style.__look);
+        return typeof border === 'number' && border > 0 ? style.__look?.borderStyle ?? 'solid' : 'none';
+    };
+    COMPUTED['border' + side + 'Color'] = (style) =>
+        computedColor(style.__look?.['border' + side + 'Color'] ?? style.__look?.borderColor, computedColor(computedAll(style).color, 'rgb(0, 0, 0)'));
+}
+Object.assign(COMPUTED, {
+    // What isn't shown (`display: none`, as Tailwind's `hidden` under a `pointer-coarse:inline-block` that doesn't apply) says so.
+    // What's in an `<svg>` is drawn in its picture, and is `inline` as a browser says its shapes are.
+    display: ({ __look: look, __element: element }) => (svgChild(element) ? look?.display ?? 'inline' : undefined) ?? (element?.__domKey !== undefined && notShownLives.has(element.__domKey)
+        ? (notShownLives.get(element.__domKey).svgPart !== undefined || notShownLives.get(element.__domKey).svgOf !== undefined ? 'inline'
+            : notShownLives.get(element.__domKey).listPart === true ? 'block' : 'none') : undefined) ?? look?.display ?? (look?.direction !== undefined && look?.display === undefined ? 'flex' : look?.tablePart !== undefined ? 'table-' + look.tablePart : look?.__inline === true ? 'inline' : 'block'),
+    flexDirection: ({ __look: look }) => (look?.direction === 'row' ? 'row' : 'column'),
+    // `position: fixed` is drawn as one of rsui's overlays, over everything, and its place in the window (see `fixed` in
+    // layout.rs), which is what's said of it: Floating UI measures a popover from the window only when its wrapper says it's fixed.
+    position: ({ __look: look }) => look?.__fixed === true || look?.__fixedInBox === true
+        ? 'fixed' : look?.position ?? (FIXED_OVERLAYS.has(look?.overlay) ? 'fixed' : 'static'),
+    top: ({ __look: look }) => computedPx(insetSide(look, 'top') ?? overlayPlace(look, 'overlayY'), 'auto'),
+    right: ({ __look: look }) => computedPx(insetSide(look, 'right') ?? (look?.overlay === 'fill' ? 0 : undefined), 'auto'),
+    bottom: ({ __look: look }) => computedPx(insetSide(look, 'bottom') ?? (look?.overlay === 'fill' ? 0 : undefined), 'auto'),
+    left: ({ __look: look }) => computedPx(insetSide(look, 'left') ?? overlayPlace(look, 'overlayX'), 'auto'),
+    overflow: (style) => {
+        const [x, y] = overflowOf(style);
+        return x === y ? x : x + ' ' + y;
+    },
+    overflowX: (style) => overflowOf(style)[0],
+    overflowY: (style) => overflowOf(style)[1],
+    // As a matrix, as a browser says it (CSS Transforms 1, "Serialization of the computed value"): vaul's drawer reads how far
+    // it's been dragged from `matrix(1, 0, 0, 1, 0, y)`, and does nothing for what doesn't look like one.
+    transform: (style) => computedTransform(style.__look?.transform, style.__element),
+    transformOrigin: () => '50% 50%',
+    opacity: ({ __look: look }) => String(look?.opacity ?? 1),
+    // Handed down, as CSS has it, until something says otherwise (`collapse` is `hidden` but for table parts).
+    visibility: (style) => {
+        for (let at = style.__element, depth = 0; at !== null && at !== undefined && depth < 64; at = at.parentElement, depth += 1) {
+            const said = at.__live?.look?.[LOOK_VISIBILITY];
+            if (said === 'hidden' || said === 'collapse' || said === 'visible') {
+                return said;
+            }
+            if (at === body) {
+                break;
+            }
+        }
+        return 'visible';
+    },
+    zIndex: ({ __look: look }) => (look?.zIndex === undefined ? 'auto' : String(look.zIndex)),
+    boxSizing: () => 'border-box',
+    width: (style) => computedBox(style).width + 'px',
+    height: (style) => computedBox(style).height + 'px',
+    cursor: (style) => computedAll(style).cursor ?? 'auto',
+    pointerEvents: ({ __look: look }) => (look?.inert === true ? 'none' : 'auto'),
+    color: (style) => computedColor(computedAll(style).color, 'rgb(0, 0, 0)'),
+    backgroundColor: ({ __look: look }) => computedColor(typeof look?.background === 'string' && !look.background.includes('gradient') ? look.background : undefined),
+    backgroundImage: ({ __look: look }) => (typeof look?.background === 'string' && look.background.includes('gradient') ? look.background : 'none'),
+    fontSize: (style) => computedPx(computedAll(style).fontSize, '16px'),
+    fontWeight: (style) => String(computedAll(style).fontWeight ?? '400').replace(/^normal$/, '400').replace(/^bold$/, '700'),
+    fontFamily: (style) => computedAll(style).fontFamily ?? 'Times New Roman',
+    fontStyle: (style) => computedAll(style).fontStyle ?? 'normal',
+    letterSpacing: (style) => {
+        const all = computedAll(style);
+        return typeof all.letterSpacing === 'number' && all.letterSpacing !== 0 ? all.letterSpacing + 'px' : 'normal';
+    },
+    wordSpacing: (style) => {
+        const all = computedAll(style);
+        return typeof all.wordSpacing === 'number' ? all.wordSpacing + 'px' : '0px';
+    },
+    lineHeight: (style) => {
+        const all = computedAll(style);
+        return typeof all.lineHeight === 'number' ? all.lineHeight + 'px' : 'normal';
+    },
+    textAlign: (style) => computedAll(style).textAlign ?? 'start',
+    textTransform: (style) => computedAll(style).__case ?? 'none',
+    textDecorationLine: (style) => {
+        const all = computedAll(style);
+        const decorations = [all.underline && 'underline', all.overline && 'overline', all.lineThrough && 'line-through'].filter(Boolean);
+        return decorations.length === 0 ? 'none' : decorations.join(' ');
+    },
+    whiteSpace: (style) => computedAll(style).__whiteSpace ?? 'normal',
+    borderRadius: ({ __look: look }) => computedPx(look?.radius),
+    boxShadow: ({ __look: look }) =>
+        look?.shadowColor === undefined ? 'none' : `${computedColor(look.shadowColor)} ${look.shadowX ?? 0}px ${look.shadowY ?? 0}px ${look.shadowBlur ?? 0}px ${look.shadowSpread ?? 0}px`,
+    gap: ({ __look: look }) => (look?.gap === undefined ? 'normal' : computedPx(look.gap)),
+    rowGap: ({ __look: look }) => (look?.rowGap === undefined ? 'normal' : computedPx(look.rowGap)),
+    columnGap: ({ __look: look }) => (look?.columnGap === undefined ? 'normal' : computedPx(look.columnGap)),
+    animationName: (style) => computedAnimationName(style.__element.__live),
+    animationDuration: (style) => style.__element.__live?.animationDuration ?? '0s',
+    transitionDuration: () => '0s',
+    transitionProperty: () => 'all',
+    direction: () => 'ltr',
+    writingMode: () => 'horizontal-tb',
+    // What makes something a containing block, which Floating UI looks at to know where a dropdown's place is said from.
+    perspective: () => 'none',
+    filter: ({ __look: look }) => (typeof look?.filter === 'string' && look.filter !== '' ? look.filter : 'none'),
+    backdropFilter: () => 'none',
+    willChange: ({ __look: look }) => (typeof look?.willChange === 'string' && look.willChange !== '' ? look.willChange : 'auto'),
+    contain: () => 'none',
+    containerType: () => 'normal',
+    // The shorthands, from the properties above.
+    borderColor: (_, style) => style.borderTopColor,
+    borderWidth: (_, style) => style.borderTopWidth,
+    borderStyle: (_, style) => style.borderTopStyle,
+    margin: (_, style) => [style.marginTop, style.marginRight, style.marginBottom, style.marginLeft].join(' '),
+    padding: (_, style) => [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft].join(' '),
+    font: (_, style) => `${style.fontStyle} ${style.fontWeight} ${style.fontSize} / ${style.lineHeight} ${style.fontFamily}`,
+});
+
+/// What an element's `overflow` comes to each way, as CSS computes it: `visible` beside something that isn't `visible` or `clip`
+/// is `auto`, and `clip` beside that is `hidden` (CSS Overflow 3, 3.1). react-remove-scroll lets a wheel through only to what
+/// says `auto` or `scroll` the way it goes.
+function overflowOf({ __look: look, __element: element }) {
+    const said = element?.__live?.overflow ?? (look?.__overflowX === undefined && look?.__overflowY === undefined ? undefined : [look.__overflowX, look.__overflowY]);
+    if (said === undefined) {
+        return ['visible', 'visible'];
+    }
+    let [x, y] = [said[0] ?? 'visible', said[1] ?? 'visible'];
+    const scrolls = (one) => one !== 'visible' && one !== 'clip';
+    if (scrolls(x) || scrolls(y)) {
+        x = x === 'visible' ? 'auto' : x === 'clip' ? 'hidden' : x;
+        y = y === 'visible' ? 'auto' : y === 'clip' ? 'hidden' : y;
+    }
+    return [x, y];
+}
+
+/// The names `item()` gives, in order: every property, then the methods, as when they were all the style's own.
+const COMPUTED_NAMES = [...Object.keys(COMPUTED), 'getPropertyValue', 'getPropertyPriority', 'item'];
+
+/// What a computed style says as it is when it's read, rather than when it was first read, as a page's is live: Radix's Presence
+/// keeps the style it got as a dialog opened and reads `animationName` from it as it closes.
+const COMPUTED_LIVE = new Set(['animationName', 'animationDuration']);
+
+for (const name of Object.keys(COMPUTED)) {
+    const work = COMPUTED[name];
+    Object.defineProperty(ComputedStyle.prototype, name, {
+        enumerable: true,
+        configurable: true,
+        get() {
+            const value = work(this[COMPUTED_FROM], this);
+            if (COMPUTED_LIVE.has(name)) {
+                return value;
+            }
+            // Once worked out it's the style's own, and stays what it was then.
+            Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true });
+            return value;
+        },
+        set(value) {
+            Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true });
+        },
+    });
+}
+
+// Private constant defaults, copied into a fresh result. Keep width/height here
+// in their original property order; each query replaces their current values.
+const PAGE_COMPUTED_DEFAULTS = {
+        display: 'block', position: 'static', top: 'auto', right: 'auto', bottom: 'auto', left: 'auto',
+        overflow: 'visible', overflowX: 'visible', overflowY: 'visible', transform: 'none', transformOrigin: '50% 50%', opacity: '1',
+        visibility: 'visible', zIndex: 'auto', boxSizing: 'content-box', width: '0px',
+        height: '0px', cursor: 'auto', pointerEvents: 'auto', color: 'rgb(0, 0, 0)',
+        backgroundColor: 'rgba(0, 0, 0, 0)', backgroundImage: 'none', fontSize: '16px', fontWeight: '400', fontFamily: 'Times New Roman',
+        fontStyle: 'normal', lineHeight: 'normal', direction: 'ltr', writingMode: 'horizontal-tb', perspective: 'none', filter: 'none',
+        backdropFilter: 'none', willChange: 'auto', contain: 'none', containerType: 'normal', borderRadius: '0px', boxShadow: 'none',
+};
+for (const side of SIDES) {
+    PAGE_COMPUTED_DEFAULTS['margin' + side] = '0px';
+    PAGE_COMPUTED_DEFAULTS['padding' + side] = '0px';
+    PAGE_COMPUTED_DEFAULTS['border' + side + 'Width'] = '0px';
+    PAGE_COMPUTED_DEFAULTS['border' + side + 'Style'] = 'none';
+    PAGE_COMPUTED_DEFAULTS['border' + side + 'Color'] = 'rgb(0, 0, 0)';
+}
+
+/// `getComputedStyle()` of the page's `<html>` or `<body>`: the window's size, and nothing moved, clipped or positioned, but what
+/// code's set on its `style`, as a scroll lock's `overflow: hidden`.
+function wholePageStyle() {
+    const style = { ...PAGE_COMPUTED_DEFAULTS,
+        width: (globalThis.innerWidth ?? 0) + 'px', height: (globalThis.innerHeight ?? 0) + 'px' };
+    for (const name of Object.keys(pageStyle)) {
+        const said = pageStyle[name];
+        if (typeof said === 'string' && said !== '' && /^[a-z][a-zA-Z]*$/.test(name)) {
+            style[name] = said;
+        }
+    }
+    withStyleMethods(style);
+    return style;
+}
+
+// CSSStyleDeclaration methods use their receiver; they do not need three fresh
+// closures and a captured style object for every html/body style query.
+const PAGE_COMPUTED_METHODS = {
+    getPropertyValue(name) {
+        const text = String(name);
+        if (text.startsWith('--')) {
+            return variableValue(text) ?? '';
+        }
+        return this[text.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] ?? '';
+    },
+    getPropertyPriority() {
+        return '';
+    },
+    item(at) {
+        return Object.keys(this)[at] ?? '';
+    },
+};
+
+/// What a computed style has besides its properties: the shorthands, and asking for one by its CSS name.
+function withStyleMethods(style) {
+    style.borderColor = style.borderTopColor;
+    style.borderWidth = style.borderTopWidth;
+    style.borderStyle = style.borderTopStyle;
+    style.margin = [style.marginTop, style.marginRight, style.marginBottom, style.marginLeft].join(' ');
+    style.padding = [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft].join(' ');
+    style.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} / ${style.lineHeight} ${style.fontFamily}`;
+    Object.assign(style, PAGE_COMPUTED_METHODS);
+}
+
+/// Sets an attribute on an element, or takes it off with `null`, as it's drawn from then on, with what it's given.
+function setAttributeOn(live, name, value) {
+    const said = (live.attributes ??= {});
+    const prop = { class: 'className', for: 'htmlFor', tabindex: 'tabIndex', readonly: 'readOnly', contenteditable: 'contentEditable' }[name.toLowerCase()] ?? name;
+    if (prop === 'style') {
+        return;
+    }
+    const before = said[prop];
+    const now = value === null ? undefined : prop === 'draggable' ? value !== 'false' : prop === 'tabIndex' ? Number(value) : value;
+    if (now !== before) {
+        said[prop] = now;
+        // Counted, for what's kept of it to be told apart: see `restyleSigned`.
+        live.attributesSet = (live.attributesSet ?? 0) + 1;
+        live.redraw?.();
+    }
+}
+
+/// Scrolling, as page code has it: how far something's scrolled, which `scrollTop` and `scrollLeft` say and change, how big what's
+// in it is, and `scroll` events. Where something's scrolled to is kept by rsui's scrolling area in Rust (see `scroll_area_with` in
+// rsui-runtime), which says each time a person scrolls it, and is told where code wants it, as a number that's new each time.
+
+/// The key of the page's own scrolling area, which `window.scrollY` and `document.documentElement.scrollTop` are about.
+const PAGE_SCROLL = '__dompage';
+/// How wide the page's own scrollbars are: classic ones, as a browser on Windows draws.
+const PAGE_SCROLLBAR = 17;
+/// What `html` says of the window's scrollbars: `scrollbar-width` and `scrollbar-color` (see `standardScrollbars`).
+const PAGE_SCROLLBAR_SAID = ['__scrollbarWidth', '__scrollbarColor', '__scrollbarThumb', '__scrollbarTrack'];
+/// How much room the window's scrollbar takes: none with `scrollbar-width: none`, less when it's thin.
+function pageScrollbarRoom() {
+    const width = pageLook().__scrollbarWidth;
+    return width === 'none' ? 0 : width === 'thin' ? 11 : PAGE_SCROLLBAR;
+}
+/// What's asked of the page's own scrolling area, as an element's are kept on what it keeps: see `scrollTo`.
+const pageScrolling = { domKey: PAGE_SCROLL, ask: 0, listeners: new Set(), told: null };
+
+// Same-program control for comparing demand-specific offsets with full extents.
+const OFFSET_ONLY_SCROLL = (() => {
+    try { return globalThis.process?.env?.RSUI_SCROLL_OFFSETS !== '0'; }
+    catch { return true; }
+})();
+
+function rawScrollOffsets(key) {
+    return askedOfTree(OFFSET_ONLY_SCROLL ? 'scrollOffsetsOf' : 'scrollOf', key);
+}
+
+/// Offset reads do not need to find the furthest descendant or scrollbar sizes.
+/// Pending programmatic requests remain visible until native layout catches up,
+/// with exactly the same pair-based reconciliation as the full scroll state.
+function scrollOffsets(live) {
+    rsuiHostMethods.keepLaidOut();
+    const said = live?.domKey === undefined ? undefined : rawScrollOffsets(live.domKey);
+    if (said === undefined) return { x: 0, y: 0 };
+    const [x, y] = said;
+    const guess = live.scrollGuess;
+    if (guess !== undefined) {
+        if (guess.fromX === x && guess.fromY === y) return { x: guess.x, y: guess.y };
+        live.scrollGuess = undefined;
+    }
+    return { x, y };
+}
+
+/// How something's scrolled, as it was last laid out: `{ x, y, width, height, viewWidth, viewHeight }`, where `width` and `height`
+/// are what's in it. With nothing that scrolls there, it's its own size, and it's at 0.
+function scrollState(live, element) {
+    rsuiHostMethods.keepLaidOut();
+    const said = live?.domKey === undefined ? undefined : askedOfTree('scrollOf', live.domKey);
+    if (said === undefined) {
+        const box = layoutBoxOf(element);
+        // What's in it can reach past it, as when it clips that: a collapsed section's `scrollHeight` is how tall it opens to.
+        const content = live?.domKey === undefined ? undefined : askedOfTree('contentSizeOf', live.domKey);
+        const width = content === undefined ? box.width : Math.max(box.width, content[0]);
+        const height = content === undefined ? box.height : Math.max(box.height, content[1]);
+        return { x: 0, y: 0, width, height, viewWidth: box.width, viewHeight: box.height, scrolls: false };
+    }
+    const [x, y, width, height, viewWidth, viewHeight, boxWidth, boxHeight, backwards] = said;
+    const state = { x, y, width, height, viewWidth, viewHeight, boxWidth, boxHeight, scrolls: true, rtl: backwards === 1 };
+    // What code has asked for shows as soon as it's asked, as on a page, until it's been laid out there.
+    const guess = live.scrollGuess;
+    if (guess !== undefined) {
+        if (guess.fromX === x && guess.fromY === y) {
+            state.x = guess.x;
+            state.y = guess.y;
+        } else {
+            live.scrollGuess = undefined;
+        }
+    }
+    return state;
+}
+
+/// Has something scroll to `x` across and `y` down, each only if it's said, as far as it can go, and says so with `scroll` once
+/// what's running now has finished, if it moved.
+function scrollTo(live, element, x, y) {
+    const now = scrollState(live, element);
+    if (!now.scrolls) {
+        return;
+    }
+    const to = (wanted, at, most) => (wanted === undefined || !Number.isFinite(Number(wanted)) ? at : Math.max(0, Math.min(Number(wanted), most)));
+    const toX = to(x, now.x, Math.max(0, now.width - now.viewWidth));
+    const toY = to(y, now.y, Math.max(0, now.height - now.viewHeight));
+    if (toX === now.x && toY === now.y) {
+        return;
+    }
+    const said = askedOfTree('scrollOf', live.domKey);
+    live.scrollGuess = { x: toX, y: toY, fromX: said?.[0], fromY: said?.[1] };
+    live.scrollAsk = (live.scrollAsk ?? 0) + 1;
+    // Rust is told how far it is from its start, which is its right where text goes from right to left (`solve_scroll`).
+    live.scrollToX = now.rtl ? Math.max(0, now.width - now.viewWidth) - toX : toX;
+    live.scrollToY = toY;
+    if (live === pageScrolling) {
+        for (const listener of pageScrolling.listeners) {
+            listener();
+        }
+    } else {
+        live.redraw?.();
+    }
+    // CSSOM queues one pending scroll event per target, not one per assignment.
+    // A library can set both axes, or adjust its request repeatedly, in one turn.
+    // Its listeners should hear the final position once rather than rendering for
+    // every intermediate request which was never shown.
+    if (live.scrollTelling !== true) {
+        live.scrollTelling = true;
+        queueMicrotask(() => {
+            live.scrollTelling = false;
+            tellScrolled(live);
+        });
+    }
+}
+
+/// What a scrolling area gives Rust to be told it's been scrolled, for something that scrolls.
+function scrollTold(live) {
+    live.scrollTold ??= () => {
+        live.scrollGuess = undefined;
+        tellScrolled(live);
+    };
+    return live.scrollTold;
+}
+
+/// What a scrolling area is given, for where code wants it, and to say it's been scrolled.
+function scrollProps(live) {
+    const props = { scrollTold: scrollTold(live) };
+    if (live.scrollAsk !== undefined) {
+        Object.assign(props, { scrollAsk: live.scrollAsk, scrollToX: live.scrollToX, scrollToY: live.scrollToY });
+    }
+    return props;
+}
+
+/// Runs what's listening for `scroll` (or `scrollend`) on the page: on `window` and `document`, on the way down if `capture` says so.
+function scrollListeners(event, where, capture) {
+    for (const one of (documentListeners.get(event.type) ?? []).slice()) {
+        if (one.where !== where || (capture !== null && one.capture !== capture)) {
+            continue;
+        }
+        if (one.once) {
+            unlistenOn(where, event.type, one.listener, one);
+        }
+        try {
+            event.currentTarget = where === 'window' ? globalThis : page;
+            if (typeof one.listener === 'function') {
+                one.listener.call(event.currentTarget, event);
+            } else {
+                one.listener?.handleEvent?.(event);
+            }
+        } catch (error) {
+            console.error(error);
+        }
+    }
+}
+
+/// Whether dispatching this event can be observed. Element listener counts are
+/// deliberately conservative: an unrelated element may keep this path enabled,
+/// but a dynamically attached listener must never be missed. Keep the scrollend
+/// timer even without listeners, since one can be attached before it fires.
+function scrollObserved(live, type) {
+    if (documentListeners.has(type)) {
+        return true;
+    }
+    if (live === pageScrolling) {
+        return typeof globalThis['on' + type] === 'function';
+    }
+    return elementListening.has(type) || typeof live.given?.[type === 'scroll' ? 'onScroll' : 'onScrollEnd'] === 'function';
+}
+
+/// Says something's been scrolled, as a page does: what's listening on `window` and `document` on the way down hears about it, then
+/// what's listening on it, and its `onScroll`. It doesn't go on up from there. The page's own scrolling is the document's, which
+/// `window` hears about after.
+function tellScrolled(live, type = 'scroll') {
+    if (type === 'scroll') {
+        // Once it's stopped moving, which is when no more of it's come for a little while, it says so with `scrollend`, as a
+        // browser does.
+        clearTimeout(live.scrollEnding);
+        live.scrollEnding = setTimeout(() => {
+            live.scrollEnding = undefined;
+            tellScrolled(live, 'scrollend');
+        }, SCROLL_END_AFTER);
+    }
+    // Native scrolling itself needs no DOM event object or element handle when
+    // nothing observes it. In particular, do not allocate these on each glide
+    // frame (and then again for its empty scrollend delivery).
+    if (!scrollObserved(live, type)) {
+        return;
+    }
+    if (live === pageScrolling) {
+        const event = elementEvent(type, page);
+        scrollListeners(event, 'window', true);
+        scrollListeners(event, 'document', null);
+        scrollListeners(event, 'window', false);
+        globalThis['on' + type]?.call(globalThis, event);
+        return;
+    }
+    const element = handleOf(live, live.tag, false);
+    const event = elementEvent(type, element);
+    scrollListeners(event, 'window', true);
+    scrollListeners(event, 'document', true);
+    if (!event.__stopped) {
+        heardBy(element, event, null);
+    }
+    if (!event.__stopped) {
+        try {
+            live.given?.[type === 'scroll' ? 'onScroll' : 'onScrollEnd']?.call(element, Object.assign(event, { currentTarget: element, nativeEvent: event }));
+        } catch (error) {
+            console.error(error);
+        }
+    }
+}
+
+/// How long after the last `scroll` a scrolling area says `scrollend`, in milliseconds.
+const SCROLL_END_AFTER = 20;
+
+/// How far from its left something's scrolled, from what a page's `scrollLeft` says, which where text goes from right to left is
+/// from its right, 0 there and less than 0 to the left of it, as Chromium has it.
+function fromScrollLeft(state, left) {
+    if (!state.rtl || left === undefined || !Number.isFinite(Number(left))) {
+        return left;
+    }
+    return Number(left) + Math.max(0, state.width - state.viewWidth);
+}
+
+/// Where `x` and `y` go, from what `scrollTo()` and `scrollBy()` are given: two numbers, or `{ left, top }`.
+function scrollPlace(first, second) {
+    if (first !== null && typeof first === 'object') {
+        return [first.left, first.top];
+    }
+    return [first, second];
+}
+
+/// Scrolls what's around something so that it shows, nearest first, as `scrollIntoView()` does: its start at the start of each,
+/// unless `block` says otherwise, and only as far as it has to with `nearest`.
+function scrollIntoView(element, how) {
+    const block = how === false ? 'end' : how?.block ?? 'start';
+    const inline = how?.inline ?? 'nearest';
+    let node = nodeOf(element);
+    if (node === undefined) {
+        return;
+    }
+    // A viewport-fixed box is unaffected by scrolling anything outside it. Use the placed look: `position: fixed` inside a
+    // transformed containing block has already become an ordinary positioned box, and must still reveal outer scrollers.
+    const viewportFixed = (one) => one.live?.look?.overlay !== undefined || one.live?.look?.__fixed === true;
+    if (viewportFixed(node)) {
+        return;
+    }
+    let box = element.getBoundingClientRect();
+    let [top, bottom, left, right] = [box.top, box.bottom, box.left, box.right];
+    const place = (wanted, start, end, areaStart, areaEnd, at) => {
+        switch (wanted) {
+            case 'end':
+                return at + end - areaEnd;
+            case 'center':
+                return at + (start + end) / 2 - (areaStart + areaEnd) / 2;
+            case 'nearest':
+                if (start < areaStart) {
+                    return at + start - areaStart;
+                }
+                if (end > areaEnd) {
+                    return at + Math.min(end - areaEnd, start - areaStart);
+                }
+                return at;
+            default:
+                return at + start - areaStart;
+        }
+    };
+    const scrollAround = (live, area) => {
+        const now = scrollState(live, null);
+        if (!now.scrolls) {
+            return;
+        }
+        const y = place(block, top, bottom, area.top, area.top + now.viewHeight, now.y);
+        const x = place(inline, left, right, area.left, area.left + now.viewWidth, now.x);
+        const was = [now.x, now.y];
+        scrollTo(live, null, x, y);
+        const moved = scrollState(live, null);
+        // What's further out sees it where it now is.
+        top -= moved.y - was[1];
+        bottom -= moved.y - was[1];
+        left -= moved.x - was[0];
+        right -= moved.x - was[0];
+    };
+    for (let at = node.parent; at !== null && at.parent !== null; at = at.parent) {
+        const around = elementOf(at);
+        scrollAround(at.live, around.getBoundingClientRect());
+        if (viewportFixed(at)) {
+            return;
+        }
+    }
+    scrollAround(pageScrolling, { top: 0, left: 0 });
+}
+
+/// What an element of a page says about scrolling, as one does.
+const scrollingProps = Object.getOwnPropertyDescriptors({
+    get scrollTop() {
+        return scrollOffsets(this.__live).y;
+    },
+    set scrollTop(value) {
+        scrollTo(this.__live, this, undefined, value);
+    },
+    get scrollLeft() {
+        const now = scrollState(this.__live, this);
+        return now.rtl ? now.x - Math.max(0, now.width - now.viewWidth) : now.x;
+    },
+    set scrollLeft(value) {
+        scrollTo(this.__live, this, fromScrollLeft(scrollState(this.__live, this), value), undefined);
+    },
+    get scrollWidth() {
+        return scrollState(this.__live, this).width;
+    },
+    get scrollHeight() {
+        return scrollState(this.__live, this).height;
+    },
+    get clientWidth() {
+        return scrollState(this.__live, this).viewWidth;
+    },
+    get clientHeight() {
+        return scrollState(this.__live, this).viewHeight;
+    },
+    scrollTo(first, second) {
+        const [x, y] = scrollPlace(first, second);
+        scrollTo(this.__live, this, fromScrollLeft(scrollState(this.__live, this), x), y);
+    },
+    scroll(first, second) {
+        const [x, y] = scrollPlace(first, second);
+        scrollTo(this.__live, this, fromScrollLeft(scrollState(this.__live, this), x), y);
+    },
+
+    scrollBy(first, second) {
+        const [x, y] = scrollPlace(first, second);
+        const now = scrollState(this.__live, this);
+        scrollTo(this.__live, this, x === undefined ? undefined : now.x + Number(x), y === undefined ? undefined : now.y + Number(y));
+    },
+    scrollIntoView(how) {
+        scrollIntoView(this, how);
+    },
+});
+
+/// How the page itself is scrolled, which `window`, `document.documentElement` and `body` say.
+const pageScrollState = () => scrollState(pageScrolling, null);
+const pageScrollOffsets = () => scrollOffsets(pageScrolling);
+/// How much of the page shows, across and down, which is the window less the page's scrollbars, as `clientWidth` and
+/// `clientHeight` say on `html` and `body`. A window that's been resized since it was laid out shows its new size at once, as
+/// a browser's viewport does in its `resize` event: what was laid out says how much showed of the old one, and floating-ui's
+/// `hide` took Mantine's dropdowns, which were well inside the grown window, as off the bottom of what had shown.
+function pageView() {
+    const width = globalThis.innerWidth ?? 0;
+    const height = globalThis.innerHeight ?? 0;
+    // The same until the tree, where things are in it, or the window's size changes: floating-ui asks it of `html` for each
+    // popover on every frame of scrolling, more than once. Where it's scrolled to isn't part of it.
+    const tree = rsuiHostMethods.chainsNow();
+    const kept = pageViewKept;
+    if (kept.tree === tree && kept.width === width && kept.height === height) {
+        return kept.view;
+    }
+    const view = pageViewNow(width, height);
+    pageViewKept = { tree, width, height, view };
+    return view;
+}
+let pageViewKept = { tree: undefined, width: 0, height: 0, view: null };
+function pageViewNow(width, height) {
+    const now = pageScrollState();
+    if (!now.scrolls || !(now.viewWidth > 0)) {
+        return [width, height];
+    }
+    if (now.boxWidth === undefined || (Math.abs(now.boxWidth - width) < 0.5 && Math.abs(now.boxHeight - height) < 0.5)) {
+        return [now.viewWidth, now.viewHeight];
+    }
+    // Laid out at another size: the window, less a scrollbar where what's in it doesn't fit, as far as that's known yet.
+    const room = pageScrollbarRoom();
+    const tall = now.height > height + 0.5;
+    const wide = now.width > width - (tall ? room : 0) + 0.5;
+    return [Math.max(0, width - (tall ? room : 0)), Math.max(0, height - (wide ? room : 0))];
+}
+const pageScrollTo = (first, second) => {
+    const [x, y] = scrollPlace(first, second);
+    scrollTo(pageScrolling, null, x, y);
+};
+const pageScrollBy = (first, second) => {
+    const [x, y] = scrollPlace(first, second);
+    const now = pageScrollState();
+    scrollTo(pageScrolling, null, x === undefined ? undefined : now.x + Number(x), y === undefined ? undefined : now.y + Number(y));
+};
+
+/// What an element's CSS comes to now, with what code has set on its `style` that hasn't been drawn yet.
+function lookNow(element) {
+    return lookOfLive(element?.__live);
+}
+
+/// [`lookNow`] for what an element is drawn with.
+function lookOfLive(live) {
+    const look = live?.look;
+    const cssom = live?.cssom;
+    if (cssom == null || look === undefined) {
+        return look;
+    }
+    let receipt = live.cssomRead;
+    if (receipt === undefined || receipt.source !== cssom) {
+        // __asProps creates an owned data object on each CSSOM write. Custom
+        // property strings are copied verbatim by inlineLook: resolving ordinary
+        // lengths, transforms, variables or removals must keep the original path.
+        let custom = true;
+        for (const name in cssom) {
+            if (!name.startsWith('--') || typeof cssom[name] !== 'string') {
+                custom = false;
+                break;
+            }
+        }
+        receipt = live.cssomRead = { source: cssom, custom, base: null, value: null };
+    }
+    if (!receipt.custom || (live.cssomRemoved?.length ?? 0) !== 0 || rsui.__instanceNow?.() != null) {
+        return cssomLook(look, cssom);
+    }
+    if (receipt.base !== look) {
+        // Keep exactly the previous overlay, not merely the normalized native
+        // look: its raw custom properties and __vars marker remain observable to
+        // the framework. A new publication or write invalidates this receipt.
+        receipt.value = cssomLook(look, cssom);
+        receipt.base = look;
+    }
+    return receipt.value;
+}
+
+function cssomLook(look, cssom) {
+    return { ...look, ...inlineLook(cssom), ...(cssom.transform !== undefined ? { transform: cssom.transform } : null) };
+}
+
+/// Each function in a `transform`, as its name and what's in its brackets split by commas (or spaces, with no commas), with any
+/// brackets inside, as `translate(calc(-50% + 4px), 5px)` has.
+function transformSteps(transform) {
+    const steps = [];
+    let at = 0;
+    while (at < transform.length) {
+        const open = transform.indexOf('(', at);
+        if (open < 0) {
+            break;
+        }
+        const name = transform.slice(at, open).trim();
+        let depth = 0;
+        let close = -1;
+        const cuts = [];
+        for (let index = open + 1; index < transform.length; index += 1) {
+            const char = transform[index];
+            if (char === '(') {
+                depth += 1;
+            } else if (char === ')') {
+                if (depth === 0) {
+                    close = index;
+                    break;
+                }
+                depth -= 1;
+            } else if (char === ',' && depth === 0) {
+                cuts.push(index);
+            }
+        }
+        if (close < 0) {
+            break;
+        }
+        const inside = transform.slice(open + 1, close);
+        let parts;
+        if (cuts.length > 0) {
+            parts = [];
+            let start = open + 1;
+            for (const cut of cuts) {
+                parts.push(transform.slice(start, cut).trim());
+                start = cut + 1;
+            }
+            parts.push(transform.slice(start, close).trim());
+        } else {
+            parts = inside.includes('(') ? [inside.trim()] : inside.trim().split(/\s+/);
+        }
+        steps.push([name, parts]);
+        at = close + 1;
+    }
+    return steps;
+}
+
+/// A `calc()` of pixels, percentages of `along` and numbers, in pixels, or `undefined` if it has anything else.
+function calcLength(text, along) {
+    let at = 0;
+    const space = () => {
+        while (at < text.length && /\s/.test(text[at])) {
+            at += 1;
+        }
+    };
+    // Each part comes to [percent, pixels, plain].
+    const factor = () => {
+        space();
+        if (text[at] === '(' || text.startsWith('calc(', at)) {
+            at += text[at] === '(' ? 1 : 5;
+            const inside = sum();
+            space();
+            if (inside === undefined || text[at] !== ')') {
+                return undefined;
+            }
+            at += 1;
+            return inside;
+        }
+        const found = /^[+-]?(\d+\.?\d*|\.\d+)(%|[a-zA-Z]+)?/.exec(text.slice(at));
+        if (found === null) {
+            return undefined;
+        }
+        at += found[0].length;
+        const number = parseFloat(found[1]) * (found[0][0] === '-' ? -1 : 1);
+        if (found[2] === '%') {
+            return [number, 0, false];
+        }
+        if (found[2] === 'px') {
+            return [0, number, false];
+        }
+        if (found[2] === 'rem') {
+            return [0, number * 16, false];
+        }
+        return found[2] === undefined ? [0, number, true] : undefined;
+    };
+    const product = () => {
+        let out = factor();
+        for (;;) {
+            space();
+            const op = text[at];
+            if (out === undefined || (op !== '*' && op !== '/')) {
+                return out;
+            }
+            at += 1;
+            const next = factor();
+            if (next === undefined) {
+                return undefined;
+            }
+            let length;
+            let by;
+            if (op === '*' && out[2]) {
+                [length, by] = [next, out[1]];
+            } else if (next[2]) {
+                [length, by] = [out, op === '*' ? next[1] : 1 / next[1]];
+            } else {
+                return undefined;
+            }
+            out = [length[0] * by, length[1] * by, length[2]];
+        }
+    };
+    const sum = () => {
+        let out = product();
+        for (;;) {
+            space();
+            const op = text[at];
+            if (out === undefined || (op !== '+' && op !== '-')) {
+                return out;
+            }
+            at += 1;
+            const next = product();
+            if (next === undefined) {
+                return undefined;
+            }
+            const sign = op === '+' ? 1 : -1;
+            out = [out[0] + sign * next[0], out[1] + sign * next[1], out[2] && next[2]];
+        }
+    };
+    const said = sum();
+    space();
+    return said === undefined || at !== text.length ? undefined : (said[0] / 100) * along + said[1];
+}
+
+/// How far `translate` in a `transform` moves something, in pixels, with a percentage of its own size.
+const TRANSLATION_NUMBER = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i;
+const TRANSLATION_LENGTH = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?(?:px|%)?$/i;
+
+function translationLength(text, size) {
+    const word = String(text).trim();
+    if (!TRANSLATION_LENGTH.test(word)) {
+        return undefined;
+    }
+    const value = Number.parseFloat(word);
+    if (!Number.isFinite(value)) {
+        return undefined;
+    }
+    if (word.endsWith('%')) {
+        return (value / 100) * size;
+    }
+    return /px$/i.test(word) || value === 0 ? value : undefined;
+}
+
+/// Only transforms whose complete composition is a 2D translation. Other units,
+/// calc, nonzero Z, scale/rotation and perspective retain the general matrix path.
+function pureTranslationOf(text, width, height) {
+    if (/(?:scale|rotate|skew|perspective|translatez)[a-z0-9]*\s*\(/i.test(text)) {
+        return null;
+    }
+    const steps = transformSteps(text);
+    if (steps.length === 0) {
+        return null;
+    }
+    let x = 0, y = 0;
+    for (const [name, args] of steps) {
+        let dx = 0, dy = 0;
+        switch (name.toLowerCase()) {
+            case 'translate':
+                if (args.length < 1 || args.length > 2) return null;
+                dx = translationLength(args[0], width);
+                dy = translationLength(args[1] ?? '0', height);
+                break;
+            case 'translatex':
+                if (args.length !== 1) return null;
+                dx = translationLength(args[0], width);
+                break;
+            case 'translatey':
+                if (args.length !== 1) return null;
+                dy = translationLength(args[0], height);
+                break;
+            case 'translate3d':
+                if (args.length !== 3 || translationLength(args[2], 0) !== 0 || String(args[2]).trim().endsWith('%')) return null;
+                dx = translationLength(args[0], width);
+                dy = translationLength(args[1], height);
+                break;
+            case 'matrix':
+            case 'matrix3d': {
+                const threeD = name.toLowerCase() === 'matrix3d';
+                if (args.length !== (threeD ? 16 : 6)) return null;
+                for (let at = 0; at < args.length; at += 1) {
+                    if (!TRANSLATION_NUMBER.test(args[at]) || !Number.isFinite(Number(args[at]))) return null;
+                    if (at === (threeD ? 12 : 4) || at === (threeD ? 13 : 5)) continue;
+                    const expected = threeD ? (at === 0 || at === 5 || at === 10 || at === 15 ? 1 : 0) : (at === 0 || at === 3 ? 1 : 0);
+                    if (Number(args[at]) !== expected) return null;
+                }
+                dx = Number(args[threeD ? 12 : 4]);
+                dy = Number(args[threeD ? 13 : 5]);
+                break;
+            }
+            default:
+                return null;
+        }
+        if (dx === undefined || dy === undefined) {
+            return null;
+        }
+        x += dx;
+        y += dy;
+    }
+    return [x, y];
+}
+
+function translationOf(transform, width, height) {
+    if (typeof transform !== 'string' || transform === '' || transform === 'none') {
+        return [0, 0];
+    }
+    const length = (text, along) => {
+        const said = String(text ?? '').trim();
+        if (said.startsWith('calc(')) {
+            return calcLength(said, along) ?? 0;
+        }
+        const value = parseFloat(said);
+        if (Number.isNaN(value)) {
+            return 0;
+        }
+        return said.endsWith('%') ? (value / 100) * along : value;
+    };
+    let x = 0;
+    let y = 0;
+    for (const [name, parts] of transformSteps(transform)) {
+        switch (name) {
+            case 'translate': case 'translate3d':
+                x += length(parts[0], width);
+                y += length(parts[1] ?? '0', height);
+                break;
+            case 'translateX':
+                x += length(parts[0], width);
+                break;
+            case 'translateY':
+                y += length(parts[0], height);
+                break;
+            case 'matrix':
+                x += parseFloat(parts[4]) || 0;
+                y += parseFloat(parts[5]) || 0;
+                break;
+            case 'matrix3d':
+                x += parseFloat(parts[12]) || 0;
+                y += parseFloat(parts[13]) || 0;
+                break;
+            default:
+                break;
+        }
+    }
+    return [x, y];
+}
+
+/// An element's box as it's laid out, whatever transforms it, for what's measured by its own size, as `ResizeObserver` and shares in
+/// a `transform` are: `getBoundingClientRect()` for something that isn't a page's element.
+function layoutBoxOf(element) {
+    if (element === null || element === undefined) {
+        return { x: 0, y: 0, width: 0, height: 0 };
+    }
+    return element.getBoundingClientRect === chainProps.getBoundingClientRect.value
+        ? clientBoxOf(element, false)
+        : element.getBoundingClientRect?.() ?? { x: 0, y: 0, width: 0, height: 0 };
+}
+
+function clientRectToJSON() {
+    return { x: this.x, y: this.y, width: this.width, height: this.height,
+        top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+}
+
+function createClientRect(x, y, width, height) {
+    return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON: clientRectToJSON };
+}
+
+/// Where an element is in the window, as `getBoundingClientRect()` says with `transformed`: the box around where it's drawn, through
+/// its own `transform` and every one above it (each about its own `transform-origin`), as a browser has it. Without, its box as it's
+/// laid out, which `offsetWidth` and the like say, whatever moves it.
+function clientBoxOf(element, transformed) {
+    if (element.__live?.svgOf !== undefined) {
+        return svgShapeRect(element.__live);
+    }
+    if (element.__live?.svgPart === true) {
+        return svgPartRect(element.__live);
+    }
+    const part = element.__domKey === undefined ? undefined : notShownLives.get(element.__domKey);
+    if (part?.svgPart !== undefined) {
+        const found = svgPartBox(part);
+        if (found !== null) {
+            const [x, y, width, height] = found;
+            return createClientRect(x, y, width, height);
+        }
+    }
+    if (element.__domKey !== undefined && notShownLives.has(element.__domKey)) {
+        // What isn't shown (`display: none`) has no box, so it's nowhere and no size, as on a page.
+        return createClientRect(0, 0, 0, 0);
+    }
+    // Where it is in the page as it's laid out now, whatever found it, as sonner's toaster rendering nothing new left every
+    // element found with `querySelector()` since at 0, 0, 0 by 0.
+    if (element.__domKey !== undefined) {
+        placed(element, true);
+    }
+    const box = element.__chain?.[element.__index];
+    if (box === undefined) {
+        return createClientRect(0, 0, 0, 0);
+    }
+    const [x, y, width, height] = box.slice(6, 10);
+    const [scrollX, scrollY] = scrolledBy(element);
+    if (!transformed) {
+        return createClientRect(x - scrollX, y - scrollY, width, height);
+    }
+    const [left, top, right, bottom] = transformedBy(element, x, y, width, height);
+    return createClientRect(left - scrollX, top - scrollY, right - left, bottom - top);
+}
+
+/// Where an element's box, laid out at `x`, `y`, `width` by `height`, is drawn: `[left, top, right, bottom]` around its corners as its
+/// own `transform` and every one above it puts them, each about its own `transform-origin` in its own box as it's laid out. A
+/// dialog's `translate(-50%, -50%)` moves what's in it with it; a `rotate-90` icon's box is turned; a `scale-95` one is smaller.
+function transformedBy(element, x, y, width, height) {
+    // Most measured boxes and ancestors have no transform. Do not allocate or
+    // walk four corner arrays unless one actually needs transforming.
+    let corners = null;
+    let translateX = 0, translateY = 0;
+    const lives = element === body ? null : livesAbove(element, 63);
+    if (lives === null) {
+        // Only how far each moves it, without the boxes of what's above it.
+        let at = element;
+        let moveX = 0;
+        let moveY = 0;
+        for (let depth = 0; at !== null && at !== undefined && at !== body && depth < 64; depth += 1) {
+            const look = lookNow(at);
+            const transform = look?.transform ?? at.__live?.given?.style?.transform;
+            if (typeof transform === 'string') {
+                const [byX, byY] = translationOf(transform, at === element ? width : 0, at === element ? height : 0);
+                moveX += byX;
+                moveY += byY;
+            }
+            at = at.parentElement;
+        }
+        return [x + moveX, y + moveY, x + width + moveX, y + height + moveY];
+    }
+    const chain = element.__chain;
+    let at = element.__index;
+    for (const live of [element.__live, ...lives]) {
+        const own = live === element.__live;
+        let [boxX, boxY, w, h] = [x, y, width, height];
+        if (!own) {
+            at -= 1;
+            while (at > 0 && chain[at]?.[0] == null) {
+                at -= 1;
+            }
+            [boxX, boxY, w, h] = [chain[at]?.[6] ?? 0, chain[at]?.[7] ?? 0, chain[at]?.[8] ?? 0, chain[at]?.[9] ?? 0];
+        }
+        const look = lookOfLive(live);
+        const transform = look?.transform ?? live?.given?.style?.transform;
+        if (typeof transform !== 'string' || transform === '' || transform === 'none') {
+            continue;
+        }
+        const translation = pureTranslationOf(transform, w, h);
+        if (translation !== null) {
+            if (corners === null) {
+                translateX += translation[0];
+                translateY += translation[1];
+            } else {
+                for (let point = 0; point < corners.length; point += 1) {
+                    corners[point][0] += translation[0];
+                    corners[point][1] += translation[1];
+                }
+            }
+            continue;
+        }
+        // Translation below this ancestor happens before its matrix: materialize
+        // the already translated corners once, rather than applying it afterwards.
+        corners ??= [[x + translateX, y + translateY], [x + width + translateX, y + translateY],
+            [x + translateX, y + height + translateY], [x + width + translateX, y + height + translateY]];
+        const m = transformMatrixOf(transform, () => w, () => h);
+        if (m === null) {
+            // What isn't known moves it as far as its translations say, as before.
+            const [byX, byY] = translationOf(transform, w, h);
+            for (let point = 0; point < corners.length; point += 1) {
+                corners[point][0] += byX;
+                corners[point][1] += byY;
+            }
+            continue;
+        }
+        const [originX, originY] = transformOriginIn(look?.transformOrigin ?? live?.given?.style?.transformOrigin, w, h);
+        const aboutX = boxX + originX;
+        const aboutY = boxY + originY;
+        for (let point = 0; point < corners.length; point += 1) {
+            const corner = corners[point];
+            const dx = corner[0] - aboutX;
+            const dy = corner[1] - aboutY;
+            const along = m[3] * dx + m[7] * dy + m[15];
+            const scale = along === 0 ? 1 : 1 / along;
+            corner[0] = aboutX + (m[0] * dx + m[4] * dy + m[12]) * scale;
+            corner[1] = aboutY + (m[1] * dx + m[5] * dy + m[13]) * scale;
+        }
+    }
+    if (corners === null) {
+        return [Math.min(x, x + width) + translateX, Math.min(y, y + height) + translateY,
+            Math.max(x, x + width) + translateX, Math.max(y, y + height) + translateY];
+    }
+    let left = corners[0][0], right = left, top = corners[0][1], bottom = top;
+    for (let point = 1; point < corners.length; point += 1) {
+        const corner = corners[point];
+        left = Math.min(left, corner[0]);
+        right = Math.max(right, corner[0]);
+        top = Math.min(top, corner[1]);
+        bottom = Math.max(bottom, corner[1]);
+    }
+    return [left, top, right, bottom];
+}
+
+/// How far what's scrolled around an element has moved it, across and down, past where it's laid out: each element it's in that's
+/// scrolled, and the page, unless it's in something `position: fixed`, which stays where it is in the window as the page scrolls.
+/// Where it's laid out is where it is in the window with what's been laid out scrolled, so `getBoundingClientRect()` only takes
+/// away what code's asked to be scrolled since; `whole` says all of it, for `offsetTop`, which is from the page as laid out.
+const SCROLL_QUERY_ELISION = (() => {
+    try { return globalThis.process?.env?.RSUI_SCROLL_QUERY_ELISION !== '0'; }
+    catch { return true; }
+})();
+
+function scrolledBy(element, whole = false) {
+    const chain = element.__chain;
+    const index = element.__index;
+    let x = 0;
+    let y = 0;
+    if (chain === undefined || index === undefined) {
+        return [x, y];
+    }
+    for (let at = index; at > 0; at -= 1) {
+        const key = chain[at]?.[0];
+        // The page's own scrolling is in the chain too, and is counted once, after the rest: counted here as well, `offsetTop`
+        // had the page's scroll twice.
+        if (key == null || key === PAGE_SCROLL) {
+            continue;
+        }
+        const live = handles.get(key)?.__live ?? pageLives.get(key)?.deref();
+        // Native scroll is already included in the measured rectangle. Only a
+        // pending request, or a caller asking for the whole scroll displacement,
+        // can contribute an adjustment; the fixed-boundary check still runs.
+        if (at < index && (!SCROLL_QUERY_ELISION || whole || live?.scrollGuess !== undefined)) {
+            const said = rawScrollOffsets(key);
+            if (said !== undefined) {
+                const guess = live?.scrollGuess;
+                const pending = guess !== undefined && guess.fromX === said[0] && guess.fromY === said[1];
+                x += (pending ? guess.x - said[0] : 0) + (whole ? said[0] : 0);
+                y += (pending ? guess.y - said[1] : 0) + (whole ? said[1] : 0);
+            }
+        }
+        // What's placed in the window stays where it is in it as the page scrolls.
+        const look = lookOfLive(live);
+        // rsui draws `position: fixed` as an overlay of the window, which is what says so once it's been placed (see `fixed` in layout.rs).
+        if (look?.overlay !== undefined || look?.position === 'fixed' || look?.__fixed === true) {
+            return [x, y];
+        }
+    }
+    if (!SCROLL_QUERY_ELISION || whole || pageScrolling.scrollGuess !== undefined) {
+        const said = rawScrollOffsets(PAGE_SCROLL);
+        if (said !== undefined) {
+            const guess = pageScrolling.scrollGuess;
+            const pending = guess !== undefined && guess.fromX === said[0] && guess.fromY === said[1];
+            x += (pending ? guess.x - said[0] : 0) + (whole ? said[0] : 0);
+            y += (pending ? guess.y - said[1] : 0) + (whole ? said[1] : 0);
+        }
+    }
+    return [x, y];
+}
+
+/// Where an element is laid out on the page, from its start, with nothing scrolled or moved by a `transform`, as `offsetTop` and
+/// `offsetLeft` go by.
+function laidOutAt(element) {
+    const box = layoutBoxOf(element);
+    const [scrollX, scrollY] = element.__chain === undefined ? [0, 0] : scrolledBy(element, true);
+    return [box.x + scrollX, box.y + scrollY];
+}
+
+/// The text of what's in an element as it's laid out, as `innerText` has it.
+function textInside(element, asShown = false) {
+    if (element?.__live?.tag === 'textarea') {
+        // Its text is what React wrote as its `defaultValue`, which is its value: see `TextArea`.
+        const said = element.__live.given?.value ?? element.__live.given?.defaultValue;
+        return said === undefined || said === null ? '' : String(said);
+    }
+    const node = nodeOf(element);
+    if (node === undefined) {
+        return '';
+    }
+    return (asShown ? pageNow.shown : pageNow.texts).slice(node.textFrom, node.textTo).join('');
+}
+
+/// A list of elements as a page gives one: by number, with `item()` and `length`, and to go through.
+function elementList(elements) {
+    const list = [...elements];
+    list.item = (at) => list[at] ?? null;
+    list.namedItem = (name) => list.find((one) => one.id === name || one.getAttribute?.('name') === name) ?? null;
+    return list;
+}
+
+// What an element knows from where it is, as an event found it: what it's in, what's in it, and where it is.
+const chainProps = Object.getOwnPropertyDescriptors({
+    // Its text, as the DOM has it: what React drew, as code may have changed it since, and what code put in it. Setting it takes
+    // what React drew out, as on a page.
+    get textContent() {
+        const own = this.__live;
+        if (own !== undefined && own.notShown !== true && this.__domKey !== undefined && listeners.has(own) && !rsuiHostMethods.hasKey(this.__domKey)) {
+            // Put in by React and not drawn yet, or drawn into a fragment that isn't the page's: its text is what it was given, as
+            // the DOM has it the moment React's put it in. Radix's Select reads its items' text that way, for its hidden options.
+            return givenText(own.given?.children);
+        }
+        if (domLoaded === null && this.__live !== undefined) {
+            // Its text nodes' as React gave them, not as they're shown: `text-transform: capitalize` doesn't change it.
+            const nodes = this.childNodes;
+            if (nodes !== undefined && nodes !== null) {
+                let out = '';
+                for (const node of Array.from(nodes)) {
+                    if (node.nodeType === 3) {
+                        out += node.data ?? '';
+                    } else if (node.nodeType === 1) {
+                        out += node.textContent ?? '';
+                    }
+                }
+                return out;
+            }
+        }
+        return domLoaded === null ? textInside(this) : domTree(this, 'textContent');
+    },
+    set textContent(text) {
+        domTreeSet(this, 'textContent', text);
+    },
+    // What's in it as HTML, and what code puts in it that way, which takes what React drew out, as `textContent` does. Until
+    // `rsui/dom` was loaded, an element had nothing for this, so what was set only became a property of it, and nothing was drawn.
+    get innerHTML() {
+        return domTree(this, 'innerHTML');
+    },
+    set innerHTML(html) {
+        domTreeSet(this, 'innerHTML', html);
+    },
+    // What's shown of it as text, as it's laid out.
+    get innerText() {
+        return textInside(this, true);
+    },
+    getRootNode() {
+        return placed(this) ? page : this;
+    },
+    compareDocumentPosition(other) {
+        if (other === this) {
+            return 0;
+        }
+        if (isOwnNode(other)) {
+            // Where a node code made is, is the DOM's to say.
+            return domPack().nodeMethods.compareDocumentPosition.call(this, other);
+        }
+        if (this.contains(other)) {
+            return 16 | 4;
+        }
+        if (other?.contains?.(this)) {
+            return 8 | 2;
+        }
+        const order = pageTree()?.order;
+        const mine = order?.indexOf(nodeOf(this)) ?? -1;
+        const theirs = order?.indexOf(nodeOf(other)) ?? -1;
+        if (mine < 0 || theirs < 0) {
+            return 1 | 32;
+        }
+        return theirs > mine ? 4 : 2;
+    },
+    get nodeType() {
+        return 1;
+    },
+    get ownerDocument() {
+        return page;
+    },
+    get shadowRoot() {
+        return null;
+    },
+    // Whether it can be edited: nothing can until something's said it can, which loads `editing.js`.
+    get isContentEditable() {
+        return editingLoaded !== null && editingLoaded.editingHost(this) !== null;
+    },
+    get contentEditable() {
+        const said = this.__live?.attributes?.contentEditable ?? this.__live?.given?.contentEditable;
+        return said === undefined || said === null ? 'inherit' : said === true || said === '' ? 'true' : String(said);
+    },
+    set contentEditable(value) {
+        setAttributeOn(this.__live ?? {}, 'contenteditable', String(value));
+    },
+    get isConnected() {
+        // What React's taken out isn't in the page any more, even where what replaced it has the same key.
+        const live = this.__live;
+        if (live?.weak !== undefined && this.__domKey !== undefined && pageLives.get(this.__domKey) !== live.weak && !notShownLives.has(this.__domKey)) {
+            return false;
+        }
+        return placed(this);
+    },
+    get parentElement() {
+        if (this.__domKey !== undefined) {
+            placed(this);
+        }
+        if (this.__chain === undefined || this.__index === undefined) {
+            return mountedParent(this);
+        }
+        // What's only there for rsui to lay things out with, which has no key of the page's, isn't an element of it.
+        let at = this.__index - 1;
+        while (at > 0 && this.__chain[at]?.[0] == null) {
+            at -= 1;
+        }
+        return at <= 0 ? body : chainElement(this.__chain, at);
+    },
+    get parentNode() {
+        return this.parentElement;
+    },
+    // What's in it, and what's next to it, as the DOM has them: what React drew, with its text, and what code put in it.
+    get childNodes() {
+        return domTree(this, 'childNodes');
+    },
+    get children() {
+        return domTree(this, 'children');
+    },
+    get firstChild() {
+        return domTree(this, 'firstChild');
+    },
+    get lastChild() {
+        return domTree(this, 'lastChild');
+    },
+    get firstElementChild() {
+        return domTree(this, 'firstElementChild');
+    },
+    get lastElementChild() {
+        return domTree(this, 'lastElementChild');
+    },
+    get childElementCount() {
+        return domTree(this, 'childElementCount');
+    },
+    get nextSibling() {
+        return domTree(this, 'nextSibling');
+    },
+    get previousSibling() {
+        return domTree(this, 'previousSibling');
+    },
+    get nextElementSibling() {
+        return domTree(this, 'nextElementSibling');
+    },
+    get previousElementSibling() {
+        return domTree(this, 'previousElementSibling');
+    },
+    hasChildNodes() {
+        return domTree(this, 'childNodes').length > 0;
+    },
+    /// A copy, as a node code made, with what it was given that's an attribute, and with what's in it if `deep` says so.
+    cloneNode(deep = false) {
+        const pack = domPack();
+        const copy = pack.makeElement(String(this.localName ?? 'div'));
+        const given = this.__live?.given ?? {};
+        const said = this.__live?.attributes === undefined ? given : { ...given, ...this.__live.attributes };
+        for (const [name, value] of Object.entries(said)) {
+            if (value === null || value === undefined || value === false || typeof value === 'object' || typeof value === 'function' || name === 'children' || name === 'key' || name === 'ref') {
+                continue;
+            }
+            const attribute = { className: 'class', htmlFor: 'for', contentEditable: 'contenteditable', tabIndex: 'tabindex', spellCheck: 'spellcheck' }[name] ?? name;
+            if (/^[a-z][a-z0-9-]*$/i.test(attribute) && !name.startsWith('on')) {
+                copy.setAttribute(attribute.toLowerCase() === attribute || attribute.includes('-') ? attribute : attribute.toLowerCase(), value === true ? '' : String(value));
+            }
+        }
+        if (deep) {
+            for (const child of domTree(this, 'childNodes')) {
+                copy.appendChild(child.cloneNode(true));
+            }
+        }
+        return copy;
+    },
+    contains(other) {
+        if (other === this) {
+            return true;
+        }
+        if (domLoaded !== null && other !== null && typeof other === 'object' && other.__own === true) {
+            return domLoaded.nodeMethods.contains.call(this, other);
+        }
+        const chain = other?.__chain;
+        if (chain === undefined || other.__index === undefined) {
+            return false;
+        }
+        if (this.__domKey !== undefined) {
+            for (let at = 0; at <= other.__index; at += 1) {
+                if (chain[at]?.[0] === this.__domKey) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return chain === this.__chain && this.__index !== undefined && other.__index >= this.__index;
+    },
+    matches(selector) {
+        // Nothing is (see `pseudoMatches`), and floating-ui asks it of each element above what it places, on every scroll.
+        if (selector === ':popover-open') {
+            return false;
+        }
+        // The same for `:modal`, which only a dialog is: what it says is what the element was drawn with, as `ownOf` has it,
+        // which is the same however it's found, so one that doesn't say so isn't, without finding it in the page.
+        if (selector === ':modal' && this.__domKey !== undefined) {
+            const live = pageLives.get(this.__domKey)?.deref();
+            if (live !== undefined) {
+                const said = live.attributes !== undefined && Object.hasOwn(live.attributes, '__modal') ? live.attributes.__modal : live.given?.__modal;
+                if (said !== true) {
+                    return false;
+                }
+            }
+        }
+        const node = nodeUpOf(this, selector);
+        if (node === undefined) {
+            querySteps(String(selector));
+            return unplacedMatches(this, selector);
+        }
+        return nodeMatches(node, selector);
+    },
+    querySelector(selector) {
+        return selected(selector, true, this)[0] ?? null;
+    },
+    querySelectorAll(selector) {
+        return selected(selector, false, this);
+    },
+    closest(selector) {
+        const node = nodeUpOf(this, selector);
+        if (node === undefined || node === null) {
+            // Not drawn yet, or not drawn at all, as an `<option>`: from what it's in, as React put it there (see `mountedParent`).
+            if (unplacedMatches(this, selector)) {
+                return this;
+            }
+            const up = this.__live === undefined ? null : mountedParent(this);
+            return up === null || up === this ? null : up.closest?.(selector) ?? null;
+        }
+        for (let at = node ?? null; at !== null && at.parent !== null; at = at.parent) {
+            if (nodeMatches(at, selector)) {
+                return at === node ? this : elementOf(at);
+            }
+        }
+        return null;
+    },
+    getElementsByTagName(name) {
+        return selected(String(name), false, this);
+    },
+    getElementsByClassName(names) {
+        return selected(String(names).trim().split(/\s+/).map((name) => '.' + name).join(''), false, this);
+    },
+    getAttribute(name) {
+        if (this.__live?.tag === 'option' && String(name).toLowerCase() === 'selected') {
+            // Which react-dom marks from the select's `defaultValue`: see `elementAttributes`.
+            return elementAttributes(this).find(([one]) => one === 'selected')?.[1] ?? null;
+        }
+        // What React's given as a property is the attribute of the same name in lower case, as `readOnly` is `readonly`.
+        const prop = { class: 'className', for: 'htmlFor', tabindex: 'tabIndex', readonly: 'readOnly', contenteditable: 'contentEditable' }[String(name).toLowerCase()] ?? String(name);
+        const set = this.__live?.attributes;
+        // What's been taken away since React gave it is gone, as `removeAttribute` says.
+        if (set !== undefined && Object.hasOwn(set, prop) && set[prop] === undefined) {
+            return null;
+        }
+        // A field's `value` attribute is its default, as React writes it: what's typed in one that keeps it itself (see `Input`)
+        // isn't, and a textarea has none.
+        if (prop === 'value' && set?.value === undefined) {
+            if (this.__live?.tag === 'textarea') {
+                return null;
+            }
+            if (this.__live?.given?.__setValue !== undefined) {
+                const said = this.__live.given.defaultValue;
+                return said === undefined || said === null ? null : String(said);
+            }
+        }
+        if (prop === 'checked' && (set === undefined || !Object.hasOwn(set, 'checked')) && this.__live?.given?.__setChecked !== undefined) {
+            return this.__live.given.__defaultChecked === true ? '' : null;
+        }
+        const lower = String(name).toLowerCase();
+        // React gives a `<select>` and a `<textarea>` their `value` as what they hold, never as an attribute.
+        const held = lower === 'value' && (this.__live?.tag === 'select' || this.__live?.tag === 'textarea');
+        let own = set?.[prop] ?? (held ? undefined : this.__live?.given?.[prop]);
+        // A field's `value` attribute is what it started with, which is what `defaultValue` says, rather than what's typed in it.
+        if (!held && lower === 'value' && (set === undefined || !Object.hasOwn(set, 'value')) && this.__live?.given?.defaultValue !== undefined
+            && this.__live?.given?.value === undefined) {
+            own = this.__live.given.defaultValue;
+        }
+        // React writes `true` and `false` as words for `aria-` and `data-`, and as there or not for what's either.
+        const spelled = lower.startsWith('aria-') || lower.startsWith('data-') || lower === 'draggable' || lower === 'spellcheck' || lower === 'contenteditable';
+        if (own === false && spelled) {
+            return 'false';
+        }
+        if (own !== undefined && own !== null && own !== false && typeof own !== 'function' && typeof own !== 'object') {
+            return own === true ? (spelled ? 'true' : '') : String(own);
+        }
+        if (name === 'class') {
+            return this.className ?? null;
+        }
+        if (name === 'id') {
+            return this.id === '' ? null : this.id ?? null;
+        }
+        if (String(name).startsWith('data-')) {
+            const given = [this.__live?.attributes, this.__live?.given].find((one) => one !== undefined && one !== null && Object.hasOwn(one, prop));
+            if (given !== undefined && (given[prop] === undefined || given[prop] === null)) {
+                // React leaves out what it's given as `undefined` or `null`, as Radix's `data-placeholder={undefined}`.
+                return null;
+            }
+            const value = this.dataset?.[String(name).slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())];
+            return value === undefined ? null : String(value);
+        }
+        return null;
+    },
+    hasAttribute(name) {
+        return this.getAttribute(name) !== null;
+    },
+    hasAttributes() {
+        return elementAttributes(this).length > 0;
+    },
+    // Its classes as its `class` says now, which changing changes that, as a `DOMTokenList` does: a list made up for it alone said
+    // nothing it had, and changed nothing.
+    get classList() {
+        const element = this;
+        const names = () => String(element.getAttribute('class') ?? '').split(/\s+/).filter(Boolean);
+        const write = (now) => element.setAttribute?.('class', [...new Set(now)].join(' '));
+        const list = {
+            add(...given) {
+                const now = names();
+                if (given.some((one) => !now.includes(String(one)))) {
+                    write([...now, ...given.map(String)]);
+                }
+            },
+            remove(...given) {
+                const now = names();
+                if (given.some((one) => now.includes(String(one)))) {
+                    write(now.filter((one) => !given.map(String).includes(one)));
+                }
+            },
+            toggle(name, force) {
+                const has = names().includes(String(name));
+                const on = force === undefined ? !has : !!force;
+                if (on !== has) {
+                    if (on) {
+                        list.add(name);
+                    } else {
+                        list.remove(name);
+                    }
+                }
+                return on;
+            },
+            replace(before, after) {
+                const now = names();
+                const at = now.indexOf(String(before));
+                if (at < 0) {
+                    return false;
+                }
+                now[at] = String(after);
+                write(now);
+                return true;
+            },
+            contains: (name) => names().includes(String(name)),
+            item: (index) => names()[index] ?? null,
+            supports: () => true,
+            forEach: (run, self) => names().forEach(run, self),
+            entries: () => names().entries(),
+            keys: () => names().keys(),
+            values: () => names().values(),
+            get length() {
+                return names().length;
+            },
+            get value() {
+                return String(element.getAttribute('class') ?? '');
+            },
+            toString: () => String(element.getAttribute('class') ?? ''),
+            [Symbol.iterator]: () => names()[Symbol.iterator](),
+        };
+        return list;
+    },
+    getAttributeNames() {
+        return elementAttributes(this).map(([name]) => name);
+    },
+    // Each attribute, as a `NamedNodeMap` has them: in order, by number and by name, with `length`, and in a `for...of`.
+    get attributes() {
+        const element = this;
+        const list = elementAttributes(this).map(([name, value]) => ({ name, value, localName: name, nodeName: name, nodeValue: value,
+            textContent: value, namespaceURI: null, prefix: null, specified: true, nodeType: 2, ownerElement: element }));
+        for (const one of list) {
+            if (!(one.name in list) && !/^\d/.test(one.name)) {
+                Object.defineProperty(list, one.name, { value: one, enumerable: false, configurable: true });
+            }
+        }
+        list.item = (index) => list[index] ?? null;
+        list.getNamedItem = (name) => list.find((one) => one.name === String(name).toLowerCase() || one.name === String(name)) ?? null;
+        list.getNamedItemNS = (_space, name) => list.getNamedItem(name);
+        list.setNamedItem = (attribute) => element.setAttribute(attribute.name, attribute.value);
+        list.removeNamedItem = (name) => element.removeAttribute(name);
+        return list;
+    },
+    getBoundingClientRect() {
+        return clientBoxOf(this, true);
+    },
+    getClientRects() {
+        const box = this.getBoundingClientRect();
+        return box.width === 0 && box.height === 0 ? [] : [box];
+    },
+    get clientLeft() {
+        const look = this.__live?.look;
+        const width = look?.borderLeftWidth ?? look?.borderWidth;
+        return typeof width === 'number' ? width : 0;
+    },
+    get clientTop() {
+        const look = this.__live?.look;
+        const width = look?.borderTopWidth ?? look?.borderWidth;
+        return typeof width === 'number' ? width : 0;
+    },
+    // As it's laid out, whatever it's transformed by, as a page has them.
+    get offsetWidth() {
+        return clientBoxOf(this, false).width;
+    },
+    get offsetHeight() {
+        return clientBoxOf(this, false).height;
+    },
+    // From what it's placed in, or from the page's start, as they're laid out, however anything's scrolled or moved by a `transform`.
+    get offsetLeft() {
+        const parent = this.offsetParent;
+        if (parent === undefined) {
+            // An `<svg>`'s, which isn't an HTML element, and has none, as on a page.
+            return undefined;
+        }
+        return laidOutAt(this)[0] - (parent === null || parent === body ? 0 : laidOutAt(parent)[0] + parent.clientLeft);
+    },
+    get offsetTop() {
+        const parent = this.offsetParent;
+        if (parent === undefined) {
+            return undefined;
+        }
+        return laidOutAt(this)[1] - (parent === null || parent === body ? 0 : laidOutAt(parent)[1] + parent.clientTop);
+    },
+});
+Object.assign(chainProps, scrollingProps);
+
+/// What a `<form>` has, as a page's does. `requestSubmit()` sends it as its buttons do, with `submit` first, and `submit()` sends it
+/// without that, as a browser has it. `elements` is each of its fields, as they are now, also by name.
+const formProps = Object.getOwnPropertyDescriptors({
+    requestSubmit(submitter = null) {
+        const sending = this.__live?.sending;
+        if (submitter !== null && submitter !== undefined && !sendsForm(String(submitter.localName ?? ''), submitter.__live?.given ?? {})) {
+            throw Object.assign(new TypeError("The specified element is not a submit button."), { name: 'TypeError' });
+        }
+        sending?.run?.(submitter ?? null);
+    },
+    submit() {
+        const sending = this.__live?.sending;
+        if (sending === undefined) {
+            return;
+        }
+        // Nothing hears about it first, so what it does is what it would have done.
+        const given = this.__live.given ?? {};
+        sendForm(sending, given, null, this, null, false);
+    },
+    reset() {
+        this.__live?.sending?.reset?.();
+    },
+    checkValidity() {
+        return checkControls(this, false);
+    },
+    reportValidity() {
+        return checkControls(this, true);
+    },
+    get noValidate() {
+        const said = this.__live?.given?.noValidate;
+        return said === true || said === '';
+    },
+    get elements() {
+        const fields = [...(this.__live?.sending?.fields ?? [])].map((one) => fieldElement(one.get()));
+        for (const field of fields) {
+            if (field.name !== '' && !(field.name in fields)) {
+                fields[field.name] = field;
+            }
+        }
+        fields.namedItem = (name) => fields.find((field) => field.name === String(name)) ?? null;
+        fields.item = (at) => fields[at] ?? null;
+        return fields;
+    },
+    get length() {
+        return this.__live?.sending?.fields.size ?? 0;
+    },
+    get method() {
+        return String(this.__live?.given?.method ?? 'get').toLowerCase();
+    },
+    get action() {
+        const action = this.__live?.given?.action;
+        return typeof action === 'string' ? action : globalThis.location?.href ?? '';
+    },
+});
+
+/// The data attributes in one native entry, made only when a handle needs updating.
+function datasetFromEntry(data) {
+    const dataset = {};
+    for (let at = 0; data !== undefined && at < data.length; at += 2) {
+        // What code took away with removeAttribute isn't a value.
+        if (data[at + 1] !== undefined && data[at + 1] !== null) {
+            dataset[datasetName(data[at])] = String(data[at + 1]);
+        }
+    }
+    return dataset;
+}
+
+/// What's at this place along what an event says it went through: an element's own handle if it has one, and otherwise one
+/// made up from what the tree says, which is as good as can be told.
+function chainElement(chain, index) {
+    if (index < 0 || chain === undefined || index >= chain.length) {
+        return null;
+    }
+    if (index === 0) {
+        return body;
+    }
+    // By place rather than taken apart, and with each `data-` name's camel case kept: floating-ui asks for `parentElement` of
+    // every element above each popover on every scroll, hundreds a frame, and this was most of that.
+    const entry = chain[index];
+    const domKey = entry[0];
+    const role = entry[1];
+    const className = entry[2];
+    const id = entry[3];
+    const value = entry[4];
+    const name = entry[5];
+    const data = entry[10];
+    let element = domKey === undefined ? undefined : handles.get(domKey);
+    // What's drawn as an element of the page says what it is, and what it was given, for what asks about it, as a selector does.
+    const live = domKey === undefined ? undefined : pageLives.get(domKey)?.deref();
+    if (element === undefined && live !== undefined) {
+        // It's the same element however it's found, as on a page, so what's been set on it or is listening on it is still there.
+        element = handleOf(live, live.tag);
+    }
+    if (element === undefined) {
+        const tagName = typeof live?.tag === 'string' ? live.tag.toUpperCase() : ROLE_TAGS[role] ?? String(role).toUpperCase();
+        element = { ...fakeElement(), tagName, nodeName: tagName, localName: tagName.toLowerCase(), className: className ?? '', id: id ?? '', textContent: name ?? '', innerText: name ?? '', dataset: datasetFromEntry(data), __domKey: domKey };
+        Object.setPrototypeOf(element, prototypeFor(tagName.toLowerCase()));
+        if (value !== undefined) {
+            element.value = value;
+        }
+        Object.defineProperties(element, chainProps);
+        if (live !== undefined) {
+            Object.defineProperty(element, '__live', { value: live, enumerable: false, configurable: true });
+            if (live.tag === 'form') {
+                Object.defineProperties(element, formProps);
+            }
+        }
+    } else if (element.__own !== true && !(element.__fromEntry === entry && element.__fromDataset === element.dataset && element.className === (className ?? ''))) {
+        // What a handle says about itself is what the tree says now, apart from a node code made, which says that itself. The same
+        // entry, found again, says the same, unless code has changed it since.
+        element.className = className ?? '';
+        element.dataset = datasetFromEntry(data);
+        element.__fromEntry = entry;
+        element.__fromDataset = element.dataset;
+    }
+    element.__chain = chain;
+    element.__index = index;
+    if (chain.__at !== undefined) {
+        // What's along the way to it is the start of what's along the way to what it was found from, from the same tree and
+        // layout, so it needn't ask again, including handles found from a selector
+        // rather than held by a ref: floating-ui goes up from each popover through every element above it, asking each
+        // for what it's in, which asked Rust for each of their whole chains again on every frame of scrolling.
+        element.__placedAt = chain.__at;
+        element.__placedWas = true;
+        element.__placedChain = chain;
+    }
+    return element;
+}
+
+/// What `dataset` calls a `data-` attribute's name (without `data-`), in camel case, kept for each name.
+function datasetName(name) {
+    let said = datasetNames.get(name);
+    if (said === undefined) {
+        said = name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+        if (datasetNames.size >= 4096) {
+            datasetNames.clear();
+        }
+        datasetNames.set(name, said);
+    }
+    return said;
+}
+const datasetNames = new Map();
+
+/// Whether this, along what an event went through, is only there to lay out what's in it, as a line of a page is, or the words
+/// of what they're in, and so isn't an element of the page.
+function onlyLaysOut(entry) {
+    const domKey = entry[0];
+    const role = entry[1];
+    const className = entry[2];
+    const id = entry[3];
+    const data = entry[10];
+    const key = entry[11];
+    if (typeof key === 'string' && key.startsWith('__') && !key.startsWith('__dom')) {
+        return true;
+    }
+    // Words with nothing to say for themselves are part of what they're in, as a page's text is, and so is a group that's only
+    // there to hold what's in it.
+    // A group React keeps by a key of its own, as what's drawn for a list's items is, is no element of the page either, and
+    // nor are words with a key `Children.toArray` gave them (a button's "Bookmark" after its icon was a `<span>`).
+    return (role === 'group' || role === 'text') && domKey == null && className == null && id == null && data == null;
+}
+
+/// Says what an event happened to, and what's hearing about it, from what came with it, leaving out what's only there to lay
+/// things out, which a page doesn't have.
+function findTargets(event, fresh = false) {
+    if (fresh) {
+        // Native input arrives in viewport coordinates. Document coordinates include the root scroll exactly once, before
+        // dispatch: a listener scrolling the page mustn't change the same event's coordinates for later listeners.
+        const scroll = pageScrollOffsets();
+        event.pageX = event.clientX + scroll.x;
+        event.pageY = event.clientY + scroll.y;
+    }
+    const said = event.__chain;
+    if (said === undefined) {
+        event.target = event.currentTarget = body;
+        return;
+    }
+    let chain = [];
+    let depth = 0;
+    let current = 0;
+    // Where what's in a portal into `body` starts, if what it happened to is in one: see `outOfPortal`.
+    let cut = -1;
+    for (let at = 0; at < said.length; at += 1) {
+        if (at === 0 || !onlyLaysOut(said[at])) {
+            chain.push(said[at]);
+        } else if (at <= event.__depth && isPortal(said[at])) {
+            cut = chain.length;
+        }
+        if (at <= event.__depth) {
+            depth = chain.length - 1;
+        }
+        if (at === event.__current) {
+            current = chain.length - 1;
+        }
+    }
+    // React's props hear it through what the portal's written in, as React has it, so one of those that's hearing it is that,
+    // where it is: everything else is along the way as the DOM has it.
+    let hearing = null;
+    if (cut > 0) {
+        if (current < cut && current > 0) {
+            hearing = chainElement(chain, current);
+        }
+        chain = [chain[0], ...chain.slice(cut)];
+        depth = depth >= cut ? depth - cut + 1 : 0;
+        current = current >= cut ? current - cut + 1 : 0;
+    }
+    event.__chain = chain;
+    event.__depth = depth;
+    event.__current = current;
+    event.__hearing = hearing;
+    const box = chain[depth];
+    event.offsetX = event.layerX = event.clientX - box[6];
+    event.offsetY = event.layerY = event.clientY - box[7];
+    event.target = event.srcElement = chainElement(chain, depth);
+    event.currentTarget = hearing ?? chainElement(chain, current);
+    if (depth === 0 && pagePointerEvents === 'none' && event.target === body) {
+        // `body` is `pointer-events: none` (a modal Radix layer's while it's open), so what the pointer's over outside the layer is
+        // the page's `<html>`, as on a page.
+        event.target = event.srcElement = documentElement;
+    }
+}
+rsui.__eventTargets(findTargets);
+
+/// What `event.composedPath()` says for an event from Rust: what it happened to and each element it's in, nearest first, and
+/// then `body`, `<html>`, the document and the window, as on a page. A click-outside check, as Mantine's and Floating UI's are,
+/// looks for its dropdown in it.
+function eventPath(event) {
+    const chain = event.__chain;
+    const out = [];
+    if (chain !== undefined) {
+        for (let at = Math.min(event.__depth ?? 0, chain.length - 1); at >= 1; at -= 1) {
+            const one = chainElement(chain, at);
+            if (one !== null) {
+                out.push(one);
+            }
+        }
+    }
+    out.push(body, documentElement, page, globalThis);
+    return out;
+}
+rsui.__eventPath?.(eventPath);
+
+/// What kind of event each is, by the web's name for its class, which code checks by `instanceof` or its constructor's name.
+const NATIVE_KINDS = { keydown: 'KeyboardEvent', keyup: 'KeyboardEvent', pointerdown: 'PointerEvent', pointerup: 'PointerEvent', pointermove: 'PointerEvent', click: 'PointerEvent', auxclick: 'PointerEvent', contextmenu: 'PointerEvent', mousedown: 'MouseEvent', mouseup: 'MouseEvent', mousemove: 'MouseEvent', dblclick: 'MouseEvent', wheel: 'WheelEvent', paste: 'ClipboardEvent', copy: 'ClipboardEvent', cut: 'ClipboardEvent', compositionstart: 'CompositionEvent', compositionupdate: 'CompositionEvent', compositionend: 'CompositionEvent', dragstart: 'DragEvent', drag: 'DragEvent', dragenter: 'DragEvent', dragover: 'DragEvent', dragleave: 'DragEvent', drop: 'DragEvent', dragend: 'DragEvent' };
+const nativeProtos = new Map();
+const nativeProtoSet = new Set();
+let eventBaseProto = null;
+
+/// Says what an event from Rust is, and, once the page's globals are in use, which of the web's classes it's of (`rsui/dom-events`).
+function classify(event, type) {
+    event.type = type;
+    // What has the pointer is told so before the pointer event after it asked, and that it's lost it before the click that
+    // follows the button coming up, whether or not the document listens (see `hearDocument`).
+    if (pointerCapture !== null) {
+        if (type === 'pointermove' || type === 'pointerup') {
+            tellCaptureGot();
+        } else if (type === 'click' || (type === 'pointerdown' && pointerCapture.told)) {
+            // Before the click; or a new press, when what had the pointer from the last one wasn't let go (its click never came).
+            tellCaptureLost();
+        }
+    }
+    if (type === 'compositionstart' && !event.data && editingLoaded !== null) {
+        // What it starts by replacing, as a browser says.
+        event.data = editingLoaded.selectedText();
+    }
+    const name = NATIVE_KINDS[type];
+    if (!domGlobalsMade || name === undefined) {
+        return;
+    }
+    eventBaseProto ??= Object.getPrototypeOf(rsui.__newEventBase());
+    const now = Object.getPrototypeOf(event);
+    if (now !== eventBaseProto && !nativeProtoSet.has(now)) {
+        // Something of its own, as what a page's handler gets for a click from an agent.
+        return;
+    }
+    let proto = nativeProtos.get(name);
+    if (proto === undefined) {
+        proto = Object.create(eventBaseProto, { constructor: { value: domEvents()[name], writable: true, configurable: true } });
+        if (name !== 'PointerEvent') {
+            // Only a pointer's events say which pointer: a `mousedown` or a key has no `pointerId`, as on a page.
+            for (const key of ['pointerId', 'pointerType', 'isPrimary', 'width', 'height']) {
+                Object.defineProperty(proto, key, { value: undefined, writable: true, configurable: true });
+            }
+        }
+        nativeProtos.set(name, proto);
+        nativeProtoSet.add(proto);
+    }
+    if (now !== proto) {
+        Object.setPrototypeOf(event, proto);
+    }
+}
+
+/// An event for a handler of an element of a page, which is `live`'s, as `type`. What it happened to is that element itself if
+/// it happened to it, and it's what's hearing about it. With nothing that came with it, as when an agent did it by what it's
+/// called, it happened to the element itself.
+function asWeb(event, type, live, tag) {
+    const web = event ?? Object.create(rsui.__newEventBase());
+    classify(web, type);
+    const self = handleOf(live, tag);
+    if (web.__chain !== undefined && (web.__hearing === null || web.__hearing === undefined)) {
+        // It's where the event says it is, for what it's in and where it is.
+        self.__chain = web.__chain;
+        self.__index = web.__current;
+    }
+    if (web.__chain === undefined || web.__depth === web.__current) {
+        web.target = web.srcElement = self;
+    }
+    web.currentTarget = self;
+    return web;
+}
+
+/// Runs each of these handlers, if it's there, with the event as each one's kind, until one stops it.
+function runEach(given, names, event, live, tag) {
+    for (const [name, type] of names) {
+        const run = given[name];
+        if (typeof run === 'function') {
+            const web = asWeb(event, type, live, tag);
+            // A disabled control's press is heard as a pointer's only, by React's props as much as by `document`: see `heardTypes`.
+            if (MOUSE_ONLY.has(type) && inDisabledControl(web?.target)) {
+                continue;
+            }
+            run(web);
+            if (event?.__stopped === true && event.__immediate === true) {
+                return;
+            }
+        }
+    }
+}
+
+/// What a page calls a transition of this prop of this element: CSS's own `rotate`, `translate` or `scale` where that's what it was
+/// given, and otherwise as `cssPropertyName` says.
+function transitionName(prop, live) {
+    if (prop === 'rotate' && live.saidRotate === true) {
+        return 'rotate';
+    }
+    if ((prop === 'translate_x' || prop === 'translate_y') && live.saidTranslate === true) {
+        return 'translate';
+    }
+    if (String(prop).startsWith('scale') && live.saidScale === true) {
+        return 'scale';
+    }
+    if (prop === 'transform') {
+        // The transform they're put together into, when it's only one of them that's said.
+        const said = [live.saidTranslate && 'translate', live.saidRotate && 'rotate', live.saidScale && 'scale'].filter(Boolean);
+        if (said.length === 1) {
+            return said[0];
+        }
+    }
+    return cssPropertyName(prop);
+}
+
+/// What the runtime calls a prop that moves, as CSS calls it.
+function cssPropertyName(prop) {
+    return { translate_x: 'transform', translate_y: 'transform', rotate: 'transform', scale: 'transform', scale_x: 'transform', scale_y: 'transform', background: 'background-color', text_color: 'color', corner_radius: 'border-radius', border_color: 'border-color', shadow_color: 'box-shadow', shadow_blur: 'box-shadow', shadow_x: 'box-shadow', shadow_y: 'box-shadow' }[prop] ?? String(prop).replace(/_/g, '-');
+}
+
+/// Which handlers hear which events, by what each is called on the way up and on the way down, and the name that hears them
+/// in rsui. A pointer's events and the mouse's that go with them are each sent all the way by themselves, pointer first, as on a
+/// page (see `fire` in rsui's `app_events.rs`).
+const WEB_EVENTS = [
+    ['__onPointerDown', [['onPointerDown', 'pointerdown']]],
+    ['__onPointerDownCapture', [['onPointerDownCapture', 'pointerdown']]],
+    ['__onPointerUp', [['onPointerUp', 'pointerup']]],
+    ['__onPointerUpCapture', [['onPointerUpCapture', 'pointerup']]],
+    ['__onPointerMove', [['onPointerMove', 'pointermove']]],
+    ['__onPointerMoveCapture', [['onPointerMoveCapture', 'pointermove']]],
+    ['__onMouseDown', [['onMouseDown', 'mousedown']]],
+    ['__onMouseDownCapture', [['onMouseDownCapture', 'mousedown']]],
+    ['__onMouseUp', [['onMouseUp', 'mouseup']]],
+    ['__onMouseUpCapture', [['onMouseUpCapture', 'mouseup']]],
+    ['__onMouseMove', [['onMouseMove', 'mousemove']]],
+    ['__onMouseMoveCapture', [['onMouseMoveCapture', 'mousemove']]],
+    ['__onWheel', [['onWheel', 'wheel']]],
+    ['__onWheelCapture', [['onWheelCapture', 'wheel']]],
+    ['__onKeyDown', [['onKeyDown', 'keydown']]],
+    ['__onKeyDownCapture', [['onKeyDownCapture', 'keydown']]],
+    ['__onKeyUp', [['onKeyUp', 'keyup']]],
+    ['__onKeyUpCapture', [['onKeyUpCapture', 'keyup']]],
+    ['__onAuxClick', [['onAuxClick', 'auxclick']]],
+    ['__onAuxClickCapture', [['onAuxClickCapture', 'auxclick']]],
+    ['__onClickCapture', [['onClickCapture', 'click']]],
+];
+/// The names of every handler that's heard as one of those, or below, which aren't props of the element itself.
+const WEB_HANDLERS = new Set(['onPaste', 'onCopy', 'onCut', 'onPasteCapture', 'onCopyCapture', 'onCutCapture', 'onCompositionStart', 'onCompositionUpdate', 'onCompositionEnd', 'onTransitionEnd', 'onAnimationEnd', 'onLoad', 'onError', 'onInput', 'onBeforeInput']);
+for (const [, names] of WEB_EVENTS) {
+    for (const [name] of names) {
+        WEB_HANDLERS.add(name);
+    }
+}
+/// What hears each part of dragging, as the web calls them, as `rsui/events` has them too.
+const DRAG_HANDLERS = { dragstart: 'onDragStart', drag: 'onDrag', dragenter: 'onDragEnter', dragover: 'onDragOver', dragleave: 'onDragLeave', drop: 'onDrop', dragend: 'onDragEnd' };
+/// Gives an event about dragging what's being dragged, from `rsui/events`, which is only read once something's dragged.
+const withDataTransfer = (event, type) => require('rsui/events').withDataTransfer(event, type);
+for (const name of Object.values(DRAG_HANDLERS)) {
+    WEB_HANDLERS.add(name);
+    WEB_HANDLERS.add(name + 'Capture');
+}
+
+/// Whether a window's been told that something wants what's dragged in from other programs, which is only said once.
+let dropsWanted = false;
+
+/// Handlers for dragging, on the way up, or on the way down if `capture`.
+function dragHandler(given, live, tag, capture) {
+    const suffix = capture ? 'Capture' : '';
+    if (!Object.values(DRAG_HANDLERS).some((name) => typeof given[name + suffix] === 'function')) {
+        return undefined;
+    }
+    if (!dropsWanted && ['onDrop', 'onDragOver', 'onDragEnter'].some((name) => typeof given[name + suffix] === 'function')) {
+        // Something can be dropped on it, from other programs too, which a window then tells about.
+        dropsWanted = true;
+        rsuiHostMethods.wantDrops();
+    }
+    return (type, event) => {
+        const run = given[DRAG_HANDLERS[type] + suffix];
+        if (typeof run === 'function') {
+            run(asWeb(withDataTransfer(event ?? Object.create(rsui.__newEventBase()), type), type, live, tag));
+        }
+    };
+}
+
+/// What a clipboard event has, with what's pasted, if it is.
+/// What was last copied in the app as HTML, with the text that went to the system's clipboard with it, for pasting it in the app
+/// as a browser would, as rsui's clipboard only holds text.
+let copiedHtml = null;
+
+function withClipboard(event, what) {
+    const text = event?.data ?? '';
+    const html = what === 'paste' && copiedHtml !== null && copiedHtml.text === text ? copiedHtml.html : '';
+    const set = new Map();
+    event.clipboardData = {
+        types: what === 'paste' ? [...(text !== '' ? ['text/plain'] : []), ...(html !== '' ? ['text/html'] : [])] : [],
+        files: [],
+        items: [],
+        getData(type) {
+            const kind = String(type).toLowerCase();
+            if (what !== 'paste') {
+                return set.get(kind === 'text' ? 'text/plain' : kind) ?? '';
+            }
+            if (/^text(\/plain)?$/.test(kind)) {
+                return text;
+            }
+            return kind === 'text/html' ? html : '';
+        },
+        setData(type, value) {
+            const kind = String(type).toLowerCase() === 'text' ? 'text/plain' : String(type).toLowerCase();
+            set.set(kind, String(value));
+            if (kind === 'text/plain') {
+                rsuiHostMethods.copy(String(value));
+            }
+            copiedHtml = set.has('text/html') ? { text: set.get('text/plain') ?? '', html: set.get('text/html') } : null;
+        },
+        clearData() {
+            set.clear();
+        },
+    };
+    return event;
+}
+
+/// Handlers for the pointer and the keyboard, for both what CSS needs to know and what was written for the web. `live` is
+/// what the element keeps, which its handle goes in.
+const ENTERS = [['onMouseEnter', 'mouseenter'], ['onPointerEnter', 'pointerenter'], ['onMouseOver', 'mouseover'], ['onPointerOver', 'pointerover']];
+const LEAVES = [['onMouseLeave', 'mouseleave'], ['onPointerLeave', 'pointerleave'], ['onMouseOut', 'mouseout'], ['onPointerOut', 'pointerout']];
+const NO_EVENT_PROPS = Object.freeze({});
+
+function eventProps(given, needs, handlers, tag, live, scrolls = false) {
+    // Most of a page's elements have no handlers, which is quick to see, and then costs nothing more.
+    let handled = false;
+    for (const name in given) {
+        if (name.charCodeAt(0) === 111 && name.charCodeAt(1) === 110 && typeof given[name] === 'function') {
+            handled = true;
+            break;
+        }
+    }
+    const nativeHover = live?.nativeHover === true;
+    const motionListened = live?.motionListened === true || motionHeardAbove;
+    // What can have the keyboard by itself, as a `<button>` with nothing listening to it can, says when it has it, for
+    // `document.activeElement`.
+    const ownFocus = tag === 'input' || tag === 'textarea' || tag === 'select' || tag === 'button' || tag === 'summary' || (tag === 'a' && typeof given.href === 'string') || given.tabIndex !== undefined;
+    if (!handled && !nativeHover && !motionListened && !ownFocus && (needs & (HOVER | PRESS | WITHIN | FOCUS)) === 0) {
+        return NO_EVENT_PROPS;
+    }
+    const out = {};
+    // What CSS's `:hover` needs is only whether it's there, and what's written for the web is given where the pointer is.
+    if ((needs & HOVER) !== 0) {
+        out.onHoverChange = handlers.hover;
+    }
+    if ((needs & PRESS) !== 0) {
+        out.onPressChange = handlers.press;
+    }
+    if ((needs & WITHIN) !== 0) {
+        out.onFocusWithinChange = handlers.within;
+    }
+    // What has the keyboard is the page's to say, which React's `onFocus` and `onBlur` hear about from it, as `focusin` and
+    // `focusout`, and anything listening does too.
+    const focusable = tag === 'input' || tag === 'textarea' || tag === 'select' || tag === 'button' || tag === 'a' || given.tabIndex !== undefined;
+    // What a page can't give the keyboard to can't have it, however it's heard, as a `<label>` that's clicked: Tab goes past it.
+    if (!(focusable && (tag !== 'a' || typeof given.href === 'string' || given.tabIndex !== undefined)) && !saysEditable(given) && tag !== 'summary') {
+        out.focusable = false;
+    }
+    if (focusable && (needs & RING) !== 0) {
+        out.onFocusRingChange = handlers.ring;
+    }
+    // Something that scrolls can have the keyboard when nothing in it can (Rust says when: see `scroller_takes_focus`), and is
+    // then `document.activeElement`, and heard as anything else that has it is.
+    if (focusable || scrolls) {
+        out.onFocus = (on) => {
+            if ((needs & FOCUS) !== 0) {
+                handlers.focus(on === true);
+            }
+            const me = handleOf(live, tag);
+            const key = live.domKey;
+            if (on && key === focusAsked.key) {
+                focusAsked = { key: undefined, at: -Infinity };
+            } else if (focusAsked.key !== undefined && performance.now() - focusAsked.at < 250) {
+                // What's said about what code gave the keyboard to before it gave it to something else.
+                return;
+            }
+            if (on) {
+                focusLeaving = null;
+                moveFocus(me, false);
+            } else if (focusedElement === me) {
+                // Rust says what had the keyboard has lost it before it says what has it now, as Tab moves it: what loses it is told
+                // what has it, as on a page, so that's waited for until what's running now has finished.
+                focusLeaving = me;
+                setTimeout(() => {
+                    if (focusLeaving === me && focusedElement === me) {
+                        focusLeaving = null;
+                        moveFocus(null, false);
+                    }
+                }, 0);
+            }
+        };
+    }
+    if (nativeHover) {
+        // What's listening with `addEventListener` hears it after React's props, as on a page, where they're both on the element.
+        out.__onPointerHover = (on, event) => {
+            runEach(given, on ? ENTERS : LEAVES, event, live, tag);
+            const element = handleOf(live, tag);
+            for (const [, type] of on ? ENTERS : LEAVES) {
+                if (elementListeners.get(element)?.get(type)?.length > 0) {
+                    const web = asWeb(event, type, live, tag);
+                    const bubbles = web.bubbles;
+                    web.bubbles = type.endsWith('over') || type.endsWith('out');
+                    heardBy(element, web, null);
+                    web.bubbles = bubbles;
+                }
+            }
+        };
+    }
+    if (!handled && !motionListened) {
+        return out;
+    }
+    if (!nativeHover && (ENTERS.some(([name]) => typeof given[name] === 'function') || LEAVES.some(([name]) => typeof given[name] === 'function'))) {
+        out.__onPointerHover = (on, event) => runEach(given, on ? ENTERS : LEAVES, event, live, tag);
+    }
+    for (const [hears, names] of WEB_EVENTS) {
+        if (names.some(([name]) => typeof given[name] === 'function')) {
+            out[hears] = (...args) => {
+                // What came with it is last, and nothing does when an agent does it by what it's called.
+                const last = args[args.length - 1];
+                runEach(given, names, typeof last === 'object' && last !== null ? last : undefined, live, tag);
+            };
+        }
+    }
+    const clipboard = (capture) => (what, event) => {
+        const name = { paste: 'onPaste', copy: 'onCopy', cut: 'onCut' }[what] + (capture ? 'Capture' : '');
+        given[name]?.(asWeb(withClipboard(event, what), what, live, tag));
+    };
+    if (typeof given.onPaste === 'function' || typeof given.onCopy === 'function' || typeof given.onCut === 'function') {
+        out.__onClipboard = clipboard(false);
+    }
+    if (typeof given.onPasteCapture === 'function' || typeof given.onCopyCapture === 'function' || typeof given.onCutCapture === 'function') {
+        out.__onClipboardCapture = clipboard(true);
+    }
+    if (typeof given.onCompositionStart === 'function' || typeof given.onCompositionUpdate === 'function' || typeof given.onCompositionEnd === 'function') {
+        out.__onComposition = (phase, event) => {
+            const name = { start: 'onCompositionStart', update: 'onCompositionUpdate', end: 'onCompositionEnd' }[phase];
+            given[name]?.(asWeb(event, 'composition' + phase, live, tag));
+        };
+    }
+    if (motionListened || typeof given.onTransitionEnd === 'function' || typeof given.onAnimationEnd === 'function' || typeof given.onAnimationStart === 'function') {
+        // It's said in words, which come as one each: it's sent as a page's `animationend` or `transitionend` is, to what it
+        // happened to and up through what it's in, so that what's listening hears it as well as React's props.
+        out.__onMotionEnd = (kind, prop) => {
+            if (kind === 'animation') {
+                motionEnded(live, tag);
+            } else if (kind === 'transitionstart') {
+                // Rust says a transition's started, which a page says as it's set off and as it starts moving.
+                (live.transitionsRunning ??= new Set()).add(transitionName(prop, live));
+                motionEvent(live, tag, 'transitionrun', { propertyName: transitionName(prop, live) });
+                motionEvent(live, tag, 'transitionstart', { propertyName: transitionName(prop, live) });
+            } else {
+                live.transitionsRunning?.delete(transitionName(prop, live));
+                motionSettled(live);
+                motionEvent(live, tag, kind === 'transitioncancel' ? 'transitioncancel' : 'transitionend', { propertyName: transitionName(prop, live) });
+            }
+        };
+    }
+    const drag = dragHandler(given, live, tag, false);
+    if (drag !== undefined) {
+        out.__onDrag = drag;
+    }
+    const dragDown = dragHandler(given, live, tag, true);
+    if (dragDown !== undefined) {
+        out.__onDragCapture = dragDown;
+    }
+    if (typeof given.onDoubleClick === 'function') {
+        out.onDoubleClick = (event) => given.onDoubleClick(asWeb(event, 'dblclick', live, tag));
+    }
+    if (typeof given.onContextMenu === 'function') {
+        out.onContextMenu = (...args) => given.onContextMenu(asWeb(args[2], 'contextmenu', live, tag));
+    }
+    return out;
+}
+
+/// A field's `onInput` hears what changes in it as `onChange` does, which is when a page's does too.
+function withInput(host, given) {
+    if (typeof given.onInput === 'function') {
+        const changed = host.onChange;
+        const input = given.onInput;
+        host.onChange = (event) => {
+            // Typing is heard as an `input` event of its own, which `onInput` hears with the rest: see `fieldChange`.
+            const typing = rsuiHostMethods.editing?.() !== undefined;
+            changed?.(event);
+            if (!typing) {
+                input({ ...event, type: 'input', inputType: 'insertText', data: null });
+            }
+        };
+    }
+}
+
+
+/// Tells an `<img>`'s `onLoad` or `onError`, once, for each picture it's given, as soon as what's running now has finished, as
+/// on a page. Only the start of the picture's read, to know how big it is.
+function imageEvents(props, live) {
+    if (typeof props.onLoad !== 'function' && typeof props.onError !== 'function') {
+        return;
+    }
+    const src = props.src;
+    if (live.imageSrc === src) {
+        return;
+    }
+    live.imageSrc = src;
+    queueMicrotask(() => {
+        if (live.imageSrc !== src) {
+            return;
+        }
+        const size = typeof src === 'string' ? rsuiHostMethods.imageSize(src) : undefined;
+        const event = asWeb(undefined, size === undefined ? 'error' : 'load', live, 'img');
+        event.bubbles = false;
+        Object.assign(event.target, { naturalWidth: size?.[0] ?? 0, naturalHeight: size?.[1] ?? 0, complete: true, src: String(src ?? '') });
+        (size === undefined ? props.onError : props.onLoad)?.(event);
+    });
+}
+
+// What `document` and `window` hear, from `addEventListener`, by the kind of thing.
+const documentListeners = new Map();
+/// Which kind each is, as `listens` has them in rsui-runtime's `event.rs`.
+const LISTEN_KINDS = { pointerdown: 1, mousedown: 1, pointerup: 2, mouseup: 2, pointermove: 4, mousemove: 4, click: 8, auxclick: 8, keydown: 16, keyup: 32, wheel: 64, paste: 128, copy: 128, cut: 128, compositionstart: 256, compositionupdate: 256, compositionend: 256, contextmenu: 512, dblclick: 1024, dragstart: 2048, drag: 2048, dragenter: 2048, dragover: 2048, dragleave: 2048, drop: 2048, dragend: 2048, rsuitext: 4096, rsuiselect: 8192 };
+
+/// The mouse's own events, which a browser doesn't send to a form control that can't be used, or to what's in one, though it
+/// sends the pointer's.
+const MOUSE_ONLY = new Set(['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick']);
+const CONTROL_TAGS = new Set(['button', 'input', 'select', 'textarea']);
+
+function inDisabledControl(element) {
+    for (let at = element, steps = 0; at !== null && at !== undefined && steps < 64; at = at.parentElement, steps += 1) {
+        const live = at.__live;
+        if (live !== undefined && CONTROL_TAGS.has(live.tag)) {
+            return live.given?.disabled === true;
+        }
+    }
+    return false;
+}
+
+/// The events Rust's one is heard as on the page: itself, or nothing for the mouse's on a control that can't be used.
+function heardTypes(kind, event) {
+    return MOUSE_ONLY.has(kind) && inDisabledControl(event.target) ? [] : [kind];
+}
+
+function listenOn(where, type, listener, options) {
+    if (listener === null || listener === undefined) {
+        return;
+    }
+    if (type === 'resize' && where === 'window') {
+        if (typeof listener === 'function') {
+            resizeListeners.add(listener);
+        }
+        return;
+    }
+    const capture = options === true || options?.capture === true;
+    const list = documentListeners.get(type) ?? [];
+    if (list.some((one) => one.listener === listener && one.capture === capture && one.where === where)) {
+        return;
+    }
+    list.push({ where, listener, capture, once: options?.once === true, last: options?.__last === true });
+    // Animations and transitions starting and ending are told to what they happen to, and up through what it's in to here,
+    // which every element that moves has to be drawn again to say, once.
+    if (MOTION_TYPES.has(type) && !motionHeardAbove) {
+        motionHeardAbove = true;
+        changed();
+    }
+    // What a browser does by default comes after everything the page has listening, whenever that was added.
+    list.sort((one, other) => Number(one.last) - Number(other.last));
+    documentListeners.set(type, list);
+    // What's given to stop listening is kept as on a page.
+    options?.signal?.addEventListener?.('abort', () => unlistenOn(where, type, listener, options));
+    sayWhatsListened();
+}
+
+function unlistenOn(where, type, listener, options) {
+    if (type === 'resize' && where === 'window') {
+        resizeListeners.delete(listener);
+        return;
+    }
+    const capture = options === true || options?.capture === true;
+    const list = documentListeners.get(type);
+    if (list === undefined) {
+        return;
+    }
+    const left = list.filter((one) => !(one.listener === listener && one.capture === capture && one.where === where));
+    if (left.length === 0) {
+        documentListeners.delete(type);
+    } else {
+        documentListeners.set(type, left);
+    }
+    sayWhatsListened();
+}
+
+/// How many listeners there are on elements for each kind of event, which Rust sends here as it does what `document` listens
+/// for, as that says what it went through.
+const elementListening = new Map();
+
+function elementListened(type, by) {
+    const now = (elementListening.get(type) ?? 0) + by;
+    if (now > 0) {
+        elementListening.set(type, now);
+    } else {
+        elementListening.delete(type);
+    }
+    if (LISTEN_KINDS[type] !== undefined && (now === 0 || now === by)) {
+        sayWhatsListened();
+    }
+}
+
+/// Tells Rust which kinds of thing to send here, so that nothing else is.
+function sayWhatsListened() {
+    let kinds = 0;
+    const phases = new Map();
+    const hear = (type, bits) => phases.set(type, (phases.get(type) ?? 0) | bits);
+    for (const type of [...documentListeners.keys(), ...elementListening.keys()]) {
+        kinds |= LISTEN_KINDS[type] ?? 0;
+        for (const one of documentListeners.get(type) ?? []) {
+            hear(type, (1 << (one.capture ? 1 : 3)) | (one.last ? (1 << 3) | (1 << 4) : 0));
+        }
+        if (elementListening.has(type)) {
+            hear(type, 1 << 2);
+        }
+        // Disabled controls suppress these mouse events at the capture boundary,
+        // even when the listener itself is on the way back up.
+        if (MOUSE_ONLY.has(type) && phases.has(type)) {
+            hear(type, 1 << 1);
+        }
+        // The pointer coming over something and leaving it is found from where it moves: see `hoverMoved`.
+        if (BOUNDARY_TYPES.has(type) && documentListeners.has(type)) {
+            kinds |= LISTEN_KINDS.pointermove;
+            hear('pointermove', 1 << 1);
+        }
+        if (type === 'drop' || type === 'dragover' || type === 'dragenter') {
+            rsuiHostMethods.wantDrops();
+        }
+    }
+    // Exact interest is refreshed immediately, including when a listener is added
+    // during dispatch, so a later phase of that very event can hear it.
+    const interests = [];
+    for (const [type, bits] of phases) interests.push(type, bits);
+    rsuiHostMethods.listenDocument(kinds, interests);
+}
+
+/// What's listening on the elements along the way to what an event happened to hears it, on the way down and then back up, as
+/// on a page. That's after the page's own handlers on the way down and before those on the way back up, which a page has hear it
+/// where React's root is, around them all. Says whether one of them said nothing further along should hear it.
+function heardAlong(type, event) {
+    const chain = event.__chain;
+    if (chain === undefined) {
+        return false;
+    }
+    const along = [];
+    for (let at = 1; at <= event.__depth && at < chain.length; at += 1) {
+        const element = chainElement(chain, at);
+        if (element !== null && elementListeners.has(element)) {
+            along.push(element);
+        }
+    }
+    if (along.length === 0) {
+        return false;
+    }
+    const target = event.target;
+    const phase = event.eventPhase;
+    for (const [elements, capture] of [[along, true], [along.slice().reverse(), false]]) {
+        for (const element of elements) {
+            event.eventPhase = element === target ? 2 : capture ? 1 : 3;
+            if (heardBy(element, event, capture)) {
+                event.eventPhase = phase;
+                return true;
+            }
+        }
+    }
+    event.eventPhase = phase;
+    return false;
+}
+
+/// Something's happened that `document` and `window` may be listening for: on the way down, `window`'s and then `document`'s,
+/// and on the way back up the other way round, as on a page. What's listening on the elements it went through hears it in
+/// between.
+rsui.__hearDocument((kind, event, prevented) => {
+    if (kind === 'keyboardleft') {
+        keyboardLeftPage();
+        return;
+    }
+    if (kind === 'keyboardback') {
+        keyboardBackInPage();
+        return;
+    }
+    if (event === undefined) {
+        return;
+    }
+    if (kind === 'pointermove' && event.eventPhase === 1 && boundaryHeard()) {
+        hoverMoved(event.target ?? null, event);
+    }
+    if (prevented === true) {
+        // It's a new object for each time it's heard here, which says what was said on the way down.
+        event.defaultPrevented = true;
+    }
+    if (event.eventPhase === 1 && MOUSE_ONLY.has(kind) && heardTypes(kind, event).length === 0) {
+        // A disabled control's `mousedown`, `mouseup` and click aren't sent at all, to it or anything around it.
+        event.stopPropagation();
+        return;
+    }
+    if (event.eventPhase === 2) {
+        // Between the page's handlers on the way down and those on the way back up, what's listening on the elements along the
+        // way hears it, as on a page, where React hears it where its root is, around them all.
+        heardOnElements(kind, event);
+        return;
+    }
+    // Something stopping it going further on the way back up keeps it from what's after that, but what a browser does by
+    // default still happens, unless it was said not to. Stopped before that, Rust says so after everything, as phase 4.
+    if (event.eventPhase === 4 || (hearDocument(kind, event) && event.eventPhase === 3)) {
+        for (const type of heardTypes(kind, event)) {
+            for (const one of (documentListeners.get(type) ?? []).slice()) {
+                if (one.last) {
+                    classify(event, type);
+                    if (type === 'paste' || type === 'copy' || type === 'cut') {
+                        withClipboard(event, type);
+                    }
+                    one.listener.call(globalThis, event);
+                }
+            }
+        }
+    }
+});
+
+// Page text selected with the pointer, as a browser does (see `pagePress` in editing.js), which only loads that the first time
+// the main button goes down on the page with nothing saying not to: until then, nothing's selected, and nothing else pays for it.
+//
+// Until the page asks about the selection (`getSelection()`, which loads `dom.js`) or listens for `selectionchange`, the last press,
+// where it was dragged to and whether it's come up are only kept, and done once it asks, as sonner asks while a toast is dragged.
+function pressMaySelect(event) {
+    if ((event.button !== undefined && event.button !== 0) || event.defaultPrevented || event.isTrusted !== true || editingLoaded !== null) {
+        return;
+    }
+    // A press in a control, as a field or a button, doesn't select the page's text.
+    if (typeof event.target?.closest === 'function' && event.target.closest('input, textarea, select, button') !== null) {
+        return;
+    }
+    if (domLoaded !== null || documentListeners.has('selectionchange')) {
+        editingPack().pagePress(event);
+        return;
+    }
+    const { target, clientX, clientY, detail, shiftKey } = event;
+    pressKept = { press: { button: 0, defaultPrevented: false, isTrusted: true, target, clientX, clientY, detail, shiftKey }, move: null, up: false };
+    listenOn('window', 'mousemove', moveMaySelect, PRESS_MAY_SELECT);
+    listenOn('window', 'mouseup', upMaySelect, PRESS_MAY_SELECT);
+}
+function moveMaySelect(event) {
+    if (pressKept !== null && !pressKept.up && (event.buttons & 1) !== 0) {
+        pressKept.move = { buttons: 1, clientX: event.clientX, clientY: event.clientY };
+    }
+}
+function upMaySelect() {
+    if (pressKept !== null) {
+        pressKept.up = true;
+    }
+    unlistenOn('window', 'mousemove', moveMaySelect, PRESS_MAY_SELECT);
+    unlistenOn('window', 'mouseup', upMaySelect, PRESS_MAY_SELECT);
+}
+/// The press kept by `pressMaySelect`, done now that the page's selection is wanted.
+function selectKeptPress() {
+    const kept = pressKept;
+    pressKept = null;
+    unlistenOn('window', 'mousedown', pressMaySelect, PRESS_MAY_SELECT);
+    upMaySelect();
+    if (kept === null) {
+        return;
+    }
+    const editing = editingPack();
+    editing.pagePress(kept.press);
+    if (kept.move !== null) {
+        editing.pageMove(kept.move);
+    }
+    if (kept.up) {
+        editing.pageRelease();
+    }
+}
+let pressKept = null;
+const PRESS_MAY_SELECT = { __last: true };
+
+/// Whether anything's listening on the page as a whole for an animation or a transition starting or ending, which every element
+/// that moves then says, as on a page.
+let motionHeardAbove = false;
+
+// The pointer coming over something and leaving it, as `window` and `document` hear it: `pointerout` and `pointerover`, and then the
+// mouse's the same, before the move itself, as a browser sends them, and again when what's under a pointer that's still changes,
+// as a dialog's overlay coming up under it does. `pointerenter` and the rest that don't go up are only for the element itself,
+// which hears them from what it's drawn with (see `nativeHover`), as React's props do from Rust.
+const BOUNDARY_TYPES = new Set(['pointerover', 'pointerout', 'mouseover', 'mouseout']);
+/// What the pointer's over, and where it is, as last said.
+const hover = { over: null, x: undefined, y: undefined, buttons: 0, due: false };
+function boundaryHeard() {
+    for (const type of BOUNDARY_TYPES) {
+        if (documentListeners.has(type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether two handles are one element: the same key, unless one was taken out and the other put in its place, as a remounted
+/// element is a new one.
+const sameElement = (one, other) => one === other || (one?.__domKey !== undefined && one.__domKey === other?.__domKey
+    && (one.__live === undefined || other.__live === undefined || one.__live === other.__live));
+
+/// Says the pointer's now over `next`, if that's something else, with each of the events that says so, as a browser does.
+function hoverMoved(next, event) {
+    if (event !== null) {
+        hover.x = event.clientX;
+        hover.y = event.clientY;
+        hover.buttons = event.buttons ?? 0;
+    }
+    const before = hover.over;
+    if (next === body || next === documentElement) {
+        next = null;
+    }
+    if (sameElement(before, next)) {
+        return;
+    }
+    hover.over = next;
+    const { PointerEvent, MouseEvent } = domEvents();
+    const send = (Kind, type, target, related, bubbles) => {
+        const made = new Kind(type, { bubbles, cancelable: bubbles, composed: true, clientX: hover.x ?? 0, clientY: hover.y ?? 0, buttons: hover.buttons,
+            relatedTarget: related, view: globalThis, pointerId: 1, pointerType: 'mouse', isPrimary: true, detail: 0 });
+        made.isTrusted = true;
+        dispatchOnPage(target, made);
+    };
+    for (const [Kind, out, over] of [[PointerEvent, 'pointerout', 'pointerover'], [MouseEvent, 'mouseout', 'mouseover']]) {
+        if (before !== null) {
+            send(Kind, out, before, next, true);
+        }
+        if (next !== null) {
+            send(Kind, over, next, before, true);
+        }
+    }
+}
+
+/// What the pointer was over has been taken out of the page: as Chromium has it, the pointer's then over the nearest thing it was in
+/// that's still there (`body` for what was in a portal), which hears `pointerover` and `mouseover`, with nothing said to what's gone.
+/// Looking again once the page has rendered then finds what's really under it.
+function hoverGone(element) {
+    if (!sameElement(hover.over, element) || !boundaryHeard()) {
+        return;
+    }
+    queueMicrotask(() => {
+        if (!sameElement(hover.over, element)) {
+            return;
+        }
+        const chain = element.__chain;
+        let around = body;
+        for (let at = (element.__index ?? 0) - 1; at > 0 && chain !== undefined; at -= 1) {
+            const one = chainElement(chain, at);
+            if (one !== null && inPageNow(one)) {
+                around = one;
+                break;
+            }
+        }
+        hover.over = null;
+        const { PointerEvent, MouseEvent } = require('rsui/dom-events');
+        for (const [Kind, type] of [[PointerEvent, 'pointerover'], [MouseEvent, 'mouseover']]) {
+            const made = new Kind(type, { bubbles: true, cancelable: true, composed: true, clientX: hover.x ?? 0, clientY: hover.y ?? 0, buttons: hover.buttons,
+                relatedTarget: null, view: globalThis, pointerId: 1, pointerType: 'mouse', isPrimary: true, detail: 0 });
+            made.isTrusted = true;
+            dispatchOnPage(around, made);
+        }
+        hover.over = around;
+    });
+}
+
+/// Once the page has rendered again, what's under a pointer that hasn't moved is looked at again, as a browser does.
+renderListeners.add(() => {
+    if (hover.x === undefined || hover.due || !boundaryHeard()) {
+        return;
+    }
+    hover.due = true;
+    let tries = 0;
+    const look = () => {
+        const at = page.elementFromPoint?.(hover.x, hover.y) ?? null;
+        // What was laid out last can still have what React's just taken out, until it's laid out again.
+        if (at !== null && at !== body && !inPageNow(at) && tries < 4) {
+            tries += 1;
+            setTimeout(look, 16);
+            return;
+        }
+        hover.due = false;
+        hoverMoved(at, null);
+    };
+    setTimeout(look, 0);
+});
+
+/// What's listening on the elements an event goes through hears it (see `heardAlong`). Says whether one of them stopped it.
+function heardOnElements(kind, event) {
+    for (const type of heardTypes(kind, event)) {
+        if (!elementListening.has(type)) {
+            continue;
+        }
+        classify(event, type);
+        if (DRAG_HANDLERS[type] !== undefined) {
+            withDataTransfer(event, type);
+        }
+        if (heardAlong(type, event)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Says whether something stopped it going further. A pointer's event and the mouse's that goes with it each come from Rust by
+/// themselves, the pointer's all the way down and back up first, as on a page.
+function hearDocument(kind, event, last = true) {
+    const down = event.eventPhase === 1;
+    const order = down ? ['window', 'document'] : ['document', 'window'];
+    for (const type of heardTypes(kind, event)) {
+        const list = documentListeners.get(type) ?? [];
+        for (const where of order) {
+            for (const one of list.slice()) {
+                if (one.where !== where || one.capture !== down || (!last && one.last)) {
+                    continue;
+                }
+                classify(event, type);
+                event.currentTarget = where === 'window' ? globalThis : page;
+                if (type === 'paste' || type === 'copy' || type === 'cut') {
+                    withClipboard(event, type);
+                } else if (DRAG_HANDLERS[type] !== undefined) {
+                    withDataTransfer(event, type);
+                }
+                if (one.once) {
+                    unlistenOn(where, type, one.listener, one);
+                }
+                try {
+                    if (typeof one.listener === 'function') {
+                        one.listener.call(event.currentTarget, event);
+                    } else {
+                        one.listener.handleEvent?.(event);
+                    }
+                } catch (error) {
+                    console.error(error);
+                }
+                if (event.__stopped === true) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether what a kind of component makes sits on a line, as MUI's `Button` makes an inline-flex `<button>`, which what it's in
+/// can't know until it's drawn, and goes by from then on (`__webInline`, which `layout.rs` reads). It's found out by each element
+/// that's drawn, for each component around it that gave back only that, apart from what gives back nothing, as CSS-in-JS's
+/// `Insertion` beside its element does. A kind of component that's made both, as MUI's `Typography` does, says neither.
+let flowLearnedSoon = false;
+/// Whether what's been learned since that was last done is about kinds of component, which anything they're in anywhere may have
+/// been drawn without, so everything's drawn again.
+let flowLearnedWide = false;
+/// The elements that what's been learned since then is about what's in, which are what's drawn again, when it's only about a kind of
+/// component made with props it hadn't been made with before: a ColorPicker's swatch with a color it hadn't had. Drawing
+/// everything again for that took a second on the Mantine kitchen sink.
+const flowRedraws = new Set();
+/// What each kind of component has been found to make with props it hadn't been made with before, since that was last done: another
+/// one made with them in the meantime is in something that has to be drawn again too, as it learned nothing new itself.
+const flowFresh = new Map();
+// Only live instances are kept; the runtime pairs these notifications on kind changes and unmount. Learning a portal-only
+// component's flow must not redraw unrelated sections of the page.
+const flowInstances = new WeakMap();
+globalThis.__rsuiFlowInstance = (type, instance, mounted) => {
+    if (typeof type !== 'function' || type.context !== undefined || type.__webStyled === true || type.__webField === true) {
+        return;
+    }
+    let instances = flowInstances.get(type);
+    if (mounted) {
+        if (instances === undefined) {
+            instances = new Set();
+            flowInstances.set(type, instances);
+        }
+        instances.add(instance);
+    } else {
+        instances?.delete(instance);
+    }
+};
+const flowChangedTypes = new Set();
+/// How many times something's been learned and drawn again, for what's kept of what's in an element to know it's out of date.
+let flowLearnedCount = 0;
+
+/// Notes that something's been learned (see `learnFlow`): about the kind of component, for `wide`, or about what's in `around`, the
+/// nearest element of the page it's in. What's affected is drawn again, once, after what's being drawn now.
+function flowLearned(wide, around, type) {
+    if (wide && typeof type === 'function' && flowInstances.get(type)?.size > 0) {
+        flowChangedTypes.add(type);
+        if (typeof around?.redraw === 'function') flowRedraws.add(around);
+    } else if (wide || around === null || around === undefined || typeof around.redraw !== 'function') {
+        flowLearnedWide = true;
+    } else {
+        flowRedraws.add(around);
+    }
+    if (flowLearnedSoon) {
+        return;
+    }
+    flowLearnedSoon = true;
+    queueMicrotask(() => {
+        flowLearnedSoon = false;
+        flowLearnedCount += 1;
+        flowFresh.clear();
+        if (flowChangedTypes.size > 0) {
+            forgetKinds();
+            hasEpoch += 1;
+            for (const type of flowChangedTypes) {
+                for (const instance of flowInstances.get(type) ?? []) {
+                    let found = false;
+                    for (let at = instance.parent; at !== null && at !== undefined; at = at.parent) {
+                        if (typeof at.__pageLive?.redraw === 'function') {
+                            flowRedraws.add(at.__pageLive);
+                            found = true;
+                        }
+                    }
+                    if (!found) flowLearnedWide = true;
+                }
+            }
+            flowChangedTypes.clear();
+        }
+        const lives = [...flowRedraws];
+        flowRedraws.clear();
+        if (flowLearnedWide) {
+            flowLearnedWide = false;
+            flowVersion += 1;
+            forgetKinds();
+            // Selectors involving a newly learned element (:has() included) must see fresh ancestor matches. The CSS rules
+            // themselves have not changed: retain their declarations, indexes and cascade plans instead of changed().
+            hasEpoch += 1;
+            for (let at = pageAbove; at !== null; at = at.up) {
+                at.chainMatched = undefined;
+                at.fromMatched = undefined;
+            }
+            for (const listener of listeners) {
+                if (typeof listener === 'function') {
+                    listener();
+                } else {
+                    listener.redraw();
+                }
+            }
+            return;
+        }
+        for (const live of lives) {
+            live.redraw();
+        }
+    });
+}
+
+/// The nearest element of the page that a component's instance is in, found up through the components around it.
+function drawnAround(instance) {
+    let around = instance?.parent ?? null;
+    while (around !== null && around !== undefined && around.__pageLive === undefined) {
+        around = around.parent;
+    }
+    return around?.__pageLive ?? null;
+}
+
+function learnFlow(inline, below = rsui.__instanceNow?.(), text = false) {
+    if (below === null || below === undefined) {
+        return;
+    }
+    const kind = inline ? 'inline' : 'block';
+    const fragment = globalThis.__Fragment;
+    const nothing = (type) => type?.__gaveNothing === true && type.__gaveSomething !== true;
+    let learned = false;
+    let wide = false;
+    let changedTypes = null;
+    let around;
+    for (let child = below, at = below.parent; at !== null && at !== undefined; child = at, at = at.parent) {
+        const type = at.type;
+        if (typeof type !== 'function' || type.context !== undefined || type === fragment || type.__webTag !== undefined || type.__webStyled === true || type.__webField === true) {
+            break;
+        }
+        // What it gave back, with what's in a fragment counted as given back itself.
+        const elements = [];
+        const gather = (value) => {
+            if (Array.isArray(value)) {
+                value.forEach(gather);
+            } else if (isValidElement(value) && value.type === fragment) {
+                gather(value.kids ?? value.props?.children);
+            } else if (value !== null && value !== undefined && value !== false && value !== true && value !== '') {
+                elements.push(value);
+            }
+        };
+        gather(at.output);
+        // A page element written with its tag's name, as shadcn's Button gives back `<button>`, is drawn by the component for that
+        // tag, which is what the one drawn is: Button was never found to sit on a line, so a table's Previous and Next stacked.
+        const mine = elements.filter((one) => isValidElement(one) && (one.type === child.type || (typeof one.type === 'string' && domElement(one.type) === child.type)));
+        if (mine.length !== 1 || elements.some((one) => !mine.includes(one) && !(isValidElement(one) && nothing(one.type)))) {
+            break;
+        }
+        const seen = type.__webFlowSeen === undefined ? kind : type.__webFlowSeen === kind ? kind : 'both';
+        // What it makes for what it's given, too, as Mantine's `Code` makes a `<code>` that goes along a line, and a `<pre>` that's a
+        // block with `block`: a kind of component that's made both is still known to go along a line for the same props.
+        const by = learnFlowBy(type, at.props, kind);
+        if (by !== 0) {
+            learned = true;
+            if (by === FLOW_FRESH) {
+                around ??= drawnAround(at);
+            } else {
+                wide = true;
+                (changedTypes ??= new Set()).add(type);
+            }
+        }
+        if (seen !== type.__webFlowSeen) {
+            try {
+                type.__webFlowSeen = seen;
+                const mark = seen === 'inline' ? true : undefined;
+                if (type.__webInline !== mark) {
+                    type.__webInline = mark;
+                    learned = true;
+                    wide = true;
+                    (changedTypes ??= new Set()).add(type);
+                }
+            } catch {}
+        }
+        if (text && seen === 'inline' && type.__webText !== true) {
+            try {
+                type.__webText = true;
+                learned = true;
+                wide = true;
+                (changedTypes ??= new Set()).add(type);
+            } catch {}
+        }
+    }
+    if (learned) {
+        if (wide && changedTypes !== null) {
+            for (const type of changedTypes) flowLearned(true, around, type);
+        } else {
+            flowLearned(false, around);
+        }
+    }
+}
+
+/// What `learnFlowBy` says when what a kind of component makes, for props it hadn't been made with, matters to what it's in.
+const FLOW_FRESH = 1;
+/// What it says when what it makes for props it had been made with has changed, which matters to everything it's in.
+const FLOW_CHANGED = 2;
+
+/// What tells apart what a component's given, for what it makes: its props that are plain values, apart from what's only how it
+/// looks or what's in it, as `block` on Mantine's `Code` is.
+function flowSignature(props) {
+    if (props === null || typeof props !== 'object') {
+        return '';
+    }
+    let out = '';
+    for (const key of Object.keys(props).sort()) {
+        if (key === 'children' || key === 'className' || key === 'style' || key === 'id') {
+            continue;
+        }
+        const value = props[key];
+        if (typeof value === 'boolean' || typeof value === 'string' || typeof value === 'number') {
+            out += key + '=' + String(value) + ';';
+        }
+    }
+    return out;
+}
+
+/// Learns whether a kind of component goes along a line for these props (`__webFlowBy`), which `__webInlineOf` says for an element
+/// of it, here and in `layout.rs`. Gives back whether that's new.
+function learnFlowBy(type, props, kind) {
+    let by = type.__webFlowBy;
+    if (by === undefined) {
+        try {
+            by = new Map();
+            type.__webFlowBy = by;
+            type.__webInlineOf = (given) => by.get(flowSignature(given)) === 'inline';
+        } catch {
+            return false;
+        }
+    }
+    const signature = flowSignature(props);
+    const was = by.get(signature);
+    const now = was === undefined || was === kind ? kind : 'both';
+    // Only what's made both ways needs it, as anything else is known by `__webInline`.
+    const matters = type.__webFlowSeen === 'both' || (type.__webFlowSeen !== undefined && type.__webFlowSeen !== kind);
+    if (now === was) {
+        // Another made with props one was first made with a moment ago is in something that was drawn without knowing that either.
+        return matters && flowFresh.get(type)?.has(signature) === true ? FLOW_FRESH : 0;
+    }
+    by.set(signature, now);
+    if (!matters) {
+        return 0;
+    }
+    // What `__webInlineOf` says for these props is all that's read of this, and it says it's not inline for props it hasn't seen,
+    // so props seen as a block for the first time change nothing that's been drawn. Drawing the whole page again for that took
+    // most of a second each time a ColorPicker's swatch was clicked in Mantine's kitchen sink, as each had props of its own.
+    if ((was === 'inline') === (now === 'inline')) {
+        return 0;
+    }
+    if (was !== undefined) {
+        return FLOW_CHANGED;
+    }
+    let fresh = flowFresh.get(type);
+    if (fresh === undefined) {
+        fresh = new Set();
+        flowFresh.set(type, fresh);
+    }
+    fresh.add(signature);
+    return FLOW_FRESH;
+}
+
+/// A component that gave back only text goes along a line, as an inline element does, and so does what gives back only it, as
+/// Ant Design's `EllipsisTooltip` gives back its `EllipsisMeasure`: see `learnFlow`.
+globalThis.__rsuiLearnedText = (type, instance) => {
+    if (type.context !== undefined) {
+        return;
+    }
+    const known = type.__webText === true;
+    if (!known) {
+        try {
+            type.__webFlowSeen = 'inline';
+            type.__webInline = true;
+            type.__webText = true;
+        } catch {
+            return;
+        }
+    }
+    // What's around this one is found out about, as what's around another of it may not have been.
+    learnFlow(true, instance, true);
+    if (!known) {
+        flowLearned(true, drawnAround(instance), type);
+    }
+};
+
+/// Which element a component first turned out to make, as a guess at what another of it makes before it's been drawn: see `learnTag`.
+const renderedTag = new WeakMap();
+/// What element each kind of component was first found to make, and what that was given, for `:has()`: see `learnMadeTag`.
+const renderedMade = new WeakMap();
+/// The kinds of component a `:has()` asked about before what they make was known: see `hasInside`.
+const hasWaiting = new WeakSet();
+/// Whether a `:has()` has asked about a component yet, before which nothing needs to learn what components make.
+let hasAsked = false;
+
+/// Has each component that gave back only the element being drawn, and what gave back only that, and so on up, know it makes this
+/// kind of element, as shadcn's Spinner gives back lucide's `Loader2Icon`, which gives back an `<svg>`: `:has(> svg)` asks.
+function learnMadeTag(tag, given, below = rsui.__instanceNow?.()) {
+    const fragment = globalThis.__Fragment;
+    for (let child = below, at = below?.parent; at !== null && at !== undefined; child = at, at = at.parent) {
+        const type = at.type;
+        if (typeof type !== 'function' || type.context !== undefined || type === fragment || type.__webTag !== undefined || type.__webStyled === true) {
+            return;
+        }
+        const output = at.output;
+        if (!isValidElement(output) || !(output.type === child.type || (typeof output.type === 'string' && domElement(output.type) === child.type))) {
+            return;
+        }
+        if (!renderedMade.has(type)) {
+            renderedMade.set(type, { tag, props: given ?? {} });
+            if (hasWaiting.has(type)) {
+                hasWaiting.delete(type);
+                flowLearned(true, drawnAround(at), type);
+            }
+        }
+    }
+}
+
+/// Says what a component in a list made, as `:first-of-type` counts by that, which is what it's taken to be from then on. What's
+/// learned is about that one in that list, as the same component can make different things in different places, and only what it's
+/// in is drawn again, and only when that's news and a rule counts by it. Only the first element it makes says, as one that makes
+/// several (a fragment, or something only around what's in it) would otherwise have each say something else, every time.
+function learnTag(kept, key, value, type, tag, who, className) {
+    if (tag === null || (value.learner !== undefined && value.learner !== who)) {
+        return;
+    }
+    value.learner = who;
+    // Its classes too, as `.ant-checkbox + span` asks about a component's `<span class="ant-checkbox">` before the label's text.
+    const classes = typeof className === 'string' ? className.trim() : '';
+    const madeClasses = (kept.classes ??= new Map());
+    if ((madeClasses.get(key) ?? '') !== classes) {
+        madeClasses.set(key, classes);
+        if (structural && kept.learnedSoon !== true) {
+            kept.peerVersion = (kept.peerVersion ?? 0) + 1;
+            kept.learnedSoon = true;
+            queueMicrotask(() => {
+                kept.learnedSoon = false;
+                kept.redraw?.();
+            });
+        }
+    }
+    if (!renderedTag.has(type)) {
+        renderedTag.set(type, tag);
+    }
+    const tags = (kept.tags ??= new Map());
+    if (tags.get(key) === tag) {
+        return;
+    }
+    tags.set(key, tag);
+    if (ofType && value.kind !== tag && kept.learnedSoon !== true) {
+        kept.learnedSoon = true;
+        queueMicrotask(() => {
+            kept.learnedSoon = false;
+            kept.redraw?.();
+        });
+    }
+}
+
+/// What kind of thing something is among what's around it, as what's been learned about it there says, if it's a component.
+function kindOf(one, tags, key) {
+    const type = one.type;
+    if (typeof type === 'function') {
+        return type.__webTag ?? tags?.get(key) ?? renderedTag.get(type) ?? type;
+    }
+    return tagOf(one) ?? type;
+}
+
+/// What's inside something, each with where it is among the others, for what's about that.
+/// Whether something before another is as it was, as far as CSS about what comes before something can tell: the same kind of
+/// thing, saying the same, apart from what's in it, though whether there's anything in it counts.
+function sameSibling(old, now) {
+    if (old === now) {
+        return true;
+    }
+    if (old.type !== now.type || old.key !== now.key) {
+        return false;
+    }
+    const [a, b] = [old.props ?? {}, now.props ?? {}];
+    const empty = (props) => props.children === undefined || props.children === null || (Array.isArray(props.children) && props.children.length === 0);
+    if (empty(a) !== empty(b)) {
+        return false;
+    }
+    let count = 0;
+    for (const name in a) {
+        if (name === 'children') {
+            continue;
+        }
+        if (!Object.is(a[name], b[name])) {
+            return false;
+        }
+        count += 1;
+    }
+    for (const name in b) {
+        if (name !== 'children') {
+            count -= 1;
+        }
+    }
+    return count === 0;
+}
+
+/// What something that comes before others says about how it is, for what's after it to know, as `.peer:checked ~ .x` asks: what
+/// it's in is drawn again, which tells them.
+function tellPeer(kept, key, how) {
+    const was = kept.peers?.get(key);
+    if (was !== undefined && was.state === how.state && was.checked === how.checked && was.attributes === how.attributes) {
+        return;
+    }
+    (kept.peers ??= new Map()).set(key, how);
+    kept.peerVersion = (kept.peerVersion ?? 0) + 1;
+    kept.redraw?.();
+}
+
+/// Where something is among what's around it: how many there are and where it is among them, and among those of its kind, with
+/// what comes before it, as `a + b` asks about, and the elements before it, which are only put together if they're asked for.
+class Place {
+    constructor(index, count, typeIndex, typeCount, kind, owner, described, elements, peerVersion, report, peerKey = '') {
+        Object.assign(this, { index, count, typeIndex, typeCount, kind, owner, peerVersion, report, peerKey });
+        this.described = described;
+        this.elements = elements;
+    }
+    get prevs() {
+        return (this.prevsMade ??= this.described.slice(0, this.index));
+    }
+    get siblings() {
+        return (this.siblingsMade ??= this.elements.slice(0, this.index));
+    }
+}
+
+/// A context's provider or a fragment, which makes no element: what's in it is among the children of what it's in, as on a page,
+/// where shadcn's ToggleGroup gives its items inside a provider of its own, and `first:` and `last:` are about them.
+const seeThrough = (one) => isValidElement(one) && (one.type === globalThis.__Fragment
+    || (typeof one.type === 'function' && one.type.context !== undefined && one.type !== NthContext.Provider));
+
+/// What's in something, each told where it is among the rest, as `:first-child`, `:nth-child()` and `a + b` ask, counting what's
+/// in a provider or a fragment as what it's in has it: see `withNthAlong`.
+function withNth(children, kept = null) {
+    const list = slotted(children);
+    if (!list.some(seeThrough)) {
+        return withNthAlong(children, kept);
+    }
+    const flat = [];
+    const spread = (items, prefix) => {
+        for (const one of items) {
+            if (seeThrough(one)) {
+                spread(slotted(one.kids ?? one.props?.children), prefix + String(one.key) + '/');
+            } else {
+                flat.push(prefix === '' || !isValidElement(one) ? one : { ...one, key: prefix + String(one.key) });
+            }
+        }
+    };
+    spread(list, '');
+    const told = withNthAlong(flat, kept);
+    let at = 0;
+    const again = (items) => items.map((one) => {
+        if (!seeThrough(one)) {
+            return told[at++];
+        }
+        const inside = again(slotted(one.kids ?? one.props?.children));
+        return { ...one, kids: inside, props: { ...one.props, children: inside } };
+    });
+    return again(list);
+}
+
+function withNthAlong(children, kept = null) {
+    // Each by the place it was written in, so that one coming before it doesn't make it another child, as React has it.
+    const list = slotted(children);
+    const elements = list.filter(isValidElement);
+    if (elements.length === 0) {
+        return children;
+    }
+    const tags = kept?.tags;
+    const keyOf = (one, at) => one.key ?? 'nth-' + (at + 1);
+    const kinds = elements.map((one, at) => kindOf(one, tags, keyOf(one, at)));
+    const counts = new Map();
+    for (const kind of kinds) {
+        counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    }
+    const seen = new Map();
+    // What came before each, as `a + b` and `a ~ b` ask about, as it is now, which what's kept for it has said: see `PEER`.
+    const prevs = [];
+    const before = kept?.current ?? null;
+    const now = kept === null ? null : new Map();
+    const peers = kept?.peers;
+    const peerVersion = kept?.peerVersion ?? 0;
+    // How those before each that pass how they are on to what's inside what comes after them are, as `.peer:checked + * > .x`
+    // asks: see `DEEP_PEER`. What's after one of them passes something new down when that changes.
+    let peerKey = '';
+    // How far what's in it is as it was last time, which is how far what comes before each of them is the same: found once, rather
+    // than for each of them, which in a long list is all the others.
+    const last = kept?.elements;
+    let unchanged = 0;
+    if (last !== undefined) {
+        const most = Math.min(last.length, elements.length);
+        while (unchanged < most && sameSibling(last[unchanged], elements[unchanged])) {
+            unchanged += 1;
+        }
+    }
+    let index = 0;
+    // The kinds of element before each, as they're known: see `same` below.
+    let kindsBefore = '';
+    const out = list.map((one) => {
+        if (!isValidElement(one)) {
+            return one;
+        }
+        const kind = kinds[index];
+        const typeIndex = seen.get(kind) ?? 0;
+        seen.set(kind, typeIndex + 1);
+        const key = keyOf(one, index);
+        // The same as last time, as long as where it is and what's before it are, so that what's inside it that hasn't changed
+        // isn't drawn again for being told something new, as React doesn't.
+        const last = before?.get(key);
+        const was = before?.get(key);
+        // And as long as what's before it is still taken to be the same kinds of element, as a lucide icon is found to be an
+        // `<svg>` once it's drawn, which `svg ~ *` asks about.
+        const same = was !== undefined && was.index === index && was.count === elements.length && was.typeIndex === typeIndex
+            && was.typeCount === counts.get(kind) && was.owner === one.type && was.peerVersion === peerVersion && index <= unchanged
+            && was.kindsBefore === kindsBefore;
+        if (same) {
+            // What kind it's taken to be is only for what's learned about it, as where it is among its kind is what's told.
+            was.kind = kind;
+        }
+        const value = same
+            ? was
+            : new Place(index, elements.length, typeIndex, counts.get(kind), kind, one.type, prevs, elements, peerVersion, kept === null ? undefined : (how) => tellPeer(kept, key, how), peerKey);
+        if (!same && kept !== null && typeof one.type === 'function') {
+            const type = one.type;
+            value.learn = (tag, who, className) => learnTag(kept, key, value, type, tag, who, className);
+        }
+        value.kindsBefore = kindsBefore;
+        kindsBefore += (typeof kind === 'string' ? kind : '') + ',';
+        now?.set(key, value);
+        const described = describe(one, value, undefined);
+        if (described.tag === null && typeof one.type === 'function' && typeof kind === 'string') {
+            // What a component's been found to make, for `svg ~ *` after a lucide icon.
+            described.tag = kind;
+        }
+        const learnedClasses = typeof one.type === 'function' ? kept?.classes?.get(key) : undefined;
+        if (learnedClasses !== undefined && learnedClasses !== '') {
+            described.classes = [...new Set([...described.classes, ...classesOf(learnedClasses)])];
+        }
+        const how = peers?.get(key);
+        if (how !== undefined) {
+            if (how.deep === true) {
+                peerKey += index + ':' + how.state + '/' + how.checked + '/' + how.attributes + ';';
+            }
+            described.state = how.state;
+            described.props = how.attributes === undefined || how.attributes === ''
+                ? { ...described.props, checked: how.checked }
+                : { ...described.props, ...JSON.parse(how.attributes), checked: how.checked };
+        }
+        prevs.push(described);
+        index += 1;
+        if (typeof one.type !== 'function') {
+            return one;
+        }
+        if (one.type.__webStyled === true || one.type.__webField === true) {
+            // A page element is told where it is itself, so that what it's in can still put it on a line, and look at it as it
+            // is, as it can't through a provider: see `Styled`'s `__nth`.
+            return cloneElement(one, { __nth: value });
+        }
+        return make(NthContext.Provider, { value, key: one.key ?? 'nth-' + index }, one);
+    });
+    if (kept !== null) {
+        kept.current = now;
+        kept.elements = elements;
+        if (tags !== undefined) {
+            // What was learned about what's no longer in it is forgotten.
+            for (const key of tags.keys()) {
+                if (!now.has(key)) {
+                    tags.delete(key);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/// What `content` says, as text, counters and attributes, in order.
+function contentTemplate(value) {
+    const out = [];
+    const each = /"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|counters?\(\s*([\w-]+)\s*(?:,\s*(?:"[^"]*"\s*,\s*)?([\w-]+))?\s*\)|attr\(\s*([\w-]+)\s*\)|(open-quote|close-quote)/g;
+    for (const found of value.matchAll(each)) {
+        if (found[1] !== undefined || found[2] !== undefined) {
+            const text = (found[1] ?? found[2])
+                .replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+                .replace(/\\(.)/g, '$1');
+            out.push({ text });
+        } else if (found[3] !== undefined) {
+            out.push({ counter: found[3], style: found[4] ?? 'decimal' });
+        } else if (found[5] !== undefined) {
+            out.push({ attr: found[5] });
+        } else {
+            out.push({ text: found[6] === 'open-quote' ? '“' : '”' });
+        }
+    }
+    return out;
+}
+
+/// What `content` comes to for one element: each counter as how many of its kind come before it and it, which is what a counter
+/// that each of them adds one to is, and each attribute as what the element was given.
+function contentText(template, context) {
+    const count = (context?.nth?.typeIndex ?? 0) + 1;
+    return template
+        .map((one) => {
+            if (one.text !== undefined) {
+                return one.text;
+            }
+            if (one.counter !== undefined) {
+                const marker = listMarker(one.style, count - 1);
+                return marker === null || one.style === 'decimal' ? String(count) : marker.replace(/\. $/, '').trim();
+            }
+            const value = context?.props?.[one.attr] ?? context?.props?.[attributeProp(one.attr)];
+            return value === undefined || value === null ? '' : String(value);
+        })
+        .join('');
+}
+
+/// What a page's attribute is called as a prop, as React has it.
+function attributeProp(name) {
+    return name === 'class' ? 'className' : name === 'for' ? 'htmlFor' : name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+/// Whether `::before` or `::after` is a box of its own, rather than text on the line, as `display: inline-block` makes it.
+function partIsBox(look) {
+    return look !== null && look !== undefined && look.__content !== undefined && look.__hidden !== true
+        && (look.__lineBox === true || look.__block === true || look.__flex === true || look.display === 'grid' || look.width !== undefined || look.height !== undefined);
+}
+
+/// `::before` and `::after`, as what they are, which is something first and last inside this.
+function withParts(children, before, after, context = null) {
+    const part = (look, key) => {
+        if (look === null || look.__content === undefined || look.__hidden === true) {
+            return null;
+        }
+        const { __content, __hidden, __scroll, __case, ...props } = look;
+        const said = typeof __content === 'object' && __content !== null ? contentText(__content.template, context) : __content;
+        const inner = said === '' ? undefined : said;
+        // `*::before` and `*::after` are what `*` says, as far as how big a box is goes.
+        const sizing = { __boxSizing: tagLook('*')?.__boxSizing, ...props };
+        if (look.__float === 'left' || look.__float === 'right') {
+            // A part that floats, as Bootstrap's breadcrumb divider does, or Pico's chevron with nothing in it but a picture, is an
+            // element that floats, with its float said where what lays out floats looks for it.
+            return make(plainDomElement('span'), { key, style: { float: look.__float }, __webMore: { look: sizing } }, inner);
+        }
+        if (inner !== undefined && partIsBox(look)) {
+            // A part that's a box of its own, as `display: inline-block` with a size makes it, is laid out as an element with that
+            // look is, with its text in it.
+            return make(plainDomElement('span'), { key, __webMore: { look: sizing } }, inner);
+        }
+        return make(inner === undefined ? 'group' : 'text', { ...finalFont(settleElement(sizing)), key, inert: true }, inner);
+    };
+    const first = part(before, 'rsui-before');
+    const last = part(after, 'rsui-after');
+    if (first === null && last === null) {
+        return children;
+    }
+    return [first, ...slotted(children), last].filter((one) => one !== null);
+}
+
+/// What goes on a shape, which is what CSS says about shapes, these classes, and shapes inside what it's in.
+function useShapeLook(className) {
+    usePage();
+    const owners = useRulesAbove();
+    const look = { ...cls(className, 'svg') };
+    const parts = {};
+    fromAbove(owners, { tag: 'svg', id: undefined, classes: classesOf(className), props: {}, state: 0, nth: null, kind: 'component' }, look, parts);
+    delete look.__hidden;
+    delete look.__scroll;
+    delete look.__case;
+    sitsOnLine(look);
+    // A shape's own `currentColor` is the text color around it, which is what it uses when it isn't given one.
+    const out = withCurrentColor(settleElement(look), undefined);
+    // What CSS only takes away, as `width: inherit` does, leaves what the shape says about itself.
+    for (const key of Object.keys(out)) {
+        if (out[key] === undefined) {
+            delete out[key];
+        }
+    }
+    return out;
+}
+
+/// A picture sits on a line of text, as a page has it, unless it's been made a block or a box of its own. What that does is up to
+/// what it's in.
+function sitsOnLine(look) {
+    if (look.__block !== true && look.__flex !== true && look.display === undefined && look.direction === undefined && look.position !== 'absolute') {
+        look.onLine = true;
+    }
+}
+
+/// What CSS says about each part of a shape, by its id, as `#ring { stroke: red }` does on something around it.
+function useShapeParts() {
+    usePage();
+    return shapePartsOf(useRulesAbove());
+}
+
+/// How a shape is drawn, as CSS and SVG's attributes both say it.
+const SHAPE_LOOKS = ['fill', 'stroke', 'strokeWidth', 'strokeLinecap', 'strokeLinejoin', 'strokeDasharray', 'strokeDashoffset'];
+
+/// What CSS says about each part of a shape, by its id, its tag, its classes and attributes and its own `style`, given the rules that
+/// come down to the shape and the variables set around it.
+function shapePartsOf(owners, variables = null) {
+    return (id, tag = null, given = {}) => {
+        const look = {};
+        // What its presentation attributes say with `var()` is what CSS starts from, as SVG has it, for that to be worked out with
+        // the variables around it: shadcn's chart fills its bars with `fill="var(--color-desktop)"`.
+        for (const key of ['fill', 'stroke']) {
+            if (typeof given[key] === 'string' && given[key].includes('var(')) {
+                look[key] = withVariables(given[key], 0, variables);
+            }
+        }
+        // With the page's rules about one class too, as `.m_b1ca1fbf { stroke: ... }` is.
+        fromAbove(owners, { tag, id, classes: classesOf(given.className), props: given, state: 0, nth: null, kind: 'component' }, look, {}, tag !== null);
+        if (given.style !== null && typeof given.style === 'object') {
+            assignLook(look, inlineLook(given.style, 16));
+        }
+        withElementVariables(look, variables);
+        const moves = look.__transition !== undefined || look.__transitionParts !== undefined ? shapeMoves(look) : undefined;
+        const { __hidden, __scroll, __case, __transition, __transitionParts, __animation, __animationParts, ...props } = look;
+        if (moves !== undefined) {
+            props.__shapeMoves = moves;
+        }
+        return props;
+    };
+}
+
+/// What an input with an `id` does when it's used, for a `<label htmlFor>` to do the same.
+const inputsById = new Map();
+
+/// A checkbox or a radio button as a browser draws one: 13 pixels across, gray around it, and blue with a white tick, or a blue dot in
+/// a blue ring, once it's chosen. It's a darker blue under the pointer.
+const BROWSER_BLUE = '#0075ff';
+const BROWSER_BLUE_UNDER = '#005cc8';
+// The tick, as a browser draws it in a box 13 across: from a fifth across and halfway down, to two fifths across and seven tenths
+// down, and up to four fifths across and a fifth down.
+const BROWSER_TICK = 'M2.6 6.5L5.2 9.1L10.4 2.6';
+function BrowserCheck({ box, checked, round, label, onToggle, accent }) {
+    // A color of its own, as `accent-color` says, or a browser's blue.
+    const blue = accent ?? BROWSER_BLUE;
+    const shape = {
+        width: 13,
+        height: 13,
+        radius: round ? 6.5 : 2,
+        borderWidth: 1,
+        borderColor: checked ? blue : '#767676',
+        background: checked && !round ? blue : '#ffffff',
+        hover: checked && !round ? (accent === undefined ? BROWSER_BLUE_UNDER : undefined) : undefined,
+        align: 'center',
+        justify: 'center',
+        inert: true,
+    };
+    let inside = null;
+    if (checked && round) {
+        inside = make('group', { width: 8, height: 8, radius: 4, background: blue });
+    } else if (checked) {
+        inside = make(rsui.Svg, { width: 13, height: 13, viewBox: '0 0 13 13', fill: 'none', stroke: '#ffffff', strokeWidth: 2.08 }, make(rsui.Path, { d: BROWSER_TICK }));
+    }
+    return make('checkbox', { ...box, name: label, checked, onToggle }, make('group', shape, inside));
+}
+
+/// What clicking a label does, which is what the checkbox inside it would.
+/// Whether a label can be for this, as a browser has it: a form control, and not, say, the `<span>` Radix's slider is.
+function labelable(element) {
+    const tag = String(element?.__live?.tag ?? element?.localName ?? '').toLowerCase();
+    return ['button', 'input', 'meter', 'output', 'progress', 'select', 'textarea'].includes(tag);
+}
+
+/// What clicking a label with no `for` does when what's in it is only known once it's drawn, as a card `<label>` around a
+/// shadcn `Field` with a Radix checkbox in it: its first button, input, select or textarea gets the keyboard and a click, as a
+/// browser has it, unless that's what was clicked, or is what the click was in.
+function labelledInside(domKey) {
+    if (domKey === undefined) {
+        return undefined;
+    }
+    return (event) => {
+        const live = pageLives.get(domKey)?.deref();
+        const label = live === undefined ? undefined : handleOf(live, 'label');
+        const control = label?.querySelector?.('button, input, select, textarea') ?? null;
+        if (control === null) {
+            return;
+        }
+        if (clickedOwnControl(event, control)) {
+            return;
+        }
+        control.focus?.();
+        control.click?.(event);
+    };
+}
+
+/// Whether a click a label heard was on what it's for, or on something in it that does something itself (a button, a link, a
+/// field), which a browser's label doesn't pass on: shadcn's switch card is a label for the switch that's in it, and a click
+/// on the switch went to it twice.
+function clickedOwnControl(event, control) {
+    const target = event?.target;
+    if (target === undefined || target === null) {
+        return false;
+    }
+    if (target === control || control.contains?.(target) === true) {
+        return true;
+    }
+    const doing = target.closest?.('button, input, select, textarea, a[href]') ?? null;
+    return doing !== null && doing !== control && typeof event.currentTarget?.contains === 'function' && event.currentTarget.contains(doing);
+}
+
+function labelToggle(children) {
+    let found;
+    const look = (value) => {
+        if (found !== undefined) {
+            return;
+        }
+        if (Array.isArray(value)) {
+            value.forEach(look);
+        } else if (isValidElement(value)) {
+            const props = value.props ?? {};
+            // Clicking it gives the field the keyboard too, as in a browser.
+            const focus = () => focusers.get(props)?.();
+            if (value.type === Input && props.type === 'checkbox' && props.checked === undefined) {
+                // One that keeps whether it's checked itself, which is only known once it's been drawn.
+                found = () => {
+                    ownToggles.get(props)?.();
+                    focus();
+                };
+            } else if ((props.type === 'checkbox' || props.type === 'radio') && typeof props.onChange === 'function') {
+                found = () => {
+                    if (props.disabled !== true) {
+                        // What the box stands for is its `value`, as Checkbox.Group reads it, and not whether it's ticked.
+                        props.onChange(changeEvent(props.type === 'radio' ? true : !props.checked, { name: props.name, type: props.type, value: props.value === undefined || props.value === null ? 'on' : String(props.value) }));
+                    }
+                    focus();
+                };
+            } else if (focusers.has(props) || value.type === Input || FIELD_TAGS.has(value.type?.__webTag)) {
+                found = focus;
+            } else {
+                look(value.kids ?? props.children);
+            }
+        }
+    };
+    look(children);
+    return found;
+}
+
+/// A range input that CSS has drawn itself, with its thumb as `::-webkit-slider-thumb` says, its track as
+/// `::-webkit-slider-runnable-track` does, across its middle, and what's around the track as `::-webkit-slider-container` does.
+/// A slider. Its thumb is as CSS says, and with `browser`, it's all as a browser draws one by itself: a round blue thumb on a
+/// rounded track that's blue up to it and gray after it.
+function WebRange({ look, thumb, track, container, value, min, max, step, onChange, disabled, browser = false, accent }) {
+    const lowest = Number(min ?? 0);
+    const highest = Number(max ?? 100);
+    const by = Number(step ?? 1) || 1;
+    const now = Number(value ?? lowest);
+    const fraction = highest > lowest ? Math.min(1, Math.max(0, (now - lowest) / (highest - lowest))) : 0;
+    // A browser's thumb is as big as it says, border and all.
+    const knob = settleElement({ __boxSizing: 'border-box', ...thumb });
+    delete knob.__appearance;
+    const knobWidth = typeof knob.width === 'number' ? knob.width : 16;
+    const knobHeight = typeof knob.height === 'number' ? knob.height : 16;
+    const set = (x, width) => {
+        if (!(width > knobWidth)) {
+            return;
+        }
+        const along = Math.min(1, Math.max(0, (x - knobWidth / 2) / (width - knobWidth)));
+        const stepped = Math.round((along * (highest - lowest)) / by) * by + lowest;
+        if (stepped !== now) {
+            onChange?.(changeEvent(String(stepped)));
+        }
+    };
+    const shown = make('group', {
+        key: 'thumb',
+        ...knob,
+        position: 'absolute',
+        left: fraction * 100 + '%',
+        marginLeft: -fraction * knobWidth,
+        top: '50%',
+        marginTop: -knobHeight / 2,
+        inert: true,
+    });
+    const drag = disabled === true ? undefined : (phase, x, _y, _dx, _dy, width) => (phase === 'start' || phase === 'move' ? set(x, width) : undefined);
+    if (!browser) {
+        if (track === undefined && container === undefined) {
+            return make('group', { ...look, onDrag: drag }, shown);
+        }
+        const lane = settleElement({ ...track });
+        delete lane.__appearance;
+        const laneHeight = typeof lane.height === 'number' ? lane.height : 0;
+        const around = container === undefined ? {} : settleElement({ ...container });
+        const outer = { ...look, onDrag: drag };
+        for (const side of ['paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight']) {
+            outer[side] ??= around[side];
+        }
+        // It's as tall as its track, which its thumb goes over, as a browser has it.
+        outer.minHeight ??= laneHeight;
+        const drawn = make('group', { key: 'track', ...lane, width: undefined, position: 'absolute', left: 0, right: 0, top: '50%', marginTop: -laneHeight / 2, inert: true });
+        return make('group', outer, drawn, shown);
+    }
+    // The track's ends are round, a pixel in from each side, and it's blue as far as the middle of the thumb.
+    const bar = { position: 'absolute', top: 4, height: 8, radius: 4, inert: true };
+    const reach = knobWidth / 2 + fraction * (Number(look.width) - knobWidth) - 1;
+    return make(
+        'group',
+        { ...look, onDrag: drag },
+        make('group', { key: 'track', ...bar, left: 1, right: 1, background: '#efefef', borderWidth: 1, borderColor: '#b2b2b2' }),
+        make('group', { key: 'done', ...bar, left: 1, width: Math.max(reach, 0), background: accent ?? BROWSER_BLUE }),
+        shown,
+    );
+}
+
+/// Whether something goes along a line with what's next to it, rather than starting a line of its own. What's in a block, and which of it
+/// floats, is worked out in Rust, in `layout.rs`, which these ask about one thing.
+const goesOnLine = (child) => natives.cssChild(layout, child, GOES_ON_LINE);
+const floatOf = (child) => natives.cssChild(layout, child, FLOAT_OF);
+const clearsFloats = (child) => natives.cssChild(layout, child, CLEARS);
+
+/// Whether any of the page's rules about more than one element says `float`, as Bootstrap's `.form-check .form-check-input` does.
+/// Only then is what's in a block asked what those rules say about it before it's laid out: see `floatFromAbove`.
+function complexFloats() {
+    const complex = pageRules();
+    if (complex === null) {
+        return false;
+    }
+    if (complex.__floats === undefined) {
+        complex.__floats = (complex.nested ?? []).some((rule) => rule?.props?.__float !== undefined);
+    }
+    return complex.__floats;
+}
+
+/// Whether any of the page's rules about more than one element makes something a box of its own on a line, as MUI's
+/// `.css-x > span { display: inline-block }` in its notched outline's legend does.
+function complexLineBoxes() {
+    const complex = pageRules();
+    if (complex === null) {
+        return false;
+    }
+    if (complex.__lineBoxes === undefined) {
+        complex.__lineBoxes = (complex.nested ?? []).some((rule) => rule?.props?.__lineBox === true || (rule?.props?.__inline === true && rule.props.__flex === true));
+    }
+    return complex.__lineBoxes;
+}
+
+/// What the rules that go down to what's in something say about whether `child` is a box of its own on a line, which
+/// `layout.rs` can't know, as only the rules about one class and its kind are known before it's drawn.
+function lineBoxFromAbove(child, inner) {
+    if (inner === null || !isValidElement(child)) {
+        return false;
+    }
+    const look = {};
+    const was = watched;
+    fromAbove(inner, describe(child, null, null), look, {}, true, null);
+    watched = was;
+    return look.__lineBox === true || (look.__inline === true && look.__flex === true);
+}
+
+/// Whether anything in a block floats, by the rules about it alone or by those that go down to it, as Bootstrap's
+/// `.form-check .form-check-input` does.
+function anyFloats(children, inner) {
+    return natives.cssChildren(layout, children, ANY_FLOAT)
+        || (inner !== null && complexFloats() && Children.toArray(children).some((child) => floatFromAbove(child, inner) !== undefined));
+}
+
+/// What the rules that go down to what's in a block say about whether `child` floats, which `floatOf` can't know, as only the
+/// rules about one class and its kind are known before it's drawn.
+function floatFromAbove(child, inner) {
+    if (inner === null || !isValidElement(child)) {
+        return undefined;
+    }
+    const look = {};
+    const was = watched;
+    fromAbove(inner, describe(child, null, null), look, {}, true, null);
+    watched = was;
+    return look.__float === 'left' || look.__float === 'right' || look.__float === 'inline-start' || look.__float === 'inline-end' ? look.__float : undefined;
+}
+
+/// What's in a block with what floats in it beside what comes after it: what floats left at the left, what floats right at the
+/// right, the first of them furthest out, and what's after them in the room between, until something says to go below them.
+/// Text that's longer than what floats goes on in the room beside it, rather than under it as a page has it.
+function withFloats(children, font, inner = null) {
+    // What rules about more than one element say floats, as only those that go down to what's in this know.
+    const nested = inner !== null && complexFloats();
+    const physical = (side) => {
+        // `inline-start` is the side the block's text starts on: its right where that goes from right to left.
+        const backwards = font?.textDirection === 'rtl';
+        return side === 'inline-start' ? (backwards ? 'right' : 'left') : side === 'inline-end' ? (backwards ? 'left' : 'right') : side;
+    };
+    const sideOf = (child) => {
+        const side = physical(floatOf(child));
+        return side === 'left' || side === 'right' || !nested ? side : physical(floatFromAbove(child, inner));
+    };
+
+    if (!natives.cssChildren(layout, children, ANY_FLOAT) && !(nested && Children.toArray(children).some((child) => sideOf(child) !== undefined))) {
+        return children;
+    }
+    const all = slotted(children);
+    const out = [];
+    let lefts = [];
+    let rights = [];
+    let beside = [];
+    let floating = false;
+    const finish = () => {
+        if (!floating) {
+            return;
+        }
+        // What floats right after text, with nothing after it, is on the text's last line if there's room, and on the next one at
+        // the right if there isn't, as a browser has it.
+        if (beside.length === 0 && lefts.length === 0 && out.length > 0 && goesOnLine(out[out.length - 1])) {
+            const run = [];
+            while (out.length > 0 && goesOnLine(out[out.length - 1])) {
+                run.unshift(out.pop());
+            }
+            const pieces = spacesBetween(run).map((piece, at) => (typeof piece === 'string' || typeof piece === 'number' ? make('text', { key: '__text' + at, shrink: 1, minAuto: true }, String(piece)) : piece));
+            // What floats is at the top of the line it's on, rather than on the line's baseline as text is.
+            const right = make('group', { key: '__right', grow: 1, direction: 'row', justify: 'end', alignSelf: 'start' }, ...rights.reverse());
+            out.push(make('group', { key: '__floats' + out.length, direction: 'row', flexWrap: true, align: 'baseline', ...strutOf(font) }, ...eachWithin(FlowContext, 'line', pieces), right));
+            rights = [];
+            floating = false;
+            return;
+        }
+        // Text beside what floats goes around it: its lines beside it are as much shorter, and the rest are as long as the block,
+        // as a page has it, when how big what floats is is known.
+        const around = besideText(beside, font);
+        const left = around === null ? null : floatRoom(lefts);
+        const right = around === null || left === null ? null : floatRoom(rights);
+        if (right !== null) {
+            const key = '__floats' + out.length;
+            const placed = (side, floats) => make('group', { key: key + side, position: 'absolute', [side]: 0, top: 0, direction: 'row', align: 'start' }, ...floats);
+            const text = make('text', { key: key + 'text', besideLeft: left.width, besideLeftBelow: left.below, besideRight: right.width, besideRightBelow: right.below }, around);
+            out.push(make('group', { key, minHeight: Math.max(left.below, right.below) }, text, ...(lefts.length > 0 ? [placed('left', lefts)] : []), ...(rights.length > 0 ? [placed('right', rights.reverse())] : [])));
+            lefts = [];
+            rights = [];
+            beside = [];
+            floating = false;
+            return;
+        }
+        // With nothing beside it, what floats right is still at the right.
+        // What's beside it that goes along a line is on one, as tall as its text's lines are at least, as Pico's nav link beside
+        // its item's floated `::before` is.
+        const between = beside.length === 0
+            ? [make('group', { key: '__beside' + out.length, grow: 1 })]
+            : [make('group', { key: '__beside' + out.length, grow: 1, shrink: 1, minWidth: 0, minAuto: true }, ...Children.toArray(intoLines(beside, true, font)))];
+        // What floats is in a box of its own on each side, which is never less than nothing across: what's beside a float pulled
+        // into the padding by a negative margin starts where the block's content does, not before it, as Bootstrap's `.form-check`
+        // has its checkbox, as CSS has it.
+        const side = (name, floats) => (floats.length === 0 ? [] : [make('group', { key: name + out.length, direction: 'row', align: 'start', shrink: 0, minWidth: 0 }, ...floats)]);
+        out.push(make('group', { key: '__floats' + out.length, direction: 'row', align: 'start' }, ...side('__lefts', lefts), ...between, ...side('__rights', rights.reverse())));
+        lefts = [];
+        rights = [];
+        beside = [];
+        floating = false;
+    };
+    for (const child of all) {
+        const side = sideOf(child);
+        if (side === 'left') {
+            lefts.push(child);
+            floating = true;
+        } else if (side === 'right') {
+            rights.push(child);
+            floating = true;
+        } else if (clearsFloats(child)) {
+            finish();
+            out.push(child);
+        } else if (floating) {
+            beside.push(child);
+        } else {
+            out.push(child);
+        }
+    }
+    finish();
+    return out;
+}
+
+/// The first `<legend>` in a fieldset, which is the fieldset's own, as a browser has it: the fieldset gives what's in it this, and
+/// the first legend drawn in it takes it, however many components it's made through, as MUI's Emotion-made one is.
+const FieldsetLegend = createContext(null);
+FieldsetLegend.Provider.displayName = 'FieldsetLegend';
+
+/// What element something given is, or for a component, what it was found to make (shadcn's FieldLegend makes a `<legend>`): until
+/// that's known, nothing, and everything's drawn again once it is (see `learnMadeTag`).
+function madeTagOf(element) {
+    const tag = isValidElement(element) ? tagOf(element) : null;
+    if (tag !== null || !isValidElement(element) || typeof element.type !== 'function') {
+        return tag;
+    }
+    hasAsked = true;
+    const made = renderedMade.get(element.type);
+    if (made === undefined) {
+        hasWaiting.add(element.type);
+        return null;
+    }
+    return made.tag;
+}
+
+/// What's in a fieldset with its `<legend>` on its top border, which has a gap where the legend is, as a browser draws it: the
+/// border's in pieces, a row of the legend with the top border halfway down it on each side, and below that the rest with the rest
+/// of the border around it. `look` loses its border and padding to those, and its rounded corners and background, which go with
+/// the border, as a browser has them start where the border does, halfway down the legend. It's left as it is with a border that
+/// isn't the same all round, corners that aren't all the same circle, a background that isn't a color, or without a legend.
+function withLegend(look, children) {
+    const all = Children.toArray(children);
+    // What it is, inside what says how it's laid out and where it is among the rest (`:nth-child()`, `+`), which are round it.
+    const inner = (child) => {
+        while (isValidElement(child) && (child.type === FlowContext.Provider || child.type === NthContext.Provider)) {
+            child = Children.toArray(child.kids ?? child.props?.children)[0];
+        }
+        return child;
+    };
+    const at = all.findIndex((child) => !(typeof child === 'string' && child.trim() === ''));
+    const border = look.borderWidth;
+    const sides = ['Top', 'Right', 'Bottom', 'Left'];
+    if (at < 0 || madeTagOf(inner(all[at])) !== 'legend') {
+        return children;
+    }
+    if (typeof border !== 'number' || border <= 0 || look.borderColor === undefined) {
+        return legendApart(look, all, at);
+    }
+    if (sides.some((side) => look['border' + side + 'Width'] !== undefined) || (look.radius !== undefined && typeof look.radius !== 'number')
+        || look.cornerRadii !== undefined || Object.keys(look).some((key) => key.startsWith('background') && key !== 'background')) {
+        return legendApart(look, all, at);
+    }
+    const radius = look.radius ?? 0;
+    const background = look.background;
+    // The corners of a piece, as `cornerRadii` has them: top left, top right, bottom right and bottom left, across then down.
+    const corners = (...which) => (radius === 0 ? {} : { cornerRadii: [0, 1, 2, 3].map((at) => (which.includes(at) ? `${radius} ${radius}` : '0 0')).join(' ') });
+    const filled = background === undefined ? {} : { background };
+    const pad = (side) => (typeof look['padding' + side] === 'number' ? look['padding' + side] : 0);
+    // The border on only these sides.
+    const line = (drawn) => {
+        const out = look.borderStyle === undefined ? {} : { borderStyle: look.borderStyle };
+        for (const side of drawn) {
+            out['border' + side + 'Width'] = border;
+            out['border' + side + 'Color'] = look.borderColor;
+        }
+        return out;
+    };
+    // The lower part of the legend's row, with the border on top of it and on one side, the middle of the border halfway down.
+    const lower = (side) => make('group', { grow: 1, marginTop: -border, ...line(['Top', side]), ...filled, ...corners(side === 'Left' ? 0 : 1), inert: true });
+    const left = make('group', { key: '__legendLeft', width: border + pad('Left'), shrink: 0, direction: 'column' }, make('group', { grow: 1 }), lower('Left'));
+    const right = make('group', { key: '__legendRight', grow: 1, direction: 'column' }, make('group', { grow: 1 }), lower('Right'));
+    const row = make('group', { key: '__legendRow', direction: 'row' }, left, all[at], right);
+    const rest = [...all.slice(0, at), ...all.slice(at + 1)];
+    const body = make('group', {
+        key: '__legendBody',
+        direction: look.direction ?? 'column',
+        gap: look.gap,
+        align: look.align,
+        justify: look.justify,
+        grow: 1,
+        paddingTop: pad('Top'),
+        paddingRight: pad('Right') + border,
+        paddingBottom: pad('Bottom') + border,
+        paddingLeft: pad('Left') + border,
+        ...line(['Right', 'Bottom', 'Left']),
+        ...filled,
+        ...corners(2, 3),
+    }, ...rest);
+    // How wide it says it is is inside its padding and border, which are the pieces' now.
+    if (look.__boxSizing !== 'border-box') {
+        for (const key of ['width', 'minWidth', 'maxWidth']) {
+            if (typeof look[key] === 'number') {
+                look[key] += pad('Left') + pad('Right') + 2 * border;
+            }
+        }
+        look.__boxSizing = 'border-box';
+    }
+    for (const key of ['borderWidth', 'borderColor', 'borderStyle', 'gap', 'justify', 'radius', 'background', ...sides.map((side) => 'padding' + side)]) {
+        delete look[key];
+    }
+    look.direction = 'column';
+    look.align = 'stretch';
+    return [row, body];
+}
+
+/// What a fieldset with no border to break has: its legend isn't one of what its `display: flex` lays out, as a browser's
+/// rendered legend isn't (Chrome lays the legend out on its own, and the rest in an anonymous box of the fieldset's own), so
+/// the fieldset's `gap` isn't between the legend and what comes after it, and its `align-items` doesn't place it.
+function legendApart(look, all, at) {
+    const LAID_OUT = ['direction', 'gap', 'columnGap', 'rowGap', 'align', 'justify', 'wrap', 'alignContent', 'reverse', 'crossReverse'];
+    const gapped = ['gap', 'columnGap', 'rowGap'].some((key) => typeof look[key] === 'number' && look[key] !== 0);
+    if (!gapped || look.display === 'grid') {
+        return all;
+    }
+    const inside = { key: '__legendBody', grow: 1 };
+    for (const key of LAID_OUT) {
+        if (look[key] !== undefined) {
+            inside[key] = look[key];
+            delete look[key];
+        }
+    }
+    look.direction = 'column';
+    look.align = 'stretch';
+    return [...all.slice(0, at + 1), make('group', inside, ...all.slice(at + 1))];
+}
+
+/// What's beside what floats as one piece of text, if it's only text, with its spaces as a page shows them.
+function besideText(beside, font) {
+    if (beside.length === 0 || !beside.every((child) => typeof child === 'string' || typeof child === 'number')) {
+        return null;
+    }
+    const kept = font?.__whiteSpace;
+    if (kept === 'pre' || kept === 'pre-wrap' || kept === 'pre-line') {
+        return null;
+    }
+    const text = beside.join('').replace(/\s+/g, ' ').trim();
+    return text === '' ? null : text;
+}
+
+/// How wide what floats on one side is, all together, and how far down it goes, with their margins, if their CSS says how big
+/// they are, as `{ width, below }`.
+function floatRoom(floats) {
+    let width = 0;
+    let below = 0;
+    for (const child of floats) {
+        const props = child.props ?? {};
+        const tag = tagOf(child);
+        const look = { ...(tag === null ? undefined : tagLook(tag)), ...looksOfClasses(props.className), ...(props.style ? inlineLook(props.style) : undefined) };
+        if (typeof look.width !== 'number' || typeof look.height !== 'number') {
+            return null;
+        }
+        for (const key of Object.keys(look)) {
+            // How padding and borders add to that depends on `box-sizing`, so it's left to the usual way.
+            if ((key.startsWith('padding') || (key.startsWith('border') && key.endsWith('Width'))) && typeof look[key] === 'number' && look[key] > 0) {
+                return null;
+            }
+        }
+        const margin = (side) => (typeof look['margin' + side] === 'number' ? look['margin' + side] : 0);
+        width += look.width + margin('Left') + margin('Right');
+        below = Math.max(below, look.height + margin('Top') + margin('Bottom'));
+    }
+    // What's beside floats pulled into the padding by a negative margin starts where the block's content does, not before it.
+    return { width: Math.max(0, width), below: Math.max(0, below) };
+}
+
+/// What's in a block, with each run of what goes along a line, between what doesn't, as a line of its own, as a page lays them out.
+/// It's only that when there's some of each, unless `always` says a run is a line by itself too.
+function intoLines(children, always = false, font = null) {
+    // Which go along a line, which don't, and which are placed by themselves (`null`), which take no part in lines and don't end one
+    // either, from `layout.rs`: a picture's left where it is by itself, but one next to another, or to text, goes along a line with
+    // it, as on a page. It's nothing when there's nothing to put on lines.
+    const inline = natives.cssChildren(layout, children, LINES, always);
+    if (inline === undefined) {
+        return children;
+    }
+    const all = slotted(children);
+    const out = [];
+    let run = [];
+    const finish = () => {
+        // Only spaces, which are nothing between two blocks.
+        if (run.some((child) => typeof child !== 'string' || child.trim() !== '')) {
+            // Text by itself on a line gets narrower to fit it, and wraps, as a page's does.
+            const pieces = spacesBetween(run).map((piece, at) => (typeof piece === 'string' || typeof piece === 'number' ? make('text', { key: '__text' + at, shrink: 1, minAuto: true }, String(piece)) : piece));
+            const line = { key: '__line' + out.length, direction: 'row', flexWrap: true, align: 'baseline', ...strutOf(font) };
+            // Where text goes from right to left, a line starts at its right (`text-align: start`, which is what nothing saying it
+            // is), as `along_line` in layout.rs has it for a line that's an element's own.
+            const align = font?.textAlign;
+            if (font?.textDirection === 'rtl' && align !== 'left' && align !== 'end' && align !== 'center') {
+                line.justify = 'end';
+            }
+            if (font?.textDirection === 'rtl') {
+                // What's on it goes in the order bidi says, from the right (`order_by_direction` in rsui-layout).
+                line.textDirection = 'rtl';
+            }
+
+            out.push(make('group', line, ...eachWithin(FlowContext, 'line', pieces)));
+        }
+        run = [];
+    };
+    all.forEach((child, at) => {
+        if (inline[at]) {
+            run.push(child);
+        } else if (inline[at] === null) {
+            // In the line it's written in, when there's one, where its place is after what's before it on that line, as CSS's static
+            // position is: Radix's focus proxy after a navigation menu's trigger was put before the line the trigger was on.
+            (run.some((one) => typeof one !== 'string' || one.trim() !== '') ? run : out).push(child);
+        } else {
+            finish();
+            out.push(child);
+        }
+    });
+    finish();
+    return out;
+}
+
+/// What's in something, in order, with each element that has no key of its own given one for the place it was written in, counting
+/// what's nothing there, as React does: so what comes and goes around one, as `{open && <span />}` does, doesn't move it to another
+/// place in the line it's put in, which would make it again, and lose what it has, such as the keyboard.
+function slotted(children) {
+    const out = [];
+    const visit = (one, place) => {
+        if (Array.isArray(one)) {
+            one.forEach((child, at) => visit(child, place === '' ? String(at) : place + ':' + at));
+        } else if (one !== null && one !== undefined && typeof one !== 'boolean') {
+            out.push(isValidElement(one) && (one.key === null || one.key === undefined) ? { ...one, key: '.s' + place } : one);
+        }
+    };
+    // Something by itself is the first of what's there, as React has it, so that it's the same once more comes after it.
+    visit(Array.isArray(children) ? children : [children], '');
+    return out;
+}
+
+/// What a line of a page needs to be at least as tall as a line of its text, in this font, as CSS's lines are.
+function strutOf(font) {
+    if (font === null) {
+        return { lineStrut: true };
+    }
+    const { fontSize, fontFamily, fontWeight, fontStyle, lineHeight } = finalFont(font);
+    return { lineStrut: true, fontSize, fontFamily, fontWeight, fontStyle, lineHeight, justify: alongLine(font.textAlign) };
+}
+
+/// Where what's on a line goes along it, as `text-align` says.
+function alongLine(textAlign) {
+    return textAlign === 'center' ? 'center' : textAlign === 'right' || textAlign === 'end' ? 'end' : undefined;
+}
+
+/// What's on a line, with a space at the end of any text that has more after it kept, as it is on a page. Text by itself drops the spaces
+/// it ends in, as they'd be at the end of its line, so these become spaces that stay, which are as wide.
+function spacesBetween(items) {
+    const kept = (text) => (/[ \t\n]$/.test(text) ? text.replace(/[ \t\n]+$/, '\u00A0') : text);
+    return items.map((item, at) => {
+        if (at === items.length - 1) {
+            return item;
+        }
+        if (typeof item === 'string') {
+            return kept(item);
+        }
+        if (isValidElement(item) && typeof item.props?.children === 'string' && goesOnLine(item) && !INLINE_BOXES.has(tagOf(item))) {
+            const children = kept(item.props.children);
+            return children === item.props.children ? item : { ...item, props: { ...item.props, children } };
+        }
+        return item;
+    });
+}
+
+/// Whether white-space keeps spaces as they're written.
+function keepsSpaces(whiteSpace) {
+    return whiteSpace === 'pre' || whiteSpace === 'pre-wrap' || whiteSpace === 'break-spaces';
+}
+
+/// Text without spaces at its ends, and none where there's only spaces.
+function trimmedText(children) {
+    const one = (child) => (typeof child === 'string' ? child.trim() : child);
+    if (!Array.isArray(children)) {
+        const trimmed = one(children);
+        return trimmed === '' ? undefined : trimmed;
+    }
+    return children.map(one).filter((child) => child !== '');
+}
+
+/// Text with each run of spaces and line breaks as one space, as a page has it, unless `whiteSpace` keeps them. `pre-line` keeps line
+/// breaks and runs the rest together.
+function spacesAsSaid(children, whiteSpace) {
+    if (whiteSpace === 'pre' || whiteSpace === 'pre-wrap' || whiteSpace === 'break-spaces') {
+        return children;
+    }
+    const lines = whiteSpace === 'pre-line';
+    const one = (child) => {
+        if (typeof child !== 'string' || !/[ \t\n\r\f]{2}|[\t\n\r\f]/.test(child)) {
+            return child;
+        }
+        return lines ? child.replace(/[ \t\r\f]*\n[ \t\r\f]*/g, '\n').replace(/[ \t\r\f]+/g, ' ') : child.replace(/[ \t\n\r\f]+/g, ' ');
+    };
+    return Array.isArray(children) ? children.map(one) : one(children);
+}
+
+/// A button whose background a page has said, and not its border, isn't drawn as the system draws one any more, so it has the
+/// border a browser's own CSS gives it: two pixels, outset, which is lighter at its top and left than at its bottom and right.
+function plainButton(look) {
+    const own = browserLook('button') ?? {};
+    const faint = browserLook('button', undefined, true) ?? {};
+    const background = look.background ?? look.backgroundColor;
+    if (background === undefined || background === own.background || background === own.backgroundColor || background === faint.background || background === faint.backgroundColor) {
+        return;
+    }
+    if (look.borderWidth !== own.borderWidth || look.borderColor !== own.borderColor) {
+        return;
+    }
+    // Nor one whose border's said with a variable, which isn't worked out yet, as Pico's `border: var(--pico-border-width) solid
+    // var(--pico-border-color)` is, at 1px as the browser's is.
+    for (const key in look) {
+        if (key.startsWith('__var border') && !key.startsWith('__var border-radius')) {
+            return;
+        }
+    }
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+        if (look['border' + side + 'Width'] !== undefined) {
+            return;
+        }
+    }
+    delete look.borderWidth;
+    delete look.borderColor;
+    for (const [side, paint] of [['Top', '#545454'], ['Left', '#545454'], ['Right', '#000000'], ['Bottom', '#000000']]) {
+        look['border' + side + 'Width'] = 2;
+        look['border' + side + 'Color'] = paint;
+    }
+    // That's all the room its border takes.
+    look.__ownBorder = true;
+}
+
+/// A text field's own look stands for Chromium's: its padding of 1px 2px, inside a border of 2px that's drawn as a gray line with
+/// the field's color inside it, which is 1px of border and 1px more of padding here. A page that gives it a border of its own has
+/// that border, around the padding Chromium has, unless it says otherwise.
+function ownFieldBorder(look, type) {
+    if (type === 'checkbox' || type === 'radio' || type === 'range' || type === 'color' || type === 'file' || type === 'hidden') {
+        return;
+    }
+    const own = browserLook('input', type);
+    if (own === undefined) {
+        return;
+    }
+    const sides = ['Top', 'Right', 'Bottom', 'Left'];
+    const bordered = look.borderWidth !== own.borderWidth || look.borderColor !== own.borderColor
+        || sides.some((side) => look['border' + side + 'Width'] !== undefined);
+    if (!bordered) {
+        return;
+    }
+    for (const side of sides) {
+        const key = 'padding' + side;
+        if (look[key] === own[key] && typeof own[key] === 'number') {
+            look[key] = Math.max(0, own[key] - 1);
+        }
+    }
+}
+
+/// What's in something, with text that's next to other text as one piece of text, as a page has it.
+function joinedText(children) {
+    if (!Array.isArray(children)) {
+        return children;
+    }
+    const out = [];
+    // Only what's side by side, as a list made with `map` keeps its own keys. An element with no key of its own is keyed by where
+    // it was written, as `slotted` would, so that what's left out or joined before it, as react-select's placeholder going once
+    // something's typed, doesn't move it to another place, which would make it again.
+    children.forEach((child, at) => {
+        if (child === null || child === undefined || typeof child === 'boolean') {
+            return;
+        }
+        const plain = typeof child === 'string' || typeof child === 'number';
+        if (plain && typeof out[out.length - 1] === 'string') {
+            out[out.length - 1] += String(child);
+        } else if (plain) {
+            out.push(String(child));
+        } else {
+            out.push(isValidElement(child) && (child.key === null || child.key === undefined) ? { ...child, key: '.s' + at } : child);
+        }
+    });
+    return out.length === 1 && typeof out[0] === 'string' ? out[0] : out;
+}
+
+/// A scrollbar as `scrollbar-width` and `scrollbar-color` say, as a browser draws its own, with their colors for its thumb and
+/// track: 17 across, 11 if it's `thin`, and nothing with `none`, which still scrolls. Null if they don't say anything. It's
+/// taken off what's said, as it's only for what scrolls.
+function standardScrollbars(look) {
+    const width = look.__scrollbarWidth;
+    const colors = look.__scrollbarColor;
+    const [thumb, track] = [look.__scrollbarThumb, look.__scrollbarTrack];
+    for (const key of ['__scrollbarWidth', '__scrollbarColor', '__scrollbarThumb', '__scrollbarTrack']) {
+        delete look[key];
+    }
+    if ((width === undefined || width === 'auto') && (colors === undefined || colors === 'auto')) {
+        return null;
+    }
+    if (width === 'none') {
+        return { scrollbarSize: 0, scrollbarRoom: 0 };
+    }
+    const size = width === 'thin' ? 11 : 17;
+    const out = { scrollbarStyle: 'classic', scrollbarRoom: size, scrollbarSize: size, fillAcross: true };
+    if (colors === 'said') {
+        const current = look.color;
+        out.scrollbarThumb = withCurrentColor({ background: thumb }, current).background;
+        out.scrollbarTrack = withCurrentColor({ background: track }, current).background;
+    }
+    return out;
+}
+
+/// `known` is what `hostType` comes to, when that's known already.
+function makeHost(tag, props, children, scroll, parts = {}, known = undefined) {
+    if (tag === 'button' || tag === 'a' || tag === 'label' || tag === 'option') {
+        children = joinedText(children);
+    }
+    const type = known ?? hostType(tag, props, children);
+    delete props.__lined;
+    // It's been through `finalFont` already, in `cssPlace`.
+    const own = props;
+    const id = own.__id;
+    const labelFor = own.__for;
+    const appearance = own.__appearance;
+    if (typeof id === 'string' && id !== '') {
+        // What finds it, for a test or an agent, the same from one run to the next: see `path_with_dom_id` in `drive.rs`.
+        own.domId = id;
+    }
+    delete own.__id;
+    delete own.__for;
+    delete own.__appearance;
+    const formName = own.__formName;
+    const label = own.__label;
+    delete own.__formName;
+    delete own.__label;
+    if (label !== undefined) {
+        own.name = label;
+        // An `aria-label` says what it's called, and isn't drawn: what shows is only what's in it.
+        own.quietName = true;
+    }
+    if (tag === 'progress' || tag === 'meter') {
+        if (appearance === 'none' && tag === 'progress') {
+            // How far along it is, as `value` out of `max` says, which nothing past the start is when it doesn't say.
+            const fraction = own.value === undefined ? 0 : Number(own.value) / (Number(own.max ?? 1) || 1);
+            children = pageBar(Number.isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : 0, parts);
+        }
+        delete own.value;
+        delete own.max;
+    }
+    if (tag === 'input' && type === 'button') {
+        delete own.value;
+        delete own.defaultValue;
+        delete own.type;
+        delete own.placeholder;
+        delete own.onChange;
+    } else if (tag === 'input' || tag === 'textarea') {
+        const kind = props.type;
+        const extra = { name: formName, type: kind };
+        if (own.name === undefined && typeof own.placeholder === 'string' && own.placeholder !== '') {
+            // With nothing else to go by, a field is called what it says to put in it, as a browser has it.
+            own.name = own.placeholder;
+        }
+        const given = own.onChange;
+        if (kind === 'checkbox' || kind === 'radio') {
+            // Something that can't be used doesn't change, whether it's clicked or its label is.
+            const toggle = () => (own.disabled === true ? undefined : given?.(changeEvent(kind === 'radio' ? true : !own.checked, extra)));
+            if (id !== undefined) {
+                inputsById.set(id, () => {
+                    toggle();
+                    // The box gets the keyboard, as its label's click gives it, by the key Rust knows it by, so that the arrow
+                    // keys go on to the next radio.
+                    const key = own.domKey ?? own.key;
+                    if (key !== undefined) {
+                        rsui.focus(key);
+                    }
+                });
+            }
+            if (appearance === 'none' || own.opacity === 0 || own.width === 0) {
+                // It's drawn by its CSS, as a box with what `::before` and `::after` say in it.
+                const { onChange: _change, checked: _checked, value: _value, name: _name, type: _type, label: _label, ...box } = own;
+                const inside = withParts(undefined, parts.before ?? null, parts.after ?? null);
+                return make('group', { ...box, onClick: own.disabled === true ? undefined : toggle }, inside);
+            }
+            const { onChange: _change, checked, label, value: _value, name: _name, type: _type, accentColor, ...box } = own;
+            return make(BrowserCheck, { box, checked: checked === true, round: kind === 'radio', label: label ?? '', onToggle: own.disabled === true ? undefined : toggle, accent: accentColor });
+        }
+        if (kind === 'range') {
+            const { onChange: _change, value: rangeValue, min, max, step, type: _type, disabled, accentColor, ...rangeLook } = own;
+            // Its parts, as WebKit and Firefox each name them.
+            const thumb = parts['-webkit-slider-thumb'] ?? parts['-moz-range-thumb'];
+            const track = parts['-webkit-slider-runnable-track'] ?? parts['-moz-range-track'];
+            if (appearance === 'none' || thumb !== undefined) {
+                return make(WebRange, { look: rangeLook, thumb: thumb ?? {}, track, container: parts['-webkit-slider-container'], value: rangeValue, min, max, step, disabled, onChange: given });
+            }
+            // As a browser draws one by itself: 129 by 16, with 2 around it.
+            const browserRange = { ...rangeLook };
+            for (const [key, size] of Object.entries({ width: 129, height: 16, marginTop: 2, marginRight: 2, marginBottom: 2, marginLeft: 2 })) {
+                browserRange[key] ??= size;
+            }
+            const knob = { width: 16, height: 16, radius: 8, background: accentColor ?? BROWSER_BLUE };
+            return make(WebRange, { look: browserRange, thumb: knob, value: rangeValue, min, max, step, disabled, onChange: given, browser: true, accent: accentColor });
+        }
+        if (kind === 'time' && own.placeholder === undefined && (own.value ?? '') === '') {
+            // What an empty one shows on a page, which is in the color of its text, as it isn't a hint it's been given.
+            own.placeholder = '-- : --';
+            own.placeholderColor = own.color;
+        } else if (parts.placeholder?.color !== undefined) {
+            own.placeholderColor = parts.placeholder.color;
+        }
+        if (parts.placeholder?.fontStyle === 'italic' || parts.placeholder?.fontStyle === 'oblique') {
+            own.placeholderItalic = true;
+        }
+        if (typeof given === 'function') {
+            own.onChange = change(given, extra);
+        }
+        if (tag === 'textarea') {
+            // `rows="3"` is as much a number as `rows={3}`, as on a page. Without one it's 2 rows, as a browser's is.
+            const rows = typeof own.rows === 'string' ? parseInt(own.rows, 10) : own.rows;
+            own.rows = Number.isInteger(rows) && rows > 0 ? rows : 2;
+        }
+        if (tag === 'input') {
+            // A page puts an input's line of text in the middle of it, up and down.
+            own.justify = 'center';
+        }
+        delete own.type;
+    }
+    if (tag === 'select') {
+        return make(Select, { ...own, appearance, __formName: formName }, children);
+    }
+    if (tag === 'label' && own.onClick === undefined) {
+        // A label's click goes to what it's for: a box is ticked, and anything else, as a text field or a Select, gets the
+        // keyboard and hears the click, as in a browser.
+        const toggle = labelFor !== undefined
+            ? (event) => {
+                const box = inputsById.get(labelFor);
+                if (box !== undefined) {
+                    box();
+                    return;
+                }
+                const control = page.getElementById?.(labelFor);
+                if (control !== null && control !== undefined && labelable(control) && !clickedOwnControl(event, control)) {
+                    control.focus?.();
+                    clickFromLabel(control, event);
+                }
+            }
+            : labelToggle(children) ?? labelledInside(own.domKey);
+        if (toggle !== undefined) {
+            own.onClick = toggle;
+            // Being clicked doesn't make it something that can have the keyboard: Tab goes past it, as on a page.
+            if (own.tabIndex === undefined) {
+                own.focusable = false;
+            }
+        }
+    }
+    if (tag === 'a' && typeof own.href !== 'string') {
+        delete own.href;
+    }
+    const scrollbars = standardScrollbars(own);
+    if (scroll !== undefined && type === 'group') {
+        // How what's in it is laid out goes on what's inside the part that scrolls. That's no box of its own, so a height in it
+        // that's a percentage is of how tall the scroller shows (`scroll_content`, see rsui-layout).
+        const { direction, gap, padding, align, justify, collapseMargins, display, columns, rows, columnGap, rowGap, justifyItems, gridFlow, alignContent, flexWrap, reverse, crossReverse, ...outer } = own;
+        const bar = parts['-webkit-scrollbar'];
+        const always = own.__scrollAlways === true;
+        delete outer.__scrollAlways;
+        // A browser's scrollbar down the side is at the left where text goes from right to left.
+        const barSide = own.textDirection === 'rtl' ? 'paddingLeft' : 'paddingRight';
+        if (scrollbars !== null) {
+            // What CSS says of its scrollbar, which goes over what `::-webkit-scrollbar` says.
+            Object.assign(outer, scrollbars);
+            if (always) {
+                outer[barSide] = (outer[barSide] ?? 0) + scrollbars.scrollbarRoom;
+            }
+            if (own.textDirection === 'rtl' && scrollbars.scrollbarRoom > 0) {
+                outer.scrollbarLeft = true;
+            }
+        } else if (bar === undefined) {
+            // A browser's own scrollbar, which takes room when there's more than shows.
+            outer.scrollbarStyle = 'classic';
+            outer.scrollbarRoom = 17;
+            outer.fillAcross = true;
+            if (always) {
+                outer[barSide] = (outer[barSide] ?? 0) + 17;
+            }
+            if (own.textDirection === 'rtl') {
+                outer.scrollbarLeft = true;
+            }
+        } else {
+            const size = bar.__hidden === true ? 0 : typeof bar.width === 'number' ? bar.width : undefined;
+            if (size !== undefined) {
+                outer.scrollbarSize = size;
+                // What CSS's scrollbar takes is room, which what's in it doesn't get.
+                outer.paddingRight = (outer.paddingRight ?? 0) + size;
+            }
+            outer.scrollbarThumb = withCurrentColor({ background: parts['-webkit-scrollbar-thumb']?.background }, own.color).background;
+            outer.scrollbarTrack = withCurrentColor({ background: parts['-webkit-scrollbar-track']?.background }, own.color).background;
+        }
+        return make('scroll', { ...outer, axis: scroll }, make('group', { direction, gap, padding, align, justify, collapseMargins, display, columns, rows, columnGap, rowGap, justifyItems, gridFlow, alignContent, flexWrap, reverse, crossReverse, scrollContent: true }, children));
+    }
+    delete own.__scrollAlways;
+    return children === undefined ? make(type, own) : make(type, own, children);
+}
+
+/// A picture's `width` and `height` as CSS sizes, which they are, as an icon's `width="1em"` is as big as the text it's in, rather than
+/// what its `viewBox` says. In pixels, it's as it was.
+function pictureSize(tag, given, look, fontAbove) {
+    if (tag !== 'svg' && tag !== 'img') {
+        return given;
+    }
+    let out = given;
+    // How wide it is for how tall, as its `viewBox` says, which what isn't said of its size comes from: see `aspect` in rsui-layout.
+    const box = tag === 'svg' && typeof given.viewBox === 'string' ? given.viewBox.trim().split(/[\s,]+/).map(Number) : null;
+    if (box !== null && box.length === 4 && box[2] > 0 && box[3] > 0) {
+        out = { ...given, aspect: box[2] / box[3] };
+    }
+    for (const side of ['width', 'height']) {
+        const said = given[side];
+        if (typeof said === 'string' && !/^\s*[0-9.]+(px)?\s*$/.test(said)) {
+            const size = typeof look.fontSize === 'number' ? look.fontSize : typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 16;
+            const pixels = length(said, size);
+            if (typeof pixels === 'number') {
+                out = out === given ? { ...given } : out;
+                out[side] = pixels;
+            }
+        }
+    }
+    return out;
+}
+
+/// What a library makes with `createElement('div')` and the like, which is what a styled component with nothing to say is.
+const domElements = new Map();
+
+function domElement(tag) {
+    const made = tagElement(tag);
+    // What draws an element isn't rendered again when it's given the same things (see `JsProps` in bridge.rs).
+    if (made !== undefined && made.__rsuiShallow !== true) {
+        made.__rsuiShallow = true;
+    }
+    return made;
+}
+
+function tagElement(tag) {
+    if (tag === 'dialog') {
+        return PageDialog;
+    }
+    if (tag === 'style') {
+        return PageStyle;
+    }
+    if (tag === 'details') {
+        return Details;
+    }
+    if (tag === 'summary') {
+        return Summary;
+    }
+    if (tag === 'progress') {
+        return Progress;
+    }
+    if (tag === 'meter') {
+        return Meter;
+    }
+    if (tag === 'canvas') {
+        return PageCanvas;
+    }
+    if (tag === 'template') {
+        return PageTemplate;
+    }
+    if (tag === 'script' || tag === 'noscript' || tag === 'meta') {
+        return NotDrawn;
+    }
+    // A field keeps what's typed in it, whichever way it was written.
+    if (tag === 'input') {
+        return Input;
+    }
+    if (tag === 'textarea') {
+        return TextArea;
+    }
+    if (tag === 'select') {
+        return PageSelect;
+    }
+    return plainDomElement(tag);
+}
+
+/// The element for a tag, with nothing a field needs on top.
+function plainDomElement(tag) {
+    if (!DOM_TAGS.has(tag)) {
+        return undefined;
+    }
+    let made = domElements.get(tag);
+    if (made === undefined) {
+        const nothing = Object.assign([''], { raw: [''] });
+        made = makeStyled(tag)(nothing);
+        made.displayName = tag;
+        domElements.set(tag, made);
+    }
+    return made;
+}
+
+function styled(target) {
+    return makeStyled(target);
+}
+const DOM_TAGS = new Set([
+    'a', 'abbr', 'address', 'article', 'aside', 'b', 'blockquote', 'button', 'canvas', 'caption', 'circle', 'cite', 'code', 'dd', 'details', 'div', 'dl', 'dt', 'ellipse', 'em', 'fieldset', 'figcaption',
+    'figure', 'footer', 'form', 'g', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'i', 'img', 'input', 'kbd', 'label', 'legend', 'li', 'line', 'main', 'mark', 'nav', 'ol', 'optgroup', 'option',
+    'p', 'path', 'polygon', 'polyline', 'pre', 'rect', 's', 'section', 'select', 'small', 'span', 'strong', 'sub', 'summary', 'sup', 'svg', 'table', 'tbody', 'td', 'textarea', 'tfoot',
+    'th', 'thead', 'time', 'tr', 'u', 'ul', 'del', 'ins', 'samp', 'var', 'dfn', 'q', 'dialog', 'progress', 'meter', 'hgroup', 'search', 'data', 'output', 'bdi', 'bdo',
+]);
+for (const tag of DOM_TAGS) {
+    styled[tag] = makeStyled(tag);
+}
+
+/// Each element a page has, as `<dom.div className="x">`, which is drawn as the page's CSS and a browser's own say it would be.
+const dom = {};
+for (const tag of DOM_TAGS) {
+    Object.defineProperty(dom, tag, { get: () => domElement(tag), enumerable: true });
+}
+
+/// What a `.css` file that's imported does, and what it gives: each class by its own name, for a CSS module.
+function __addCssFile(text, file) {
+    addCss(text, file);
+    if (!String(file).toLowerCase().endsWith('.module.css')) {
+        return {};
+    }
+    const named = new Proxy({}, { get: (_, name) => (typeof name === 'string' && name !== '__esModule' ? name : undefined) });
+    return { __esModule: true, default: named };
+}
+
+/// Adds some CSS, as what's in a `.css` file is.
+/// What's been added with `addCss`, as each one's sheet and what it says, to work out again when the window's size changes.
+const addedCss = [];
+
+/// `from` is the file the CSS is in, as a path or a `file:` URL such as `import.meta.url`, or the folder it's in, which is the
+/// app's own if it doesn't say. The same CSS from the same place again, as when a file runs again because it was saved, is put
+/// where it was rather than added again.
+function addCss(text, from) {
+    const place = cssPlace(from);
+    const before = addedCss.find((one) => one.text === text && one.place === place);
+    if (before !== undefined) {
+        before.made = null;
+    } else {
+        const added = { sheet: newSheet(), text, place, made: null };
+        addedCss.push(added);
+        // It's at the end of `<head>`, as a bundler puts what's imported there.
+        headNodes.push({ __virtual: true, __added: added });
+    }
+    // It's put in the next time anything's looked up, by when the app's code has loaded, as what its tools make of it depends on that.
+    loadedSeen = -1;
+    changed();
+}
+
+function cssPlace(from) {
+    const path = require('path');
+    if (from === undefined || from === null) {
+        return path.resolve(path.dirname(rsuiHostMethods.appFile()));
+    }
+    const given = String(from?.href ?? from);
+    return path.resolve(given.startsWith('file:') ? require('url').fileURLToPath(given) : given);
+}
+
+// CSS the app's own tools make something of, as its bundler did: its PostCSS settings, or Tailwind, which makes the CSS for the
+// classes the app's code uses. What they make is worked out in Rust, in `css_build.rs`, which runs them, and is used in place of
+// what was written. It's made once the app's code has loaded, as that's what has the classes in it, and again when more of it
+// loads or it's saved.
+
+/// How many of the app's files had loaded when what its tools make was last looked at.
+let loadedSeen = -1;
+/// Whether that's been asked since what's running now started.
+let loadedAsked = false;
+
+// Packing the app takes what's been made, which is made now, as nothing's drawn when it's packed.
+globalThis.__rsuiBeforePacking = () => {
+    builtSheets();
+};
+
+/// Has what the app's tools make of its CSS be what's used, if anything's come up since it was last looked at, and says whether it
+/// changed anything.
+function builtSheets() {
+    // Asking how many files have loaded goes through all of them, so it's asked once for everything looked up together, as a
+    // render does, unless a sheet's just been added.
+    if (loadedAsked && loadedSeen !== -1) {
+        return false;
+    }
+    if (!loadedAsked) {
+        loadedAsked = true;
+        queueMicrotask(() => {
+            loadedAsked = false;
+        });
+    }
+    const loaded = natives.cssLoadedCount();
+    if (loaded === loadedSeen) {
+        return false;
+    }
+    loadedSeen = loaded;
+    let any = false;
+    for (const added of addedCss) {
+        if (added.built === false) {
+            continue;
+        }
+        const made = natives.cssBuild(added.text, added.place);
+        if (made.error !== undefined && !unsupported.has(made.error)) {
+            unsupported.add(made.error);
+            console.warn("rsui/web: the app's CSS tools said: " + made.error);
+        }
+        if (made.css !== added.made) {
+            added.made = made.css;
+            refillSheet(added);
+            any = true;
+        }
+    }
+    return any;
+}
+
+/// Puts what some CSS says into `sheet`. `from` is the file it's in, or the folder, if it's in one.
+function fillSheet(text, from = null, append = false) {
+    if (!append) {
+        sheet.sourceText = text;
+        sheet.sourceFrom = from;
+    }
+    const block = readCss(text);
+    const rules = inCascadeOrder(block.rules);
+    addFontFaces({ rules }, from);
+    for (const [name, value] of block.declarations) {
+        pageDeclaration(name, value);
+    }
+    for (const rule of rules) {
+        addPageRule(rule);
+    }
+}
+
+/// What a sheet that's been added says, as it is now: what the app's tools made of it, if they see it, or what it says itself.
+const textOfAdded = (added) => (added.node !== undefined ? added.node.textContent : added.built === false ? added.text : added.made ?? added.text);
+
+/// Puts what one sheet that's been added says into it again, after what it said is taken out.
+function refillSheet(added) {
+    const was = sheet;
+    emptySheet(added.sheet);
+    sheet = added.sheet;
+    try {
+        fillSheet(textOfAdded(added), added.place);
+    } finally {
+        sheet = was;
+    }
+    added.scan = undefined;
+}
+
+/// Works out what's been added with `addCss` again, as what CSS says about the window's size may have changed.
+function refillSheets() {
+    const filled = new Set();
+    for (const added of addedCss) {
+        refillSheet(added);
+        filled.add(added.sheet);
+    }
+    // Styles rendered in the tree and createGlobalStyle have their own sheets,
+    // too. Their unchanged source text still has to reevaluate media conditions.
+    for (const one of sheets) {
+        if (!filled.has(one) && typeof one.sourceText === 'string') {
+            const text = one.sourceText;
+            const from = one.sourceFrom;
+            const was = sheet;
+            emptySheet(one);
+            sheet = one;
+            try {
+                fillSheet(text, from);
+            } finally {
+                sheet = was;
+            }
+        }
+    }
+}
+
+/// A `<style>`'s text and its `sheet`, as CSS-in-JS uses them: its text set, or added to, as emotion adds a text node at a time,
+/// or a rule at a time with `insertRule()`, of which only what's new is read. `cssRules` are its rules as each was written, with
+/// what's under `@media` and what's `!important` in them. What's added at the end is only put together with the rest when the
+/// whole text is asked for, and the rules are kept as they're put in and taken out rather than found in the text again, as
+/// emotion asks how many there are each time it adds one.
+function styleElement(made) {
+    let text = '';
+    let more = [];
+    let list = null;
+    let objects = null;
+    const whole = () => {
+        if (more.length > 0) {
+            text += more.join('');
+            more = [];
+        }
+        return text;
+    };
+    const setText = (value, keep = null) => {
+        const before = whole();
+        text = String(value ?? '');
+        list = keep;
+        objects = keep === null ? null : objects;
+        if (made.__added !== undefined && text !== before) {
+            styleTextChanged(made.__added, before, text);
+        }
+    };
+    const append = (piece) => {
+        if (made.__added !== undefined) {
+            made.__added.scan ??= cssScan(whole(), CLEAN_SCAN);
+        }
+        more.push(piece);
+        if (made.__added !== undefined) {
+            styleTextAdded(made.__added, piece);
+        }
+    };
+    // Its text nodes, as CSS-in-JS puts a rule in one each, and what it says is all of theirs together.
+    const nodes = [];
+    const textNode = (value) => page.createTextNode(String(value ?? ''));
+    const fromNodes = () => nodes.map((one) => String(one?.textContent ?? one?.data ?? '')).join('');
+    const replaceAll = (value) => {
+        nodes.length = 0;
+        if (String(value ?? '') !== '') {
+            const one = textNode(value);
+            one.parentNode = made;
+            nodes.push(one);
+        }
+        setText(value);
+    };
+    Object.defineProperty(made, 'textContent', { get: whole, set: replaceAll, enumerable: true, configurable: true });
+    Object.defineProperty(made, 'innerHTML', { get: whole, set: replaceAll, configurable: true });
+    Object.defineProperty(made, 'innerText', { get: whole, set: replaceAll, configurable: true });
+    Object.defineProperty(made, 'childNodes', { get: () => nodes, configurable: true });
+    Object.defineProperty(made, 'firstChild', { get: () => nodes[0] ?? null, configurable: true });
+    Object.defineProperty(made, 'lastChild', { get: () => nodes[nodes.length - 1] ?? null, configurable: true });
+    made.hasChildNodes = () => nodes.length > 0;
+    made.appendChild = (child) => {
+        const piece = String(child?.textContent ?? '');
+        nodes.push(child);
+        if (child !== null && typeof child === 'object') {
+            child.parentNode = made;
+        }
+        if (piece !== '') {
+            list = null;
+            objects = null;
+            append(piece);
+        }
+        return child;
+    };
+    made.insertBefore = (child, before) => {
+        const at = before === null || before === undefined ? nodes.length : nodes.indexOf(before);
+        if (at < 0) {
+            throw Object.assign(new Error("Failed to execute 'insertBefore' on 'Node': The node before which the new node is to be inserted is not a child of this node."), { name: 'NotFoundError' });
+        }
+        if (at === nodes.length) {
+            return made.appendChild(child);
+        }
+        nodes.splice(at, 0, child);
+        child.parentNode = made;
+        setText(fromNodes());
+        return child;
+    };
+    made.removeChild = (child) => {
+        const at = nodes.indexOf(child);
+        if (at < 0) {
+            throw Object.assign(new Error("Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node."), { name: 'NotFoundError' });
+        }
+        nodes.splice(at, 1);
+        child.parentNode = null;
+        setText(fromNodes());
+        return child;
+    };
+    made.replaceChildren = (...children) => {
+        replaceAll(children.map((one) => (typeof one === 'string' ? one : String(one?.textContent ?? ''))).join(''));
+    };
+    const rules = () => (list ??= topLevelRules(whole()));
+    const cssRules = () => (objects ??= rules().map(cssRuleOf));
+    made.sheet = {
+        get cssRules() {
+            return cssRules();
+        },
+        get rules() {
+            return cssRules();
+        },
+        insertRule(rule, index = 0) {
+            const all = rules();
+            const at = Math.max(0, Math.min(Number(index) || 0, all.length));
+            const one = String(rule).trim();
+            all.splice(at, 0, one);
+            objects?.splice(at, 0, cssRuleOf(one));
+            if (at === all.length - 1) {
+                // What goes at the end is what's added to the text, which is all that's read.
+                append(all.length === 1 && whole() === '' ? one : '\n' + one);
+            } else {
+                setText(all.join('\n'), all);
+            }
+            return at;
+        },
+        deleteRule(index) {
+            const all = rules();
+            all.splice(Number(index), 1);
+            objects?.splice(Number(index), 1);
+            setText(all.join('\n'), all);
+        },
+        get ownerNode() {
+            return made;
+        },
+    };
+}
+
+/// A sheet's rules as they're written in it, one by one, without what's between them.
+function topLevelRules(text) {
+    const out = [];
+    let depth = 0;
+    let quote = null;
+    let from = -1;
+    for (let at = 0; at < text.length; at += 1) {
+        const c = text[at];
+        if (quote !== null) {
+            if (c === '\\') {
+                at += 1;
+            } else if (c === quote || c === '\n') {
+                quote = null;
+            }
+            continue;
+        }
+        if (c === '/' && text[at + 1] === '*') {
+            const end = text.indexOf('*/', at + 2);
+            at = end < 0 ? text.length : end + 1;
+            continue;
+        }
+        if (from < 0 && /\s/.test(c)) {
+            continue;
+        }
+        if (from < 0) {
+            from = at;
+        }
+        if (c === '"' || c === "'") {
+            quote = c;
+        } else if (c === '\\') {
+            at += 1;
+        } else if (c === '{') {
+            depth += 1;
+        } else if ((c === '}' && depth <= 1) || (c === ';' && depth === 0)) {
+            depth = 0;
+            out.push(text.slice(from, at + 1).trim());
+            from = -1;
+        } else if (c === '}') {
+            depth -= 1;
+        }
+    }
+    if (from >= 0 && text.slice(from).trim() !== '') {
+        out.push(text.slice(from).trim());
+    }
+    return out;
+}
+
+/// A rule as `cssRules` has it: what it says as it was written, and what kind of rule it is, as CSSOM numbers them.
+function cssRuleOf(text) {
+    const lower = text.slice(0, 16).toLowerCase();
+    const type = !lower.startsWith('@') ? 1 : lower.startsWith('@media') ? 4 : lower.startsWith('@font-face') ? 5 : lower.startsWith('@import') ? 3
+        : /^@(-webkit-|-moz-)?keyframes/.test(lower) ? 7 : lower.startsWith('@supports') ? 12 : 0;
+    const brace = text.indexOf('{');
+    return type === 1 ? { type, cssText: text, selectorText: (brace < 0 ? text : text.slice(0, brace)).trim() } : { type, cssText: text };
+}
+
+/// What a `<style>` says now, which said `before`, which is read again, unless all that's changed is what's been added at its end.
+function styleTextChanged(added, before, now) {
+    added.text = now;
+    if (now.startsWith(before)) {
+        added.scan ??= cssScan(before, CLEAN_SCAN);
+        styleTextAdded(added, now.slice(before.length));
+        return;
+    }
+    added.layered = /@layer\b/i.test(now);
+    refillSheet(added);
+    restyled();
+}
+
+/// What's been added at the end of a `<style>`, as CSS-in-JS adds a rule at a time, which is all that's read, into the same sheet,
+/// after what's there: it comes to the same, as long as what was there before ended between rules, and none of it is in a
+/// `@layer`, whose order is about the whole sheet. `added.scan` says where what was there before left off.
+function styleTextAdded(added, more) {
+    if (!added.layered && added.scan.clean && !/@layer\b/i.test(more)) {
+        const was = sheet;
+        sheet = added.sheet;
+        try {
+            fillSheet(more, added.place, true);
+        } finally {
+            sheet = was;
+        }
+        added.scan = cssScan(more, added.scan);
+    } else {
+        added.layered ||= /@layer\b/i.test(more);
+        refillSheet(added);
+    }
+    restyled();
+}
+
+/// Where CSS that's been read so far leaves off: inside how many blocks, a string or a comment, and whether that's between rules.
+const CLEAN_SCAN = Object.freeze({ depth: 0, quote: null, comment: false, clean: true });
+function cssScan(text, from) {
+    let { depth, quote, comment } = from;
+    let pending = false;
+    for (let at = 0; at < text.length; at += 1) {
+        const c = text[at];
+        if (comment) {
+            if (c === '*' && text[at + 1] === '/') {
+                comment = false;
+                at += 1;
+            }
+        } else if (quote !== null) {
+            if (c === '\\') {
+                at += 1;
+            } else if (c === quote || c === '\n') {
+                quote = null;
+            }
+        } else if (c === '/' && text[at + 1] === '*') {
+            comment = true;
+            at += 1;
+        } else if (c === '"' || c === "'") {
+            quote = c;
+        } else if (c === '\\') {
+            at += 1;
+        } else if (c === '{') {
+            depth += 1;
+        } else if (c === '}') {
+            depth = Math.max(0, depth - 1);
+            pending = false;
+        } else if (c === ';' && depth === 0) {
+            pending = false;
+        } else if (depth === 0 && !/\s/.test(c)) {
+            pending = true;
+        }
+    }
+    return { depth, quote, comment, clean: depth === 0 && quote === null && !comment && !pending };
+}
+
+/// What `@font-face` says, for the fonts it gives to be used. A font's file is found from the sheet it's in, which is `from`, a file
+/// or the folder it's in, or the app's own folder for a sheet that's in the page.
+function addFontFaces(block, from = null) {
+    for (const rule of block.rules) {
+        if (rule.selector.toLowerCase() === '@font-face') {
+            const own = Object.fromEntries(rule.block.declarations);
+            const file = fontFileOf(own.src ?? '', from);
+            // Or a font the system has, as `local('Segoe UI Semibold')` names, which Radix's "Segoe UI (Custom)" is made of.
+            const local = file === null ? localFontOf(own.src ?? '') : null;
+            if (own['font-family'] !== undefined && (file !== null || local !== null)) {
+                const family = own['font-family'].replace(/^["']|["']$/g, '');
+                const weight = own['font-weight'] === 'bold' ? 700 : own['font-weight'] === undefined || own['font-weight'] === 'normal' ? 400 : Number(own['font-weight']);
+                // Its text is drawn bigger or smaller than it says, by `size-adjust`.
+                const adjust = /^\s*([0-9.]+)%\s*$/.exec(own['size-adjust'] ?? '');
+                // And sits higher or lower in its lines, by `ascent-override` and `descent-override`, as shares of its size.
+                const share = (said) => {
+                    const found = /^\s*([0-9.]+)%\s*$/.exec(said ?? '');
+                    return found === null ? undefined : Number(found[1]) / 100;
+                };
+                const face = [family, weight, own['font-style'], file, local?.family, own['size-adjust'], own['ascent-override'], own['descent-override']].join('|');
+                if (!fontFacesSeen.has(face)) {
+                    // What's written in it is measured again.
+                    fontFacesSeen.add(face);
+                    restyleAll('@font-face ' + family);
+                }
+                natives.cssFontFile(layout, family, weight, own['font-style'] === 'italic', file ?? local.family, adjust === null ? 1 : Number(adjust[1]) / 100,
+                    local?.weight, local?.italic, share(own['ascent-override']), share(own['descent-override']));
+            }
+        }
+    }
+}
+
+/// How heavy a font is, by the word its name ends in.
+const WEIGHT_WORDS = { thin: 100, hairline: 100, extralight: 200, ultralight: 200, light: 300, semilight: 350, regular: 400, normal: 400, book: 400,
+    medium: 500, semibold: 600, demibold: 600, bold: 700, extrabold: 800, ultrabold: 800, heavy: 900, black: 900 };
+
+/// The first font the system has that `src` names with `local()`, as its family, its weight and whether it's italic, from its name:
+/// `Segoe UI Semibold Italic` is Segoe UI at 600, italic.
+function localFontOf(src) {
+    for (const one of commas(src)) {
+        const found = /local\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)/i.exec(one);
+        if (found === null) {
+            continue;
+        }
+        const words = (found[1] ?? found[2] ?? found[3]).trim().split(/\s+/);
+        let weight = 400;
+        let italic = false;
+        while (words.length > 1) {
+            const last = words[words.length - 1].toLowerCase();
+            if (last === 'italic' || last === 'oblique') {
+                italic = true;
+            } else if (WEIGHT_WORDS[last] !== undefined) {
+                weight = WEIGHT_WORDS[last];
+            } else {
+                break;
+            }
+            words.pop();
+        }
+        if (words[0] !== '') {
+            return { family: words.join(' '), weight, italic };
+        }
+    }
+    return null;
+}
+
+/// Which formats of font file can be read here: TrueType, and WOFF around it.
+const FONT_FORMATS = new Set(['truetype', 'opentype', 'woff']);
+
+/// The file `src` says to use: the first of its `url()`s in a format that can be read here, as a browser takes the first it can use,
+/// without what's after `?` or `#`, as a bundler leaves on them.
+function fontFileOf(src, from) {
+    const path = require('path');
+    for (const one of commas(src)) {
+        const found = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)/i.exec(one);
+        if (found === null) {
+            // `local()`, a font the system has, which it's found by its family.
+            continue;
+        }
+        const url = (found[1] ?? found[2] ?? found[3]).trim().replace(/[?#].*$/, '');
+        const format = /format\(\s*["']?([\w-]+)/i.exec(one)?.[1].toLowerCase();
+        const kind = format ?? { ttf: 'truetype', otf: 'opentype', woff: 'woff' }[path.extname(url).slice(1).toLowerCase()];
+        if (url === '' || url.startsWith('data:') || !FONT_FORMATS.has(kind)) {
+            continue;
+        }
+        if (url.startsWith('file:')) {
+            return require('url').fileURLToPath(url);
+        }
+        const app = path.dirname(rsuiHostMethods.appFile());
+        // What starts with `/` is from where the app's served, which is its own folder.
+        return url.startsWith('/') ? path.join(app, url) : path.resolve(cssFolder(from) ?? app, url);
+    }
+    return null;
+}
+
+/// The folder a sheet's in, from the file it's in or the folder itself.
+function cssFolder(from) {
+    if (from === null || from === undefined) {
+        return null;
+    }
+    try {
+        return require('fs').statSync(from).isDirectory() ? from : require('path').dirname(from);
+    } catch {
+        return require('path').dirname(from);
+    }
+}
+
+function pageDeclaration(name, value) {
+    if (name.startsWith('--')) {
+        rootVariables.set(name, value);
+        variablesTouched = true;
+    } else {
+        sheet.page.push([name, value]);
+    }
+}
+
+/// A rule's selectors, with one that's only `:where(...)` or `:is(...)` as each of what's in it, as Pico's `:where(:root)` and Chakra's
+/// `:where(html, .chakra-theme)` are, so that what's about the page is the page's and what's about a class is that class's.
+function unwrappedSelectors(selector) {
+    const out = [];
+    for (const one of commas(selector)) {
+        const text = one.trim();
+        const open = text.indexOf('(');
+        if (/^:(where|is)\(/i.test(text) && insideParens(text, open)[1] === text.length) {
+            out.push(...commas(insideParens(text, open)[0]).map((inner) => inner.trim()));
+        } else {
+            out.push(one);
+        }
+    }
+    return out;
+}
+
+function addPageRule(rule) {
+    const selector = rule.selector;
+    if (selector.startsWith('@')) {
+        if (selector.toLowerCase().startsWith('@media')) {
+            if (sheetMediaApplies(selector.toLowerCase().slice(6))) {
+                for (const inner of rule.block.rules) {
+                    addPageRule(inner);
+                }
+            }
+        } else if (/^@(supports|layer)\b/i.test(selector)) {
+            if (!/^@supports/i.test(selector) || supportsApplies(selector.slice(9))) {
+                for (const inner of rule.block?.rules ?? []) {
+                    addPageRule(inner);
+                }
+            }
+        } else if (/^@property/i.test(selector)) {
+            registerProperty(selector.slice(9).trim(), rule.block);
+        } else if (/^@(-webkit-|-moz-|-o-|-ms-)?keyframes/i.test(selector)) {
+            addKeyframes(selector, rule.block);
+        } else if (!SAYS_NOTHING_HERE.test(selector.toLowerCase())) {
+            notHere(selector);
+        }
+        return;
+    }
+    for (const one of unwrappedSelectors(selector)) {
+        const steps = readSelector(one);
+        if (steps !== null) {
+            noteRule(steps, rule.block.declarations);
+        }
+        if (steps === null) {
+            notHere('the selector ' + one);
+        } else if (steps.length === 1 && !onlyWhenDrawn(steps[0])) {
+            addPageStep(steps[0], rule.block);
+        } else {
+            // Something that's only known once it's been drawn, as `.a .b` and `.b:hover` are, goes to everything in the page to look at.
+            const said = rule.block.declarations.map(([name, value, important]) => name + ': ' + value + (important === true ? ' !important' : '')).join('; ');
+            if (steps.length === 1 && mayBeOnPage(steps[0]) && rule.block.declarations.some(([name]) => name.startsWith('--'))) {
+                // Variables set on the page itself, but only while it has some attribute or isn't something, as Mantine's
+                // `:root[data-mantine-color-scheme='light']` and Pico's `:root:not([data-theme=dark])` set theirs: see
+                // `pageRuleVariables`.
+                (sheet.pageWhen ??= []).push({ step: steps[0], at: ruleCount++, weight: specificity(steps), variables: rule.block.declarations.filter(([name]) => name.startsWith('--')) });
+                pageWhenCount += 1;
+                variablesTouched = true;
+            }
+            for (const [name] of rule.block.declarations) {
+                if (name.startsWith('--') && !elementVariables.has(name)) {
+                    elementVariables.add(name);
+                    variablesTouched = true;
+                }
+            }
+            if (said !== '') {
+                // Where it is in the cascade, as a rule about one class is, for the two to be put in order: see `planOf`.
+                (sheet.complex ??= []).push(one + ' { ' + said + ' }');
+                (sheet.complexOrder ??= []).push(ruleCount++);
+            }
+        }
+    }
+}
+
+/// Whether a step could be about `html` or `body` themselves: no other kind of element, no part of one, and no state.
+function mayBeOnPage(step) {
+    return (step.tag === null || PAGE_TAGS.has(step.tag)) && step.part === null && !step.pseudo.some((one) => needsOf([one]) !== 0);
+}
+
+/// The variables the page's rules about `html` and `body` themselves set while it has an attribute or class, or hasn't, as
+/// `:root[data-mantine-color-scheme='light'] { --x: ... }` does, which a browser has `html` hand down to everything. What says more
+/// goes over what says less, then the later, and `body`'s over `html`'s. It's the same for as long as nothing's changed.
+function pageRuleVariables() {
+    // Kept by `version` rather than in `workedOut`, as this is asked for while sheets are being read.
+    if (pageWhenKept.at !== version || pageWhenKept.count !== pageWhenCount || pageWhenKept.shape !== sheetsShape) {
+        pageWhenKept = { at: version, count: pageWhenCount, shape: sheetsShape, value: null };
+        if (pageWhenCount > 0) {
+            const rank = sheetRanks();
+            const said = sheets.flatMap((one) => (one.pageWhen ?? []).map((rule) => ({ ...rule, sheet: rank.get(one) })));
+            said.sort((a, b) => a.weight - b.weight || a.sheet - b.sheet || a.at - b.at);
+            const element = (tag, of) => ({ tag, id: undefined, classes: [...pageClasses], props: pageAttributes(of), state: 0, nth: null, prevs: [], kind: 'element' });
+            const html = element('html', documentElement);
+            const inHtml = { el: html, up: null };
+            const bodyElement = element('body', body);
+            const out = new Map();
+            for (const which of [0, 1]) {
+                for (const rule of said) {
+                    const step = rule.step;
+                    const on = which === 0 ? stepMatches(step, html, null, null) : stepMatches(step, bodyElement, inHtml, null);
+                    if (on) {
+                        for (const [name, value] of rule.variables) {
+                            out.set(name, value);
+                        }
+                    }
+                }
+            }
+            pageWhenKept.value = out.size === 0 ? null : out;
+        }
+    }
+    return pageWhenKept.value;
+}
+/// Whether a rule is about more than which class or kind of element something is, which is only known for each one as it's drawn.
+function onlyWhenDrawn(step) {
+    const plain = step.pseudo.every((one) => one.name === 'root');
+    return !plain || step.part !== null || step.attrs.length > 0 || step.classes.length > 1 || (step.id !== null && !PAGE_IDS.has(step.id));
+}
+
+/// What the page's CSS says about what's in it that's only known as it's drawn, as rules on everything inside the page: what each
+/// sheet says, in the order the sheets are in, and what says more about what it's for after what says less, as `compile` has it.
+function pageRules() {
+    const now = workedOut();
+    if (now.complex === undefined) {
+        const each = [];
+        for (const one of sheets) {
+            if ((one.complex?.length ?? 0) > 0) {
+                each.push(sheetRules(one));
+            }
+        }
+        // Each sheet's are in order already, and with more than one, a sort that keeps the order of those that say as much is the
+        // order they're in the sheets.
+        const nested = each.length < 2 ? each[0] : each.flat().sort((a, b) => (a.weight ??= specificity(a.steps)) - (b.weight ??= specificity(b.steps)));
+        now.complex = nested === undefined ? null : { nested };
+    }
+    return now.complex;
+}
+
+/// What one sheet's rules that are only known as they're drawn come to. It's worked out once, and only what's been added to the
+/// sheet since is worked out after that, until what declarations come to changes, or the sheet's emptied.
+function sheetRules(one) {
+    let made = one.compiled;
+    if (made === undefined || made.declared !== declared) {
+        if (RESTYLE_ENV.log) console.error('rsui css sheet-reset: sheet=' + sheets.indexOf(one) + ' version=' + version
+            + ' declared=' + (made?.declared ?? 'none') + '->' + declared + ' previous_count=' + (made?.count ?? 0)
+            + ' previous_nested=' + (made?.nested.length ?? 0) + ' source_count=' + one.complex.length);
+        made = one.compiled = { declared, count: 0, nested: [] };
+    }
+    if (made.count < one.complex.length) {
+        // In the order they're written, each the rule one of them is, to say where each is in the cascade, then in order.
+        const more = compile(readCss(one.complex.slice(made.count).join('\n')), 16, false).nested;
+        if (more.length === one.complex.length - made.count) {
+            more.forEach((rule, at) => {
+                rule.sheet = one;
+                rule.order = one.complexOrder[made.count + at];
+            });
+        }
+        more.sort((a, b) => (a.weight ??= specificity(a.steps)) - (b.weight ??= specificity(b.steps)));
+        // With what's been added, they're put in order again, keeping the order of those that say as much.
+        made.nested = made.count === 0 ? more : made.nested.concat(more).sort((a, b) => (a.weight ??= specificity(a.steps)) - (b.weight ??= specificity(b.steps)));
+        made.count = one.complex.length;
+    }
+    return made.nested;
+}
+
+const PAGE_TAGS = new Set(['html', 'body', ':root']);
+const PAGE_IDS = new Set(['app', 'root']);
+
+function addPageStep(step, block) {
+    if (PAGE_IDS.has(step.id)) {
+        sheet.root = [...(sheet.root ?? []), ...block.declarations];
+        return;
+    }
+    const onPage = step.pseudo.some((one) => one.name === 'root') || (step.tag !== null && PAGE_TAGS.has(step.tag));
+    if (onPage && step.classes.length === 0) {
+        for (const [name, value] of block.declarations) {
+            if (name === 'font-size') {
+                // How big a rem is, and the text size of everything on the page, which are worked out once what the variables in
+                // them stand for is known: see `rootFontSize` and `pageLook`.
+                (step.tag === 'body' ? (sheet.bodyFont ??= []) : (sheet.rootFont ??= [])).push(value);
+                variablesTouched = true;
+            } else {
+                pageDeclaration(name, value);
+            }
+        }
+        if (step.tag === 'body') {
+            // How `body` lays out what's in it, as a flex box that puts it in the middle does, which is for its own box, inside the window.
+            sheet.body = [...(sheet.body ?? []), ...block.declarations.filter(([name]) => !name.startsWith('--'))];
+        }
+        return;
+    }
+    if (step.classes.length > 0) {
+        // If it only says variables, it's a theme, and it goes with whatever class turns it on.
+        const name = step.classes[step.classes.length - 1];
+        const variables = classVariables.get(name) ?? new Map();
+        for (const [key, value] of block.declarations) {
+            if (key.startsWith('--')) {
+                variables.set(key, value);
+                variablesTouched = true;
+            }
+        }
+        classVariables.set(name, variables);
+        if (step.pseudo.length === 0) {
+            // The variables are the element's own too, for what's inside it, when it isn't the page that has the class.
+            const rules = sheet.classes.get(name) ?? [];
+            rules.push({ sheet, at: ruleCount++, declarations: block.declarations });
+            sheet.classes.set(name, rules);
+            touchedRules.add('classes ' + name);
+            for (const key of variables.keys()) {
+                elementVariables.add(key);
+            }
+        } else if (block.declarations.some(([key]) => !key.startsWith('--'))) {
+            notHere(step.pseudo.map((one) => ':' + one.name).join('') + ' on .' + name);
+        }
+        return;
+    }
+    if (step.tag !== null && step.pseudo.length === 0) {
+        const rules = sheet.tags.get(step.tag) ?? [];
+        rules.push(...block.declarations);
+        sheet.tags.set(step.tag, rules);
+        touchedRules.add('tags ' + step.tag);
+        addTagRule(step.tag, block.declarations);
+    } else if (step.tag === null && step.pseudo.length === 0) {
+        // `*` is for everything, and most of what it says only takes away what a browser does by itself. A variable it sets is
+        // what everything has unless something more particular sets it, as it's set again on each element.
+        const rules = sheet.tags.get('*') ?? [];
+        for (const declaration of block.declarations) {
+            if (declaration[0].startsWith('--')) {
+                universalVariables.set(declaration[0], declaration[1]);
+                variablesTouched = true;
+            } else {
+                rules.push(declaration);
+            }
+        }
+        sheet.tags.set('*', rules);
+        touchedRules.add('tags *');
+        addTagRule('*', block.declarations.filter(([name]) => !name.startsWith('--')));
+    } else {
+        notHere(step.pseudo.map((one) => ':' + one.name).join('') + (step.tag === null ? '' : ' on ' + step.tag));
+    }
+}
+
+/// A rule about a kind of element, kept with where it is in the cascade too, for a rule about more that says no more than it does,
+/// as `:where(ul) li` does, to be put in order with it: see `planOf`.
+function addTagRule(tag, declarations) {
+    const rules = sheet.tagRules.get(tag) ?? [];
+    rules.push({ sheet, at: ruleCount++, declarations });
+    sheet.tagRules.set(tag, rules);
+    touchedRules.add('tagRules ' + tag);
+}
+
+/// `value`, or what it was last time if that says the same, as something every element reads from a context has to be, so that they
+/// aren't all drawn again for a new object that says what the old one did.
+function useSameValue(value) {
+    const kept = useRef(undefined);
+    const key = JSON.stringify(value);
+    if (kept.current === undefined || kept.current.key !== key) {
+        kept.current = { key, value };
+    }
+    return kept.current.value;
+}
+
+/// `createGlobalStyle`, as a component that adds what it says when it's first there.
+function createGlobalStyle(strings, ...values) {
+    let added = null;
+    let own = null;
+    return function GlobalStyle(props) {
+        const theme = useContext(ThemeContext);
+        const text = textOf(strings, values, { ...props, theme });
+        if (added !== text) {
+            added = text;
+            // What it said before is no longer what it says, as it's one that changes with its props.
+            if (own === null) {
+                own = newSheet();
+            }
+            emptySheet(own);
+            const was = sheet;
+            sheet = own;
+            try {
+                fillSheet(text);
+            } finally {
+                sheet = was;
+            }
+            // It's during a render, and what's drawn after this should see it, and what's been drawn has to hear about it.
+            queueMicrotask(restyled);
+        }
+        return null;
+    };
+}
+
+/// A `<style>` that's in what's drawn, rather than in `<head>`, which is a sheet of the page's for as long as it's there, as in a
+/// browser, and draws nothing. React 19's, with an `href`, are one sheet for each `href`, however many say it.
+const treeSheets = new Map();
+
+function PageStyle(props) {
+    const html = props.dangerouslySetInnerHTML?.__html;
+    const text = typeof html === 'string' ? html : Children.toArray(props.children).join('');
+    const href = typeof props.href === 'string' ? props.href : null;
+    const kept = useRef(null);
+    if (kept.current === null) {
+        let shared = href === null ? undefined : treeSheets.get(href);
+        if (shared === undefined) {
+            shared = { sheet: newSheet(), text: null, users: 0, href };
+            if (href !== null) {
+                treeSheets.set(href, shared);
+            }
+        }
+        shared.users += 1;
+        kept.current = shared;
+    }
+    const own = kept.current;
+    if (own.text !== text) {
+        own.text = text;
+        emptySheet(own.sheet);
+        const was = sheet;
+        sheet = own.sheet;
+        try {
+            fillSheet(text);
+        } finally {
+            sheet = was;
+        }
+        // It's during a render, and what's drawn after this should see it, and what's been drawn has to hear about it.
+        queueMicrotask(restyled);
+    }
+    useEffect(
+        () => () => {
+            own.users -= 1;
+            if (own.users === 0) {
+                if (own.href !== null) {
+                    treeSheets.delete(own.href);
+                }
+                dropSheet(own.sheet);
+                // A `<style>` with nothing in it, as Mantine's `InlineStyles` leaves when it has no styles to say, said nothing
+                // that's gone now.
+                if (typeof own.text !== 'string' || own.text.trim() !== '') {
+                    restyled();
+                }
+            }
+        },
+        [],
+    );
+    return null;
+}
+
+/// `<template>`: what's in it isn't shown and takes no room, but its components still run, as React renders them into its
+/// `content` in a browser, which is where React Aria builds its collections.
+function PageTemplate({ children }) {
+    return make('group', { overlay: 'fill', inert: true, opacity: 0 }, children);
+}
+/// What's in a page that isn't drawn: what runs, what's for when nothing runs, and what's said about the page.
+function NotDrawn() {
+    return null;
+}
+
+/// The window, as the page's `body` says it should look.
+// A page's words aren't broken to fit, as rsui's own text's are.
+const PAGE_DEFAULTS = { background: '#ffffff', color: '#000000', fontFamily: 'Times New Roman', fontSize: 16, keepWords: true };
+
+/// The props of one of the page's own boxes, `body` or `#root`, from what CSS says about it.
+function pageBox(look) {
+    const { __hidden, __scroll, __scrollAlways, __overflowX, __overflowY, __case, __inline, ...out } = settleElement(look);
+    // What the page says of its scrollbars goes on the window's own scroll area, not on these.
+    standardScrollbars(out);
+    return out;
+}
+
+const subscribePageScroll = (listener) => {
+    pageScrolling.listeners.add(listener);
+    return () => pageScrolling.listeners.delete(listener);
+};
+
+/// Draws the page again, for what code put in `body` itself: see `__redrawPage`.
+let bodyRedraw = null;
+
+function PageWindow({ children, ...rest }) {
+    usePage();
+    const [, setBodyKids] = useState(0);
+    bodyRedraw = () => setBodyKids((was) => was + 1);
+    // What code put in `body` itself comes after what the app drew, as on a page.
+    const bodyKids = page.body.__kids !== undefined && page.body.__kids.length > 0 ? domPack().renderKids(page.body) : null;
+    if (bodyKids !== null) {
+        children = [children, bodyKids];
+    }
+    // What's right inside the page is told where it is among the rest, as what's in any element is, for `h1 + p` and `:first-child`.
+    const nthKept = useRef(null);
+    const [, setState] = useState(0);
+    if (structural && children !== undefined) {
+        nthKept.redraw ??= () => setState((was) => was ^ 1);
+        children = withNth(children, nthKept);
+    }
+    // Where code wants the page scrolled to, as `window.scrollTo()` says.
+    useSyncExternalStore(subscribePageScroll, () => pageScrolling.scrollAsk ?? 0);
+    const { __hidden, __scroll, __case, ...look } = pageLook();
+    for (const name of Object.keys(PAGE_DEFAULTS)) {
+        if (look[name] === undefined) {
+            look[name] = PAGE_DEFAULTS[name];
+        }
+    }
+    const now = workedOut();
+    const star = tagLook('*') ?? {};
+    const box = { ...now.box };
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+        // `body`'s margin, which is 8 unless something says otherwise, as `* { margin: 0 }` often does. It's a margin, so that what's
+        // first in the page goes together with it, as on a page.
+        const margin = now.margin['margin' + side] ?? star['margin' + side] ?? 8;
+        if (typeof margin === 'number' && margin !== 0) {
+            box['margin' + side] = margin;
+        }
+    }
+    // The same as it was, while it says the same, as everything in the page has it from here.
+    const font = useSameValue(fontFrom(look, null));
+    const pageScroll = now.pageScroll ?? 'both';
+    // What the page says of its scrollbars, on `html` or `body`, which are the window's.
+    const pageScrollbars = standardScrollbars(look) ?? {};
+    // In a page that scrolls, `body` is as tall as what's in it, and at least as tall as the window. Otherwise it's as tall as the window.
+    const filling = pageScroll === 'none' ? { flex: 1 } : { grow: 1, shrink: 0 };
+    const body = now.body ?? {};
+    let inner;
+    if (body.__flex === true || body.display === 'grid') {
+        // `body` lays out what's in it itself, as a flex box that puts it in the middle does, and what's in it is the page's root
+        // element, as `#root` is, which is a block of its own, as on a page.
+        const root = pageBox({ ...browserLook('div'), ...rootLook() });
+        inner = make('group', { ...filling, ...pageBox({ ...box, ...body }) }, make('group', root, children));
+    } else {
+        const root = pageBox({ ...box, ...body, ...rootLook() });
+        inner = Object.keys(root).length === 0 && pageScroll === 'none' ? children : make('group', { ...root, ...filling }, children);
+    }
+    // It's always there, so that CSS that comes later, as a `<style>` added to `<head>` does, doesn't make what's in the page
+    // start again, as something different around it would.
+    inner = make(NestedRules.Provider, { value: pageOwners() }, inner);
+    if (pageScroll !== 'none') {
+        // The page scrolls when there's more of it than the window, with the scrollbars a browser has.
+        // What's placed by itself with nothing positioned around it is placed from the page, as from a page's first box.
+        inner = make('scroll', { axis: pageScroll, flex: 1, collapseMargins: true, scrollbarStyle: 'classic', scrollbarRoom: PAGE_SCROLLBAR, fillAcross: true, domKey: PAGE_SCROLL, staticBox: false, focusable: false, ...scrollProps(pageScrolling), ...pageScrollbars, ...(pagePointerEvents === 'none' ? { inert: true } : null) }, inner);
+    } else if (pagePointerEvents === 'none') {
+        inner = make('group', { flex: 1, collapseMargins: true, inert: true }, inner);
+    }
+    // On this, rather than around what's in it, so that it's the same whether there's a font or not: see `provideHere`.
+    rsui.__provideHere(InheritedFont, font);
+    return make('window', { ...finalFont(look), collapseMargins: true, staticBox: false, ...rest }, inner);
+}
+
+// A page that's only as much as code tends to touch, so that what isn't important doesn't stop it. Nothing here draws anything: `body`'s
+// classes turn on what CSS says about them, and the rest takes what it's told and forgets.
+
+const classList = (kept) => ({
+    // Only what changes the page has anything drawn again, as saying what's already so is common, on every render.
+    add(...names) {
+        const before = kept.size;
+        for (const name of names) {
+            kept.add(name);
+        }
+        if (kept.size !== before) {
+            pageChanged(names.map((name) => '.' + name));
+        }
+    },
+    remove(...names) {
+        const before = kept.size;
+        for (const name of names) {
+            kept.delete(name);
+        }
+        if (kept.size !== before) {
+            pageChanged(names.map((name) => '.' + name));
+        }
+    },
+    toggle(name, force) {
+        const on = force ?? !kept.has(name);
+        if (on !== kept.has(name)) {
+            if (on) {
+                kept.add(name);
+            } else {
+                kept.delete(name);
+            }
+            pageChanged(['.' + name]);
+        }
+        return on;
+    },
+    contains: (name) => kept.has(name),
+    get length() {
+        return kept.size;
+    },
+    toString: () => [...kept].join(' '),
+});
+
+const pageStyle = {
+    setProperty(name, value) {
+        if (String(name) === 'pointer-events') {
+            pageStyle.pointerEvents = value;
+            return;
+        }
+        if (pageVariables.get(name) !== String(value)) {
+            pageVariables.set(name, String(value));
+            pageChanged([]);
+        }
+    },
+    removeProperty(name) {
+        if (String(name) === 'pointer-events') {
+            const was = pagePointerEvents;
+            pageStyle.pointerEvents = '';
+            return was;
+        }
+        if (pageVariables.delete(name)) {
+            pageChanged([]);
+        }
+    },
+    getPropertyValue: (name) => (String(name) === 'pointer-events' ? pagePointerEvents : variableValue(name) ?? ''),
+    getPropertyPriority: () => '',
+};
+/// `body.style.pointerEvents` (or `html`'s), as a modal Radix layer sets it to `none` while it's open: nothing in the page takes the
+/// pointer then, apart from what says it does itself (`pointer-events: auto`, as the layer has), and what's under it is `<html>`'s.
+let pagePointerEvents = '';
+Object.defineProperty(pageStyle, 'pointerEvents', {
+    get: () => pagePointerEvents,
+    set: (value) => {
+        const text = value === null || value === undefined ? '' : String(value);
+        if (text !== pagePointerEvents) {
+            pagePointerEvents = text;
+            // Only the page's own box reads it (`PageWindow`, which every change draws again), as Radix sets it each time a
+            // modal opens or closes: nothing else is drawn again for it.
+            restyled();
+        }
+    },
+    enumerable: true,
+    configurable: true,
+});
+
+/// What React's `style` doesn't put `px` after, as it's a number of nothing.
+const UNITLESS = new Set(['opacity', 'zIndex', 'flex', 'flexGrow', 'flexShrink', 'flexOrder', 'order', 'fontWeight', 'lineHeight', 'zoom', 'scale',
+    'gridRow', 'gridColumn', 'gridRowStart', 'gridRowEnd', 'gridColumnStart', 'gridColumnEnd', 'columnCount', 'tabSize', 'orphans', 'widows',
+    'fillOpacity', 'strokeOpacity', 'stopOpacity', 'floodOpacity', 'strokeWidth', 'aspectRatio', 'animationIterationCount']);
+const kebabOf = (name) => (name.startsWith('--') ? name : name.replace(/^(webkit|moz|ms)([A-Z])/, '-$1$2').replace(/[A-Z]/g, (letter) => '-' + letter.toLowerCase()));
+const camelOf = (name) => (name.startsWith('--') ? name : name.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()));
+
+/// An element's `style`, as a page has it: what's written on the element, which is what React's `style` prop says, with what code
+/// has set over it, which is drawn from then on. `owner` is what's told when it changes, or nothing, for what isn't drawn.
+class PageStyleDeclaration {
+    constructor(owner = null) {
+        Object.defineProperty(this, '__owner', { value: owner, writable: true });
+        Object.defineProperty(this, '__set', { value: new Map(), writable: true });
+    }
+    /// What React's `style` says, as names and values CSS would have.
+    __fromProps() {
+        const out = new Map();
+        // A page's element keeps React's `style` apart from what else it was given (see `styleProp`).
+        const live = this.__owner?.live;
+        const given = live?.styleProp !== undefined ? live.styleProp : live?.given?.style;
+        if (given !== null && typeof given === 'object') {
+            for (const [name, value] of Object.entries(given)) {
+                if (value === undefined || value === null || value === '' || typeof value === 'boolean') {
+                    continue;
+                }
+                out.set(kebabOf(name), typeof value === 'number' && value !== 0 && !UNITLESS.has(name) && !name.startsWith('--') ? value + 'px' : String(value));
+            }
+        }
+        return out;
+    }
+    __all() {
+        const all = this.__fromProps();
+        for (const [name, [value]] of this.__set) {
+            if (value === null) {
+                all.delete(name);
+            } else {
+                all.set(name, value);
+            }
+        }
+        return all;
+    }
+    __changed() {
+        this.__owner?.changed?.();
+    }
+    setProperty(name, value, priority = '') {
+        const key = String(name).startsWith('--') ? String(name) : String(name).toLowerCase();
+        const text = value === null || value === undefined ? '' : String(value).trim();
+        if (text === '') {
+            this.removeProperty(key);
+            return;
+        }
+        const was = this.__set.get(key);
+        if (was?.[0] === text && was?.[1] === String(priority)) {
+            return;
+        }
+        this.__set.set(key, [text, String(priority)]);
+        this.__changed();
+    }
+    getPropertyValue(name) {
+        return this.__all().get(String(name).startsWith('--') ? String(name) : String(name).toLowerCase()) ?? '';
+    }
+    getPropertyPriority(name) {
+        return this.__set.get(String(name).toLowerCase())?.[1] ?? '';
+    }
+    removeProperty(name) {
+        const key = String(name).startsWith('--') ? String(name) : String(name).toLowerCase();
+        const before = this.getPropertyValue(key);
+        if (before === '') {
+            return '';
+        }
+        // What React's `style` says is taken off too, until React says it again.
+        this.__set.set(key, [null, '']);
+        this.__changed();
+        return before;
+    }
+    get cssText() {
+        return [...this.__all()].map(([name, value]) => name + ': ' + value + ';').join(' ');
+    }
+    set cssText(text) {
+        this.__set = new Map([...this.__fromProps().keys()].map((name) => [name, [null, '']]));
+        for (const part of cssDeclarations(String(text ?? ''))) {
+            const colon = part.indexOf(':');
+            if (colon > 0) {
+                const name = part.slice(0, colon).trim();
+                const value = part.slice(colon + 1).trim();
+                const important = /!important$/i.test(value);
+                if (value !== '') {
+                    this.__set.set(name.startsWith('--') ? name : name.toLowerCase(), [important ? value.replace(/\s*!important$/i, '') : value, important ? 'important' : '']);
+                }
+            }
+        }
+        this.__changed();
+    }
+    get length() {
+        return this.__all().size;
+    }
+    item(at) {
+        return [...this.__all().keys()][at] ?? '';
+    }
+    /// What code has set, as React's `style` would have it, to go over what React says.
+    __asProps() {
+        const out = {};
+        for (const [name, [value]] of this.__set) {
+            if (value !== null) {
+                out[camelOf(name)] = value;
+            }
+        }
+        return out;
+    }
+    /// What code has taken off of React's `style`.
+    __removed() {
+        return [...this.__set].filter(([, [value]]) => value === null).map(([name]) => camelOf(name));
+    }
+    [Symbol.iterator]() {
+        return this.__all().keys();
+    }
+}
+
+/// What's between the `;`s of a `style`, apart from those in brackets, as in `url(data:image/png;base64,...)`.
+function cssDeclarations(text) {
+    const parts = [];
+    let depth = 0;
+    let start = 0;
+    for (let at = 0; at <= text.length; at += 1) {
+        const letter = text[at];
+        if (letter === '(') {
+            depth += 1;
+        } else if (letter === ')') {
+            depth -= 1;
+        } else if ((letter === ';' && depth === 0) || at === text.length) {
+            parts.push(text.slice(start, at));
+            start = at + 1;
+        }
+    }
+    return parts;
+}
+
+/// An element's `style`, with each property by its own name too, as `element.style.opacity = '1'` has it.
+function styleFor(owner) {
+    const declaration = new PageStyleDeclaration(owner);
+    return new Proxy(declaration, {
+        get(target, key) {
+            if (typeof key === 'symbol' || key in target) {
+                const value = target[key];
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+            return target.getPropertyValue(kebabOf(String(key)));
+        },
+        set(target, key, value) {
+            if (typeof key === 'symbol' || key === 'cssText' || key in PageStyleDeclaration.prototype) {
+                target[key] = value;
+            } else {
+                target.setProperty(kebabOf(String(key)), value);
+            }
+            return true;
+        },
+        has: (target, key) => typeof key === 'symbol' || key in target || target.getPropertyValue(kebabOf(String(key))) !== '',
+    });
+}
+
+/// Says to Rust that an element whose `style` code has just given `animation-name: none` (or `animation: none`) is to be measured
+/// with no animation until it's drawn again, and that it isn't once that's taken back. A page works out its style before it says
+/// where anything is, so Radix Collapsible, which does this for a moment in a layout effect, measures its content at its full
+/// height, not at the `height: 0` its opening animation starts from. `getComputedStyle()` says `none` meanwhile.
+function stillForReads(live, style) {
+    const key = live.domKey;
+    if (key === undefined) {
+        return;
+    }
+    const name = style.getPropertyValue('animation-name');
+    const stilled = name === 'none' || (name === '' && style.getPropertyValue('animation') === 'none');
+    if (stilled && typeof live.placedAnimation === 'string' && live.stillSaid !== true) {
+        const moved = [];
+        const base = {};
+        for (const line of live.placedAnimation.split('\n').slice(1)) {
+            const prop = line.split(' ')[1];
+            if (prop !== undefined && !moved.includes(prop)) {
+                moved.push(prop);
+                if (live.placedOut?.[prop] !== undefined) {
+                    base[prop] = live.placedOut[prop];
+                }
+            }
+        }
+        live.stillSaid = true;
+        rsuiHostMethods.stillNow(key, moved, base);
+    } else if (!stilled && live.stillSaid === true) {
+        live.stillSaid = false;
+        rsuiHostMethods.stillNow(key);
+    }
+}
+
+/// The animation an element plays as its style is now, as `getComputedStyle()` says it: what its `style` says now, which code may
+/// have changed since it was drawn, over what CSS gives it. Radix Collapsible writes `animation-name: none` while it measures and
+/// takes it back, and Presence then reads the closing animation's name, and waits for it to end.
+function computedAnimationName(live) {
+    if (live === undefined) {
+        return 'none';
+    }
+    const style = live.styleDeclaration;
+    if (style !== undefined) {
+        const name = style.getPropertyValue('animation-name');
+        if (name !== '') {
+            return name;
+        }
+        const shorthand = style.getPropertyValue('animation');
+        if (shorthand !== '') {
+            return animationOf({ __animation: shorthand }).name;
+        }
+    }
+    if (live.cssAnimationName !== undefined) {
+        // It was drawn with one written on it, which has been taken off since.
+        return live.cssAnimationName;
+    }
+    return live.animationName ?? 'none';
+}
+
+/// What has the pointer, as `setPointerCapture()` says: the element's key (or the element, for one with none), the element, the
+/// pointer's id, and whether it's been told (`gotpointercapture`). Radix's Slider follows the pointer only while
+/// `hasPointerCapture()` says the thumb or track it went down on has it, and vaul's drawer has its Cancel button's click by it.
+/// Rust sends what the pointer does to it until the button comes up (`capture_pointer` in app.rs), and it's let go once that's
+/// been heard, as in a browser: `gotpointercapture` before the next pointer event, `lostpointercapture` after `pointerup`.
+let pointerCapture = null;
+const captureKey = (element) => element?.__domKey ?? element;
+const pointerCaptureMethods = {
+    setPointerCapture(id) {
+        if (pointerCapture !== null && pointerCapture.key === captureKey(this)) {
+            return;
+        }
+        if (pointerCapture?.told === true) {
+            capturedEvent('lostpointercapture');
+        }
+        pointerCapture = { key: captureKey(this), element: this, id, told: false };
+        listenOn('window', 'pointerup', captureReleased, { __last: true });
+        const key = this.__domKey;
+        if (typeof key === 'string') {
+            rsuiHostMethods.capturePointer?.(key);
+        }
+    },
+    releasePointerCapture() {
+        if (pointerCapture !== null && pointerCapture.key === captureKey(this)) {
+            if (pointerCapture.told) {
+                capturedEvent('lostpointercapture');
+            }
+            pointerCapture = null;
+            unlistenOn('window', 'pointerup', captureReleased);
+            rsuiHostMethods.capturePointer?.(null);
+        }
+    },
+    hasPointerCapture(id) {
+        return pointerCapture !== null && pointerCapture.key === captureKey(this) && (id === undefined || pointerCapture.id === id);
+    },
+};
+
+/// `gotpointercapture` or `lostpointercapture`, to what has the pointer.
+function capturedEvent(type) {
+    const { element, id } = pointerCapture;
+    // What's no longer on the page isn't told, as a browser's capture goes with an element that's taken out.
+    if (!inPageNow(element)) {
+        return;
+    }
+    const { PointerEvent } = domEvents();
+    const made = new PointerEvent(type, { bubbles: true, composed: true, pointerId: id, pointerType: 'mouse', isPrimary: true, view: globalThis });
+    made.isTrusted = true;
+    dispatchOn(element, made);
+}
+
+/// What has the pointer is told it has, before the pointer event that follows asking for it, as a browser's "process pending pointer
+/// capture" has it.
+function tellCaptureGot() {
+    if (pointerCapture !== null && !pointerCapture.told) {
+        pointerCapture.told = true;
+        capturedEvent('gotpointercapture');
+    }
+}
+
+/// The button's come up and that's been heard, so the pointer's let go, as a mouse's is (Pointer Events 3, "implicit release").
+function tellCaptureLost() {
+    if (pointerCapture === null) {
+        return;
+    }
+    if (pointerCapture.told) {
+        capturedEvent('lostpointercapture');
+    }
+    pointerCapture = null;
+    unlistenOn('window', 'pointerup', captureReleased);
+}
+
+// Implicit capture release follows the last pointerup's dispatch even when no click or compatibility mouse event follows.
+function captureReleased(event) {
+    if (event.buttons === 0) {
+        tellCaptureLost();
+    }
+}
+
+const fakeElement = () => ({
+    nodeType: 1,
+    // What it's part of, which `page` is, once it's been made.
+    get ownerDocument() {
+        return globalThis.document;
+    },
+    style: {},
+    classList: classList(new Set()),
+    dataset: {},
+    children: [],
+    shadowRoot: null,
+    setAttribute() {},
+    getAttribute: () => null,
+    removeAttribute() {},
+    addEventListener() {},
+    removeEventListener() {},
+    ...pointerCaptureMethods,
+    // What code puts in an element, which is drawn after what React put there: see `dom.js`.
+    appendChild(child) {
+        return domPack().insert(this, child, null);
+    },
+    insertBefore(child, before) {
+        return domPack().insert(this, child, before ?? null);
+    },
+    removeChild(child) {
+        return domPack().nodeMethods.removeChild.call(this, child);
+    },
+    replaceChild(child, old) {
+        return domPack().nodeMethods.replaceChild.call(this, child, old);
+    },
+    append(...nodes) {
+        domPack().elementMethods.append.call(this, ...nodes);
+    },
+    prepend(...nodes) {
+        domPack().elementMethods.prepend.call(this, ...nodes);
+    },
+    replaceChildren(...nodes) {
+        domPack().elementMethods.replaceChildren.call(this, ...nodes);
+    },
+    remove() {},
+    focus() {},
+    blur() {},
+    click() {},
+    play: () => Promise.resolve(),
+    pause() {},
+    load() {},
+    canPlayType: () => '',
+    contains: () => false,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getBoundingClientRect: () => ({ x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }),
+});
+
+// What's listened for on `body` and the page's root element is heard as `document` hears it, which is as near as it comes.
+const listensAsDocument = {
+    addEventListener: (type, listener, options) => listenOn('document', String(type), listener, options),
+    removeEventListener: (type, listener, options) => unlistenOn('document', String(type), listener, options),
+};
+const body = { ...fakeElement(), ...listensAsDocument, tagName: 'BODY', nodeName: 'BODY', localName: 'body', classList: classList(pageClasses), style: pageStyle, contains: (other) => other !== null && other !== undefined };
+const documentElement = { ...fakeElement(), ...listensAsDocument, tagName: 'HTML', nodeName: 'HTML', localName: 'html', classList: classList(pageClasses), style: pageStyle, contains: (other) => other !== null && other !== undefined };
+body.dispatchEvent = (event) => dispatchOnPage(body, event);
+
+/// Whether `body` or `html` is what a selector says, for `matches()` and `closest()`, as Base UI's `closest(target, 'a')` asks of
+/// everything up from what was clicked: its tag, `:root`, its id, classes and attributes. A selector about what it's in or comes
+/// after only says `html` for `body`.
+const PAGE_COMPOUND = /^(\*|[a-zA-Z][\w-]*)?((?:#[\w-]+|\.[\w-]+|\[[^\]]+\]|:[\w-]+)*)$/;
+function pageElementMatches(element, selector) {
+    for (const whole of commas(String(selector))) {
+        const parts = whole.trim().split(/\s*[\s>]\s*/);
+        const last = parts.pop();
+        if (parts.length > 1 || (parts.length === 1 && !(element === body && pageElementMatches(documentElement, parts[0])))) {
+            continue;
+        }
+        const found = PAGE_COMPOUND.exec(last);
+        if (found === null) {
+            continue;
+        }
+        const [, tag, rest] = found;
+        if (tag !== undefined && tag !== '*' && tag.toLowerCase() !== element.localName) {
+            continue;
+        }
+        const each = rest.match(/#[\w-]+|\.[\w-]+|\[[^\]]+\]|:[\w-]+/g) ?? [];
+        const attribute = (name) => element.getAttribute?.(name) ?? null;
+        const all = each.every((one) => {
+            if (one.startsWith('#')) {
+                return attribute('id') === one.slice(1);
+            }
+            if (one.startsWith('.')) {
+                return element.classList.contains(one.slice(1));
+            }
+            if (one.startsWith(':')) {
+                return one === ':root' ? element === documentElement : one === ':scope';
+            }
+            const [, name, op, quoted] = /^\[\s*([\w-]+)\s*(?:([~|^$*]?=)\s*(.*?))?\s*\]$/.exec(one) ?? [];
+            if (name === undefined) {
+                return false;
+            }
+            const value = attribute(name);
+            if (op === undefined) {
+                return value !== null;
+            }
+            const wanted = quoted.replace(/^(['"])(.*)$/, '$2');
+            if (value === null) {
+                return false;
+            }
+            return { '=': value === wanted, '~=': value.split(/\s+/).includes(wanted), '|=': value === wanted || value.startsWith(wanted + '-'), '^=': value.startsWith(wanted), '$=': value.endsWith(wanted), '*=': value.includes(wanted) }[op];
+        });
+        if (all) {
+            return true;
+        }
+    }
+    return false;
+}
+for (const element of [body, documentElement]) {
+    element.matches = element.webkitMatchesSelector = (selector) => pageElementMatches(element, selector);
+}
+body.closest = (selector) => (pageElementMatches(body, selector) ? body : pageElementMatches(documentElement, selector) ? documentElement : null);
+documentElement.closest = (selector) => (pageElementMatches(documentElement, selector) ? documentElement : null);
+// What's in `body` is what's on the page, and `html` has `head` and `body`, as a page does.
+const pageChildren = () => {
+    const tree = pageTree();
+    return tree === null ? [] : tree.root.children.map(elementOf);
+};
+/// What's in `body`: what the app drew, then what code put in it with `appendChild()` and the like, as Radix's focus guards and
+/// a library's own popups are, which are drawn after it (see `PageWindow`).
+const pageDrawnChildren = () => pageChildren().filter((one) => one.__own !== true);
+const bodyChildren = () => {
+    const own = body.__kids;
+    return own === undefined || own.length === 0 ? pageChildren() : [...pageDrawnChildren(), ...own];
+};
+const bodyElements = () => bodyChildren().filter((one) => one.nodeType === undefined || one.nodeType === 1);
+Object.defineProperties(body, {
+    children: { get: () => elementList(bodyElements()), configurable: true },
+    childNodes: { get: () => elementList(bodyChildren()), configurable: true },
+    firstElementChild: { get: () => bodyElements()[0] ?? null, configurable: true },
+    lastElementChild: { get: () => bodyElements().at(-1) ?? null, configurable: true },
+    firstChild: { get: () => bodyChildren()[0] ?? null, configurable: true },
+    lastChild: { get: () => bodyChildren().at(-1) ?? null, configurable: true },
+    childElementCount: { get: () => bodyElements().length, configurable: true },
+    // For `rsui/dom`, which puts what code adds after these, as it does in any element React drew in.
+    __drawnChildren: { value: pageDrawnChildren, configurable: true, enumerable: false },
+    // Drawn again when code changes what's in it.
+    __redrawPage: { value: () => bodyRedraw?.(), configurable: true, enumerable: false },
+    parentElement: { get: () => documentElement, configurable: true },
+    parentNode: { get: () => documentElement, configurable: true },
+    previousElementSibling: { get: () => head, configurable: true },
+    nextElementSibling: { get: () => null, configurable: true },
+    // Its text nodes' as React gave them, as an element's are, not as they're shown: `text-transform` doesn't change it.
+    textContent: { get: () => bodyText(), configurable: true },
+    nodeType: { value: 1, configurable: true },
+});
+function bodyText() {
+    const nodes = bodyChildren();
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+        return (pageTree()?.texts ?? []).join('');
+    }
+    let out = '';
+    for (const node of nodes) {
+        if (node?.nodeType === 3) {
+            out += node.data ?? '';
+        } else if (node?.nodeType === 1) {
+            out += node.textContent ?? '';
+        }
+    }
+    return out;
+}
+body.contains = (other) => other === body || (other !== null && other !== undefined && other !== documentElement && other !== page && (other.isConnected ?? true));
+body.querySelector = (selector) => selected(selector, true).find((one) => one !== head && one !== body && one !== documentElement) ?? null;
+body.querySelectorAll = (selector) => selected(selector, false).filter((one) => one !== head && one !== body && one !== documentElement);
+Object.defineProperties(documentElement, {
+    children: { get: () => elementList([head, body]), configurable: true },
+    firstElementChild: { get: () => head, configurable: true },
+    lastElementChild: { get: () => body, configurable: true },
+    childElementCount: { get: () => 2, configurable: true },
+    parentElement: { get: () => null, configurable: true },
+    parentNode: { get: () => globalThis.document, configurable: true },
+});
+documentElement.dispatchEvent = (event) => dispatchOnPage(documentElement, event);
+body.focus = () => moveFocus(null, false);
+// The page is as big as the window, and scrolls as the window's scrolling area does, which is the document's.
+for (const whole of [documentElement, body]) {
+    // What's set on it is what selectors about it look at, as `[data-theme=dark] .x` does: see `keepsPageAttributes`.
+    keepsPageAttributes(whole);
+    const scrolled = () => pageScrollState();
+    Object.defineProperties(whole, {
+        // What shows of the page, which is the window until it's been laid out, rather than nothing: floating-ui's `flip` and
+        // `shift` keep what they place inside this, and moved Mantine's tooltip over what it's for when it was 0.
+        clientWidth: { get: () => pageView()[0], configurable: true },
+        clientHeight: { get: () => pageView()[1], configurable: true },
+        scrollWidth: { get: () => Math.max(scrolled().width, globalThis.innerWidth ?? 0), configurable: true },
+        scrollHeight: { get: () => Math.max(scrolled().height, globalThis.innerHeight ?? 0), configurable: true },
+        offsetWidth: { get: () => globalThis.innerWidth ?? 0, configurable: true },
+        offsetHeight: { get: () => globalThis.innerHeight ?? 0, configurable: true },
+        // The page's scroll is the document's (`document.scrollingElement` is `<html>`): `<body>` says 0 and setting it does
+        // nothing, as in a browser's standards mode.
+        scrollTop: whole === body ? { get: () => 0, set: () => {}, configurable: true } : { get: () => pageScrollOffsets().y, set: (value) => pageScrollTo(undefined, value), configurable: true },
+        scrollLeft: whole === body ? { get: () => 0, set: () => {}, configurable: true } : { get: () => pageScrollOffsets().x, set: (value) => pageScrollTo(value, undefined), configurable: true },
+        // The document it's in, which is the one there is now, rather than whatever there was when it was made, and no border, as
+        // Floating UI takes away to know where a dropdown goes.
+        ownerDocument: { get: () => globalThis.document, configurable: true },
+        clientLeft: { get: () => 0, configurable: true },
+        clientTop: { get: () => 0, configurable: true },
+    });
+    // It's an `HTMLElement`, as on a page, which is how code tells an element from the window.
+    Object.setPrototypeOf(whole, elementClasses.HTMLElement.prototype);
+    whole.scrollTo = pageScrollTo;
+    whole.scroll = pageScrollTo;
+    whole.scrollBy = pageScrollBy;
+    whole.getBoundingClientRect = () => ({ x: 0, y: 0, left: 0, top: 0, right: globalThis.innerWidth ?? 0, bottom: globalThis.innerHeight ?? 0, width: globalThis.innerWidth ?? 0, height: globalThis.innerHeight ?? 0 });
+}
+// The window's scrolling is `<html>`'s, as `document.scrollingElement` says in a page with a doctype: `<body>` isn't scrolled itself,
+// so its `scrollTop` is 0 and setting it does nothing, as in Edge and Chrome.
+Object.defineProperties(body, {
+    scrollTop: { get: () => 0, set: () => {}, configurable: true },
+    scrollLeft: { get: () => 0, set: () => {}, configurable: true },
+});
+// `<body>` is as tall as what's in it, inside its margins, rather than the window, and moves up as the page is scrolled, as on a
+// page: a short page's body ends where its content does.
+body.getBoundingClientRect = () => {
+    const { x: scrollX, y: scrollY } = pageScrollState();
+    const [shownWidth] = pageView();
+    const styleOf = (element) => {
+        try {
+            return globalThis.getComputedStyle?.(element) ?? null;
+        } catch {
+            return null;
+        }
+    };
+    const style = styleOf(body);
+    const margin = (side) => parseFloat(style?.['margin' + side]) || 0;
+    const x = margin('Left') - scrollX;
+    const y = margin('Top') - scrollY;
+    // Down to the bottom of the last thing in the flow of the page, with its margin: what's fixed or absolute takes no room.
+    let bottom = y;
+    for (const child of body.children) {
+        const box = child.getBoundingClientRect?.();
+        if (box === undefined || (box.width === 0 && box.height === 0)) {
+            continue;
+        }
+        const own = styleOf(child);
+        if (own?.position === 'fixed' || own?.position === 'absolute') {
+            continue;
+        }
+        bottom = Math.max(bottom, box.bottom + (parseFloat(own?.marginBottom) || 0));
+    }
+    const width = Math.max(0, shownWidth - margin('Left') - margin('Right'));
+    const height = bottom - y;
+    return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON() { return { x, y, width, height, top: y, right: x + width, bottom: y + height, left: x }; } };
+};
+// `<html>` is as wide as what shows of the page, as tall as all of it, and moves up as the page is scrolled down, as on a page:
+// floating-ui takes where it is away from where a popover's button is, plus how far the page is scrolled (`getHTMLOffset`), to
+// place a dropdown that's `position: absolute` in the page. Always at the top, it put Mantine's dropdowns where they'd be in the
+// window, which in the page was as far off as the page had been scrolled, and had every one placed again on every frame of
+// scrolling.
+documentElement.getBoundingClientRect = () => {
+    const { x, y, height } = pageScrollState();
+    const [width, shown] = pageView();
+    const tall = Math.max(height, shown);
+    return { x: -x, y: -y, left: -x, top: -y, right: width - x, bottom: tall - y, width, height: tall, toJSON() { return { x: -x, y: -y, width, height: tall, top: -y, right: width - x, bottom: tall - y, left: -x }; } };
+};
+
+/// What's attributes on what `document.createElement()` makes, which `setAttribute()` sets, and selectors look at.
+function keepsAttributes(made) {
+    const attributes = new Map();
+    made.setAttribute = (name, value) => {
+        attributes.set(String(name).toLowerCase(), String(value));
+        if (String(name).toLowerCase() === 'id') {
+            made.id = String(value);
+        }
+        if (String(name).toLowerCase() === 'class') {
+            made.className = String(value);
+        }
+        made.__attributesChanged?.(String(name).toLowerCase());
+    };
+    made.getAttribute = (name) => {
+        const key = String(name).toLowerCase();
+        if (attributes.has(key)) {
+            return attributes.get(key);
+        }
+        const own = { class: made.className, id: made.id }[key] ?? made[key];
+        return typeof own === 'string' && own !== '' ? own : null;
+    };
+    made.hasAttribute = (name) => made.getAttribute(name) !== null;
+    made.removeAttribute = (name) => {
+        attributes.delete(String(name).toLowerCase());
+        made.__attributesChanged?.(String(name).toLowerCase());
+    };
+    made.__attributes = attributes;
+}
+
+/// What `document.createElement()` makes, which isn't drawn, as there's nowhere for it to go, apart from a `<style>`, whose CSS
+/// is the page's while it's in `<head>`, and a `<link rel="stylesheet">`, whose file's is.
+function madeElement(tag) {
+    const lower = tag.toLowerCase();
+    const upper = tag.toUpperCase();
+    const made = { ...fakeElement(), tagName: upper, nodeName: upper, localName: lower, id: '', className: '', parentNode: null, parentElement: null };
+    made.style = styleFor(null);
+    Object.setPrototypeOf(made, prototypeFor(lower));
+    keepsAttributes(made);
+    // What's listened for on it is heard, as its `load` is.
+    delete made.addEventListener;
+    delete made.removeEventListener;
+    made.remove = () => made.parentNode?.removeChild?.(made);
+    for (const [name, by] of [['nextSibling', 1], ['previousSibling', -1], ['nextElementSibling', 1], ['previousElementSibling', -1]]) {
+        Object.defineProperty(made, name, {
+            get() {
+                if (made.parentNode !== head) {
+                    return null;
+                }
+                const children = headChildren();
+                return children[children.indexOf(made) + by] ?? null;
+            },
+            configurable: true,
+        });
+    }
+    if (lower === 'style') {
+        // What it says is one of the page's sheets while it's in `<head>`: see `styleElement`.
+        styleElement(made);
+    }
+    if (lower === 'link') {
+        made.__attributesChanged = () => {
+            if (made.__added !== undefined) {
+                headChanged();
+            }
+        };
+        for (const name of ['rel', 'href', 'media', 'as', 'type', 'crossOrigin']) {
+            Object.defineProperty(made, name, {
+                get: () => made.getAttribute(name) ?? '',
+                set: (value) => made.setAttribute(name, value),
+                enumerable: true,
+                configurable: true,
+            });
+        }
+    }
+    return made;
+}
+
+/// What's in `<head>`, in order, as the page has it. CSS that's imported is where a bundler would have put its `<style>` for it,
+/// which is at the end of `<head>` when it's imported, but isn't one of its children, as it isn't something the page made.
+const headNodes = [];
+
+/// What CSS is in `<head>`: a `<style>`, or a `<link rel="stylesheet">` to a file of the app's, which is read then.
+function headCss(node) {
+    if (node.tagName === 'STYLE') {
+        return { text: node.textContent ?? '', from: undefined };
+    }
+    if (node.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(node.getAttribute('rel') ?? '')) {
+        const href = node.getAttribute('href') ?? '';
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(href) && !href.startsWith('file:')) {
+            notHere('A stylesheet from ' + href);
+            return null;
+        }
+        const path = require('path');
+        const file = href.startsWith('file:') ? require('url').fileURLToPath(href) : path.resolve(path.dirname(rsuiHostMethods.appFile()), href.replace(/^\//, ''));
+        try {
+            return { text: require('fs').readFileSync(file, 'utf8'), from: file };
+        } catch {
+            return { text: null, from: file };
+        }
+    }
+    return null;
+}
+
+/// Puts what's in `<head>` into the cascade in the order it's there, which is how much each sheet counts: see `sheets`. With
+/// `nodes`, that's only what's just been put in, and only their sheets are read and placed: what was there already stays as it was.
+function headChanged(nodes = null) {
+    let added = false;
+    const fresh = [];
+    for (const node of nodes ?? headNodes) {
+        if (node.__virtual === true) {
+            continue;
+        }
+        const css = headCss(node);
+        if (node.__added !== undefined && (css === null || node.__added.from !== css.from || (css.from !== undefined && node.__added.text !== css.text))) {
+            addedCss.splice(addedCss.indexOf(node.__added), 1);
+            dropSheet(node.__added.sheet);
+            node.__added = undefined;
+        }
+        if (node.__added === undefined && css !== null) {
+            // What a `<style>` the page made says is as it is, as a browser has it, rather than what the app's CSS tools would
+            // make of it, as they only see what's imported, and a file a `<link>` gives.
+            const one = { sheet: sheetInHead(node), text: css.text ?? '', place: cssPlace(css.from), made: null, from: css.from, built: css.from !== undefined };
+            if (node.tagName === 'STYLE') {
+                // What it says is what it says now, however that's been put together: see `styleElement`.
+                one.node = node;
+            }
+            addedCss.push(one);
+            node.__added = one;
+            fresh.push(one);
+            added ||= one.built;
+            if (node.tagName === 'LINK') {
+                // A stylesheet says whether it could be read once what's running now has finished, as a page's does.
+                queueMicrotask(() => {
+                    const event = elementEvent(css.text === null ? 'error' : 'load', node);
+                    node.dispatchEvent?.(event);
+                    (css.text === null ? node.onerror : node.onload)?.call(node, event);
+                });
+            }
+        }
+    }
+    if (nodes === null) {
+        // What's in `<head>` counts in the order it's there, among the sheets it has: the rest stay where they are.
+        const inHead = headNodes.map((node) => node.__added?.sheet).filter((one) => one !== undefined);
+        const counted = new Set(inHead);
+        const slots = [];
+        sheets.forEach((one, at) => {
+            if (counted.has(one)) {
+                slots.push(at);
+            }
+        });
+        slots.forEach((at, index) => {
+            if (sheets[at] !== inHead[index]) {
+                // What both are about comes out in another order.
+                for (const key of [...(sheets[at].keys ?? ['*']), ...(inHead[index].keys ?? ['*'])]) {
+                    restyleKey(key);
+                }
+                sheets[at] = inHead[index];
+                sheetsShape += 1;
+            }
+        });
+    }
+    if (added) {
+        // What the app's tools make of it is made once something's next drawn.
+        loadedSeen = -1;
+    }
+    // Only what's new is read: what was there already says what it said.
+    for (const one of fresh) {
+        refillSheet(one);
+    }
+    restyled();
+}
+
+/// Takes something out of `<head>`, if it's there.
+function leaveHead(node) {
+    const at = headNodes.indexOf(node);
+    if (at < 0) {
+        return false;
+    }
+    headNodes.splice(at, 1);
+    if (node.__added !== undefined) {
+        addedCss.splice(addedCss.indexOf(node.__added), 1);
+        dropSheet(node.__added.sheet);
+        node.__added = undefined;
+    }
+    if (node.__virtual !== true) {
+        node.parentNode = node.parentElement = null;
+    }
+    return true;
+}
+
+/// Puts things in `<head>` before `before`, or at the end, as `insertBefore()`, `prepend()` and `append()` do.
+function intoHead(nodes, before) {
+    const fragment = nodes.flatMap((node) => (node?.nodeType === 11 ? [...(node.childNodes ?? [])] : [node]));
+    for (const node of fragment) {
+        if (node === null || node === undefined || typeof node !== 'object') {
+            continue;
+        }
+        node.parentNode?.removeChild?.(node);
+        leaveHead(node);
+    }
+    const at = before === null || before === undefined ? headNodes.length : headNodes.indexOf(before);
+    if (at < 0) {
+        throw Object.assign(new Error("Failed to execute 'insertBefore' on 'Node': The node before which the new node is to be inserted is not a child of this node."), { name: 'NotFoundError' });
+    }
+    const placed = fragment.filter((node) => node !== null && node !== undefined && typeof node === 'object');
+    headNodes.splice(at, 0, ...placed);
+    for (const node of placed) {
+        node.parentNode = node.parentElement = head;
+    }
+    const sheetsPlaced = placed.filter((node) => node.tagName === 'STYLE' || node.tagName === 'LINK');
+    if (sheetsPlaced.length > 0) {
+        headChanged(sheetsPlaced);
+    }
+}
+
+/// What's in `<head>` that the page put there.
+const headChildren = () => headNodes.filter((node) => node.__virtual !== true);
+
+/// What's in `<head>` that a selector says, as it says it, in order: what it is, its id, its classes and its attributes.
+function headSelected(selector, first) {
+    const steps = querySteps(String(selector));
+    const out = [];
+    const above = [pageElement(), { tag: 'head', id: undefined, classes: [], props: {}, state: 0, nth: null, prevs: [], kind: 'element' }];
+    const children = headChildren();
+    const describeHead = (node, index) => {
+        const props = Object.fromEntries(node.__attributes ?? []);
+        if (props.class !== undefined) {
+            props.className = props.class;
+        }
+        return { tag: node.localName, id: node.id || undefined, classes: classesOf(node.className), props, state: 0, empty: false, kind: 'element', nth: { index, count: children.length, typeIndex: 0, typeCount: 1 }, prevs: [] };
+    };
+    for (const [index, node] of children.entries()) {
+        const own = describeHead(node, index);
+        if (steps.some((one) => matchAll(one, one.length - 1, own, above))) {
+            out.push(node);
+            if (first) {
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+const head = {
+    ...fakeElement(),
+    tagName: 'HEAD',
+    nodeName: 'HEAD',
+    localName: 'head',
+    appendChild(child) {
+        intoHead([child], null);
+        return child;
+    },
+    append(...children) {
+        intoHead(children, null);
+    },
+    prepend(...children) {
+        intoHead(children, headNodes[0] ?? null);
+    },
+    insertBefore(child, before) {
+        intoHead([child], before ?? null);
+        return child;
+    },
+    replaceChild(child, old) {
+        intoHead([child], old);
+        head.removeChild(old);
+        return old;
+    },
+    removeChild(child) {
+        if (leaveHead(child)) {
+            restyled();
+        }
+        return child;
+    },
+    contains: (other) => other === head || headNodes.includes(other),
+    querySelector: (selector) => headSelected(selector, true)[0] ?? null,
+    querySelectorAll: (selector) => headSelected(selector, false),
+    getElementsByTagName: (name) => headSelected(String(name), false),
+    get children() {
+        return headChildren();
+    },
+    get childNodes() {
+        return headChildren();
+    },
+    get firstChild() {
+        return headChildren()[0] ?? null;
+    },
+    get firstElementChild() {
+        return headChildren()[0] ?? null;
+    },
+    get lastChild() {
+        return headChildren().at(-1) ?? null;
+    },
+    get lastElementChild() {
+        return headChildren().at(-1) ?? null;
+    },
+    get childElementCount() {
+        return headChildren().length;
+    },
+};
+
+const page = {
+    body,
+    documentElement,
+    // What scrolls the page, which is `<html>` in standards mode, as `body.scrollTop` is 0 there.
+    get scrollingElement() {
+        return documentElement;
+    },
+    get defaultView() {
+        return globalThis;
+    },
+    get location() {
+        return globalThis.location;
+    },
+    get URL() {
+        return here().url;
+    },
+    get baseURI() {
+        return here().url;
+    },
+    referrer: '',
+    readyState: 'complete',
+    // What a page written now starts with, `<!doctype html>`.
+    doctype: { name: 'html', nodeType: 10, publicId: '', systemId: '' },
+    compatMode: 'CSS1Compat',
+    head,
+    hidden: false,
+    visibilityState: 'visible',
+    get title() {
+        return rsui.mainWindow.getState().title;
+    },
+    set title(value) {
+        rsui.mainWindow.setTitle(String(value));
+    },
+    addEventListener: (type, listener, options) => listenOn('document', String(type), listener, options),
+    removeEventListener: (type, listener, options) => unlistenOn('document', String(type), listener, options),
+    dispatchEvent: (event) => dispatchOnPage(page, event),
+    get activeElement() {
+        return activeElementNow();
+    },
+    get designMode() {
+        return editingLoaded?.designMode ?? 'off';
+    },
+    set designMode(value) {
+        editingPack().designMode = value;
+    },
+    hasFocus: () => !keyboardOut,
+    getAnimations: () => movingOnPage(),
+    nodeType: 9,
+    // The top of the tree, as a browser's `document` is: what walks up `parentNode` until `null` (react-remove-scroll's
+    // `getOutermostShadowParent`, on every wheel in a drawer) stops here.
+    nodeName: '#document',
+    parentNode: null,
+    parentElement: null,
+    getSelection: () => domPack().selection,
+    // What's in `<head>` is still what it was; anything else is a node of the page's DOM: see `dom.js`.
+    createElement: (tag) => (HEAD_TAGS.has(String(tag).toLowerCase()) ? madeElement(String(tag)) : domPack().makeElement(String(tag))),
+    createElementNS: (space, tag) => (HEAD_TAGS.has(String(tag).toLowerCase()) ? madeElement(String(tag)) : domPack().makeElement(String(tag), space === 'http://www.w3.org/2000/svg' ? space : null)),
+    createTextNode: (text) => domPack().makeText(String(text)),
+    createComment: (text) => domPack().makeComment(String(text)),
+    createDocumentFragment: () => domPack().makeFragment(),
+    createRange: () => new (domPack().Range)(),
+    // Documents apart from this one, as editors make to read HTML into without it running or showing.
+    implementation: {
+        createHTMLDocument: (title = '') => new (domPack().ParsedDocument)(`<title>${String(title)}</title>`),
+        hasFeature: () => true,
+    },
+    // An event to be given its type with `initEvent()`, of the kind asked for, as `createEvent('MouseEvents')` makes a `MouseEvent`.
+    createEvent: (kind) => {
+        const name = String(kind).replace(/s$/, '');
+        const Made = /^[A-Za-z]*Event$/.test(name) && typeof globalThis[name] === 'function' ? globalThis[name] : globalThis.Event;
+        return new Made('');
+    },
+    caretPositionFromPoint: (x, y) => editingPack().caretPositionFromPoint(Number(x), Number(y)),
+    caretRangeFromPoint: (x, y) => editingPack().caretRangeFromPoint(Number(x), Number(y)),
+    queryCommandState: (command) => editingPack().queryCommandState(command),
+    queryCommandSupported: (command) => editingPack().queryCommandSupported(command),
+    queryCommandEnabled: (command) => editingPack().queryCommandEnabled(command),
+    queryCommandValue: () => '',
+    contains: (node) => node === page || node?.isConnected === true,
+    createTreeWalker: (rootNode, whatToShow, filter) => new (require('rsui/dom-observers').TreeWalker)(rootNode, whatToShow, filter),
+    createNodeIterator: (rootNode, whatToShow, filter) => new (require('rsui/dom-observers').NodeIterator)(rootNode, whatToShow, filter),
+    get firstElementChild() {
+        return documentElement;
+    },
+    get children() {
+        return elementList([documentElement]);
+    },
+    getElementById: (id) => idElements.get(String(id)) ?? selected('#' + String(id), true)[0] ?? null,
+    getElementsByClassName: (names) => selected(String(names).trim().split(/\s+/).map((name) => '.' + name).join(''), false),
+    getElementsByTagName: (name) => selected(String(name), false),
+    querySelector: (selector) => selected(selector, true)[0] ?? null,
+    querySelectorAll: (selector) => selected(selector, false),
+    elementFromPoint: (x, y) => lastOf(pageChain(rsuiHostMethods.chainAt(Number(x), Number(y)))),
+    elementsFromPoint(x, y) {
+        const chain = pageChain(rsuiHostMethods.chainAt(Number(x), Number(y)));
+        if (chain === undefined) {
+            return [];
+        }
+        const out = [];
+        for (let at = chain.length - 1; at >= 1; at -= 1) {
+            out.push(chainElement(chain, at));
+        }
+        return [...out, body, documentElement];
+    },
+    execCommand: (command, showUI, value) => editingPack().execCommand(command, showUI, value),
+};
+
+/// What only goes in `<head>`, which `document.createElement()` makes as it did, for CSS.
+const HEAD_TAGS = new Set(['style', 'link', 'script', 'meta', 'title', 'base', 'noscript', 'template']);
+
+// The page's address, and the way back to where it's been and forward again, as a browser keeps them. There's no address bar
+// here, so they're only kept in memory, and the page starts at `app://rsui/`. `history.pushState()` and `replaceState()` change
+// where it is without saying so, `back()`, `forward()` and `go()` say so with `popstate` once what's running now has finished,
+// and a different `#` says so with `popstate` and then `hashchange`, as Chromium has it. That's all a router written for a
+// browser, like react-router's `BrowserRouter` and `HashRouter`, needs. Going to another address of the page, as
+// `location.assign()` or a link does, can't load another page, as there's only this one, so it's taken as going there in this
+// one, with `popstate` for what's showing to follow it. An address somewhere else is opened by the system, as a browser would.
+
+const START_URL = 'app://rsui/';
+
+/// Where the page has been, and where it is among that.
+const visited = { entries: [{ url: START_URL, state: null }], at: 0 };
+
+const here = () => visited.entries[visited.at];
+
+/// A copy of what's kept with a place, as a browser keeps a copy rather than what it was given.
+function keptState(state) {
+    if (state === undefined || state === null || typeof state !== 'object') {
+        return state ?? null;
+    }
+    try {
+        return typeof structuredClone === 'function' ? structuredClone(state) : JSON.parse(JSON.stringify(state));
+    } catch {
+        return state;
+    }
+}
+
+/// An address as it would be from where the page is now, or an error as a browser's, if it's somewhere else.
+function addressIn(url) {
+    const now = new URL(here().url);
+    const next = url === undefined || url === null ? now : new URL(String(url), now);
+    if (next.protocol !== now.protocol || next.host !== now.host) {
+        throw Object.assign(new Error('A history entry can only be made for an address of this page, not ' + next.href), { name: 'SecurityError' });
+    }
+    return next;
+}
+
+/// Whether two addresses are the same, apart from their `#`.
+const samePage = (one, other) => one.split('#')[0] === other.split('#')[0];
+
+/// An event the window hears, made as a page makes it.
+function windowEvent(type, more) {
+    const event = Object.create(rsui.__newEventBase());
+    Object.assign(event, { type, bubbles: false, cancelable: false, defaultPrevented: false, target: globalThis, currentTarget: globalThis, srcElement: globalThis, eventPhase: 2, timeStamp: performance.now() }, more);
+    event.preventDefault = () => {
+        if (event.cancelable) {
+            event.defaultPrevented = true;
+        }
+    };
+    event.stopPropagation = () => {
+        event.__stopped = true;
+    };
+    event.stopImmediatePropagation = () => {
+        event.__stopped = true;
+        event.__immediate = true;
+    };
+    return event;
+}
+
+/// What `window.dispatchEvent()` does: tells what's listening on the window, and its `on` handler, and says whether nothing said
+/// not to do what it would.
+function tellWindow(event) {
+    if (event === null || typeof event !== 'object') {
+        return true;
+    }
+    const type = String(event.type);
+    for (const key of ['target', 'currentTarget', 'srcElement']) {
+        try {
+            event[key] = globalThis;
+        } catch {
+            // What's made as a class may only have a getter for it.
+        }
+    }
+    const run = (listener) => {
+        try {
+            if (typeof listener === 'function') {
+                listener.call(globalThis, event);
+            } else {
+                listener?.handleEvent?.(event);
+            }
+        } catch (error) {
+            console.error(error);
+        }
+    };
+    if (type === 'resize') {
+        for (const listener of [...resizeListeners]) {
+            run(listener);
+        }
+    }
+    for (const capture of [true, false]) {
+        for (const one of (documentListeners.get(type) ?? []).slice()) {
+            if (one.where !== 'window' || one.capture !== capture) {
+                continue;
+            }
+            if (one.once) {
+                unlistenOn('window', type, one.listener, one);
+            }
+            run(one.listener);
+            if (event.__immediate === true) {
+                return event.defaultPrevented !== true;
+            }
+        }
+    }
+    const own = globalThis['on' + type];
+    if (typeof own === 'function') {
+        run(own);
+    }
+    return event.defaultPrevented !== true;
+}
+
+/// Says that the page is somewhere else among where it's been, as going back does.
+function arrived(from, to) {
+    tellWindow(windowEvent('popstate', { state: here().state }));
+    if (samePage(from, to) && new URL(from).hash !== new URL(to).hash) {
+        tellWindow(windowEvent('hashchange', { oldURL: from, newURL: to }));
+    }
+}
+
+/// Goes to an address of the page, as a new place to have been, or in place of where it is, and says so.
+function goTo(url, replace) {
+    const from = here().url;
+    const next = addressIn(url).href;
+    if (next === from && !replace) {
+        return;
+    }
+    const entry = { url: next, state: null };
+    if (replace) {
+        visited.entries[visited.at] = entry;
+    } else {
+        visited.entries.splice(visited.at + 1, Infinity, entry);
+        visited.at += 1;
+    }
+    if (samePage(from, next)) {
+        // Only the `#` is different, which is said straight away, and `hashchange` once what's running now has finished.
+        tellWindow(windowEvent('popstate', { state: null }));
+        // The fragment changed, which going from none to an empty one (`x` to `x#`) is too, though `location.hash` says '' for both.
+        setTimeout(() => tellWindow(windowEvent('hashchange', { oldURL: from, newURL: next })), 0);
+    } else {
+        // A page would load here, and as this is the only one, it's this one that's told.
+        setTimeout(() => tellWindow(windowEvent('popstate', { state: null })), 0);
+    }
+}
+
+/// Follows a link that nothing said not to: to an address of the page, in it, and anywhere else, as the system opens it.
+function followLink(href) {
+    let url;
+    try {
+        url = new URL(String(href), here().url);
+    } catch {
+        return;
+    }
+    const now = new URL(here().url);
+    if (url.protocol !== now.protocol || url.host !== now.host) {
+        require('rsui/desktop').shell.open(url.href);
+        return;
+    }
+    // Whatever `target` says, there are no other windows of the page for it to go to, so it's this one.
+    const from = here().url;
+    goTo(url.href, false);
+    if (samePage(from, url.href) && url.href.includes('#')) {
+        // A link to a place in the page goes there, as a browser scrolls to the fragment, even when it's already the address.
+        scrollToFragment(url.hash.slice(1));
+    }
+}
+
+/// Scrolls to what a URL's `#fragment` names, as a browser does after going there: the top of the page for nothing or `top`, or
+/// else the element with that `id` (or an `<a name>`), brought into view at the top.
+function scrollToFragment(fragment) {
+    let name = fragment;
+    try {
+        name = decodeURIComponent(fragment);
+    } catch {}
+    if (name === '' || name.toLowerCase() === 'top') {
+        pageScrollTo(0, 0);
+        return;
+    }
+    const found = page.getElementById?.(name) ?? page.querySelector?.(`a[name="${name.replace(/["\\]/g, '\\$&')}"]`) ?? null;
+    found?.scrollIntoView?.({ block: 'start' });
+}
+
+const history = {
+    scrollRestoration: 'auto',
+    get length() {
+        return visited.entries.length;
+    },
+    get state() {
+        return here().state;
+    },
+    pushState(state, _unused, url) {
+        const next = addressIn(url).href;
+        visited.entries.splice(visited.at + 1, Infinity, { url: next, state: keptState(state) });
+        visited.at += 1;
+    },
+    replaceState(state, _unused, url) {
+        visited.entries[visited.at] = { url: addressIn(url).href, state: keptState(state) };
+    },
+    go(delta = 0) {
+        const by = Math.trunc(Number(delta) || 0);
+        // Going nowhere would load the page again, which can't be done to the only one there is.
+        if (by === 0) {
+            return;
+        }
+        setTimeout(() => {
+            const to = visited.at + by;
+            if (to < 0 || to >= visited.entries.length) {
+                return;
+            }
+            const from = here().url;
+            visited.at = to;
+            arrived(from, here().url);
+        }, 0);
+    },
+    back() {
+        history.go(-1);
+    },
+    forward() {
+        history.go(1);
+    },
+};
+
+/// `window.location`, which is where the page is now, and setting any part of it goes there.
+const location = {
+    assign(url) {
+        goTo(url, false);
+    },
+    replace(url) {
+        goTo(url, true);
+    },
+    reload() {},
+    toString() {
+        return here().url;
+    },
+    get ancestorOrigins() {
+        return [];
+    },
+};
+for (const part of ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin']) {
+    Object.defineProperty(location, part, {
+        get: () => new URL(here().url)[part],
+        set:
+            part === 'origin'
+                ? undefined
+                : (value) => {
+                      if (part === 'href') {
+                          goTo(value, false);
+                          return;
+                      }
+                      const next = new URL(here().url);
+                      next[part] = String(value);
+                      goTo(next.href, false);
+                  },
+        enumerable: true,
+        configurable: true,
+    });
+}
+
+function installPage() {
+    rsuiHostMethods.fillFragments();
+    // A page's code asks where things are at any time, as `querySelector` and `getBoundingClientRect` do, so what's laid out is
+    // always kept for it rather than let go of as the tree changes.
+    rsuiHostMethods.keepLaidOut();
+    // Letters on a page are drawn the way a browser draws them.
+    rsuiHostMethods.systemText();
+    const world = globalThis;
+    // What a library makes with `createElement('div')` is drawn as the page would draw it.
+    world.__rsuiDom = domElement;
+    world.__rsuiColor = color;
+    // CSS that asks how big the window is gets worked out again when it changes, and so does anything that's watching.
+    world.__rsuiPageResized = () => {
+        resizedCss();
+        for (const listener of resizeListeners) {
+            listener({ type: 'resize' });
+        }
+    };
+    for (const [name, at] of [['innerWidth', 0], ['innerHeight', 1], ['outerWidth', 0], ['outerHeight', 1]]) {
+        Object.defineProperty(world, name, { get: () => (world.__rsuiPageSize ?? [800, 600])[at], configurable: true });
+    }
+    // What a canvas has is on its prototype, which only loads `rsui/canvas` once it's used.
+    const canvasProto = elementClasses.HTMLCanvasElement.prototype;
+    for (const name of ['width', 'height']) {
+        Object.defineProperty(canvasProto, name, {
+            get() {
+                return canvasPack().canvasElementProps[name].get.call(this);
+            },
+            set(value) {
+                canvasPack().canvasElementProps[name].set.call(this, value);
+            },
+            configurable: true,
+        });
+    }
+    for (const name of ['getContext', 'toDataURL', 'toBlob', 'transferControlToOffscreen', 'captureStream']) {
+        Object.defineProperty(canvasProto, name, {
+            value(...args) {
+                return canvasPack().canvasElementProps[name].value.apply(this, args);
+            },
+            configurable: true,
+            writable: true,
+        });
+    }
+    // These are made the first time they're asked for, which loads what a canvas needs. `new Image()` is a canvas's too, as it's
+    // what's drawn on one.
+    const fromCanvas = (name, from = name) => {
+        Object.defineProperty(world, name, {
+            get() {
+                const made = canvasPack()[from];
+                Object.defineProperty(world, name, { value: made, writable: true, enumerable: false, configurable: true });
+                return made;
+            },
+            set(value) {
+                Object.defineProperty(world, name, { value, writable: true, enumerable: false, configurable: true });
+            },
+            enumerable: false,
+            configurable: true,
+        });
+    };
+    for (const name of ['CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D', 'CanvasGradient', 'CanvasPattern', 'Path2D', 'ImageData', 'ImageBitmap', 'TextMetrics', 'OffscreenCanvas', 'DOMMatrix', 'createImageBitmap']) {
+        if (!Object.prototype.hasOwnProperty.call(world, name)) {
+            fromCanvas(name);
+        }
+    }
+    fromCanvas('Image', 'PageImage');
+    // The DOM's own classes are `rsui/dom`'s, made the first time they're asked for.
+    for (const name of DOM_CLASSES) {
+        const was = Object.getOwnPropertyDescriptor(world, name);
+        if (was !== undefined && was.get?.__pageWorld !== true) {
+            continue;
+        }
+        Object.defineProperty(world, name, {
+            get() {
+                domPack();
+                return world[name];
+            },
+            set(value) {
+                Object.defineProperty(world, name, { value, writable: true, enumerable: false, configurable: true });
+            },
+            enumerable: false,
+            configurable: true,
+        });
+    }
+    // Everything else a page has as a global, from `document` and `window` to `history` and the event classes, is
+    // `rsui/dom-globals`'s, which is only loaded the first time one of them is touched.
+    domGlobalsWhenTouched();
+}
+
+/// The DOM's classes that `rsui/dom` has, which loading it puts in place of what stands in for them.
+const DOM_CLASSES = ['MutationObserver', 'Range', 'StaticRange', 'Text', 'Comment', 'CharacterData', 'Selection', 'DocumentFragment', 'DOMParser', 'XMLSerializer'];
+
+/// What `rsui/dom-globals` needs from in here to make the page's globals.
+const domInternals = {
+    rsui, elementClasses, computedStyleOf, fillFormData, domPack, page, listenOn, unlistenOn, tellWindow, pageScrollTo, pageScrollBy,
+    pageScrollState, pageScrollOffsets, location, history, resizeListeners, onPageRendered: (listener) => renderListeners.add(listener), mediaApplies,
+    PageElement, ResizeObserver: PageResizeObserver,
+    // For the window's focus: whether Tab has taken the keyboard out of the page, and what has it, which hears it go and come
+    // back with the window's.
+    keyboardOut: () => keyboardOut,
+    focusedNow: () => (focusedElement !== null && inPageNow(focusedElement) ? focusedElement : null),
+    tellFocus: (element, type) => dispatchOn(element, focusEvent(type, null, type === 'focusin' || type === 'focusout')),
+};
+
+/// The event classes and the like that only `rsui/dom-globals` makes, which `rsui/dom-events` has.
+const DOM_EXTRA = ['UIEvent', 'MouseEvent', 'PointerEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'WheelEvent', 'CompositionEvent',
+    'DragEvent', 'ClipboardEvent', 'StorageEvent', 'SubmitEvent', 'AnimationEvent', 'TransitionEvent', 'ErrorEvent', 'PromiseRejectionEvent',
+    'MediaQueryListEvent', 'DOMRectReadOnly', 'TreeWalker', 'NodeIterator', 'NodeFilter', 'CSS'];
+
+/// Whether the page's globals have been made, which is when what Rust sends is given the web's event classes: see `classify`.
+let domGlobalsMade = false;
+
+/// Each of the page's globals, as something that loads `rsui/dom-globals` when it's first looked at or set, and is then what that
+/// made.
+function domGlobalsWhenTouched() {
+    const world = globalThis;
+    const names = [...Object.keys(elementClasses).filter((name) => !DOM_CLASSES.includes(name)), 'getComputedStyle', 'FormData', 'getSelection', 'DOMRect', 'IntersectionObserver', 'ResizeObserver', 'Event', 'CustomEvent', 'document', 'window', 'matchMedia', 'addEventListener',
+        'removeEventListener', 'dispatchEvent', 'scrollTo', 'scroll', 'scrollBy', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset',
+        'requestAnimationFrame', 'cancelAnimationFrame', 'navigator', 'location', 'history', 'PopStateEvent', 'HashChangeEvent',
+        ...DOM_EXTRA];
+    const before = new Map();
+    let installed = false;
+    const install = () => {
+        if (installed) {
+            return;
+        }
+        installed = true;
+        for (const name of names) {
+            const was = before.get(name);
+            if (was === undefined) {
+                delete world[name];
+            } else {
+                Object.defineProperty(world, name, was);
+            }
+        }
+        require('rsui/dom-globals')(domInternals);
+        domGlobalsMade = true;
+    };
+    for (const name of new Set(names)) {
+        const was = Object.getOwnPropertyDescriptor(world, name);
+        if (was !== undefined && was.configurable === false) {
+            continue;
+        }
+        // What `layer.js` has stand in for it until this is loaded, for a library that looks before there's a page, isn't kept.
+        before.set(name, was?.get?.__pageWorld === true ? undefined : was);
+        Object.defineProperty(world, name, {
+            get() {
+                install();
+                return world[name];
+            },
+            set(value) {
+                install();
+                world[name] = value;
+            },
+            enumerable: was?.enumerable ?? false,
+            configurable: true,
+        });
+    }
+}
+
+// What a browser says about each element is read now, so that what's in `em` in it is known before any of a page's CSS is.
+natives.cssBrowserStart(declaring);
+installPage();
+
+// What a page's code imports from here. What styled-components and emotion are, and what code converted for rsui used to call, is
+// theirs to give, from their own packages, which work here: the ones here are only for rsui's own tests of how CSS is worked out.
+module.exports = {
+    dom,
+    __pageElement: domElement,
+    __elementPortal: (children, container, key) => __jsx(ElementPortal, { container, children, key }, null, key !== undefined && key !== null),
+    __addCssFile,
+    Details,
+    Meter,
+    Progress,
+    Summary,
+    Input,
+    Option,
+    PageWindow,
+    Select,
+    TextArea,
+    addCss,
+    useShapeLook,
+    useShapeParts,
+    // For what's checking how this works, as what's worked out can't be seen from outside otherwise: CSS written as a styled
+    // component, and what an element with some classes looks like.
+    __styled: styled,
+    __css: css,
+    __createGlobalStyle: createGlobalStyle,
+    __keyframes: keyframes,
+    __ThemeProvider: ThemeProvider,
+    __cls: cls,
+    __webStyle: webStyle,
+    __compile: (text) => {
+        const compiled = compile(readCss(text));
+        compiled.own = settleElement({ ...compiled.own });
+        return compiled;
+    },
+    __remSize: () => remSize,
+    __unsupported: () => [...unsupported],
+    __variable: variableValue,
+};
+
+// Page text is selected with the pointer from the first press: see `pressMaySelect`.
+listenOn('window', 'mousedown', pressMaySelect, PRESS_MAY_SELECT);

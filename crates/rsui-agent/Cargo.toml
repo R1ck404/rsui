@@ -1,0 +1,15 @@
+[package]
+name = "rsui-agent"
+description = "Lets agents read and operate a rsui app, as tools over the Model Context Protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rsui-core = { path = "../rsui-core" }
+rsui-headless = { path = "../rsui-headless" }
+rsui-runtime = { path = "../rsui-runtime" }
+serde_json = "1"

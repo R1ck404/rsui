@@ -1,0 +1,25 @@
+[package]
+name = "rsui-layout"
+description = "A small flexbox layout for rsui trees, updated by what changed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+foldhash = "0.2.0"
+rsui-core = { path = "../rsui-core" }
+thin-vec = "0.2.21"
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1"
+rsui-alloc = { path = "../rsui-alloc" }
+rsui-runtime = { path = "../rsui-runtime" }
+triomphe = "0.1.17"
+
+[[bench]]
+name = "layout"
+harness = false

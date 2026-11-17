@@ -1,0 +1,26 @@
+[package]
+name = "rsui-core"
+description = "Renderer-independent UI element tree, keyed diffing and deterministic snapshots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ecow = { version = "0.3.1", features = ["serde"] }
+foldhash = "0.2.0"
+itoa = "1.0.18"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thin-vec = { version = "0.2.21", features = ["serde"] }
+triomphe = "0.1.17"
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1"
+
+[[bench]]
+name = "core"
+harness = false

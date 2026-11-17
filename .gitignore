@@ -1,0 +1,5 @@
+target/
+*.proptest-regressions
+__pycache__/
+node_modules/
+**/.rsui/react-compiler/

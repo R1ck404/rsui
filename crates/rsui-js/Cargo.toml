@@ -1,0 +1,33 @@
+[package]
+name = "rsui-js"
+description = "rsui's own JavaScript engine: TypeScript and JSX in, small bytecode out, and as little memory and time spent as can be managed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Counts what JavaScript makes as its own, for measuring memory: see `owners.rs` in rsui-alloc. Off by default.
+owners = ["rsui-alloc/owners"]
+# Counts which functions the engine is in, every millisecond, and writes them to the file `RSUI_JSPROF` names when it's done.
+jsprof = []
+# Compiles hot functions to x86-64 machine code, on 64-bit Windows (elsewhere it builds and does nothing). `RSUI_JIT`
+# says how: see `src/jit/mod.rs`. Off here by default; rsui-tsx turns it on by default.
+jit = []
+# Has the JIT's compiled code record what it sees (which callee each call called, what kinds of numbers arithmetic met,
+# which way branches went, what elements were read), for an optimizing tier to compile from: see
+# `src/jit/feedback.rs`. `RSUI_OPT=0` turns it off. Without it, compiled code is as it was.
+jit-opt = ["jit"]
+# Counts what the interpreter runs (each instruction by kind, natives by name, calls and loop turns per function, objects
+# made per place in the code, how often prototypes change) into the file `RSUI_COUNTS` names, in parts that whoever runs
+# the engine marks: see `src/counts.rs`. For measuring only.
+counts = []
+
+[dependencies]
+foldhash = "0.2.0"
+rsui-alloc = { path = "../rsui-alloc" }
+
+[dev-dependencies]
+rsui-alloc = { path = "../rsui-alloc" }

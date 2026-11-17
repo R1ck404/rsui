@@ -1,0 +1,70 @@
+[package]
+name = "rsui"
+description = "A fast, memory-frugal UI framework: components, layout, text and rendering, all from scratch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Experimental no-change presentation reuse, without another copy of scene commands.
+retained-frame = ["rsui-render/retained-frame"]
+# Experimental ordinary App backend; deliberately off by default.
+automatic-render = ["mutation-pilot"]
+mutation-pilot = ["rsui-render/mutation-pilot"]
+idle-probe = ["render-diagnostics"]
+render-diagnostics = ["rsui-render/render-diagnostics"]
+# Counts what each stage holds, for measuring memory; see `owners.rs` in rsui-alloc. Off by default.
+alloc-owners = ["rsui-alloc/owners"]
+
+[dependencies]
+rsui-alloc = { path = "../rsui-alloc" }
+rsui-core = { path = "../rsui-core" }
+rsui-headless = { path = "../rsui-headless" }
+rsui-image = { path = "../rsui-image" }
+rsui-layout = { path = "../rsui-layout" }
+rsui-render = { path = "../rsui-render" }
+rsui-runtime = { path = "../rsui-runtime" }
+rsui-text = { path = "../rsui-text" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1"
+windows = { version = "0.62", features = [
+    "Win32_Security",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+] }
+
+[[bench]]
+name = "frame"
+harness = false
