@@ -505,37 +505,6 @@ fn fill_lines(runs: &[Run], lines: &mut Vec<[f32; 4]>) {
     }
 }
 
-/// Adds a shape that all goes the same way around, so that where these overlap, they add up rather than cancel out.
-fn add_polygon(points: &[(f32, f32)], lines: &mut Vec<[f32; 4]>) {
-    let mut area = 0.0;
-    for (at, point) in points.iter().enumerate() {
-        let next = points[(at + 1) % points.len()];
-        area += point.0 * next.1 - next.0 * point.1;
-    }
-    let mut add = |from: (f32, f32), to: (f32, f32)| lines.push([from.0, from.1, to.0, to.1]);
-    if area >= 0.0 {
-        for (at, point) in points.iter().enumerate() {
-            add(*point, points[(at + 1) % points.len()]);
-        }
-    } else {
-        for (at, point) in points.iter().enumerate().rev() {
-            add(points[(at + 1) % points.len()], *point);
-        }
-    }
-}
-
-fn add_circle(middle: (f32, f32), radius: f32, lines: &mut Vec<[f32; 4]>) {
-    let each = 2.0 * (1.0 - (CURVE_TOLERANCE / radius.max(CURVE_TOLERANCE)).min(1.0)).acos();
-    let steps = ((TAU / each.max(0.01)).ceil() as usize).clamp(8, 128);
-    let points: Vec<(f32, f32)> = (0..steps)
-        .map(|step| {
-            let (sin, cos) = (step as f32 / steps as f32 * TAU).sin_cos();
-            (middle.0 + radius * cos, middle.1 + radius * sin)
-        })
-        .collect();
-    add_polygon(&points, lines);
-}
-
 /// The parts of `runs` that a dash pattern shows, as SVG's `stroke-dasharray` and `stroke-dashoffset` have it: `pattern`
 /// is the length of each dash and each gap after it in turn, said again if there's an odd number of them, and `offset` is
 /// how far into the pattern each run starts. It's `None` for a solid line, which is what a pattern that's all gaps, or that
@@ -617,59 +586,16 @@ fn dashed(runs: &[Run], pattern: &[f32], offset: f32) -> Option<Vec<Run>> {
     Some(out)
 }
 
-/// The lines around a path's stroke: a box along each line of it, with a circle at each corner, all of them adding up.
+/// The lines around a path's stroke, with round corners.
 #[cfg(test)]
 fn stroke_lines(runs: &[Run], width: f32, cap: LineCap, lines: &mut Vec<[f32; 4]>) {
     stroke_lines_joined(runs, width, cap, LineJoin::Round, lines);
 }
 
-/// What a corner of a stroke adds outside the boxes along its two lines, as `join` says.
-fn add_join(
-    before: (f32, f32),
-    at: (f32, f32),
-    after: (f32, f32),
-    half: f32,
-    join: LineJoin,
-    lines: &mut Vec<[f32; 4]>,
-) {
-    if join == LineJoin::Round {
-        add_circle(at, half, lines);
-        return;
-    }
-    let unit = |from: (f32, f32), to: (f32, f32)| {
-        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-        let length = dx.hypot(dy);
-        (dx / length, dy / length)
-    };
-    let (first, second) = (unit(before, at), unit(at, after));
-    if !(first.0.is_finite() && second.0.is_finite()) {
-        return;
-    }
-    let cross = first.0 * second.1 - first.1 * second.0;
-    // Outside the turn, which is the other way from where it turns.
-    let side = if cross > 0.0 { -1.0 } else { 1.0 };
-    let left = |(x, y): (f32, f32)| (-y * half * side, x * half * side);
-    let (a, b) = (left(first), left(second));
-    let (one, two) = ((at.0 + a.0, at.1 + a.1), (at.0 + b.0, at.1 + b.1));
-    if join == LineJoin::Miter {
-        let (mx, my) = (a.0 + b.0, a.1 + b.1);
-        let along = (mx * mx + my * my).sqrt();
-        if along > f32::EPSILON {
-            let (mx, my) = (mx / along, my / along);
-            let cos = (mx * a.0 + my * a.1) / half;
-            // SVG's `stroke-miterlimit` is 4 unless it says, which is how far out the point can be, in widths.
-            if cos > 0.0 && 1.0 / cos <= 4.0 {
-                let reach = half / cos;
-                let tip = (at.0 + mx * reach, at.1 + my * reach);
-                add_polygon(&[at, one, tip, two], lines);
-                return;
-            }
-        }
-    }
-    add_polygon(&[at, one, two], lines);
-}
-
-/// [`stroke_lines`], with its corners as `join` says.
+/// The lines around a path's stroke, with its corners as `join` says: one outline for each run, its two sides with the ends and
+/// corners between them, as the canvas strokes. That's what a browser fills, and filled, its edges are only ever counted once.
+/// Pieces laid over each other, a box for each line and a circle at each corner, would be counted twice at their edges where they
+/// overlap, which a curve does at every point along it, and that made curves heavier than straight lines, and lumpy.
 fn stroke_lines_joined(
     runs: &[Run],
     width: f32,
@@ -677,89 +603,40 @@ fn stroke_lines_joined(
     join: LineJoin,
     lines: &mut Vec<[f32; 4]>,
 ) {
-    let half = width / 2.0;
-    if half <= 0.0 {
+    use crate::canvas::geom::{Cap, Join, Matrix, Path, StrokeStyle, Stroker};
+    if !(width > 0.0 && width.is_finite()) {
         return;
     }
+    let mut path = Path::default();
     for run in runs {
-        let mut points = run.points.clone();
-        points.dedup();
-        if run.closed && points.first() != points.last() {
-            let first = points[0];
-            points.push(first);
-        }
-        if points.len() < 2 {
-            // A dot is what a line that doesn't go anywhere looks like with round ends.
-            if cap == LineCap::Round {
-                if let Some(point) = points.first() {
-                    add_circle(*point, half, lines);
-                }
-            }
+        let Some(&first) = run.points.first() else {
             continue;
-        }
-        let count = points.len();
-        for (at, pair) in points.windows(2).enumerate() {
-            let (mut from, mut to) = (pair[0], pair[1]);
-            let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-            let length = (dx * dx + dy * dy).sqrt();
-            // Too short to have a direction, or too long for a number to hold.
-            if !(length > f32::EPSILON && length.is_finite()) {
-                continue;
-            }
-            let (unit_x, unit_y) = (dx / length, dy / length);
-            if !run.closed && cap == LineCap::Square {
-                if at == 0 {
-                    from = (from.0 - unit_x * half, from.1 - unit_y * half);
-                }
-                if at == count - 2 {
-                    to = (to.0 + unit_x * half, to.1 + unit_y * half);
-                }
-            }
-            let (across_x, across_y) = (-unit_y * half, unit_x * half);
-            add_polygon(
-                &[
-                    (from.0 + across_x, from.1 + across_y),
-                    (to.0 + across_x, to.1 + across_y),
-                    (to.0 - across_x, to.1 - across_y),
-                    (from.0 - across_x, from.1 - across_y),
-                ],
-                lines,
-            );
-        }
-        // A corner too slight to show doesn't need anything there, which is most of them in a curve.
-        for at in 1..count - 1 {
-            if !nearly_straight(points[at - 1], points[at], points[at + 1], half) {
-                add_join(
-                    points[at - 1],
-                    points[at],
-                    points[at + 1],
-                    half,
-                    join,
-                    lines,
-                );
-            }
+        };
+        path.move_to(first);
+        for &point in &run.points[1..] {
+            path.line_to(point);
         }
         if run.closed {
-            if !nearly_straight(points[count - 2], points[0], points[1], half) {
-                add_join(points[count - 2], points[0], points[1], half, join, lines);
-            }
-        } else if cap == LineCap::Round {
-            add_circle(points[0], half, lines);
-            add_circle(points[count - 1], half, lines);
+            path.close();
         }
     }
-}
-
-/// Whether the outside of this corner is too small to see, which is how far it opens up at this width.
-fn nearly_straight(before: (f32, f32), at: (f32, f32), after: (f32, f32), half: f32) -> bool {
-    let first = (at.0 - before.0, at.1 - before.1);
-    let second = (after.0 - at.0, after.1 - at.1);
-    let cross = first.0 * second.1 - first.1 * second.0;
-    let dot = first.0 * second.0 + first.1 * second.1;
-    if dot <= 0.0 {
-        return false;
-    }
-    cross.atan2(dot).abs() * half < CURVE_TOLERANCE * 2.0
+    let style = StrokeStyle {
+        width,
+        cap: match cap {
+            LineCap::Butt => Cap::Butt,
+            LineCap::Round => Cap::Round,
+            LineCap::Square => Cap::Square,
+        },
+        join: match join {
+            LineJoin::Miter => Join::Miter,
+            LineJoin::Round => Join::Round,
+            LineJoin::Bevel => Join::Bevel,
+        },
+        // SVG's `stroke-miterlimit` is 4 unless it says.
+        miter_limit: 4.0,
+        ..StrokeStyle::default()
+    };
+    Stroker::default().stroke(&path, &style, &Matrix::IDENTITY, lines);
 }
 
 /// Lines cut down to what's inside a picture of this size, which is all that's going to be seen, whatever a path says. Past the
@@ -1244,6 +1121,25 @@ mod tests {
         let bitmap = drawn(&mut lines);
         assert_eq!(coverage_at(&bitmap, 2, 2), 255);
         assert_eq!(coverage_at(&bitmap, 1, 6), 255);
+    }
+
+    #[test]
+    fn a_curve_is_no_heavier_than_it_is_wide() {
+        // A circle 16 across, drawn 1.5 wide, as an icon's would be: its ink is its length times its width, with edges that
+        // aren't counted twice where one bit of the curve meets the next.
+        for width in [1.0f32, 1.5, 3.0] {
+            let mut lines = Vec::new();
+            stroke_lines(
+                &trace("M20 12 A8 8 0 1 1 4 12 A8 8 0 1 1 20 12 Z", AS_IS),
+                width,
+                LineCap::Butt,
+                &mut lines,
+            );
+            let bitmap = drawn(&mut lines);
+            let ink: f32 = bitmap.coverage.iter().map(|&amount| f32::from(amount) / 255.0).sum();
+            let wanted = std::f32::consts::TAU * 8.0 * width;
+            assert!((ink / wanted - 1.0).abs() < 0.02, "{width}: {ink} against {wanted}");
+        }
     }
 
     #[test]

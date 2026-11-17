@@ -4025,7 +4025,12 @@ const browserLooks = new Map();
 
 /// What a browser says this element looks like by itself, as it is before anything's been worked out from it. An input's depends on
 /// its `type`, as a checkbox isn't drawn as a field.
-function browserLook(tag, type, disabled = false) {
+function browserLook(tag, type, disabled = false, nowhere = false) {
+    if (tag === 'a' && nowhere) {
+        // Only a link that goes somewhere is blue and underlined, as a browser's own CSS has it (`a:any-link`): an `<a>` with no
+        // `href` is written as what's around it.
+        return undefined;
+    }
     if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
         tag = type;
     } else if (tag === 'input' && buttonInput({ type })) {
@@ -4443,7 +4448,8 @@ function hostType(tag, props, children) {
     }
     switch (tag) {
         case 'a':
-            return 'link';
+            // An `<a>` with no `href` goes nowhere, and a browser draws it as it would a `<span>`, in the text around it.
+            return typeof props.href === 'string' ? 'link' : hostType('span', props, children);
         case 'img':
         case 'canvas':
             return 'image';
@@ -4794,7 +4800,7 @@ function useFieldLook(tag, className, style, given = {}) {
     // as they were written, and only then worked out together, so that what its size and its padding come to are worked out
     // with each other wherever each was said, as `box-sizing` needs. Its classes went in before the page's rules once, which
     // put Tailwind's `textarea { font-size: 100% }` over shadcn's `text-sm` on it.
-    const raw = { ...browserLook(tag, given.type, disabled), ...dirLook(given.dir), ...tagLook('*'), ...tagLook(tag) };
+    const raw = { ...browserLook(tag, given.type, disabled, typeof given.href !== 'string'), ...dirLook(given.dir), ...tagLook('*'), ...tagLook(tag) };
     const parts = {};
     const me = { tag, id: given.id, classes: classesOf(className), props: given, state: 0, nth, prevs: nth?.prevs, kind: 'component' };
     fromAbove(owners, me, raw, parts, true, () => {
@@ -6495,6 +6501,12 @@ function withFont(children, font) {
             // It says how far apart its lines are itself.
             merged.__lineScale = null;
         }
+        if (font.ellipsis === true) {
+            // It's on the line that's cut off with `…`, as a `<span>` in a button with `text-overflow: ellipsis` is, so it's only as
+            // wide as there's room for, rather than as wide as its words.
+            merged.shrink = 1;
+            merged.minWidth = 0;
+        }
         return { ...children, props: finalFont(merged) };
     }
     if (children.kids === null || children.kids === undefined || (DOM_TAGS.has(children.type) && !HOST_NAMES.has(children.type))) {
@@ -8171,6 +8183,10 @@ function makeStyled(target, settings = {}) {
             if (addedCss.length > 0) {
                 workedOut();
             }
+            if (!pageCheck.scheduled) {
+                pageCheck.scheduled = true;
+                setTimeout(warnPageRulesLeftOut, 0);
+            }
             // What CSS says, as it was when this was drawn, which it's drawn again once it isn't, as `usePage` has it: see below.
             const seen = version;
             // What it is on the page, kept from one drawing to the next, which what's set on it with `setAttribute()` and the like is
@@ -8316,7 +8332,7 @@ function makeStyled(target, settings = {}) {
             let needs = 0;
             let started = null;
             if (isHost) {
-                Object.assign(look, browserLook(tag, props.type, props.disabled === true), dirLook(props.dir), tagLook('*'), tagLook(tag));
+                Object.assign(look, browserLook(tag, props.type, props.disabled === true, typeof props.href !== 'string'), dirLook(props.dir), tagLook('*'), tagLook(tag));
                 if (hasWatched.size !== 0) {
                     // What it starts from before the page's rules, for working them out again when `:has()` changes: see `freshLook`.
                     started = { ...look };
@@ -8517,6 +8533,8 @@ function makeStyled(target, settings = {}) {
             }
 
             // How text is written in it, from what it says and what it's in, and what tells whether that's changed: see `layout.rs`.
+            // The color CSS says for it itself, before what it inherits is in its look, which an `<svg>`'s `color` attribute is under.
+            const ownColorSaid = look.color;
             look = natives.cssOwnFont(layout, look, fontAbove, tag, isHost, placing);
             if (look.__logical === true) {
                 // Which way the text goes is known now, which logical properties' sides depend on.
@@ -8535,7 +8553,13 @@ function makeStyled(target, settings = {}) {
                 look.crossReverse = true;
             }
             const fontKey = placing.fontKey;
-            const font = useMemo(() => fontFrom(look, null), [fontKey]);
+            // A button's or a link's text that ends in `…` (`text-overflow: ellipsis`) is all of what's on its line, a `<span>` in it
+            // too, which is told so with what it's written in: see `ellipsisLine` below.
+            const ellipsisLine = look.ellipsis === true && (tag === 'button' || tag === 'a');
+            const font = useMemo(() => {
+                const made = fontFrom(look, null);
+                return ellipsisLine ? { ...made, __ellipsisLine: true } : made;
+            }, [fontKey, ellipsisLine]);
             // What goes down to what's in it, from this component itself rather than from providers around what it makes, which
             // would be there only when it has something of its own to pass down, and make everything in it start again when that
             // changes, as a sheet that gains a rule about attributes does. It's on every render, as `provideHere` needs.
@@ -8743,7 +8767,13 @@ function makeStyled(target, settings = {}) {
                     const lined = intoLines(children, onlyElements, lookFont());
                     children = lined !== children ? lined : [make('group', { key: '__line0', display: 'contents' }, ...eachWithin(FlowContext, 'block', all))];
                 } else {
-                    children = intoLines(children, onlyElements, lookFont());
+                    const lined = intoLines(children, onlyElements, lookFont());
+                    if (lined !== children) {
+                        // What's in it is on lines of its own now, so the block isn't one too: a line in a line would have the
+                        // height of its text twice over, which two buttons side by side came to, 3px taller than on a page.
+                        along = false;
+                    }
+                    children = lined;
                 }
             } else if (INLINE_TEXT_TAGS.has(tag) && look.display === undefined && look.__flex !== true && look.direction === undefined && children !== undefined && natives.cssChildren(layout, children, HOLDS_BLOCK)) {
                 // Something on a line with a block in it is broken around that block, and its text is on lines of what it's in, unless
@@ -8992,6 +9022,17 @@ function makeStyled(target, settings = {}) {
                         delete host[key];
                     }
                 }
+                // Its `color` attribute is one of those too, which lucide's icons and those like them always write, as
+                // `color="currentColor"`: CSS goes over it, `currentColor` is the color around it, and any other color is that color.
+                if (host.color !== undefined) {
+                    const said = String(host.color).trim().toLowerCase();
+                    const own = ownColorSaid !== undefined || said === 'currentcolor' || said === 'inherit' ? undefined : color(said);
+                    if (own === undefined) {
+                        delete host.color;
+                    } else {
+                        host.color = own;
+                    }
+                }
             }
             // Where it goes in what it's in, and what's only worked out once everything's been said, which is the props it's made with:
             // see `layout.rs`. A fieldset's legend takes some of its look first.
@@ -9070,7 +9111,9 @@ function makeStyled(target, settings = {}) {
                 // rsui-text.
                 out.inlineArea = true;
             }
-            if (lined) {
+            if (lined || scroll !== undefined) {
+                // Text that scrolls is in a box of its own that does, as only a group scrolls: a `<pre>` with `overflow: auto` and a
+                // `max-height` shows that much of its text, and scrolls through the rest.
                 out.__lined = true;
             }
             if (keepable && !keptNow) {
@@ -9100,7 +9143,10 @@ function makeStyled(target, settings = {}) {
             if (font !== null && typeof type === 'string' && type !== 'text' && type !== 'span' && type !== 'input') {
                 // Its lines through or under text are drawn on the text right in it too, as CSS has them go to what's inside, when
                 // it's a box of its own in a flex box or a grid, as Mantine's `Anchor` in a `Group` is.
-                const lined = given_flow === 'block' || given_flow === 'line' ? font : decoratedFont(out, font);
+                const decorated = given_flow === 'block' || given_flow === 'line' ? font : decoratedFont(out, font);
+                // A button's or a link's text is its own, though it's drawn as text inside it, so `text-overflow: ellipsis` on it
+                // cuts that text off with `…`, as it does on a page.
+                const lined = out.ellipsis === true && (type === 'button' || type === 'link') ? { ...decorated, ellipsis: true, noWrap: true } : decorated;
                 children = keptNow ? [...children.slice(0, keptCount), ...withFont(children.slice(keptCount), lined)] : withFont(children, lined);
             }
             if (scroll !== undefined) {
@@ -9117,6 +9163,21 @@ function makeStyled(target, settings = {}) {
                 // What's in it that's drawn without a `Styled` of its own reads what this passes down without watching it, and is drawn
                 // again from here when that changes: see `drawNative`.
                 tellNativeKids(live, [inner === PAGE_RULES ? pageOwners() : inner, font, variablesInside ?? variablesAbove, lookForInside ?? parentLook, inside, theme, version, declared, form, kindsForgotten]);
+            }
+            if (fontAbove === null && out.keepWords === undefined) {
+                // Words written with CSS aren't broken to fit, as a page's aren't, wherever they are: only what says to
+                // (`overflow-wrap`, `word-break`) breaks them. Inside a `PageWindow` that's what the page passes down; outside one, it's
+                // said here, on the element itself, rather than in what it passes down, which would make its text its own elements.
+                out.keepWords = true;
+            }
+            if ((given.ellipsis === true || fontAbove?.__ellipsisLine === true) && type === 'text') {
+                // Text on the line of a button or link that ends in `…` (see `withFont`), as a `<span>` in it is: it's only as wide
+                // as there's room for, and ends in `…` itself, as the line it's on does on a page.
+                out.ellipsis = true;
+                out.noWrap = true;
+                out.shrink = 1;
+                out.minWidth = 0;
+                out.minAuto = false;
             }
             if (given.__nativeProbe !== undefined) {
                 // What it passes down goes into what's made of it, which isn't told when that changes.
@@ -12014,7 +12075,7 @@ function svgPartRect(live) {
     if (box === null) {
         return none;
     }
-    const outer = svg.getBoundingClientRect();
+    const outer = clientBoxOf(svg, false);
     const view = String(svg.__live?.given?.viewBox ?? '').trim().split(/[\s,]+/).map(Number);
     let [scaleX, scaleY, offsetX, offsetY] = [1, 1, 0, 0];
     if (view.length === 4 && view.every(Number.isFinite) && view[2] > 0 && view[3] > 0) {
@@ -12026,9 +12087,17 @@ function svgPartRect(live) {
     }
     const x = outer.x + offsetX + box[0] * scaleX;
     const y = outer.y + offsetY + box[1] * scaleY;
-    const width = (box[2] - box[0]) * scaleX;
-    const height = (box[3] - box[1]) * scaleY;
-    return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON: () => ({ x, y, width, height }) };
+    return svgInnerRect(svg, x, y, (box[2] - box[0]) * scaleX, (box[3] - box[1]) * scaleY);
+}
+
+/// Where a box in an `<svg>`, worked out from where the `<svg>` is laid out, is drawn: through the `<svg>`'s own transform and those of
+/// what it's in, each about its own origin, as a browser has it. A chevron's path in a `rotate-180` span is turned with it.
+function svgInnerRect(svg, x, y, width, height) {
+    const [scrollX, scrollY] = scrolledBy(svg);
+    const own = clientBoxOf(svg, false);
+    const laidOut = [own.x + scrollX, own.y + scrollY, own.width, own.height];
+    const [left, top, right, bottom] = transformedBy(svg, x + scrollX, y + scrollY, width, height, laidOut);
+    return createClientRect(left - scrollX, top - scrollY, right - left, bottom - top);
 }
 
 /// The box around a shape's geometry in its svg's units, `[left, top, right, bottom]`, or null for what has none.
@@ -12330,7 +12399,9 @@ function svgPartBox(part) {
     if (own === null) {
         return null;
     }
-    const svg = handleOf(svgLive, 'svg').getBoundingClientRect();
+    // Its box as it's laid out: the shape is turned and moved with it below, rather than placed in the box around it turned.
+    const handle = handleOf(svgLive, 'svg');
+    const svg = clientBoxOf(handle, false);
     const given = svgLive.given ?? {};
     const view = String(given.viewBox ?? '').trim().split(/[\s,]+/).map(Number);
     let [viewX, viewY, viewWidth, viewHeight] = view.length === 4 && view.every(Number.isFinite) && view[2] > 0 && view[3] > 0
@@ -12339,7 +12410,8 @@ function svgPartBox(part) {
     const left = svg.x + (svg.width - viewWidth * scale) / 2 - viewX * scale;
     const top = svg.y + (svg.height - viewHeight * scale) / 2 - viewY * scale;
     const [x0, y0, x1, y1] = own;
-    return [left + x0 * scale, top + y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale];
+    const drawn = svgInnerRect(handle, left + x0 * scale, top + y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale);
+    return [drawn.x, drawn.y, drawn.width, drawn.height];
 }
 
 /// The box around a piece of an `<svg>`'s shape, in the `<svg>`'s units, as [left, top, right, bottom], or null.
@@ -12607,11 +12679,12 @@ function forgetSvgParts(key) {
 function svgShapeRect(kept) {
     const svg = pageLives.get(kept.svgOf)?.deref();
     let outer;
+    let handle;
     if (svg !== undefined) {
         // The `<svg>` itself, which says where it is as it was last laid out.
-        const handle = handles.get(kept.svgOf) ?? handleOf(svg, 'svg');
+        handle = handles.get(kept.svgOf) ?? handleOf(svg, 'svg');
         handle.__placedByKey = true;
-        outer = handle.getBoundingClientRect();
+        outer = clientBoxOf(handle, false);
     }
     const empty = (x, y) => ({ x, y, left: x, top: y, right: x, bottom: y, width: 0, height: 0, toJSON: () => ({ x, y, width: 0, height: 0 }) });
     if (outer === undefined) {
@@ -12638,11 +12711,7 @@ function svgShapeRect(kept) {
     if (box === null) {
         return empty(fromX, fromY);
     }
-    const x = fromX + box[0] * scaleX;
-    const y = fromY + box[1] * scaleY;
-    const width = (box[2] - box[0]) * scaleX;
-    const height = (box[3] - box[1]) * scaleY;
-    return { x, y, left: x, top: y, right: x + width, bottom: y + height, width, height, toJSON: () => ({ x, y, width, height }) };
+    return svgInnerRect(handle, fromX + box[0] * scaleX, fromY + box[1] * scaleY, (box[2] - box[0]) * scaleX, (box[3] - box[1]) * scaleY);
 }
 
 /// The box round a shape's geometry in its picture's units, as `[left, top, right, bottom]`, or nothing.
@@ -13671,6 +13740,11 @@ Object.assign(COMPUTED, {
     boxSizing: () => 'border-box',
     width: (style) => computedBox(style).width + 'px',
     height: (style) => computedBox(style).height + 'px',
+    // As CSS says them, or what nothing saying is: `auto` for the least, `none` for the most.
+    minWidth: ({ __look: look }) => computedPx(look?.minWidth, 'auto'),
+    minHeight: ({ __look: look }) => computedPx(look?.minHeight, 'auto'),
+    maxWidth: ({ __look: look }) => computedPx(look?.maxWidth, 'none'),
+    maxHeight: ({ __look: look }) => computedPx(look?.maxHeight, 'none'),
     cursor: (style) => computedAll(style).cursor ?? 'auto',
     pointerEvents: ({ __look: look }) => (look?.inert === true ? 'none' : 'auto'),
     color: (style) => computedColor(computedAll(style).color, 'rgb(0, 0, 0)'),
@@ -14595,7 +14669,7 @@ function clientBoxOf(element, transformed) {
 /// Where an element's box, laid out at `x`, `y`, `width` by `height`, is drawn: `[left, top, right, bottom]` around its corners as its
 /// own `transform` and every one above it puts them, each about its own `transform-origin` in its own box as it's laid out. A
 /// dialog's `translate(-50%, -50%)` moves what's in it with it; a `rotate-90` icon's box is turned; a `scale-95` one is smaller.
-function transformedBy(element, x, y, width, height) {
+function transformedBy(element, x, y, width, height, ownBox = null) {
     // Most measured boxes and ancestors have no transform. Do not allocate or
     // walk four corner arrays unless one actually needs transforming.
     let corners = null;
@@ -14622,7 +14696,9 @@ function transformedBy(element, x, y, width, height) {
     let at = element.__index;
     for (const live of [element.__live, ...lives]) {
         const own = live === element.__live;
-        let [boxX, boxY, w, h] = [x, y, width, height];
+        // What's turned about its own `transform-origin` is turned about the element's own box, which is what's measured, unless
+        // that's a part of it, as a shape in an `<svg>` is (`ownBox`).
+        let [boxX, boxY, w, h] = ownBox ?? [x, y, width, height];
         if (!own) {
             at -= 1;
             while (at > 0 && chain[at]?.[0] == null) {
@@ -15687,6 +15763,13 @@ function eventProps(given, needs, handlers, tag, live, scrolls = false) {
     // What can have the keyboard by itself, as a `<button>` with nothing listening to it can, says when it has it, for
     // `document.activeElement`.
     const ownFocus = tag === 'input' || tag === 'textarea' || tag === 'select' || tag === 'button' || tag === 'summary' || (tag === 'a' && typeof given.href === 'string') || given.tabIndex !== undefined;
+    // Whether it's hovered, pressed or has what has the keyboard in it is still heard once its CSS has asked, while what it says
+    // now doesn't: a sidebar item whose active classes have no `hover:` was left by the pointer unheard, and showed its hover
+    // look once it wasn't active, as if the pointer were still there.
+    if (live !== undefined && live !== null) {
+        live.statesHeard = (live.statesHeard ?? 0) | (needs & (HOVER | PRESS | WITHIN));
+        needs |= live.statesHeard;
+    }
     if (!handled && !nativeHover && !motionListened && !ownFocus && (needs & (HOVER | PRESS | WITHIN | FOCUS)) === 0) {
         return NO_EVENT_PROPS;
     }
@@ -16499,10 +16582,28 @@ function flowSignature(props) {
         const value = props[key];
         if (typeof value === 'boolean' || typeof value === 'string' || typeof value === 'number') {
             out += key + '=' + String(value) + ';';
+        } else if (value !== null && typeof value === 'object' && !Array.isArray(value) && !isValidElement(value)) {
+            // What kind of thing an object it's given says it is, which is often what decides what's made of it: a settings row's
+            // `<Control field={field}>` makes a switch, which goes along a line, for `field.kind` 'toggle', and a row of buttons,
+            // which is a block, for 'choice'.
+            for (const name of FLOW_KIND_KEYS) {
+                let kind;
+                try {
+                    kind = value[name];
+                } catch {
+                    continue;
+                }
+                if (typeof kind === 'string' || typeof kind === 'number' || typeof kind === 'boolean') {
+                    out += key + '.' + name + '=' + String(kind) + ';';
+                }
+            }
         }
     }
     return out;
 }
+
+/// What an object given to a component is called that says what kind of thing it is: see `flowSignature`.
+const FLOW_KIND_KEYS = ['kind', 'type', 'variant', 'as'];
 
 /// Learns whether a kind of component goes along a line for these props (`__webFlowBy`), which `__webInlineOf` says for an element
 /// of it, here and in `layout.rs`. Gives back whether that's new.
@@ -16812,6 +16913,12 @@ function withNthAlong(children, kept = null) {
         if (!same && kept !== null && typeof one.type === 'function') {
             const type = one.type;
             value.learn = (tag, who, className) => learnTag(kept, key, value, type, tag, who, className);
+            // The element that says what a component makes stays the one that says, through what's learned. Otherwise one that
+            // makes two (a fragment of a backdrop and a popover) has whichever is drawn first say, which changes as each is drawn
+            // again by itself, and each change has what it's in drawn again, which draws the other first: for ever.
+            if (was !== undefined && was.owner === type && was.learner !== undefined) {
+                value.learner = was.learner;
+            }
         }
         value.kindsBefore = kindsBefore;
         kindsBefore += (typeof kind === 'string' ? kind : '') + ',';
@@ -17939,7 +18046,9 @@ function makeHost(tag, props, children, scroll, parts = {}, known = undefined) {
             outer.scrollbarThumb = withCurrentColor({ background: parts['-webkit-scrollbar-thumb']?.background }, own.color).background;
             outer.scrollbarTrack = withCurrentColor({ background: parts['-webkit-scrollbar-track']?.background }, own.color).background;
         }
-        return make('scroll', { ...outer, axis: scroll }, make('group', { direction, gap, padding, align, justify, collapseMargins, display, columns, rows, columnGap, rowGap, justifyItems, gridFlow, alignContent, flexWrap, reverse, crossReverse, scrollContent: true }, children));
+        // It's at least as tall as what shows, as a scroller's own box is in CSS, which is what lays out what's in it: so `margin-top:
+        // auto` puts the last thing in a sidebar that scrolls at its bottom, and what grows has the room that's left.
+        return make('scroll', { ...outer, axis: scroll }, make('group', { direction, gap, padding, align, justify, collapseMargins, display, columns, rows, columnGap, rowGap, justifyItems, gridFlow, alignContent, flexWrap, reverse, crossReverse, scrollContent: true, grow: 1, shrink: 0 }, children));
     }
     delete own.__scrollAlways;
     return children === undefined ? make(type, own) : make(type, own, children);
@@ -18579,6 +18688,7 @@ function pageDeclaration(name, value) {
         rootVariables.set(name, value);
         variablesTouched = true;
     } else {
+        pageCheck.said = true;
         sheet.page.push([name, value]);
     }
 }
@@ -18748,6 +18858,18 @@ function sheetRules(one) {
 }
 
 const PAGE_TAGS = new Set(['html', 'body', ':root']);
+
+/// Whether CSS has said anything about `html`, `body` or `:root` that isn't a variable, whether a `PageWindow` has been drawn, which
+/// is what those go on, and whether the first page element has looked, once, a moment after it was drawn.
+const pageCheck = { said: false, shown: false, scheduled: false };
+
+/// Says, once, that what CSS said about `html` and `body` (their font, color and background, as an app's `body { font-family: ... }`
+/// does) was left out, as it only goes on a `PageWindow`, and nothing was drawn in one. Their variables are used wherever they are.
+function warnPageRulesLeftOut() {
+    if (pageCheck.said && !pageCheck.shown) {
+        notHere("what CSS says about `html` and `body`, outside a `<PageWindow>` (`import { PageWindow } from 'rsui/web'`),");
+    }
+}
 const PAGE_IDS = new Set(['app', 'root']);
 
 function addPageStep(step, block) {
@@ -18762,6 +18884,7 @@ function addPageStep(step, block) {
                 // How big a rem is, and the text size of everything on the page, which are worked out once what the variables in
                 // them stand for is known: see `rootFontSize` and `pageLook`.
                 (step.tag === 'body' ? (sheet.bodyFont ??= []) : (sheet.rootFont ??= [])).push(value);
+                pageCheck.said = true;
                 variablesTouched = true;
             } else {
                 pageDeclaration(name, value);
@@ -18958,6 +19081,7 @@ let bodyRedraw = null;
 
 function PageWindow({ children, ...rest }) {
     usePage();
+    pageCheck.shown = true;
     const [, setBodyKids] = useState(0);
     bodyRedraw = () => setBodyKids((was) => was + 1);
     // What code put in `body` itself comes after what the app drew, as on a page.
@@ -18999,6 +19123,14 @@ function PageWindow({ children, ...rest }) {
     // In a page that scrolls, `body` is as tall as what's in it, and at least as tall as the window. Otherwise it's as tall as the window.
     const filling = pageScroll === 'none' ? { flex: 1 } : { grow: 1, shrink: 0 };
     const body = now.body ?? {};
+    if (children !== undefined && children !== null) {
+        // What's right in the page goes on lines as what's in any block does (see `intoLines`), and spaces between blocks are
+        // nothing, as on a page: a `{'\n'}` between two `<div>`s in it was a line of its own, 40px tall. In a flex box or a grid, a
+        // space by itself is nothing either.
+        children = body.__flex === true || body.display === 'grid'
+            ? Children.toArray(children).filter((child) => typeof child !== 'string' || child.trim() !== '')
+            : intoLines(children, false, font);
+    }
     let inner;
     if (body.__flex === true || body.display === 'grid') {
         // `body` lays out what's in it itself, as a flex box that puts it in the middle does, and what's in it is the page's root

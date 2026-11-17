@@ -42,6 +42,10 @@ const layoutReference = (() => {
             if ((props.__whiteSpace === 'nowrap' || props.__whiteSpace === 'pre') && props.noWrap === undefined) {
                 props.noWrap = true;
             }
+            // Spaces at the end of a line are part of it where they're kept as written.
+            if (props.__whiteSpace === 'pre' || props.__whiteSpace === 'pre-wrap' || props.__whiteSpace === 'break-spaces') {
+                props.keepSpaces = true;
+            }
             delete props.__whiteSpace;
             delete props.__sizeSaid;
         }
@@ -294,6 +298,9 @@ const layoutReference = (() => {
             delete look.justifyItems;
         } else if (look.display === 'grid' && content !== undefined) {
             look.alignContent = content;
+        } else if (look.display !== 'grid' && look.flexWrap === true && content !== undefined) {
+            // Where the lines of a flex box that wraps go.
+            look.alignContent = content;
         } else if (content !== undefined && look.display !== 'grid' && look.direction === 'row' && look.align === undefined) {
             // Only for things that wrap, which these don't, unless it's the only thing that's saying where they go.
             look.align = ALIGN[content] ?? 'stretch';
@@ -525,7 +532,8 @@ const layoutReference = (() => {
             if (ownSize && typeof look.__fontScale !== 'number') {
                 look.__sizeSaid = true;
             }
-            resolveRelative(look, typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 16);
+            // With nothing around it saying, rsui's own text size, which is what it's drawn at (`NATIVE_TEXT_SIZE` in layout.rs).
+            resolveRelative(look, typeof fontAbove?.fontSize === 'number' ? fontAbove.fontSize : 14);
         }
         for (const name of FONT_PROPS) {
             if (look[name] === undefined && fontAbove !== null && fontAbove[name] !== undefined) {
@@ -610,7 +618,8 @@ const childrenReference = (({ NestedRules, InheritedFont, FlowContext, NthContex
         }
         switch (tag) {
             case 'a':
-                return 'link';
+                // An `<a>` with no `href` is drawn as a `<span>` would be.
+                return typeof props.href === 'string' ? 'link' : hostType('span', props, children);
             case 'img':
                 return 'image';
             case 'button':

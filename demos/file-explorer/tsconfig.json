@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "jsx": "react",
+    "jsxFactory": "__jsx",
+    "jsxFragmentFactory": "__Fragment",
+    "target": "es2022",
+    "lib": ["es2022"],
+    "types": [],
+    "skipLibCheck": true
+  },
+  "include": ["**/*.ts", "**/*.tsx", "../../crates/rsui-tsx/rsui.d.ts"],
+  "exclude": ["node_modules"]
+}

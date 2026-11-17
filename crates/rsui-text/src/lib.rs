@@ -58,6 +58,7 @@ pub mod bidi;
 mod unicode_tables;
 mod universal;
 mod universal_tables;
+mod variations;
 
 pub use atlas::{AtlasGlyph, GlyphAtlas, GlyphKey, Upload, whole_part};
 pub use color::ColorBitmap;
@@ -73,3 +74,4 @@ pub use rich::{
     paragraph_arrangement, paragraph_text, path_of_run,
 };
 pub use shape::is_mark;
+pub use variations::VariationAxis;

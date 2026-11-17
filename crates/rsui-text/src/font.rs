@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::data::FontData;
 use crate::gpos::PairKerning;
+use crate::variations::{self, NamedInstance, Variation, VariationAxis};
 
 /// How many parts one composite glyph may have, across all its levels. A part can itself
 /// have parts, even including the glyph it's part of, so without a limit a small damaged
@@ -110,6 +111,12 @@ pub struct Font {
     color: Option<ColorTables>,
     /// Where it says which glyphs a character has with a variation selector after it.
     variations: Option<usize>,
+    hhea: Range<usize>,
+    os2: Option<Range<usize>>,
+    name: Option<Range<usize>>,
+    stat: Option<Range<usize>>,
+    /// The axes it varies along and where it's set on them, for a font that varies.
+    vary: Option<Box<Variation>>,
 }
 
 /// One flat shape of an emoji or other colored glyph. Each is drawn over the ones before it.
@@ -184,6 +191,13 @@ struct Tables {
     colr: Option<Range<usize>>,
     cpal: Option<Range<usize>>,
     os2: Option<Range<usize>>,
+    fvar: Option<Range<usize>>,
+    avar: Option<Range<usize>>,
+    gvar: Option<Range<usize>>,
+    hvar: Option<Range<usize>>,
+    mvar: Option<Range<usize>>,
+    stat: Option<Range<usize>>,
+    name: Option<Range<usize>>,
 }
 
 /// A `.woff` file is the font's tables, each packed by itself, and this puts them back as they'd be in a font file.
@@ -286,15 +300,15 @@ impl Font {
 
         let hhea = table(&tables.hhea);
         let too_short = || FontError::Invalid("the hhea table is too short");
-        let ascent = read_i16(hhea, 4).ok_or_else(too_short)?;
-        let descent = read_i16(hhea, 6).ok_or_else(too_short)?;
-        let line_gap = read_i16(hhea, 8).ok_or_else(too_short)?;
         let h_metric_count = read_u16(hhea, 34).ok_or_else(too_short)?;
-        let (ascent, descent, line_gap) = tables
-            .os2
-            .as_ref()
-            .and_then(|range| windows_metrics(table(range), (ascent, descent, line_gap)))
-            .unwrap_or((ascent, descent, line_gap));
+        let metrics = vertical_metrics(
+            bytes,
+            units_per_em,
+            &tables.hhea,
+            tables.os2.as_ref(),
+            &|_| 0.0,
+        )
+        .ok_or_else(too_short)?;
 
         let glyph_count = read_u16(table(&tables.maxp), 4)
             .ok_or(FontError::Invalid("the maxp table is too short"))?;
@@ -318,26 +332,46 @@ impl Font {
         };
 
         let typo = tables.os2.as_ref().map(|range| table(range)).and_then(|os2| Some((read_i16(os2, 68)?, read_i16(os2, 70)?)));
+        let vary = tables.fvar.clone().and_then(|fvar| {
+            let axes = variations::axes(table(&fvar));
+            if axes.is_empty() {
+                return None;
+            }
+            // `GDEF`'s store, from version 1.3 on.
+            let gdef_store = tables.gdef.clone().and_then(|gdef| {
+                let at = (read_u32(table(&gdef), 0)? >= 0x0001_0003)
+                    .then(|| read_u32(table(&gdef), 14))??;
+                (at != 0).then(|| gdef.start + at as usize..gdef.end)
+            });
+            let values = axes.iter().map(|axis| axis.default).collect();
+            let coordinates = vec![0; axes.len()];
+            Some(Box::new(Variation {
+                axes,
+                values,
+                coordinates,
+                fvar,
+                avar: tables.avar.clone(),
+                gvar: tables.gvar.clone(),
+                hvar: tables.hvar.clone(),
+                mvar: tables.mvar.clone(),
+                gdef_store,
+                hvar_scalars: Vec::new(),
+                mvar_scalars: Vec::new(),
+                gdef_scalars: Vec::new(),
+            }))
+        });
         Ok(Self {
             face,
             path: None,
             typo,
             variations,
             color,
-            metrics: FontMetrics {
-                units_per_em,
-                ascent,
-                descent,
-                line_gap,
-                // `sxHeight`, which only an `OS/2` table of version 2 or later has.
-                x_height: tables
-                    .os2
-                    .as_ref()
-                    .map(|range| table(range))
-                    .filter(|os2| read_u16(os2, 0).is_some_and(|version| version >= 2))
-                    .and_then(|os2| read_i16(os2, 86))
-                    .unwrap_or(0),
-            },
+            metrics,
+            hhea: tables.hhea.clone(),
+            os2: tables.os2.clone(),
+            name: tables.name.clone(),
+            stat: tables.stat.clone(),
+            vary,
             glyph_count,
             h_metric_count,
             long_offsets,
@@ -380,6 +414,132 @@ impl Font {
 
     pub fn glyph_count(&self) -> u16 {
         self.glyph_count
+    }
+
+    /// The axes this font varies along, such as weight, in the order its `fvar` table has them, or none for a font that
+    /// doesn't vary.
+    pub fn variation_axes(&self) -> &[VariationAxis] {
+        self.vary.as_ref().map_or(&[], |vary| &vary.axes)
+    }
+
+    /// Where this font is set along each of its axes, by tag, which is each one's default until
+    /// [`Self::set_variations`] says otherwise.
+    pub fn variations(&self) -> impl Iterator<Item = ([u8; 4], f32)> + '_ {
+        self.vary.iter().flat_map(|vary| {
+            vary.axes
+                .iter()
+                .zip(&vary.values)
+                .map(|(axis, value)| (axis.tag, *value))
+        })
+    }
+
+    /// Whether this font is set anywhere along its axes but at their defaults, so that its glyphs, advances and
+    /// measurements aren't the ones in its tables as they are.
+    pub fn is_varied(&self) -> bool {
+        self.moved().is_some()
+    }
+
+    /// Sets this font along its axes, such as `(*b"wght", 600.0)` for semibold, each within what the font has, and
+    /// leaving those not given at their defaults. A font that doesn't vary stays as it is.
+    pub fn set_variations(&mut self, settings: &[([u8; 4], f32)]) {
+        let Some(mut vary) = self.vary.take() else {
+            return;
+        };
+        vary.set(self.bytes(), settings);
+        let bytes = self.bytes();
+        let mvar = vary.mvar.clone().and_then(|range| bytes.get(range));
+        let delta = |tag: &[u8; 4]| {
+            mvar.map_or(0.0, |mvar| {
+                variations::metric_delta(mvar, &vary.mvar_scalars, tag)
+            })
+        };
+        let metrics = vertical_metrics(
+            bytes,
+            self.metrics.units_per_em,
+            &self.hhea,
+            self.os2.as_ref(),
+            &delta,
+        );
+        let moved = |value: i16, tag: &[u8; 4]| (f32::from(value) + delta(tag)).round() as i16;
+        let typo = self
+            .os2
+            .clone()
+            .and_then(|range| bytes.get(range))
+            .and_then(|os2| Some((moved(read_i16(os2, 68)?, b"hasc"), moved(read_i16(os2, 70)?, b"hdsc"))));
+        if let Some(metrics) = metrics {
+            self.metrics = metrics;
+        }
+        self.typo = typo;
+        self.vary = Some(vary);
+    }
+
+    /// Where the font is set along its axes, if that's anywhere but their defaults.
+    #[inline]
+    fn moved(&self) -> Option<&Variation> {
+        self.vary.as_deref().filter(|vary| vary.is_moved())
+    }
+
+    /// What `GDEF` says values in `GPOS` change by, where the font is set, if it's been moved along its axes.
+    pub(crate) fn gdef_variations(&self) -> Option<variations::Store<'_>> {
+        let vary = self.moved()?;
+        Some(variations::Store {
+            data: self.bytes().get(vary.gdef_store.clone()?)?,
+            scalars: &vary.gdef_scalars,
+        })
+    }
+
+    /// The places along its axes this font names, such as "Semibold Text", for a font that varies.
+    pub(crate) fn named_instances(&self) -> Vec<NamedInstance> {
+        self.vary
+            .as_ref()
+            .and_then(|vary| self.bytes().get(vary.fvar.clone()))
+            .map(variations::named_instances)
+            .unwrap_or_default()
+    }
+
+    /// The font's `STAT` table, which names what each place along its axes is, if it has one.
+    pub(crate) fn stat_table(&self) -> Option<&[u8]> {
+        self.bytes().get(self.stat.clone()?)
+    }
+
+    /// One of the names in the font's `name` table, by its number, in English if it has that.
+    pub(crate) fn name(&self, id: u16) -> Option<String> {
+        let table = self.bytes().get(self.name.clone()?)?;
+        let count = read_u16(table, 2)? as usize;
+        let strings = read_u16(table, 4)? as usize;
+        let mut best: Option<(u8, usize)> = None;
+        for index in 0..count {
+            let record = 6 + index * 12;
+            if read_u16(table, record + 6)? != id {
+                continue;
+            }
+            let platform = read_u16(table, record)?;
+            let encoding = read_u16(table, record + 2)?;
+            let language = read_u16(table, record + 4)?;
+            let rank = match (platform, encoding, language) {
+                (3, 1 | 10, 0x409) => 4,
+                (3, 1 | 10, _) => 3,
+                (0, _, _) => 2,
+                (1, 0, 0) => 1,
+                _ => continue,
+            };
+            if best.is_none_or(|(best, _)| rank > best) {
+                best = Some((rank, record));
+            }
+        }
+        let (rank, record) = best?;
+        let length = read_u16(table, record + 8)? as usize;
+        let at = strings + read_u16(table, record + 10)? as usize;
+        let text = table.get(at..at + length)?;
+        Some(if rank == 1 {
+            text.iter().map(|&byte| char::from(byte)).collect()
+        } else {
+            let units: Vec<u16> = text
+                .chunks_exact(2)
+                .map(|two| u16::from_be_bytes([two[0], two[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        })
     }
 
     fn bytes(&self) -> &[u8] {
@@ -459,6 +619,7 @@ impl Font {
             gsub: get(&self.gsub_table),
             gpos: get(&self.gpos_table),
             gdef: get(&self.gdef_table),
+            variations: self.gdef_variations(),
         }
     }
 
@@ -610,14 +771,37 @@ impl Font {
             return 0;
         }
         let index = glyph.min(self.h_metric_count - 1) as usize;
-        read_u16(&self.bytes()[self.hmtx.clone()], index * 4).unwrap_or(0)
+        let advance = read_u16(&self.bytes()[self.hmtx.clone()], index * 4).unwrap_or(0);
+        match self.moved() {
+            None => advance,
+            Some(vary) => self.varied_advance(vary, glyph, advance),
+        }
+    }
+
+    /// A glyph's advance where the font is set along its axes, which is what `HVAR` says, or how far apart `gvar`
+    /// moves the points where the glyph starts and ends, rounded to whole units, as DirectWrite and HarfBuzz have them.
+    fn varied_advance(&self, vary: &Variation, glyph: u16, advance: u16) -> u16 {
+        let bytes = self.bytes();
+        let delta = if let Some(hvar) = vary.hvar.clone().and_then(|range| bytes.get(range)) {
+            variations::advance_delta(hvar, &vary.hvar_scalars, glyph)
+        } else if let Some(gvar) = vary.gvar.clone().and_then(|range| bytes.get(range)) {
+            let count = self.glyph_data(glyph).map_or(0, outline_point_count);
+            // Only where they're named moves the points after the outline's, so where the outline's are doesn't matter.
+            let points = vec![(0.0, 0.0); count + 4];
+            let mut deltas = points.clone();
+            variations::glyph_deltas(gvar, glyph, &vary.coordinates, &points, &[], &mut deltas);
+            deltas[count + 1].0 - deltas[count].0
+        } else {
+            0.0
+        };
+        (f32::from(advance) + delta.round()).clamp(0.0, f32::from(u16::MAX)) as u16
     }
 
     /// The adjustment between two glyphs next to each other, in font units. Usually
     /// negative, as in "AV", which would look too far apart otherwise.
     pub fn kerning(&self, left: u16, right: u16) -> i16 {
         if let Some(gpos) = &self.gpos {
-            return gpos.kerning(self.bytes(), left, right);
+            return gpos.kerning(self.bytes(), left, right, self.gdef_variations());
         }
         self.kern
             .as_ref()
@@ -683,20 +867,84 @@ impl Font {
         let Some(contours) = read_i16(data, 0) else {
             return;
         };
+        let varied = self.moved().and_then(|vary| {
+            let gvar = self.bytes().get(vary.gvar.clone()?)?;
+            Some((gvar, &vary.coordinates[..]))
+        });
         if contours >= 0 {
-            let _ = simple_outline(data, contours as usize, transform, sink);
+            let _ = simple_outline(data, contours as usize, transform, sink, |points, ends| {
+                if let Some((gvar, coordinates)) = varied {
+                    move_points(gvar, glyph, coordinates, points, ends);
+                }
+            });
         } else {
-            let _ = self.composite_outline(data, transform, budget, sink);
+            let _ = self.composite_outline(glyph, data, transform, budget, varied, sink);
         }
     }
 
     fn composite_outline(
         &self,
+        glyph: u16,
         data: &[u8],
         parent: Transform,
         budget: &mut u32,
+        varied: Option<(&[u8], &[i32])>,
         sink: &mut impl OutlineSink,
     ) -> Option<()> {
+        let mut parts = Vec::new();
+        let read = read_components(data, budget, &mut parts);
+        if let Some((gvar, coordinates)) = varied {
+            // Each part is a point to `gvar`, which can move it, and the four after them say where the glyph starts and
+            // ends.
+            let mut points: Vec<(f32, f32)> = parts.iter().map(|(_, own)| (own.dx, own.dy)).collect();
+            move_points(gvar, glyph, coordinates, &mut points, &[]);
+            for ((_, own), (x, y)) in parts.iter_mut().zip(points) {
+                own.dx = x;
+                own.dy = y;
+            }
+        }
+        for (component, own) in parts {
+            self.outline_at(component, parent.then(own), budget, sink);
+        }
+        read
+    }
+}
+
+/// Moves a glyph's points as `gvar` says, for where the font is set along its axes. `ends` are the last point of each of
+/// its contours, for a glyph with an outline.
+fn move_points(gvar: &[u8], glyph: u16, coordinates: &[i32], points: &mut Vec<(f32, f32)>, ends: &[usize]) {
+    let count = points.len();
+    points.resize(count + 4, (0.0, 0.0));
+    let mut deltas = vec![(0.0, 0.0); points.len()];
+    variations::glyph_deltas(gvar, glyph, coordinates, points, ends, &mut deltas);
+    points.truncate(count);
+    for (point, delta) in points.iter_mut().zip(deltas) {
+        point.0 += delta.0;
+        point.1 += delta.1;
+    }
+}
+
+/// How many points a glyph has, as `gvar` counts them: those of its outline, or one for each part of a glyph made of
+/// others.
+fn outline_point_count(data: &[u8]) -> usize {
+    match read_i16(data, 0) {
+        Some(contours @ 1..) => {
+            read_u16(data, 10 + (contours as usize - 1) * 2).map_or(0, |last| last as usize + 1)
+        }
+        Some(i16::MIN..=-1) => {
+            let mut budget = MAX_COMPONENTS;
+            let mut parts = Vec::new();
+            let _ = read_components(data, &mut budget, &mut parts);
+            parts.len()
+        }
+        _ => 0,
+    }
+}
+
+/// Reads the parts of a glyph made of others, each with how it's placed, into `parts`, as far as `budget` allows and
+/// the data isn't damaged, which is `None`.
+fn read_components(data: &[u8], budget: &mut u32, parts: &mut Vec<(u16, Transform)>) -> Option<()> {
+    {
         const ARGS_ARE_WORDS: u16 = 1 << 0;
         const ARGS_ARE_XY: u16 = 1 << 1;
         const HAS_SCALE: u16 = 1 << 3;
@@ -750,8 +998,7 @@ impl Font {
             } else {
                 (0.0, 0.0)
             };
-            let own = Transform { a, b, c, d, dx, dy };
-            self.outline_at(component, parent.then(own), budget, sink);
+            parts.push((component, Transform { a, b, c, d, dx, dy }));
             if flags & MORE_COMPONENTS == 0 {
                 return Some(());
             }
@@ -798,6 +1045,8 @@ fn read_tables(bytes: &[u8], face: u32) -> Result<Tables, FontError> {
     let (mut loca, mut glyf, mut kern, mut gpos) = (None, None, None, None);
     let (mut gsub, mut gdef) = (None, None);
     let (mut colr, mut cpal, mut os2) = (None, None, None);
+    let (mut fvar, mut avar, mut gvar, mut hvar, mut mvar) = (None, None, None, None, None);
+    let (mut stat, mut name) = (None, None);
     for index in 0..count as usize {
         let record = start + 12 + index * 16;
         let Some(tag) = bytes.get(record..record + 4) else {
@@ -829,6 +1078,13 @@ fn read_tables(bytes: &[u8], face: u32) -> Result<Tables, FontError> {
             b"COLR" => colr = Some(range),
             b"CPAL" => cpal = Some(range),
             b"OS/2" => os2 = Some(range),
+            b"fvar" => fvar = Some(range),
+            b"avar" => avar = Some(range),
+            b"gvar" => gvar = Some(range),
+            b"HVAR" => hvar = Some(range),
+            b"MVAR" => mvar = Some(range),
+            b"STAT" => stat = Some(range),
+            b"name" => name = Some(range),
             _ => {}
         }
     }
@@ -847,6 +1103,13 @@ fn read_tables(bytes: &[u8], face: u32) -> Result<Tables, FontError> {
         colr,
         cpal,
         os2,
+        fvar,
+        avar,
+        gvar,
+        hvar,
+        mvar,
+        stat,
+        name,
     })
 }
 
@@ -959,11 +1222,13 @@ impl Transform {
     }
 }
 
+/// Reads a glyph's outline, has `adjust` move its points, given the last point of each contour, and sends it to `sink`.
 fn simple_outline(
     data: &[u8],
     contours: usize,
     transform: Transform,
     sink: &mut impl OutlineSink,
+    adjust: impl FnOnce(&mut Vec<(f32, f32)>, &[usize]),
 ) -> Option<()> {
     const X_SHORT: u8 = 1 << 1;
     const Y_SHORT: u8 = 1 << 2;
@@ -1030,23 +1295,34 @@ fn simple_outline(
         point.1 = y;
     }
 
+    let mut ends = Vec::with_capacity(contours);
     let mut start = 0;
     for contour in 0..contours {
         let end = read_u16(data, ends_start + contour * 2)? as usize;
         // Ends must increase, and stay within the points.
         if end < start || end >= point_count {
-            return None;
+            break;
         }
+        ends.push(end);
+        start = end + 1;
+    }
+    let mut points: Vec<(f32, f32)> = points
+        .into_iter()
+        .map(|(x, y)| (x as f32, y as f32))
+        .collect();
+    adjust(&mut points, &ends);
+    let mut start = 0;
+    for &end in &ends {
         emit_contour(&points[start..=end], &flags[start..=end], transform, sink);
         start = end + 1;
     }
-    Some(())
+    (ends.len() == contours).then_some(())
 }
 
 /// Turns one contour's points into curves. Two control points in a row have an implied
 /// point on the curve halfway between them.
 fn emit_contour(
-    points: &[(i32, i32)],
+    points: &[(f32, f32)],
     flags: &[u8],
     transform: Transform,
     sink: &mut impl OutlineSink,
@@ -1058,7 +1334,7 @@ fn emit_contour(
     }
     let at = |index: usize| {
         let (x, y) = points[index % count];
-        transform.apply(x as f32, y as f32)
+        transform.apply(x, y)
     };
     let on_curve = |index: usize| flags[index % count] & ON_CURVE != 0;
     let middle = |a: (f32, f32), b: (f32, f32)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
@@ -1105,12 +1381,24 @@ fn emit_contour(
 /// How far above and below the baseline a font's lines go, and the gap between them, as Windows has them, which is what a browser
 /// on Windows uses: its typographic ones if it says to use those, and its Windows ones otherwise, with what `hhea` has more than
 /// those as the gap. `None` if the `OS/2` table is too short to say.
-fn windows_metrics(os2: &[u8], (ascent, descent, gap): (i16, i16, i16)) -> Option<(i16, i16, i16)> {
+fn windows_metrics(
+    os2: &[u8],
+    (ascent, descent, gap): (i16, i16, i16),
+    delta: &dyn Fn(&[u8; 4]) -> f32,
+) -> Option<(i16, i16, i16)> {
+    let moved = |value: i16, tag: &[u8; 4]| -> i16 { (f32::from(value) + delta(tag)).round() as i16 };
     let selection = read_u16(os2, 62)?;
     if selection & (1 << 7) != 0 {
-        return Some((read_i16(os2, 68)?, read_i16(os2, 70)?, read_i16(os2, 72)?));
+        return Some((
+            moved(read_i16(os2, 68)?, b"hasc"),
+            moved(read_i16(os2, 70)?, b"hdsc"),
+            moved(read_i16(os2, 72)?, b"hlgp"),
+        ));
     }
-    let (above, below) = (i32::from(read_u16(os2, 74)?), i32::from(read_u16(os2, 76)?));
+    let clipping = |at: usize, tag: &[u8; 4]| -> Option<i32> {
+        Some((f32::from(read_u16(os2, at)?) + delta(tag)).round() as i32)
+    };
+    let (above, below) = (clipping(74, b"hcla")?, clipping(76, b"hcld")?);
     if above == 0 && below == 0 {
         return None;
     }
@@ -1118,4 +1406,35 @@ fn windows_metrics(os2: &[u8], (ascent, descent, gap): (i16, i16, i16)) -> Optio
     let more = (total - above - below).max(0);
     let narrow = |value: i32| i16::try_from(value).ok();
     Some((narrow(above)?, narrow(-below)?, narrow(more)?))
+}
+
+/// A font's measurements, as Windows has them, with what `delta` says each of the font's own measurements changes by, by
+/// `MVAR`'s tags for them, for a font that varies. `None` if `hhea` is too short.
+fn vertical_metrics(
+    bytes: &[u8],
+    units_per_em: u16,
+    hhea: &Range<usize>,
+    os2: Option<&Range<usize>>,
+    delta: &dyn Fn(&[u8; 4]) -> f32,
+) -> Option<FontMetrics> {
+    let moved = |value: i16, tag: &[u8; 4]| -> i16 { (f32::from(value) + delta(tag)).round() as i16 };
+    let hhea = bytes.get(hhea.clone())?;
+    let ascent = moved(read_i16(hhea, 4)?, b"hasc");
+    let descent = moved(read_i16(hhea, 6)?, b"hdsc");
+    let line_gap = moved(read_i16(hhea, 8)?, b"hlgp");
+    let os2 = os2.and_then(|range| bytes.get(range.clone()));
+    let (ascent, descent, line_gap) = os2
+        .and_then(|os2| windows_metrics(os2, (ascent, descent, line_gap), delta))
+        .unwrap_or((ascent, descent, line_gap));
+    Some(FontMetrics {
+        units_per_em,
+        ascent,
+        descent,
+        line_gap,
+        // `sxHeight`, which only an `OS/2` table of version 2 or later has.
+        x_height: os2
+            .filter(|os2| read_u16(os2, 0).is_some_and(|version| version >= 2))
+            .and_then(|os2| read_i16(os2, 86))
+            .map_or(0, |height| moved(height, b"xhgt")),
+    })
 }

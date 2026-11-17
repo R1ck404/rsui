@@ -924,6 +924,30 @@ fn lines_of_text_go_where_they_are_told_along_the_width() {
 }
 
 #[test]
+fn text_kept_to_two_lines_is_kept_to_them_wherever_it_goes_along_them() {
+    // As a grid's names are: centered, and no more than two lines, the second ending in "…". The test font only draws `A`, and this is several lines of it in the window.
+    let words = |align: &str, most: Option<f64>| {
+        let mut text = Element::new(Role::Text)
+            .name(["AAAA"; 24].join(" "))
+            .prop("font_size", 14.0)
+            .prop("text_align", align);
+        if let Some(most) = most {
+            text = text.prop("max_lines", most);
+        }
+        Element::new(Role::Window).child(text).into_node()
+    };
+    let lowest = |scene: &Scene| scene.quads.iter().map(|quad| quad.rect[1]).fold(f32::MIN, f32::max);
+    let mut fixture = Fixture::new();
+    let all = lowest(fixture.scene(&words("center", None), 1.0));
+    let left = lowest(fixture.scene(&words("left", Some(2.0)), 1.0));
+    let center = lowest(fixture.scene(&words("center", Some(2.0)), 1.0));
+    assert!(left < all, "kept to two lines, it ends higher than all of it: {left} against {all}");
+    assert_eq!(center, left, "centered, it's kept to the same two lines");
+    // And none, which is no lines kept rather than a crash.
+    fixture.scene(&words("center", Some(0.0)), 1.0);
+}
+
+#[test]
 fn underlined_text_has_a_line_under_it() {
     let line = |underline: bool| {
         Element::new(Role::Window)

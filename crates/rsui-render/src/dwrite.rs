@@ -8,11 +8,12 @@ use std::os::windows::ffi::OsStrExt;
 use rsui_text::{Font, GlyphBitmap, SystemGlyphs};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE, DWRITE_FONT_FILE_TYPE,
-    DWRITE_FONT_SIMULATIONS_NONE, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_DEFAULT,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-    DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE, DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory,
-    IDWriteFactory, IDWriteFactory5, IDWriteFontFace, IDWriteInMemoryFontFileLoader,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_AXIS_TAG, DWRITE_FONT_AXIS_VALUE,
+    DWRITE_FONT_FACE_TYPE, DWRITE_FONT_FILE_TYPE, DWRITE_FONT_SIMULATIONS_NONE, DWRITE_GLYPH_RUN,
+    DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory, IDWriteFactory5,
+    IDWriteFactory6, IDWriteFontFace, IDWriteInMemoryFontFileLoader,
 };
 use windows::core::{BOOL, Interface, PCWSTR};
 
@@ -64,9 +65,13 @@ struct DirectWriteGlyphs {
     lcd: bool,
     factory: IDWriteFactory5,
     loader: IDWriteInMemoryFontFileLoader,
-    /// Each font, by where its file's bytes are, how long they are and which font in them it is. `None` is one DirectWrite can't read.
-    faces: HashMap<(usize, usize, u32), Option<IDWriteFontFace>>,
+    /// Each font, by where its file's bytes are, how long they are, which font in them it is and where it's set along its axes,
+    /// for one that varies. `None` is one DirectWrite can't read.
+    faces: HashMap<FaceKey, Option<IDWriteFontFace>>,
 }
+
+/// What tells fonts apart for DirectWrite: their file's bytes, which font in it, and each axis's tag and value, as bits.
+type FaceKey = (usize, usize, u32, Vec<(u32, u32)>);
 
 impl DirectWriteGlyphs {
     /// `None` on a Windows too old to have what this needs.
@@ -91,7 +96,23 @@ impl DirectWriteGlyphs {
 
     fn face(&mut self, font: &Font) -> Option<IDWriteFontFace> {
         let bytes = font.file_bytes();
-        let key = (bytes.as_ptr() as usize, bytes.len(), font.face_index());
+        // A font set somewhere along its axes is drawn there, as one at its defaults is drawn as its tables have it.
+        let axes: Vec<DWRITE_FONT_AXIS_VALUE> = if font.is_varied() {
+            font.variations()
+                .map(|(tag, value)| DWRITE_FONT_AXIS_VALUE {
+                    axisTag: DWRITE_FONT_AXIS_TAG(u32::from_le_bytes(tag)),
+                    value,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let key = (
+            bytes.as_ptr() as usize,
+            bytes.len(),
+            font.face_index(),
+            axes.iter().map(|axis| (axis.axisTag.0, axis.value.to_bits())).collect(),
+        );
         if let Some(found) = self.faces.get(&key) {
             return found.clone();
         }
@@ -131,6 +152,14 @@ impl DirectWriteGlyphs {
                 .ok()?;
                 if !supported.as_bool() {
                     return None;
+                }
+                if !axes.is_empty() {
+                    let factory: IDWriteFactory6 = self.factory.cast().ok()?;
+                    let resource = factory.CreateFontResource(&file, font.face_index()).ok()?;
+                    let varied = resource
+                        .CreateFontFace(DWRITE_FONT_SIMULATIONS_NONE, &axes)
+                        .ok()?;
+                    return varied.cast().ok();
                 }
                 self.factory
                     .CreateFontFace(
@@ -308,6 +337,23 @@ mod tests {
         assert_eq!(three.coverage.len(), one.coverage.len() * 3);
         // A stem's edge covers the parts of a pixel differently, which is what makes it look sharper.
         assert!(three.coverage.chunks_exact(3).any(|rgb| rgb[0] != rgb[2]));
+    }
+
+    #[test]
+    fn a_font_that_varies_is_drawn_where_it_is_set() {
+        let Ok(regular) = Font::open("C:/Windows/Fonts/SegUIVar.ttf") else {
+            return;
+        };
+        let mut bold = Font::open("C:/Windows/Fonts/SegUIVar.ttf").expect("it opened once");
+        bold.set_variations(&[(*b"wght", 700.0)]);
+        let glyph = regular.glyph('l').expect("it has l");
+        let mut system = DirectWriteGlyphs::new(false).expect("DirectWrite is there");
+        let ink = |drawn: GlyphBitmap| drawn.coverage.iter().map(|&value| u32::from(value)).sum::<u32>();
+        let thin = ink(system.rasterize(&regular, glyph, 40.0, 0.0).expect("drawn"));
+        let thick = ink(system.rasterize(&bold, glyph, 40.0, 0.0).expect("drawn"));
+        // A bold stem covers far more.
+        assert!(thick as f32 > thin as f32 * 1.3, "{thin} {thick}");
+        assert_eq!(system.faces.len(), 2);
     }
 
     #[test]

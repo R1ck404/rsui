@@ -1751,12 +1751,19 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         style = style.scaled(self.scale);
         let content = content_box_of(&self.look, rect, self.scale);
         let color = self.look.text_color.unwrap_or(self.around_color());
+        // Text that's cut off at its edges, as CSS's `overflow: hidden` has it, doesn't show past them, however it's arranged:
+        // a `<pre>` that's kept to its lines is cut off at its `max-height` too.
+        let cut = rsui_layout::clips(element);
         if self.look.arranged {
+            if cut {
+                self.clip_to(rect);
+            }
             self.paint_arranged_text(element, rect, style, content, color);
+            if cut {
+                self.unclip();
+            }
             return;
         }
-        // Text that's cut off at its edges, as CSS's `overflow: hidden` has it, doesn't show past them.
-        let cut = rsui_layout::clips(element);
         if cut {
             self.clip_to(rect);
         }
@@ -1900,7 +1907,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
     #[inline(never)]
     fn clamp_lines(&mut self, text: &str, style: TextStyle, limit: f32, keep: usize) {
         let layout = &mut *self.glyphs;
-        if layout.lines.len() <= keep || layout.lines.first().is_none_or(|line| line.start != 0) {
+        if keep == 0 || layout.lines.len() <= keep || layout.lines.first().is_none_or(|line| line.start != 0) {
             return;
         }
         let last = layout.lines[keep - 1];
@@ -1953,6 +1960,11 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         } else {
             self.text
                 .layout_into(&element.name, style, content.width, self.glyphs);
+            // Only so many lines, the last ending in "…", as it was measured, before they're put along their lines: centered
+            // text that's kept to two lines, as a grid's names are, is centered as it's cut.
+            if let Some(lines) = rsui_text::max_lines(element) {
+                self.clamp_lines(&element.name, style, content.width, lines);
+            }
         }
         rsui_text::space_letters(self.glyphs, style.letter_spacing);
         rsui_text::space_words(self.glyphs, &element.name, style.word_spacing);
@@ -2223,10 +2235,37 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                 self.paint_text_selection(text, layout, range, (content.left, content.top));
             }
         }
+        // A line kept to one that's too long, and says to end in `…`, as CSS's `text-overflow: ellipsis` does: what doesn't fit
+        // before the `…` isn't drawn, whichever run it's in, and the `…` is in the paragraph's own look.
+        let cut = (one_line
+            && matches!(element.props.get("ellipsis"), Some(PropValue::Bool(true)))
+            && layout.width() > content.width + 0.01)
+            .then(|| {
+                let (dots, width) = self.text.ellipsis_glyph(style);
+                (dots, (content.width - width).max(0.0))
+            });
+        let mut dots_at: Option<(f32, f32)> = None;
         for at in 0..layout.pieces.len() {
             let piece = layout.pieces[at];
             let part = looks[piece.run as usize];
             let top = content.top + piece.top;
+            let start = piece.first_glyph as usize;
+            let all = &layout.glyphs[start..start + piece.glyph_count as usize];
+            let mut kept = all.len();
+            if let Some((_, room)) = cut {
+                let end_of = |index: usize| all.get(index + 1).map_or(piece.x + piece.width, |next| next.x);
+                kept = (0..all.len()).take_while(|&index| end_of(index) <= room).count();
+                // The `…` goes where the last of what's kept ends, on its line.
+                if let Some(first) = all.first() {
+                    let end = if kept == 0 { 0.0 } else { end_of(kept - 1) };
+                    if dots_at.is_none_or(|(was, _)| end > was) {
+                        dots_at = Some((end, first.y));
+                    }
+                }
+                if kept == 0 {
+                    continue;
+                }
+            }
             if !clip.overlaps(
                 content.left + piece.x - piece.before,
                 top,
@@ -2236,11 +2275,8 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                 continue;
             }
             let piece_style = text.runs[piece.run as usize].style;
-            let start = piece.first_glyph as usize;
             self.glyphs.glyphs.clear();
-            self.glyphs
-                .glyphs
-                .extend_from_slice(&layout.glyphs[start..start + piece.glyph_count as usize]);
+            self.glyphs.glyphs.extend_from_slice(&all[..kept]);
             self.place_glyphs(piece_style, content.left, content.top, part.color);
             if part.decoration.any() {
                 let baseline = layout
@@ -2267,6 +2303,13 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                     top + piece.height,
                 ]);
             }
+        }
+        if let (Some((mut dots, _)), Some((x, baseline))) = (cut, dots_at) {
+            dots.x = x;
+            dots.y = baseline;
+            self.glyphs.glyphs.clear();
+            self.glyphs.glyphs.push(dots);
+            self.place_glyphs(style, content.left, content.top, first.color);
         }
         self.text.give_back_rich(scratch);
         if keep && fonts == self.text.font_count() {

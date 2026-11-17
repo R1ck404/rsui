@@ -150,6 +150,32 @@ pub(crate) fn set_frameless_look(window: HWND, frameless: bool, fullscreen: bool
         (true, false) => ROUND_CORNERS,
         (true, true) => SQUARE_CORNERS,
     };
+    // A window with no frame of its own draws its own buttons, but with the frame all the way in, for a backdrop, the system draws
+    // its minimize, maximize and close over them, as its menu (`WS_SYSMENU`) says it has them: so it hasn't, while that's so.
+    // SAFETY: the window is this program's, and a closed one only gives an error.
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+            SetWindowLongPtrW, SetWindowPos, WS_MINIMIZEBOX, WS_SYSMENU,
+        };
+        let style = GetWindowLongPtrW(window, GWL_STYLE);
+        let menu = WS_SYSMENU.0 as isize;
+        // It's given back once there's no backdrop, to a window made as one usually is, which has a minimize box.
+        let usual = style & WS_MINIMIZEBOX.0 as isize != 0;
+        let wanted = if frameless && see_through { style & !menu } else if frameless && usual { style | menu } else { style };
+        if wanted != style {
+            SetWindowLongPtrW(window, GWL_STYLE, wanted);
+            let _ = SetWindowPos(
+                window,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
     // SAFETY: what's given is the size that's said and lasts through each call, and a closed window, or a Windows 10 that doesn't have
     // the corners, only gives an error.
     unsafe {

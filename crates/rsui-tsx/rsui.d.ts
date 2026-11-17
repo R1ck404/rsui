@@ -450,6 +450,8 @@ declare module 'rsui' {
         selectable?: boolean;
         /** Keeps text to one line, cutting off what doesn't fit. */
         noWrap?: boolean;
+        /** Wraps text onto no more than this many lines, with `...` at the end of the last if there's more, as CSS's `line-clamp` does. */
+        maxLines?: number;
         /** How soft a shadow is, in pixels, which is what gives something one. */
         shadowBlur?: number;
         shadowColor?: Color;
@@ -983,8 +985,33 @@ declare module 'rsui/desktop' {
         png: Uint8Array;
         url: string;
     }
+    export interface FolderEntry {
+        name: string;
+        folder: boolean;
+        hidden: boolean;
+        system: boolean;
+        readonly: boolean;
+        /** A symbolic link or a junction. */
+        link: boolean;
+        size: number;
+        modified: number;
+        created: number;
+    }
+    export interface Drive {
+        /** Like `C:\\`. */
+        path: string;
+        label: string;
+        kind: 'fixed' | 'removable' | 'network' | 'optical' | 'ram' | 'unknown';
+        /** In bytes, 0 when it can't be read. */
+        total: number;
+        free: number;
+    }
     /** What Explorer shows for files. These are only read, so they're real while an app's being checked too. */
     export const files: {
+        /** What's in a folder, read in one pass on another thread, with each thing's size, times (in milliseconds) and attributes, in the order Explorer sorts names: without regard to case, and numbers by their value. */
+        list(folder: string): Promise<FolderEntry[]>;
+        /** The drives there are. A network drive that isn't connected can take a while to answer. */
+        drives(): Promise<Drive[]>;
         /** A picture of what's in it, as a photo's or a document's first page, at most `size` pixels across. It's `null` for a file with none. */
         thumbnail(path: string, options?: { size?: number }): Promise<Picture | null>;
         /** Its icon, at most `size` pixels across. */
@@ -1206,6 +1233,8 @@ interface Storage {
     clear(): void;
     [name: string]: any;
 }
+/** A clock for measuring, in milliseconds since the program started, with fractions of one. */
+declare const performance: { now(): number; readonly timeOrigin: number };
 declare const console: {
     log(...values: unknown[]): void;
     info(...values: unknown[]): void;
@@ -1311,6 +1340,12 @@ declare module 'fs' {
     export function createReadStream(path: string, options?: BufferEncoding | { encoding?: BufferEncoding; start?: number; end?: number }): import('stream').Readable;
     export function createWriteStream(path: string, options?: { flags?: string }): import('stream').Writable;
     export function existsSync(path: string): boolean;
+    /** Calls `listener` when something in the folder (or under it, with `recursive`) changes, from a thread that waits for Windows to say so. */
+    export function watch(
+        path: string,
+        options?: { recursive?: boolean; persistent?: boolean } | ((event: 'rename' | 'change', filename: string | null) => void),
+        listener?: (event: 'rename' | 'change', filename: string | null) => void,
+    ): { close(): void; unref(): unknown; ref(): unknown };
     export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
     export function unlinkSync(path: string): void;
     export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;

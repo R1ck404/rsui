@@ -831,6 +831,7 @@ fn css_weights_come_to_the_fonts_there_most_often_are() {
     assert_eq!(FontStyle::of_weight("bold"), FontStyle::Bold);
     assert_eq!(FontStyle::of_weight("normal"), FontStyle::Regular);
     assert_eq!(FontStyle::of_weight("300"), FontStyle::Light);
+    assert_eq!(FontStyle::of_weight("350"), FontStyle::Semilight);
     assert_eq!(FontStyle::of_weight("500"), FontStyle::Medium);
     assert_eq!(FontStyle::of_weight("600"), FontStyle::Semibold);
     assert_eq!(FontStyle::of_weight("700"), FontStyle::Bold);

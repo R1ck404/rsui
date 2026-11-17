@@ -589,9 +589,17 @@ pub(crate) fn props_why(
         }
     }
     if out.is_empty() {
-        out.push(format!(
-            "{parent} gave it the same props, but not in the same order, which counts as different."
-        ));
+        let same_order = old_props.len() == new_props.len()
+            && old_props.iter().zip(&new_props).all(|((old_atom, _), (new_atom, _))| old_atom == new_atom);
+        out.push(if same_order {
+            // Each prop is the same, but some hold an object or a function, and without `memo` that renders again, as React
+            // has it (see `JsProps` in bridge.rs).
+            format!(
+                "{parent} gave it the same props, but some hold objects or functions, and a component renders again for those unless it's wrapped in `memo`, as in React."
+            )
+        } else {
+            format!("{parent} gave it the same props, but not in the same order, which counts as different.")
+        });
     }
     out
 }

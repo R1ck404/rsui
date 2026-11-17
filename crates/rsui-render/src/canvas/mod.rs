@@ -8,7 +8,7 @@
 //! size and pixels, and uploads only the part that changed since it last did.
 
 mod blur;
-mod geom;
+pub(crate) mod geom;
 mod paint;
 mod pixels;
 mod raster;

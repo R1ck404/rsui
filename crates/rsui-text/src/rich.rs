@@ -12,7 +12,7 @@ use rsui_layout::{Rect, Size};
 use crate::bidi;
 use crate::dictionary::{needs_dictionary, word_starts};
 use crate::engine::{PlacedGlyph, TextEngine, TextLayout, TextStyle};
-use crate::lines::{WIDTH_TOLERANCE, can_break_after, is_ideograph, is_space};
+use crate::lines::{WIDTH_TOLERANCE, can_break_between, is_ideograph, is_space};
 
 /// A stretch of a paragraph with one look.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -601,7 +601,7 @@ impl TextEngine {
             let can_end_here = !is_space(character)
                 && character != '\n'
                 && (cut.gap > 0.0
-                    || previous.is_some_and(can_break_after)
+                    || previous.is_some_and(|previous| can_break_between(previous, character))
                     || is_ideograph(character)
                     || words.binary_search(&byte).is_ok());
             if new_run || level != cut.level || can_end_here {

@@ -1049,8 +1049,44 @@ pub(crate) fn press_media_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) const MORE_FUNCTIONS: [(&str, HostFunction); 10] = [
+/// `folderList(path)`: a promise of what's in a folder, a line for each thing: its name, then flags (1 a folder, 2 hidden,
+/// 4 the system's, 8 read-only, 16 a link), its size, and when it was changed and made, in milliseconds, with tabs between.
+/// No name can have a tab or a new line in it on Windows. It's only read, so it's real while an app's being checked too.
+fn host_folder_list(vm: &mut Vm, args: Args) -> Result<Value, Value> {
+    use std::fmt::Write as _;
+    let path = path_at(vm, args, 0);
+    Ok(vm.later(move || {
+        let entries = system::list_folder(&path)?;
+        let mut text = String::with_capacity(entries.len() * 48);
+        for one in entries {
+            let flags = u32::from(one.folder)
+                | u32::from(one.hidden) << 1
+                | u32::from(one.system) << 2
+                | u32::from(one.readonly) << 3
+                | u32::from(one.link) << 4;
+            let _ = writeln!(text, "{}\t{flags}\t{}\t{}\t{}", one.name, one.size, one.modified as i64, one.created as i64);
+        }
+        Ok(Some(text))
+    }))
+}
+
+/// `drives()`: a promise of the drives there are, as JSON of `[{ path, label, kind, total, free }]`.
+fn host_drives(vm: &mut Vm, _args: Args) -> Result<Value, Value> {
+    Ok(vm.later(|| {
+        let drives: Vec<serde_json::Value> = system::drives()
+            .into_iter()
+            .map(|drive| {
+                serde_json::json!({ "path": drive.path, "label": drive.label, "kind": drive.kind, "total": drive.total, "free": drive.free })
+            })
+            .collect();
+        Ok(Some(serde_json::Value::Array(drives).to_string()))
+    }))
+}
+
+pub(crate) const MORE_FUNCTIONS: [(&str, HostFunction); 12] = [
     ("filePicture", host_file_picture),
+    ("folderList", host_folder_list),
+    ("drives", host_drives),
     ("captureScreen", host_capture_screen),
     ("jumpListSet", host_jump_list_set),
     ("jumpListClear", host_jump_list_clear),

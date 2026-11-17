@@ -131,6 +131,8 @@ pub(crate) struct Tables<'a> {
     pub(crate) gsub: Option<&'a [u8]>,
     pub(crate) gpos: Option<&'a [u8]>,
     pub(crate) gdef: Option<&'a [u8]>,
+    /// What `GDEF` says values in `GPOS` change by, for a font that's been set somewhere along its axes.
+    pub(crate) variations: Option<crate::variations::Store<'a>>,
 }
 
 /// A quick way to tell that a lookup has nothing to do with a glyph, as most don't. This is two
@@ -616,6 +618,7 @@ enum Matcher {
 struct Shaper<'a, 'b> {
     table: &'a [u8],
     gdef: Option<&'a [u8]>,
+    variations: Option<crate::variations::Store<'a>>,
     slots: &'b mut Vec<Slot>,
     budget: u32,
     max_slots: usize,
@@ -663,6 +666,7 @@ pub(crate) fn substitute_stages(
     let mut shaper = Shaper {
         table,
         gdef: tables.gdef,
+        variations: tables.variations,
         slots,
         budget,
         max_slots,
@@ -949,6 +953,7 @@ pub(crate) fn position(
     let mut shaper = Shaper {
         table,
         gdef: tables.gdef,
+        variations: tables.variations,
         slots,
         budget,
         max_slots,
@@ -1807,7 +1812,8 @@ impl Shaper<'_, '_> {
         }
     }
 
-    fn apply_value(&mut self, index: usize, record: usize, format: u16) -> Option<()> {
+    /// Applies a value record, whose device tables, for a font that varies, are kept from `base`.
+    fn apply_value(&mut self, index: usize, record: usize, format: u16, base: usize) -> Option<()> {
         let table = self.table;
         let mut at = record;
         let mut read = |bit: u16| -> Option<i32> {
@@ -1818,7 +1824,26 @@ impl Shaper<'_, '_> {
             at += 2;
             Some(i32::from(value))
         };
-        let (x_place, y_place, x_advance) = (read(1)?, read(2)?, read(4)?);
+        let (mut x_place, mut y_place, mut x_advance) = (read(1)?, read(2)?, read(4)?);
+        if let Some(store) = self.variations
+            && format & 0xF0 != 0
+        {
+            let device = |bit: u16| -> i32 {
+                if format & bit == 0 {
+                    return 0;
+                }
+                let before = (format & (bit - 1)).count_ones() as usize;
+                match read_u16(table, record + before * 2) {
+                    Some(0) | None => 0,
+                    Some(offset) => {
+                        crate::variations::device_delta(table, base + offset as usize, store)
+                    }
+                }
+            };
+            x_place += device(0x10);
+            y_place += device(0x20);
+            x_advance += device(0x40);
+        }
         let slot = &mut self.slots[index];
         slot.x_offset += x_place;
         slot.y_offset += y_place;
@@ -1841,7 +1866,7 @@ impl Shaper<'_, '_> {
             }
             _ => return None,
         };
-        self.apply_value(index, record, format)?;
+        self.apply_value(index, record, format, subtable)?;
         Some(index + 1)
     }
 
@@ -1854,12 +1879,15 @@ impl Shaper<'_, '_> {
         let format_2 = read_u16(table, subtable + 6)?;
         let (size_1, size_2) = (value_size(format_1), value_size(format_2));
         let second_glyph = self.slots[second].glyph;
+        // Where the values' changes for a font that varies are kept from: the pair's set, or the subtable for classes.
+        let mut base = subtable;
         let records = match read_u16(table, subtable)? {
             1 => {
                 if covered >= read_u16(table, subtable + 8)? as usize {
                     return None;
                 }
                 let set = subtable + read_u16(table, subtable + 10 + covered * 2)? as usize;
+                base = set;
                 let count = read_u16(table, set)? as usize;
                 let pair_size = 2 + size_1 + size_2;
                 let (mut low, mut high) = (0, count);
@@ -1892,16 +1920,28 @@ impl Shaper<'_, '_> {
             }
             _ => return None,
         };
-        self.apply_value(index, records, format_1)?;
-        self.apply_value(second, records + size_1, format_2)?;
+        self.apply_value(index, records, format_1, base)?;
+        self.apply_value(second, records + size_1, format_2, base)?;
         Some(if format_2 != 0 { second + 1 } else { second })
     }
 
     fn anchor(&self, at: usize) -> Option<(i32, i32)> {
-        Some((
+        let (mut x, mut y) = (
             i32::from(read_i16(self.table, at + 2)?),
             i32::from(read_i16(self.table, at + 4)?),
-        ))
+        );
+        // An anchor of the third kind can move, for a font that varies.
+        if let Some(store) = self.variations
+            && read_u16(self.table, at)? == 3
+        {
+            let device = |offset: usize| match read_u16(self.table, at + offset) {
+                Some(0) | None => 0,
+                Some(device) => crate::variations::device_delta(self.table, at + device as usize, store),
+            };
+            x += device(6);
+            y += device(8);
+        }
+        Some((x, y))
     }
 
     fn cursive_position(&mut self, subtable: usize, index: usize, flags: Flags) -> Option<usize> {
@@ -2207,6 +2247,7 @@ mod would_substitute_tests {
             gsub: Some(table),
             gpos: None,
             gdef: None,
+            variations: None,
         };
         let step = Step {
             lookup: 0,
@@ -2326,6 +2367,7 @@ mod would_substitute_tests {
             gsub: Some(&table),
             gpos: None,
             gdef: None,
+            variations: None,
         };
         let step = Step {
             lookup: 0,
@@ -2353,6 +2395,7 @@ mod would_substitute_tests {
                 gsub: Some(&table),
                 gpos: None,
                 gdef: None,
+                variations: None,
             };
             let step = Step {
                 lookup: 0,
@@ -2408,6 +2451,7 @@ mod would_substitute_tests {
             gsub: Some(table),
             gpos: None,
             gdef: None,
+            variations: None,
         };
         let step = Step {
             lookup: 0,
@@ -2470,6 +2514,7 @@ mod would_substitute_tests {
             gsub: None,
             gpos: None,
             gdef: None,
+            variations: None,
         };
         assert!(!would_substitute(tables, &[], &[5, 6], true));
     }

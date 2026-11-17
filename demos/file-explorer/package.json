@@ -1,0 +1,16 @@
+{
+  "name": "rsui-file-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A fast, customizable file explorer built with rsui, Tailwind 4 and Blode Icons.",
+  "dependencies": {
+    "blode-icons-react": "^1.0.1",
+    "tailwindcss": "^4.3.5"
+  },
+  "scripts": {
+    "start": "rsui-tsx app.tsx",
+    "pack": "rsui-tsx --pack file-explorer.exe app.tsx",
+    "shot": "rsui-tsx --png screenshot.png app.tsx"
+  },
+  "license": "MIT OR Apache-2.0"
+}

@@ -1504,3 +1504,221 @@ mod tests {
         assert_eq!(title.to_string(), "New note");
     }
 }
+
+/// One thing in a folder, as Windows says while it reads the folder.
+#[derive(Clone, Debug)]
+pub struct FolderEntry {
+    pub name: String,
+    pub folder: bool,
+    pub size: u64,
+    /// Milliseconds since 1970.
+    pub modified: f64,
+    /// Milliseconds since 1970.
+    pub created: f64,
+    pub hidden: bool,
+    pub system: bool,
+    pub readonly: bool,
+    /// A symbolic link or a junction.
+    pub link: bool,
+}
+
+/// Names in the order Explorer shows them: letters without regard to case, and runs of digits by their value, so `file2`
+/// comes before `file10`.
+pub fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a.is_ascii() && b.is_ascii() {
+        return natural_order_ascii(a.as_bytes(), b.as_bytes());
+    }
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let run = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut digits = String::new();
+                    while let Some(digit) = chars.peek().copied().filter(char::is_ascii_digit) {
+                        digits.push(digit);
+                        chars.next();
+                    }
+                    digits
+                };
+                let (x, y) = (run(&mut a), run(&mut b));
+                let (x, y) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                let by_value = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+                if by_value != Ordering::Equal {
+                    return by_value;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let by_letter = x.to_lowercase().cmp(y.to_lowercase());
+                if by_letter != Ordering::Equal {
+                    return by_letter;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
+/// [`natural_order`] for names that are all ASCII, as nearly all are, a byte at a time: sorting a folder of 25,000 names this way
+/// takes a few milliseconds, where lowering each character on the way took ten times that.
+fn natural_order_ascii(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        if x.is_ascii_digit() && y.is_ascii_digit() {
+            let run = |text: &[u8], mut at: usize| {
+                while at < text.len() && text[at] == b'0' {
+                    at += 1;
+                }
+                let start = at;
+                while at < text.len() && text[at].is_ascii_digit() {
+                    at += 1;
+                }
+                (start, at)
+            };
+            // Leading zeros are skipped, but the run starts where its digits do.
+            let (x_start, x_end) = run(a, i);
+            let (y_start, y_end) = run(b, j);
+            let by_value = (x_end - x_start).cmp(&(y_end - y_start)).then_with(|| a[x_start..x_end].cmp(&b[y_start..y_end]));
+            if by_value != Ordering::Equal {
+                return by_value;
+            }
+            i = x_end;
+            j = y_end;
+            // `run` stopped at the zeros' end for a run that was only zeros, so step over any digits it didn't take.
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+        } else {
+            let by_letter = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+            if by_letter != Ordering::Equal {
+                return by_letter;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
+/// What's in a folder, in one pass and in [`natural_order`]. Windows gives each name with its size, times and attributes as
+/// it reads the folder, so nothing more is asked of each file, and a folder of 100,000 things lists in milliseconds rather
+/// than seconds.
+pub fn list_folder(path: &Path) -> Result<Vec<FolderEntry>, String> {
+    use std::os::windows::fs::MetadataExt;
+    let millis = |time: std::io::Result<std::time::SystemTime>| {
+        time.ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |since| since.as_secs_f64() * 1000.0)
+    };
+    let entries = std::fs::read_dir(path).map_err(|error| format!("can't read {}: {error}", path.display()))?;
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        // On Windows this comes from what reading the folder gave, with no call of its own.
+        let Ok(metadata) = entry.metadata() else { continue };
+        let attributes = metadata.file_attributes();
+        found.push(FolderEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            folder: attributes & 0x10 != 0,
+            size: metadata.file_size(),
+            modified: millis(metadata.modified()),
+            created: millis(metadata.created()),
+            hidden: attributes & 0x2 != 0,
+            system: attributes & 0x4 != 0,
+            readonly: attributes & 0x1 != 0,
+            link: attributes & 0x400 != 0,
+        });
+    }
+    found.sort_by(|a, b| natural_order(&a.name, &b.name).then_with(|| a.name.cmp(&b.name)));
+    Ok(found)
+}
+
+/// A drive, as This PC shows it.
+#[derive(Clone, Debug)]
+pub struct Drive {
+    /// Like `C:\`.
+    pub path: String,
+    pub label: String,
+    /// `fixed`, `removable`, `network`, `optical`, `ram` or `unknown`.
+    pub kind: &'static str,
+    /// In bytes, or 0 when it can't be read, as an optical drive with nothing in it.
+    pub total: u64,
+    pub free: u64,
+}
+
+/// The drives there are. A network drive that isn't connected can take a while to answer, so this belongs on a thread.
+pub fn drives() -> Vec<Drive> {
+    use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+    use windows::core::PCWSTR;
+    let mask = unsafe { GetLogicalDrives() };
+    let mut found = Vec::new();
+    for letter in 0..26u8 {
+        if mask & (1 << letter) == 0 {
+            continue;
+        }
+        let path = format!("{}:\\", (b'A' + letter) as char);
+        let root = wide(&path);
+        let at = PCWSTR(root.as_ptr());
+        let kind = match unsafe { GetDriveTypeW(at) } {
+            2 => "removable",
+            3 => "fixed",
+            4 => "network",
+            5 => "optical",
+            6 => "ram",
+            _ => "unknown",
+        };
+        let mut label = [0u16; 261];
+        let named = unsafe { GetVolumeInformationW(at, Some(&mut label), None, None, None, None) }.is_ok();
+        let end = label.iter().position(|&unit| unit == 0).unwrap_or(label.len());
+        let (mut free, mut total) = (0u64, 0u64);
+        if unsafe { GetDiskFreeSpaceExW(at, Some(&raw mut free), Some(&raw mut total), None) }.is_err() {
+            (free, total) = (0, 0);
+        }
+        found.push(Drive {
+            path,
+            label: if named { String::from_utf16_lossy(&label[..end]) } else { String::new() },
+            kind,
+            total,
+            free,
+        });
+    }
+    found
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::natural_order;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn names_sort_as_explorer_has_them() {
+        let mut names = vec!["file10.txt", "File2.txt", "file1.txt", "a", "B", "file02b", "file2a", "x0010", "x9"];
+        names.sort_by(|a, b| natural_order(a, b));
+        assert_eq!(names, ["a", "B", "file1.txt", "File2.txt", "file2a", "file02b", "file10.txt", "x9", "x0010"]);
+        assert_eq!(natural_order("abc", "ABC"), Ordering::Equal);
+        assert_eq!(natural_order("a", "ab"), Ordering::Less);
+    }
+
+    #[test]
+    fn a_folder_lists_in_one_pass() {
+        let folder = std::env::temp_dir().join(format!("rsui-list-folder-{}", std::process::id()));
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("b10.txt"), "hello").unwrap();
+        std::fs::write(folder.join("b9.txt"), "").unwrap();
+        let found = super::list_folder(&folder).unwrap();
+        let names: Vec<&str> = found.iter().map(|one| one.name.as_str()).collect();
+        assert_eq!(names, ["b9.txt", "b10.txt", "sub"]);
+        assert_eq!(found[1].size, 5);
+        assert!(found[2].folder && !found[0].folder);
+        assert!(found[1].modified > 0.0);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+}

@@ -631,7 +631,13 @@ impl Stroker {
             let (a, b) = (points[i % count], points[(i + 1) % count]);
             if i > 0 || closed {
                 let previous = if i == 0 { segments - 1 } else { i - 1 };
-                join(&mut left, &mut right, points[i % count], normal(previous), normal(i), style, half, scale);
+                // How long the shorter of the two segments is, which says whether their insides meet along them.
+                let length = |at: usize| {
+                    let (a, b) = (points[at % count], points[(at + 1) % count]);
+                    (b.0 - a.0).hypot(b.1 - a.1)
+                };
+                let room = length(previous).min(length(i));
+                join(&mut left, &mut right, points[i % count], normal(previous), normal(i), style, half, scale, room);
             } else {
                 left.push((a.0 + nx, a.1 + ny));
                 right.push((a.0 - nx, a.1 - ny));
@@ -670,6 +676,7 @@ fn join(
     style: &StrokeStyle,
     half: f32,
     scale: f32,
+    room: f32,
 ) {
     let (bdx, bdy, bnx, bny) = before;
     let (adx, ady, anx, any) = after;
@@ -729,8 +736,21 @@ fn join(
         }
     }
     outer.push(outer_end);
-    // The inside goes through the corner itself, so nothing's left out where the sides cross.
     let inner = if left_outside { right } else { left };
+    // Where a corner is slight, as each of the many a curve is made of is, the insides of the two segments cross along both of
+    // them, and that's the corner of the inside. Going through the corner itself there instead would go over what the segments
+    // cover twice, right up to the inside edge, whose pixels would then be counted twice over: curves came out heavier than lines.
+    let turn = dot.clamp(-1.0, 1.0).acos();
+    if turn < PI / 2.0 && half * (turn / 2.0).tan() < room {
+        let (mx, my) = (bnx + anx, bny + any);
+        let length = (mx * mx + my * my).sqrt();
+        if length > 0.0 {
+            let reach = half / (turn / 2.0).cos();
+            inner.push((at.0 - sign * mx / length * reach, at.1 - sign * my / length * reach));
+            return;
+        }
+    }
+    // Otherwise the inside goes through the corner itself, so nothing's left out where the sides cross.
     let (inner_start, inner_end) = if left_outside { (right_start, right_end) } else { (left_start, left_end) };
     inner.push(inner_start);
     inner.push(at);

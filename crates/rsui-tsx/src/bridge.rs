@@ -1406,7 +1406,12 @@ fn run_main_file(path: &Path) -> Result<(Root, Option<String>), String> {
         });
         SIZE.with(|slot| slot.set(size));
         // What a page asks about how big the window is, as `innerWidth` does, is that from the start, before it's ever resized.
-        if let Some((width, height)) = size {
+        // Run again, as it is when it's saved, the window's already the size it is, which may be maximized, and that stays: a
+        // page that lays itself out from `innerWidth` isn't left laid out for the size it opened at.
+        let told = vm
+            .get_global("__rsuiPageSize")
+            .is_ok_and(|known| !known.is_undefined());
+        if let Some((width, height)) = size.filter(|_| !told) {
             let pair = vm.new_array(vec![
                 Value::number(f64::from(width)),
                 Value::number(f64::from(height)),

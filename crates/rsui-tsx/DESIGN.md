@@ -140,8 +140,10 @@ That's at the end of whatever JavaScript was running: a handler, an effect or a 
 A JavaScript timer waits on the runtime's own timer, so a waiting app has no thread awake for it. Promises run when
 whatever's running finishes. JavaScript runs on one thread, which is the one the window is on.
 
-Props compare by what's in them, one level down, like `React.memo` on every component. A function or an array made during a
-render is a new value, so what's given one renders again, just as in React.
+A component skips rendering when it's given the same props object, or props that are the same one level down and are all plain
+values: numbers, strings, booleans. Props that hold an object, an array or a function render it again whenever what it's in
+renders, as in React, unless it's wrapped in `memo`, which compares them one level down (see `JsProps` in bridge.rs). A function or
+an array made during a render is a new value, so even with `memo`, what's given one renders again, just as in React.
 
 A child is the same component as last time if it's in the same place, as in React: where it is in the array of children it's in, with `null`, `false` and `undefined` keeping their places, and the same for each array and element around it. An array or a fragment is one place, with its own places inside. A key takes the place of where it is in its array. A component of another type in a place, or one inside an element of another type, is a new one, and what was there is unmounted.
 
@@ -161,9 +163,10 @@ habits matter once a list gets long, and both of them are in that app:
 
 - **Keep state as far down as it can go.** What's being typed in a box belongs in a component of its own. Kept in the
   component holding the list, each key renders every row.
-- **Give rows the same functions each time.** A component skips rendering if its props are the same, and `onClick={() => ...}`
-  in the parent is a new function each time, so it never is. The functions from `useState` and `useReducer` never change,
-  and `useCallback` keeps others. Making a function inside the row itself costs nothing, as it only runs when the row does.
+- **Wrap rows in `memo`, and give them the same functions each time.** A row given a function or an object only skips rendering
+  when it's wrapped in `memo` and each prop is the same, and `onClick={() => ...}` in the parent is a new function each time, so it
+  never is. The functions from `useState` and `useReducer` never change, and `useCallback` keeps others. Making a function inside
+  the row itself costs nothing, as it only runs when the row does.
 
 ## Seeing why it renders
 
@@ -270,8 +273,9 @@ isn't being looked at costs the same. A program made with `--pack` doesn't have 
 - `name` on an element is what agents and screen readers call it. If it has text inside it as well, that's what shows.
 - There's no `ref` to an element, as `focus(key)` and `autoFocus` on `TextInput` do what they're mostly for. An error while rendering shows
   in place of that component, and the rest carries on, unless an error boundary says otherwise.
-- Every component skips rendering if its props are the same, with no `memo` needed. Mutating something inside a prop, and
-  expecting that to show, won't work. So won't reading something that changed outside it, when its parent renders.
+- A component given only plain values skips rendering when they're the same, with no `memo` needed. One given objects or
+  functions needs `memo` for that, as in React. Mutating something inside a prop of a component that skips, and expecting that
+  to show, won't work. So won't reading something that changed outside it, when its parent renders.
 - On rsui's own elements, a click only reaches the one thing it's on, and what's around it doesn't hear about it, unless it says
   `e.passOn()` or what's around it has `onClickCapture`. A page's elements are as a page's are: see "Writing an app as for a page".
 - `localStorage` is kept in `%APPDATA%\rsui-storage`, or the file `RSUI_STORAGE_FILE` says, in one JSON file for each program. The whole file is written

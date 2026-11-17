@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    font-family: var(--fx-font);
+    font-size: var(--fx-font-size);
+    color: var(--fx-text);
+    background: var(--fx-body);
+    user-select: none;
+}
+
+button {
+    cursor: default;
+}

@@ -49,6 +49,12 @@ export default function App() {
 `crates/rsui-tsx/rsui.d.ts` has the types for editors and `tsc`, with a description of everything. `crates/rsui-tsx/DESIGN.md`
 explains how it works, how it differs from React, and how to keep a long list fast.
 
+## Demos
+
+[`demos/file-explorer`](demos/file-explorer) is a full file explorer in TypeScript with Tailwind CSS 4: tabs, panes split any way
+(dragging a tab onto them too), details, list and grid views, search, previews, file operations, drag and drop, and 88 settings. It
+opens a folder of 25,000 files in about 80 ms.
+
 ## For agents
 
 Working on an app needs no window and no person.

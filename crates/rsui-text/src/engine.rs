@@ -29,6 +29,8 @@ pub enum FontStyle {
     Bold,
     /// Lighter than regular, as CSS's 300 and below are.
     Light,
+    /// Between light and regular, as CSS's 350 is, which is a family's semilight font if it has one, and light otherwise.
+    Semilight,
     /// A little heavier than regular, as CSS's 500 is, which is a family's medium or semibold font if it has one, as Windows
     /// chooses, and regular otherwise.
     Medium,
@@ -51,8 +53,9 @@ impl FontStyle {
             "bold" | "bolder" => Self::Bold,
             "normal" | "lighter" => Self::Regular,
             _ => match weight.parse::<u16>() {
-                Ok(0..=350) => Self::Light,
-                Ok(351..=450) => Self::Regular,
+                Ok(0..=325) => Self::Light,
+                Ok(326..=374) => Self::Semilight,
+                Ok(375..=450) => Self::Regular,
                 Ok(451..=550) => Self::Medium,
                 Ok(551..=650) => Self::Semibold,
                 Ok(651..=750) => Self::Bold,
@@ -70,8 +73,22 @@ impl FontStyle {
             Self::Medium => &["Medium", "Semibold", "SemiBold", ""],
             Self::Bold => &["Bold"],
             Self::Light => &["Light", "Semilight", ""],
+            Self::Semilight => &["Semilight", "SemiLight", "Light", ""],
             Self::Semibold => &["Semibold", "SemiBold", "Bold"],
             Self::Black => &["Black", "Heavy", "Bold"],
+        }
+    }
+
+    /// The CSS weight this stands for, which a variable font is set to the place nearest.
+    fn css_weight(self) -> f32 {
+        match self {
+            Self::Light => 300.0,
+            Self::Semilight => 350.0,
+            Self::Regular => 400.0,
+            Self::Medium => 500.0,
+            Self::Semibold => 600.0,
+            Self::Bold => 700.0,
+            Self::Black => 900.0,
         }
     }
 }
@@ -1231,7 +1248,11 @@ impl TextEngine {
             || style.italic
             || matches!(
                 style.font,
-                FontStyle::Light | FontStyle::Medium | FontStyle::Semibold | FontStyle::Black
+                FontStyle::Light
+                    | FontStyle::Semilight
+                    | FontStyle::Medium
+                    | FontStyle::Semibold
+                    | FontStyle::Black
             )
         {
             self.open_chosen_font(style);
@@ -1275,6 +1296,22 @@ impl TextEngine {
         // better than text in the wrong font.
         let families = style.family.map_or("Segoe UI", |family| family.as_str());
         let found = families.split(',').map(css_family).find_map(|family| {
+            // A family that's places along a variable font's axes, such as `Segoe UI Variable Text`, is set to the place
+            // for this weight, as a browser chooses it.
+            match crate::system_fonts::find_variable(family) {
+                crate::system_fonts::Variable::Family(instances) => {
+                    let chosen = crate::system_fonts::choose_instance(
+                        &instances,
+                        weight.css_weight(),
+                        style.italic,
+                    )?;
+                    let mut font = Font::open_face(&chosen.path, chosen.face).ok()?;
+                    font.set_variations(&chosen.settings);
+                    return Some(font);
+                }
+                crate::system_fonts::Variable::NotAFamily => return None,
+                crate::system_fonts::Variable::No => {}
+            }
             let named = |suffix: &str| {
                 let mut name = family.to_owned();
                 if !suffix.is_empty() {
@@ -1308,11 +1345,30 @@ impl TextEngine {
 
     /// How wide the widest word is, which is as narrow as text can be without breaking one.
     pub fn longest_word(&mut self, text: &str, style: TextStyle) -> f32 {
-        text.split(|character: char| character.is_whitespace())
-            .filter(|word| !word.is_empty())
-            .map(|word| self.line_width(word, style))
-            .fold(0.0, f32::max)
-            .ceil()
+        // A word ends where a line can, as the lines here are broken: at a space, after a hyphen or a dash, and between
+        // ideographs. So `abc-defghijk` is two, as it is on a page, and only as wide as its longer half has to fit.
+        let mut longest = 0.0f32;
+        let mut start = 0;
+        let mut characters = text.char_indices().peekable();
+        while let Some((at, character)) = characters.next() {
+            let end = at + character.len_utf8();
+            if character.is_whitespace() {
+                if at > start {
+                    longest = longest.max(self.line_width(&text[start..at], style));
+                }
+                start = end;
+            } else if characters.peek().is_some_and(|&(_, next)| {
+                crate::lines::can_break_between(character, next) || crate::lines::is_ideograph(next)
+            })
+            {
+                longest = longest.max(self.line_width(&text[start..end], style));
+                start = end;
+            }
+        }
+        if start < text.len() {
+            longest = longest.max(self.line_width(&text[start..], style));
+        }
+        longest.ceil()
     }
 
     /// Fills in `layout` with one line of text, however long it is. Past `limit`, what doesn't fit is cut off, with an
@@ -1391,6 +1447,15 @@ impl TextEngine {
         line.width = limit;
         line.x = 0.0;
         line.glyph_count = layout.glyphs.len() as u32;
+    }
+
+    /// The `…` that ends text cut off with one, in this style, and how wide it is: for a paragraph, whose runs each have
+    /// their own look, but whose `…` is in the look of the paragraph itself, as CSS has it.
+    pub fn ellipsis_glyph(&mut self, style: TextStyle) -> (PlacedGlyph, f32) {
+        let primary = self.primary(style);
+        let (face, glyph) = self.find_glyph(primary, '\u{2026}');
+        let width = self.character_width(primary, style.size, None, '\u{2026}');
+        (PlacedGlyph { font: face as u16, glyph, x: 0.0, y: 0.0 }, width)
     }
 
     /// The face and glyph for a character: from the wanted font if it has it, otherwise
@@ -2476,6 +2541,15 @@ impl Measure for TextEngine {
                 || element.props.get_symbol(ONE_LINE_NAMES.1).is_some());
         if one_line {
             let mut size = TextEngine::measure(self, &element.name, style, f32::INFINITY);
+            if element.props.get("keep_spaces") == Some(&PropValue::Bool(true)) {
+                // Spaces it ends with are kept, as CSS's `white-space: pre` has them, and take room: where the caret would be after
+                // the last of them is how wide each line is.
+                for line in element.name.split('\n') {
+                    if line.ends_with(char::is_whitespace) {
+                        size.width = size.width.max(self.line_width(line, style));
+                    }
+                }
+            }
             size.width += style.letter_spacing * widest_line_characters(&element.name) as f32;
             size.width += style.word_spacing * widest_line_spaces(&element.name) as f32;
             let (line_height, _) = self.style_metrics(self.primary(style), style);
@@ -2491,6 +2565,10 @@ impl Measure for TextEngine {
                 && element.props.get_symbol(ONE_LINE_NAMES.0).is_none();
             let width = if keeps_all {
                 page_width(size.width)
+            } else if element.props.get_symbol(ONE_LINE_NAMES.2).is_some() {
+                // A page's text that ends in `…` is as wide as a browser has it too, where there's room: only rsui's own text is
+                // whole pixels, which made a truncated `<span>` a fraction of a pixel wider than on a page.
+                page_width(size.width).min(max_width)
             } else {
                 size.width.ceil().min(max_width)
             };

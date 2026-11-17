@@ -25,7 +25,48 @@ function asked(ask) {
     }
 }
 
+/// A folder's listing as Rust gives it, a line for each thing, as objects.
+function listing(text) {
+    const found = [];
+    if (!text) {
+        return found;
+    }
+    for (const line of String(text).split('\n')) {
+        if (line === '') {
+            continue;
+        }
+        const [name, flags, size, modified, created] = line.split('\t');
+        const bits = Number(flags);
+        found.push({
+            name,
+            folder: (bits & 1) !== 0,
+            hidden: (bits & 2) !== 0,
+            system: (bits & 4) !== 0,
+            readonly: (bits & 8) !== 0,
+            link: (bits & 16) !== 0,
+            size: Number(size),
+            modified: Number(modified),
+            created: Number(created),
+        });
+    }
+    return found;
+}
+
+/// A promise of what `ask` gives, which is rejected if asking throws.
+function promised(ask, then) {
+    try {
+        return Promise.resolve(ask()).then(then);
+    } catch (error) {
+        return Promise.reject(error);
+    }
+}
+
 const files = {
+    /// What's in a folder, read in one pass on another thread, with each thing's size, times and attributes:
+    /// `[{ name, folder, hidden, system, readonly, link, size, modified, created }]`, in the order Explorer sorts names.
+    list: (folder) => promised(() => host.folderList(resolved(folder)), listing),
+    /// The drives there are, as `[{ path, label, kind, total, free }]`.
+    drives: () => promised(() => host.drives(), (text) => JSON.parse(text)),
     /// What Explorer shows of what's in a file, as a photo's or a document's first page, at most `size` pixels across:
     /// `{ width, height, png, url }`, with `png` a PNG file's bytes and `url` a `data:` URL of it. It's `null` for a file that
     /// has no thumbnail.

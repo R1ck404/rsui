@@ -4,6 +4,7 @@
 //! feature, and only how far they move the next glyph.
 
 use crate::font::{read_i16, read_u16, read_u32};
+use crate::variations::{Store, device_delta};
 
 /// How many pair adjustment subtables to look through. Fonts need a handful, so a font
 /// with more is damaged or trying to slow things down.
@@ -95,7 +96,13 @@ impl PairKerning {
     }
 
     /// The adjustment between two glyphs, given the whole font file.
-    pub(crate) fn kerning(&self, file: &[u8], left: u16, right: u16) -> i16 {
+    pub(crate) fn kerning(
+        &self,
+        file: &[u8],
+        left: u16,
+        right: u16,
+        varied: Option<Store<'_>>,
+    ) -> i16 {
         let mut total = 0i16;
         for (index, &first) in self.lookups.iter().enumerate() {
             let end = self
@@ -103,7 +110,7 @@ impl PairKerning {
                 .get(index + 1)
                 .map_or(self.subtables.len(), |&next| next as usize);
             for &subtable in &self.subtables[first as usize..end] {
-                let found = pair_adjustment(file, subtable as usize, left, right);
+                let found = pair_adjustment(file, subtable as usize, left, right, varied);
                 if let Some(Some(value)) = found {
                     total = total.saturating_add(value);
                 }
@@ -149,7 +156,13 @@ fn default_language_features(gpos: &[u8], script_list: usize) -> Option<Vec<u16>
 /// the first glyph, or if it lists pairs and this isn't one of them. A subtable of classes
 /// applies to any glyphs it covers, so it ends the lookup even with nothing to adjust,
 /// which the inner `None` means.
-fn pair_adjustment(file: &[u8], subtable: usize, left: u16, right: u16) -> Option<Option<i16>> {
+fn pair_adjustment(
+    file: &[u8],
+    subtable: usize,
+    left: u16,
+    right: u16,
+    varied: Option<Store<'_>>,
+) -> Option<Option<i16>> {
     let format = read_u16(file, subtable)?;
     let coverage = subtable + read_u16(file, subtable + 2)? as usize;
     let covered = coverage_index(file, coverage, left)?;
@@ -175,7 +188,8 @@ fn pair_adjustment(file: &[u8], subtable: usize, left: u16, right: u16) -> Optio
                 let second = read_u16(file, pair)?;
                 match second.cmp(&right) {
                     std::cmp::Ordering::Equal => {
-                        return Some(x_advance(file, pair + 2, value_format_1));
+                        // A pair's values keep their changes from where its set starts.
+                        return Some(x_advance(file, pair + 2, value_format_1, set, varied));
                     }
                     std::cmp::Ordering::Less => low = middle + 1,
                     std::cmp::Ordering::Greater => high = middle,
@@ -200,7 +214,7 @@ fn pair_adjustment(file: &[u8], subtable: usize, left: u16, right: u16) -> Optio
                 return Some(None);
             }
             let record = subtable + 16 + (class_1 * class_2_count + class_2) * record_size;
-            Some(x_advance(file, record, value_format_1))
+            Some(x_advance(file, record, value_format_1, subtable, varied))
         }
         _ => None,
     }
@@ -210,16 +224,41 @@ fn value_size(format: u16) -> usize {
     format.count_ones() as usize * 2
 }
 
-/// How far the second glyph moves, from a value record.
-fn x_advance(file: &[u8], record: usize, format: u16) -> Option<i16> {
+/// How far the second glyph moves, from a value record, with what it changes by where the font is set along its axes,
+/// for a font that varies. Its changes are kept from where the subtable starts.
+fn x_advance(
+    file: &[u8],
+    record: usize,
+    format: u16,
+    subtable: usize,
+    varied: Option<Store<'_>>,
+) -> Option<i16> {
     const X_PLACEMENT: u16 = 1 << 0;
     const Y_PLACEMENT: u16 = 1 << 1;
     const X_ADVANCE: u16 = 1 << 2;
-    if format & X_ADVANCE == 0 {
+    const X_ADVANCE_DEVICE: u16 = 1 << 6;
+    if format & (X_ADVANCE | X_ADVANCE_DEVICE) == 0 {
         return None;
     }
     let skipped = (format & (X_PLACEMENT | Y_PLACEMENT)).count_ones() as usize;
-    read_i16(file, record + skipped * 2)
+    let value = if format & X_ADVANCE != 0 {
+        read_i16(file, record + skipped * 2)?
+    } else {
+        0
+    };
+    if format & X_ADVANCE_DEVICE == 0 {
+        return Some(value);
+    }
+    let Some(varied) = varied else {
+        return Some(value);
+    };
+    let before = (format & 0x3F).count_ones() as usize;
+    let device = read_u16(file, record + before * 2)? as usize;
+    if device == 0 {
+        return Some(value);
+    }
+    let delta = device_delta(file, subtable + device, varied);
+    Some((i32::from(value) + delta).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
 }
 
 /// A glyph's position in a coverage table, if it's there.

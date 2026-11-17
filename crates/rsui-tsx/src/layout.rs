@@ -156,6 +156,7 @@ names! {
     reverse = "reverse",
     size_said = "__sizeSaid",
     no_wrap = "noWrap",
+    keep_spaces = "keepSpaces",
     line_height = "lineHeight",
     font_family = "fontFamily",
     font_weight = "fontWeight",
@@ -252,6 +253,9 @@ struct FontFile {
 }
 
 /// Fonts only a Mac has, which a family that names them first goes past, to what's after them, as a browser here does.
+/// How big rsui's own text is when nothing says, as `DEFAULT_SIZE` in rsui-text has it.
+const NATIVE_TEXT_SIZE: f64 = 14.0;
+
 const MAC_ONLY: [&str; 2] = ["-apple-system", "blinkmacsystemfont"];
 
 /// What's kept for each engine that's loaded `rsui/web`.
@@ -1037,6 +1041,10 @@ impl Cx<'_, '_> {
             look.delete(n.justify_items);
         } else if grid && !content.is_undefined() {
             look.set(n.align_content, content);
+        } else if !grid && look.is_true(n.flex_wrap) && content_text.is_some() {
+            // Where the lines of a flex box that wraps go, which rsui-layout spreads as CSS does: `flex-start` keeps them at the
+            // top rather than stretching each to share what's left.
+            look.set(n.align_content, content);
         } else if let Some(content) = &content_text {
             if !grid && look.is(self.vm, n.direction, "row") && look.is_undefined(n.align) {
                 let word = align_word(content).unwrap_or("stretch");
@@ -1305,7 +1313,9 @@ impl Cx<'_, '_> {
                 // A size in pixels, which a font that's only monospace doesn't change, here or in anything in it.
                 look.set(n.size_said, Value::TRUE);
             }
-            self.resolve_relative(look, above_size.unwrap_or(16.0));
+            // With nothing around it saying how big its text is, as outside a `PageWindow`, that's how big rsui's own text is
+            // (`DEFAULT_SIZE` in rsui-text), which is what it's drawn at: `0.8em` is a share of that.
+            self.resolve_relative(look, above_size.unwrap_or(NATIVE_TEXT_SIZE));
         }
         let props = self.font_props();
         if has_above {
@@ -1427,6 +1437,14 @@ impl Cx<'_, '_> {
                 || props.is(self.vm, n.white_space, "pre");
             if keeps && props.is_undefined(n.no_wrap) {
                 props.set(n.no_wrap, Value::TRUE);
+            }
+            // Spaces at the end of a line are part of it when they're kept as they're written, as `pre` keeps them: a `<span>`
+            // that's only a space in a `pre` is as wide as a space.
+            if props.is(self.vm, n.white_space, "pre")
+                || props.is(self.vm, n.white_space, "pre-wrap")
+                || props.is(self.vm, n.white_space, "break-spaces")
+            {
+                props.set(n.keep_spaces, Value::TRUE);
             }
             props.delete(n.white_space);
             props.delete(n.size_said);
@@ -2221,7 +2239,9 @@ impl Kx<'_, '_> {
             // `<button>` or `<input>`), so it isn't made the page's `a` until it's drawn: it goes along a line as that does.
             let page_inline = node.ty.is_string() && inline_text_tag(self.tag_of(&node)?.text());
             if text || page_inline || self.get(node.ty, n.web_inline)? == Value::TRUE || self.inline_by_props(&node)? {
-                return Ok(true);
+                // Unless CSS makes it a block, as `<span class="block">` is: then it's a box of its own, and what it's in lays it
+                // out as one, rather than as words on a line, which would leave out a box with nothing in it.
+                return Ok(self.said_flow(&node)? != Flow::Block);
             }
         }
         if self.passes_down(&node)? {

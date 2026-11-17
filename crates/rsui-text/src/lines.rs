@@ -25,6 +25,13 @@ pub(crate) fn can_break_after(character: char) -> bool {
     ) || is_ideograph(character)
 }
 
+/// Whether a line may end between these two characters: where [`can_break_after`] says, and after a `?` or `!` that has a
+/// word straight after it, as a browser breaks `lmnop?qrs`, which Unicode's rules for lines allow. A `/` isn't one, as a
+/// browser keeps `defghijk/lmnop` together.
+pub(crate) fn can_break_between(before: char, after: char) -> bool {
+    can_break_after(before) || (matches!(before, '?' | '!') && after.is_alphanumeric())
+}
+
 /// Whether a line may start at this character regardless of what came before. Text in
 /// these scripts doesn't use spaces, so lines can end between any two characters.
 pub(crate) fn is_ideograph(character: char) -> bool {
@@ -74,7 +81,10 @@ pub(crate) fn next_measured_line(
                 .is_some_and(|next| is_ideograph(next.1));
             let starts_word =
                 !word_starts.is_empty() && word_starts.binary_search(&(index + 1)).is_ok();
-            if next_has_width && (can_break_after(character) || next_is_ideograph || starts_word) {
+            let breaks = characters
+                .get(index + 1)
+                .map_or_else(|| can_break_after(character), |next| can_break_between(character, next.1));
+            if next_has_width && (breaks || next_is_ideograph || starts_word) {
                 last_break = Some((visible_end, visible_end));
             }
         }
@@ -148,7 +158,8 @@ pub(crate) fn next_line(
         } else {
             visible_width = width;
             visible_end = position + character.len_utf8();
-            if can_break_after(character) {
+            let next = characters.clone().next().map(|(_, c)| c);
+            if next.map_or_else(|| can_break_after(character), |next| can_break_between(character, next)) {
                 last_break = Some((visible_end, visible_end, visible_width));
             }
         }
@@ -164,5 +175,19 @@ pub(crate) fn next_line(
         next: text.len(),
         width: visible_width,
         last: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_can_end_after_a_question_mark_but_not_a_slash() {
+        assert!(can_break_between('-', 'a'));
+        assert!(can_break_between('?', 'q'));
+        assert!(!can_break_between('?', '"'));
+        assert!(!can_break_between('/', 'l'));
+        assert!(!can_break_between('a', 'b'));
     }
 }
