@@ -199,8 +199,9 @@ fn a_handler_seeing_a_let_reads_what_it_holds_now() {
     );
     // 0 to 1 leaves half at 0, so the child keeps what it had.
     assert_eq!(renders_for(&mut ui, "add"), 1);
-    // 1 to 2 makes it 1.
-    assert_eq!(renders_for(&mut ui, "add"), 2);
+    // 1 to 2 makes it 1, which the child's handler is handed without it rendering, as it's a handler (`onShow`) made from the
+    // same code.
+    assert_eq!(renders_for(&mut ui, "add"), 1);
     ui.click(&key("child")).unwrap();
     assert!(line_with(&ui, "shown").contains("shown half 1"));
 }
@@ -449,4 +450,179 @@ fn the_same_object_with_methods_renders_it_again() {
     );
     ui.click(&key("toggle")).unwrap();
     assert!(line_with(&ui, "cell ").contains("cell on"));
+}
+
+#[test]
+fn a_handler_that_sees_new_state_is_handed_it_without_the_child_rendering() {
+    // As `useEvent` would have it by hand: the child keeps its handler, which now does what the new one does.
+    let mut ui = start(
+        r#"
+        import { useEffect, useState } from 'rsui';
+        let renders = 0;
+        let effects = 0;
+        function Child(props) {
+            renders++;
+            useEffect(() => { effects++; }, [props.onShow]);
+            return <button key="child" onClick={props.onShow}>child renders {renders}</button>;
+        }
+        function Shows(props) {
+            return <text>says {props.say()}</text>;
+        }
+        export default function App() {
+            const [count, setCount] = useState(0);
+            const [shown, setShown] = useState('none');
+            return (
+                <window>
+                    <button key="add" onClick={() => setCount(count + 1)}>add</button>
+                    <Child onShow={() => setShown('saw ' + count + ' after ' + effects + ' effects')} />
+                    <Shows say={() => 'count ' + count} />
+                    <text>shown {shown}</text>
+                </window>
+            );
+        }
+        "#,
+    );
+    // The app, and `Shows`, whose `say` is called as it renders, which isn't named as a handler is.
+    assert_eq!(renders_for(&mut ui, "add"), 2);
+    assert!(line_with(&ui, "says").contains("says count 1"));
+    assert_eq!(renders_for(&mut ui, "add"), 2);
+    assert!(line_with(&ui, "says").contains("says count 2"));
+    assert!(line_with(&ui, "child renders").contains("child renders 1"));
+    // What it was handed sees what the app's last render did, and its effect, which only runs when the handler is another,
+    // ran once.
+    ui.click(&key("child")).unwrap();
+    assert!(line_with(&ui, "shown").contains("shown saw 2 after 1 effects"));
+}
+
+#[test]
+fn handlers_that_see_an_object_of_handlers_that_sees_itself_are_the_same() {
+    // As the file explorer's `act` is: each of what's in it can call the others through it.
+    let mut ui = start(
+        r#"
+        import { useState } from 'rsui';
+        let renders = 0;
+        function Child(props) {
+            renders++;
+            return <button key="child" onClick={() => props.step()}>child renders {renders}</button>;
+        }
+        export default function App() {
+            const [count, setCount] = useState(0);
+            const [other, setOther] = useState(0);
+            const act = { go: (n) => setCount(n), next: () => act.go(count + 1), back: () => act.go(count - 1) };
+            return (
+                <window>
+                    <button key="other" onClick={() => setOther(other + 1)}>other {other}</button>
+                    <Child step={act.next} />
+                    <text>count {count}</text>
+                </window>
+            );
+        }
+        "#,
+    );
+    assert_eq!(renders_for(&mut ui, "other"), 1);
+    // The child renders once what its `step` sees has changed, which isn't a handler's name, so it's given the new one.
+    assert_eq!(renders_for(&mut ui, "child"), 2);
+    assert!(line_with(&ui, "count ").contains("count 1"));
+    ui.click(&key("child")).unwrap();
+    assert!(line_with(&ui, "count ").contains("count 2"));
+}
+
+/// A page's `<div>`s around components given handlers made in place, a keyed list among them, and what reads a context.
+const PAGE: &str = r#"
+    import { createContext, useContext, useState } from 'rsui';
+    const Theme = createContext('light');
+    let renders = 0;
+    function Tab(props) {
+        renders++;
+        return <button key={'tab' + props.id} onClick={props.onPick}>tab {props.label} renders {renders}</button>;
+    }
+    function Themed() {
+        return <span>theme {useContext(Theme)}</span>;
+    }
+    export default function App() {
+        const [other, setOther] = useState(0);
+        const [label, setLabel] = useState('a');
+        const [order, setOrder] = useState(['x', 'y', 'z']);
+        const [theme, setTheme] = useState('light');
+        const [picked, setPicked] = useState('none');
+        return (
+            <window>
+                <button key="other" onClick={() => setOther(other + 1)}>other {other}</button>
+                <button key="rename" onClick={() => setLabel(label + 'b')}>rename</button>
+                <button key="reverse" onClick={() => setOrder([...order].reverse())}>reverse</button>
+                <button key="flip" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}>flip</button>
+                <Theme.Provider value={theme}>
+                    <div className="bar" style={{ padding: 4 }}>
+                        <span>tabs</span>
+                        <div className="list">
+                            {order.map((id) => (
+                                <Tab key={id} id={id} label={label + id} onPick={() => setPicked(label + id + ' ' + other)} />
+                            ))}
+                        </div>
+                        <div className="themed"><Themed /></div>
+                    </div>
+                </Theme.Provider>
+                <text>picked {picked}</text>
+            </window>
+        );
+    }
+"#;
+
+#[test]
+fn a_page_element_given_the_same_again_isnt_drawn_again() {
+    let mut ui = start(PAGE);
+    // The app, the button that says what `other` is now, and the provider, which isn't the app's: the `<div>`s are given what
+    // does the same, handlers seeing `other` and all.
+    assert_eq!(renders_for(&mut ui, "other"), 3);
+    assert_eq!(renders_for(&mut ui, "other"), 3);
+    ui.click(&key("taby")).unwrap();
+    assert!(line_with(&ui, "picked").contains("picked ay 2"));
+    // What changed in them still shows, a keyed list's order, and what reads a context.
+    ui.click(&key("rename")).unwrap();
+    assert!(line_with(&ui, "tab abx").contains("tab abx"));
+    ui.click(&key("reverse")).unwrap();
+    let outline = ui.outline();
+    let at = |name: &str| outline.find(name).unwrap_or_else(|| panic!("no {name} in\n{outline}"));
+    assert!(at("tab abz") < at("tab aby") && at("tab aby") < at("tab abx"));
+    ui.click(&key("flip")).unwrap();
+    assert!(line_with(&ui, "theme ").contains("theme dark"));
+    ui.click(&key("tabz")).unwrap();
+    assert!(line_with(&ui, "picked").contains("picked abz 2"));
+}
+
+#[test]
+fn a_handler_made_again_before_something_on_a_page_doesnt_move_it() {
+    // What's after a button whose handler sees what changed is still where it was, as far as CSS can tell, so it isn't told
+    // so again and drawn again (see `sameToCss` in web.js), though CSS asks what's before it.
+    let mut ui = start(
+        r#"
+        import { useState } from 'rsui';
+        let renders = 0;
+        function Label(props) {
+            renders++;
+            return <span className="label">label renders {renders}</span>;
+        }
+        export default function App() {
+            const [other, setOther] = useState(0);
+            return (
+                <window>
+                    <style>{'.row button + .label { color: red; }'}</style>
+                    <div className="row">
+                        <button key="other" onClick={() => setOther(other + 1)}>other {other}</button>
+                        <Label />
+                    </div>
+                </window>
+            );
+        }
+        "#,
+    );
+    let label = line_with(&ui, "label renders");
+    let before = ui.runtime().renders();
+    ui.click(&key("other")).unwrap();
+    ui.click(&key("other")).unwrap();
+    assert!(line_with(&ui, "text \"other").contains("other 2"));
+    assert_eq!(line_with(&ui, "label renders"), label);
+    // Each time the app, the `<div>`, the button, which says something else, and three providers around them that aren't the
+    // app's: but not the label's `<span>`, which a new place would draw again.
+    assert_eq!(ui.runtime().renders() - before, 12);
 }

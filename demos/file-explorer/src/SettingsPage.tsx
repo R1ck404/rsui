@@ -1,6 +1,6 @@
 // The settings screen. Every setting in `SECTIONS` shows here, with its own control, and changes apply as they're made.
 
-import { memo, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { clipboard, dialogs } from 'rsui/desktop';
 import { promises as fs } from 'fs';
 import * as I from './icons';
@@ -114,7 +114,7 @@ function Control(props: { field: Field; settings: Settings; change: Change }) {
     }
 }
 
-const FieldRow = memo(function FieldRow(props: { field: Field; settings: Settings; change: Change }) {
+function FieldRow(props: { field: Field; settings: Settings; change: Change }) {
     const { field, settings, change } = props;
     const changed = settings[field.key] !== DEFAULTS[field.key];
     return (
@@ -139,7 +139,7 @@ const FieldRow = memo(function FieldRow(props: { field: Field; settings: Setting
             </div>
         </div>
     );
-});
+}
 
 function Keyboard(props: { settings: Settings; change: Change }) {
     const { settings, change } = props;

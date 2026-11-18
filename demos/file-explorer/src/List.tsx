@@ -4,7 +4,7 @@
 // scrolls them in Rust, and a row made of `<row>` and `<text>` costs a fraction of one made of styled `<div>`s, which go through the
 // page's CSS. Everything around it is Tailwind. The colors come from the same settings, so the two look the same.
 
-import { memo, useCallback } from 'react';
+import { useEffect, useRef } from 'react';
 import { attributesOf, displayName, formatDate, formatSize, kindLabel, type Entry } from './files';
 import { FileIcon } from './FileIcon';
 import { ChevronDownIcon } from './icons';
@@ -12,7 +12,7 @@ import type { Settings, SortKey, View } from './settings';
 import type { Colors } from './theme';
 import { HAS_THUMBNAIL, useThumbnail } from './thumbs';
 
-/** What every row is drawn with. It's made once per settings change, so rows can tell it hasn't changed. */
+/** What every row is drawn with, from the settings. */
 export interface Look {
     rowHeight: number;
     iconSize: number;
@@ -43,14 +43,14 @@ export interface Look {
 }
 
 export interface Handlers {
-    pick(path: string, mods: { ctrl: boolean; shift: boolean }): void;
-    activate(path: string, mods: { ctrl: boolean; shift: boolean }): void;
-    open(path: string): void;
-    context(path: string | null): void;
-    dragOut(path: string): void;
-    rename(path: string, name: string | null): void;
-    emptyClick(): void;
-    emptyDouble(): void;
+    onPick(path: string, mods: { ctrl: boolean; shift: boolean }): void;
+    onActivate(path: string, mods: { ctrl: boolean; shift: boolean }): void;
+    onOpen(path: string): void;
+    onContext(path: string | null): void;
+    onDragOut(path: string): void;
+    onRename(path: string, name: string | null): void;
+    onEmptyClick(): void;
+    onEmptyDouble(): void;
 }
 
 export const COLUMN_WIDTH = { size: 92, type: 120, modified: 168, created: 168, attributes: 56 };
@@ -76,16 +76,19 @@ function paint(look: Look, selected: boolean, cursor: boolean, odd: boolean) {
     };
 }
 
-const RenameField = memo(function RenameField(props: { entry: Entry; look: Look; handlers: Handlers }) {
+function RenameField(props: { entry: Entry; look: Look; handlers: Handlers }) {
     const { entry, look, handlers } = props;
     let done = false;
     const finish = (name: string | null) => {
         if (!done) {
             done = true;
-            handlers.rename(entry.path, name);
+            handlers.onRename(entry.path, name);
         }
     };
-    const field = useCallback((element: any) => {
+    // Focused once, as it shows, with the name selected.
+    const field = useRef<any>(null);
+    useEffect(() => {
+        const element = field.current;
         if (element) {
             element.focus();
             const end = look.renameSelectsBase && !entry.folder && entry.ext ? entry.name.length - entry.ext.length - 1 : entry.name.length;
@@ -113,7 +116,7 @@ const RenameField = memo(function RenameField(props: { entry: Entry; look: Look;
             onBlur={(event: any) => finish(event.currentTarget.value)}
         />
     );
-});
+}
 
 // How far the pointer has gone with the button down since it went down on a row, and whether files are being dragged out.
 // rsui says `start` as soon as the button goes down, and dragging files out takes the pointer over until it's let go, so a
@@ -124,9 +127,9 @@ let pressed = { path: '', moved: 0, dragging: false };
 /** What a row does with the pointer, which is the same in every view. */
 function pointer(entry: Entry, handlers: Handlers) {
     return {
-        onClick: (event: any) => handlers.activate(entry.path, { ctrl: !!event?.ctrlKey, shift: !!event?.shiftKey }),
-        onDoubleClick: () => handlers.open(entry.path),
-        onContextMenu: () => handlers.context(entry.path),
+        onClick: (event: any) => handlers.onActivate(entry.path, { ctrl: !!event?.ctrlKey, shift: !!event?.shiftKey }),
+        onDoubleClick: () => handlers.onOpen(entry.path),
+        onContextMenu: () => handlers.onContext(entry.path),
         onDrag: (phase: string, _x: number, _y: number, dx: number, dy: number) => {
             if (phase === 'start') {
                 pressed = { path: entry.path, moved: 0, dragging: false };
@@ -134,7 +137,7 @@ function pointer(entry: Entry, handlers: Handlers) {
                 pressed.moved += Math.abs(dx) + Math.abs(dy);
                 if (pressed.moved >= DRAG_AFTER) {
                     pressed.dragging = true;
-                    handlers.dragOut(entry.path);
+                    handlers.onDragOut(entry.path);
                 }
             } else if (phase === 'end' || phase === 'cancel') {
                 pressed = { path: '', moved: 0, dragging: false };
@@ -160,7 +163,7 @@ function Icon(props: { entry: Entry; look: Look; size: number; inverted: boolean
     );
 }
 
-const DetailsRow = memo(function DetailsRow(props: {
+function DetailsRow(props: {
     entry: Entry;
     selected: boolean;
     cursor: boolean;
@@ -233,9 +236,9 @@ const DetailsRow = memo(function DetailsRow(props: {
             <group height={1} background={look.colors.line} />
         </column>
     );
-});
+}
 
-const Tile = memo(function Tile(props: { entry: Entry; selected: boolean; cursor: boolean; renaming: boolean; look: Look; handlers: Handlers }) {
+function Tile(props: { entry: Entry; selected: boolean; cursor: boolean; renaming: boolean; look: Look; handlers: Handlers }) {
     const { entry, selected, cursor, renaming, look, handlers } = props;
     const p = paint(look, selected, cursor, false);
     const picture = useThumbnail(entry, look.tile.icon <= 48 ? 96 : 256, look.gridThumbnails && HAS_THUMBNAIL.has(entry.kind), look.thumbnailCache, 30);
@@ -271,9 +274,9 @@ const Tile = memo(function Tile(props: { entry: Entry; selected: boolean; cursor
             )}
         </column>
     );
-});
+}
 
-const SortHeader = memo(function SortHeader(props: {
+function SortHeader(props: {
     label: string;
     sortKey: SortKey;
     current: SortKey;
@@ -303,9 +306,9 @@ const SortHeader = memo(function SortHeader(props: {
             ) : null}
         </button>
     );
-});
+}
 
-export const ColumnHeaders = memo(function ColumnHeaders(props: { look: Look; sortKey: SortKey; descending: boolean; onSort: (key: SortKey) => void }) {
+export function ColumnHeaders(props: { look: Look; sortKey: SortKey; descending: boolean; onSort: (key: SortKey) => void }) {
     const { look, sortKey, descending, onSort } = props;
     return (
         <div className="flex h-[30px] shrink-0 items-center gap-3 border-b border-(--fx-line) pr-[26px] pl-[18px]">
@@ -323,7 +326,7 @@ export const ColumnHeaders = memo(function ColumnHeaders(props: { look: Look; so
             ) : null}
         </div>
     );
-});
+}
 
 export function FileList(props: {
     items: Entry[];
@@ -345,51 +348,48 @@ export function FileList(props: {
     // A grid's rows are as far apart as a tile is tall and the gap under it, and it puts as many tiles across as fit itself.
     const stride = grid ? look.tile.height + GRID_GAP : look.rowHeight + 1;
 
-    // Made again when what the rows show changes, and only then: each row is `memo`, so only the ones that changed draw again.
-    const renderRow = useCallback(
-        (row: number) => {
-            if (grid) {
-                const entry = items[row];
-                return (
-                    <Tile
-                        key={entry.path}
-                        entry={entry}
-                        selected={selected.has(entry.path)}
-                        cursor={cursor === entry.path}
-                        renaming={renaming === entry.path}
-                        look={look}
-                        handlers={handlers}
-                    />
-                );
-            }
+    // Draws one row; rows whose props didn't change aren't drawn again.
+    const renderRow = (row: number) => {
+        if (grid) {
             const entry = items[row];
             return (
-                <group key={entry.path} paddingX={8} height={stride} paddingBottom={1}>
-                    <DetailsRow
-                        entry={entry}
-                        selected={selected.has(entry.path)}
-                        cursor={cursor === entry.path}
-                        renaming={renaming === entry.path}
-                        odd={row % 2 === 1}
-                        look={look}
-                        now={now}
-                        handlers={handlers}
-                        details={view === 'details'}
-                    />
-                </group>
+                <Tile
+                    key={entry.path}
+                    entry={entry}
+                    selected={selected.has(entry.path)}
+                    cursor={cursor === entry.path}
+                    renaming={renaming === entry.path}
+                    look={look}
+                    handlers={handlers}
+                />
             );
-        },
-        [items, selected, cursor, renaming, look, now, view, stride],
-    );
+        }
+        const entry = items[row];
+        return (
+            <group key={entry.path} paddingX={8} height={stride} paddingBottom={1}>
+                <DetailsRow
+                    entry={entry}
+                    selected={selected.has(entry.path)}
+                    cursor={cursor === entry.path}
+                    renaming={renaming === entry.path}
+                    odd={row % 2 === 1}
+                    look={look}
+                    now={now}
+                    handlers={handlers}
+                    details={view === 'details'}
+                />
+            </group>
+        );
+    };
 
     if (items.length === 0) {
         return (
             <div
                 className="flex min-h-0 flex-1 items-center justify-center text-(--fx-faint)"
-                onClick={() => handlers.emptyClick()}
+                onClick={() => handlers.onEmptyClick()}
                 onContextMenu={(event: any) => {
                     event.preventDefault();
-                    handlers.context(null);
+                    handlers.onContext(null);
                 }}
             >
                 {empty}
@@ -417,9 +417,9 @@ export function FileList(props: {
             bottom={0}
             paddingTop={6}
             onResize={onShape}
-            onClick={() => handlers.emptyClick()}
-            onDoubleClick={() => handlers.emptyDouble()}
-            onContextMenu={() => handlers.context(null)}
+            onClick={() => handlers.onEmptyClick()}
+            onDoubleClick={() => handlers.onEmptyDouble()}
+            onContextMenu={() => handlers.onContext(null)}
             />
         </div>
     );

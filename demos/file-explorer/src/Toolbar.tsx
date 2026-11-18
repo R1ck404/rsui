@@ -1,13 +1,13 @@
 // The bar along the top of a panel: back, forward and refresh, where it is as breadcrumbs (`This PC / Users / Rick`), the search,
 // and how the folder's shown. It's quiet until it's used, as a browser's toolbar is.
 
-import { memo, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { COMPUTER, crumbsOf, normalize } from './files';
 import * as I from './icons';
 import type { Settings, View } from './settings';
 import { IconButton, IconSegmented } from './ui';
 
-const Address = memo(function Address(props: { folder: string; mode: Settings['addressMode']; editAt: number; narrow: boolean; onGo: (path: string) => void }) {
+function Address(props: { folder: string; mode: Settings['addressMode']; editAt: number; narrow: boolean; onGo: (path: string) => void }) {
     const { folder, mode, editAt, narrow, onGo } = props;
     const [editing, setEditing] = useState(false);
     const field = useRef<any>(null);
@@ -73,9 +73,9 @@ const Address = memo(function Address(props: { folder: string; mode: Settings['a
             })}
         </div>
     );
-});
+}
 
-const Search = memo(function Search(props: {
+function Search(props: {
     query: string;
     recursive: boolean;
     focusAt: number;
@@ -135,7 +135,7 @@ const Search = memo(function Search(props: {
             </button>
         </div>
     );
-});
+}
 
 const VIEWS: [string, any, string][] = [
     ['details', I.TableIcon, 'Details'],
@@ -143,7 +143,7 @@ const VIEWS: [string, any, string][] = [
     ['grid', I.GridIcon, 'Grid'],
 ];
 
-export const PaneBar = memo(function PaneBar(props: {
+export function PaneBar(props: {
     settings: Settings;
     folder: string;
     canBack: boolean;
@@ -202,4 +202,4 @@ export const PaneBar = memo(function PaneBar(props: {
             </div>
         </header>
     );
-});
+}

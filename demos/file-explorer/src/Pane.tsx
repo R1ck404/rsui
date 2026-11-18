@@ -2,7 +2,7 @@
 // its own. A tab has one of these, or several beside and above each other. Only the one that has the keyboard (`active`) hears it.
 // It's as big as layout makes it, and only knows how wide that is in the steps that change what it shows: see `useRoom`.
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { clipboard, dialogs, drag, menus, shell, type MenuItem } from 'rsui/desktop';
 import { promises as fs, watch } from 'fs';
 import { exec } from 'child_process';
@@ -29,13 +29,6 @@ export const WINDOW_COMMANDS = new Set<Command>([
     'newTab', 'closeTab', 'nextTab', 'previousTab', 'split', 'splitDown', 'closePane', 'otherPane', 'paneLeft', 'paneRight', 'paneUp', 'paneDown',
     'evenPanes', 'collapseSidebar', 'customize', 'settings', 'toggleSidebar', 'togglePreview',
 ]);
-
-/** A function that keeps its identity across renders and always runs the latest version, so what it's given to doesn't render again for it. */
-export function useStable<T extends (...args: any[]) => any>(run: T): T {
-    const latest = useRef(run);
-    latest.current = run;
-    return useCallback(((...args: any[]) => latest.current(...args)) as T, []);
-}
 
 /** What the panel says about itself, for the tab it's in, the preview and the window's title. */
 export interface PaneReport {
@@ -129,10 +122,13 @@ function useRoom(element: { current: any }, look: Look): Room {
     return room;
 }
 
-export const Pane = memo(function Pane(props: {
+export function Pane(props: {
     initial: PaneState;
     settings: Settings;
-    session: Session;
+    /** What's remembered of each folder's view, by its lowercased path, and what's pinned: only what a pane uses of the
+     * session, so that what else is remembered, as which pane has the keyboard, doesn't render every pane. */
+    views: Session['views'];
+    pinned: Session['pinned'];
     drives: Drive[];
     look: Look;
     active: boolean;
@@ -150,7 +146,7 @@ export const Pane = memo(function Pane(props: {
     /** Ringed softly in the accent, as the one of several panes that has the keyboard. */
     marked?: boolean;
 }) {
-    const { initial, settings, session, drives, look, active, keysOff, change, updateSession } = props;
+    const { initial, settings, views, pinned, drives, look, active, keysOff, change, updateSession } = props;
     // Made again somewhere else, it carries on with what it was showing.
     const [was] = useState(() => kept.get(initial.id));
     const [history, setHistory] = useState(() => was?.history ?? { stack: initial.stack, at: initial.at });
@@ -175,7 +171,7 @@ export const Pane = memo(function Pane(props: {
     const typed = useRef({ text: '', at: 0 });
 
     // The view and sort, for this folder if it has its own.
-    const own = settings.rememberViewPerFolder ? session.views[folder.toLowerCase()] : undefined;
+    const own = settings.rememberViewPerFolder ? views[folder.toLowerCase()] : undefined;
     const view: View = own?.view ?? settings.view;
     const sortKey: SortKey = own?.sortKey ?? settings.sortKey;
     const sortDescending = own?.sortDescending ?? settings.sortDescending;
@@ -342,7 +338,7 @@ export const Pane = memo(function Pane(props: {
 
     // Moving around
 
-    const go = useCallback((path: string, select?: string) => {
+    const go = (path: string, select?: string) => {
         setQuery('');
         setFound(null);
         setRenaming(null);
@@ -357,7 +353,7 @@ export const Pane = memo(function Pane(props: {
             const stack = was.stack.slice(0, was.at + 1).concat(path).slice(-200);
             return { stack, at: stack.length - 1 };
         });
-    }, []);
+    };
     const step = (by: number) => {
         const at = history.at + by;
         if (at < 0 || at >= history.stack.length) {
@@ -718,7 +714,7 @@ export const Pane = memo(function Pane(props: {
                   { label: settings.useRecycleBin ? 'Move to Recycle Bin' : 'Delete for good', shortcut: keys.delete, onClick: () => void remove(), disabled: folder === COMPUTER },
                   { separator: true },
                   ...(entry.folder
-                      ? [{ label: session.pinned.includes(entry.path) ? 'Unpin' : 'Pin', onClick: () => togglePin(entry.path) }]
+                      ? [{ label: pinned.includes(entry.path) ? 'Unpin' : 'Pin', onClick: () => togglePin(entry.path) }]
                       : []),
                   { label: 'Show in Explorer', onClick: () => void shell.reveal(entry.path).catch(() => {}) },
                   { label: 'Properties', shortcut: keys.properties, onClick: () => void shell.properties(entry.path).catch(() => {}) },
@@ -747,83 +743,75 @@ export const Pane = memo(function Pane(props: {
                   { label: 'Hidden items', checked: settings.showHidden, shortcut: keys.toggleHidden, onClick: () => run('toggleHidden') },
                   { label: 'Refresh', shortcut: keys.refresh, onClick: () => run('refresh') },
                   { separator: true },
-                  { label: session.pinned.includes(folder) ? 'Unpin this folder' : 'Pin this folder', onClick: () => togglePin(), disabled: folder === COMPUTER },
+                  { label: pinned.includes(folder) ? 'Unpin this folder' : 'Pin this folder', onClick: () => togglePin(), disabled: folder === COMPUTER },
                   { label: 'Open in terminal', shortcut: keys.openTerminal, onClick: () => terminal(), disabled: folder === COMPUTER },
                   { label: 'Properties', onClick: () => run('properties'), disabled: folder === COMPUTER },
               ];
         menus.popup(menu);
     };
 
-    // What rows call. It's made once, and reads the latest of everything through `latest`, so rows never render for it.
-    latest.current.handlers = { pickTo, open, contextMenu, rename, settings, selected, cursor, chosen };
-    const handlers: Handlers = useMemo(
-        () => ({
-            pick: (path, mods) => latest.current.handlers.pickTo(path, mods),
-            activate: (path, mods) => {
-                const now = latest.current.handlers;
-                now.pickTo(path, mods);
-                if (now.settings.openWith === 'single' && !mods.ctrl && !mods.shift) {
-                    now.open(path);
-                }
-            },
-            open: (path) => latest.current.handlers.open(path),
-            context: (path) => latest.current.handlers.contextMenu(path),
-            dragOut: (path) => {
-                const now = latest.current.handlers;
-                const paths: string[] = now.selected.has(path) ? [...now.selected] : [path];
-                drag.startFiles(paths).then((done: string) => done === 'move' && setReload((n) => n + 1), () => {});
-            },
-            rename: (path, name) => void latest.current.handlers.rename(path, name),
-            emptyClick: () => {
-                setSelected(new Set());
-                setAnchor(null);
-            },
-            emptyDouble: () => latest.current.handlers.settings.doubleClickEmptyUp && latest.current.run('up'),
-        }),
-        [],
-    );
+    // What rows call.
+    const handlers: Handlers = {
+        onPick: (path, mods) => pickTo(path, mods),
+        onActivate: (path, mods) => {
+            pickTo(path, mods);
+            if (settings.openWith === 'single' && !mods.ctrl && !mods.shift) {
+                open(path);
+            }
+        },
+        onOpen: (path) => open(path),
+        onContext: (path) => contextMenu(path),
+        onDragOut: (path) => {
+            const paths: string[] = selected.has(path) ? [...selected] : [path];
+            drag.startFiles(paths).then((done: string) => done === 'move' && setReload((n) => n + 1), () => {});
+        },
+        onRename: (path, name) => void rename(path, name),
+        // Clicking where there's nothing lets go of what's selected; with nothing selected it changes nothing.
+        onEmptyClick: () => {
+            setSelected((was) => (was.size === 0 ? was : new Set()));
+            setAnchor(null);
+        },
+        onEmptyDouble: () => settings.doubleClickEmptyUp && run('up'),
+    };
 
-    // What the bar is given, made once.
+    // What the bar is given.
     const on = {
-        shape: useStable((rows: number, columns: number) => {
+        shape: (rows: number, columns: number) => {
             shape.current.perRow = Math.max(1, columns);
             shape.current.perPage = Math.max(1, Math.floor(rows) - 1);
-        }),
-        back: useStable(() => step(-1)),
-        forward: useStable(() => step(1)),
-        up: useStable(() => up()),
-        refresh: useStable(() => run('refresh')),
-        view: useStable((next: View) => setViewing({ view: next })),
-        hidden: useStable(() => change('showHidden', !settings.showHidden)),
-        newFolder: useStable(() => void newFolder()),
-        sort: useStable((key: SortKey) =>
+        },
+        back: () => step(-1),
+        forward: () => step(1),
+        up: () => up(),
+        refresh: () => run('refresh'),
+        view: (next: View) => setViewing({ view: next }),
+        hidden: () => change('showHidden', !settings.showHidden),
+        newFolder: () => void newFolder(),
+        sort: (key: SortKey) =>
             setViewing(key === sortKey ? { sortDescending: !sortDescending } : { sortKey: key, sortDescending: key !== 'name' && key !== 'type' }),
-        ),
-        activate: useStable(() => props.onActivate(initial.id)),
-        close: useStable(() => props.onClose?.(initial.id)),
-        dragOver: useStable((event: any) => {
+        activate: () => props.onActivate(initial.id),
+        close: () => props.onClose?.(initial.id),
+        dragOver: (event: any) => {
             if (folder !== COMPUTER) {
                 event.preventDefault();
             }
-        }),
-        drop: useStable((event: any) => {
+        },
+        drop: (event: any) => {
             event.preventDefault();
             const paths = (event.dataTransfer?.files ?? []).map((file: any) => file.path).filter(Boolean);
             void dropped(paths, event.shiftKey);
-        }),
+        },
     };
 
     const section = useRef<any>(null);
     const room = useRoom(section, look);
 
     // The columns that fit, as `useRoom` has them from how wide it's laid out.
-    const fitted: Look = useMemo(() => {
-        const cols = room.cols;
-        const dropped = (Object.keys(cols) as (keyof typeof cols)[]).some((key) => cols[key] !== look.cols[key]);
-        // The side of a split that doesn't have the keyboard shows what's selected softly, as a window that isn't in front does.
-        const soft = !active && look.selection === 'filled';
-        return dropped || soft ? { ...look, cols, selection: soft ? 'subtle' : look.selection } : look;
-    }, [look, room, active]);
+    const cols = room.cols;
+    const narrowed = (Object.keys(cols) as (keyof typeof cols)[]).some((key) => cols[key] !== look.cols[key]);
+    // The side of a split that doesn't have the keyboard shows what's selected softly, as a window that isn't in front does.
+    const soft = !active && look.selection === 'filled';
+    const fitted: Look = narrowed || soft ? { ...look, cols, selection: soft ? 'subtle' : look.selection } : look;
 
     // What it says about itself, for its tab, the preview and the window's title.
     const focusEntry = entryAt(cursor) ?? null;
@@ -833,16 +821,13 @@ export const Pane = memo(function Pane(props: {
 
     // Drawing
 
-    const selectedSize = useMemo(() => {
-        let bytes = 0;
-        for (const path of selected) {
-            const entry = items[byPath.get(path) ?? -1];
-            if (entry && !entry.folder) {
-                bytes += entry.size;
-            }
+    let selectedSize = 0;
+    for (const path of selected) {
+        const entry = items[byPath.get(path) ?? -1];
+        if (entry && !entry.folder) {
+            selectedSize += entry.size;
         }
-        return bytes;
-    }, [selected, items]);
+    }
     const drive = drives.find((one) => folder.toLowerCase().startsWith(one.path.toLowerCase()));
     const emptyText =
         listing.error && listing.folder === folder
@@ -937,10 +922,10 @@ export const Pane = memo(function Pane(props: {
             ) : null}
         </section>
     );
-});
+}
 
 /** This PC: each drive as a card with how full it is. */
-const Drives = memo(function Drives(props: { drives: Drive[]; settings: Settings; onOpen: (path: string) => void }) {
+function Drives(props: { drives: Drive[]; settings: Settings; onOpen: (path: string) => void }) {
     const { drives, settings, onOpen } = props;
     return (
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
@@ -978,4 +963,4 @@ const Drives = memo(function Drives(props: { drives: Drive[]; settings: Settings
             </div>
         </div>
     );
-});
+}

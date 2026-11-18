@@ -12,11 +12,11 @@
 // of the splits they're in (src/Splits.tsx). So a window that's resized, or a handle that's dragged, moves everything at once,
 // while a share that changes, as when a pane's split or closed, glides there.
 //
-// Folders are read in one pass on another thread (rsui's `files.list`), only the rows on screen are drawn, and each row renders
-// again only when something about it changed: see src/Pane.tsx and src/List.tsx. How a tab's panes are laid out is
+// Folders are read in one pass on another thread (rsui's `files.list`), only the rows on screen are drawn, and rsui renders
+// again only what changed, without the app saying so: see src/Pane.tsx and src/List.tsx. How a tab's panes are laid out is
 // src/layout.ts.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { mainWindow, useColorScheme } from 'rsui';
 import { PageWindow } from 'rsui/web';
 import './app.css';
@@ -30,7 +30,7 @@ import {
     remove, sideAt, smallest, splitId, tidy, withSizes, type Handle as HandleBox, type Layout, type Preset, type Rect, type Side,
 } from './src/layout';
 import type { Look } from './src/List';
-import { forgetPanes, Pane, useStable, WINDOW_COMMANDS, type PaneReport } from './src/Pane';
+import { forgetPanes, Pane, WINDOW_COMMANDS, type PaneReport } from './src/Pane';
 import { DockLayer, LayoutMenu, Notice, Slot } from './src/Panes';
 import { Splits } from './src/Splits';
 import { Preview } from './src/Preview';
@@ -230,7 +230,7 @@ function App() {
 
     // Settings and what's remembered
 
-    const change = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
+    const change = <K extends keyof Settings>(key: K, value: Settings[K]) => {
         setSettings((was) => {
             if (was[key] === value) {
                 return was;
@@ -239,22 +239,22 @@ function App() {
             saveSettings(next);
             return next;
         });
-    }, []);
-    const replaceSettings = useCallback((next: Settings) => {
+    };
+    const replaceSettings = (next: Settings) => {
         saveSettings(next);
         setSettings(next);
-    }, []);
-    const updateSession = useCallback((update: (was: Session) => Session) => {
+    };
+    const updateSession = (update: (was: Session) => Session) => {
         setSession((was) => {
             const next = update(was);
             saveSession(next);
             return next;
         });
-    }, []);
+    };
 
     const system = useColorScheme();
     const dark = settings.theme === 'system' ? system === 'dark' : settings.theme === 'dark';
-    const colors = useMemo(() => colorsOf(settings, dark), [settings, dark]);
+    const colors = colorsOf(settings, dark);
     applyVariables(cssVariables(settings, colors));
     useEffect(() => {
         try {
@@ -263,7 +263,7 @@ function App() {
             // Windows 10 has no backdrops.
         }
     }, [settings.backdrop]);
-    const refreshDrives = useStable(() => readDrives().then(setDrives, () => {}));
+    const refreshDrives = () => readDrives().then(setDrives, () => {});
     useEffect(() => {
         refreshDrives();
     }, []);
@@ -271,49 +271,46 @@ function App() {
     // A note that goes by itself, as when there's no room to split a pane.
     const [notice, setNotice] = useState<string | null>(null);
     const noticeTimer = useRef<any>(null);
-    const tell = useCallback((text: string) => {
+    const tell = (text: string) => {
         setNotice(text);
         clearTimeout(noticeTimer.current);
         noticeTimer.current = setTimeout(() => setNotice(null), 1800);
-    }, []);
+    };
 
-    const look: Look = useMemo(
-        () => ({
-            rowHeight: rowHeight(settings),
-            iconSize: settings.iconSize,
-            stroke: settings.iconStroke,
-            iconStyle: settings.iconStyle,
-            tintFolders: settings.tintFolders,
-            colorFiles: settings.colorFileIcons,
-            sharedIcons: settings.systemIconCache,
-            showExtensions: settings.showExtensions,
-            dimHidden: settings.dimHidden,
-            zebra: settings.zebra,
-            rowLines: settings.rowLines,
-            selection: settings.selection,
-            dateFormat: settings.dateFormat,
-            clock24: settings.clock24,
-            sizeUnits: settings.sizeUnits,
-            cols: {
-                size: settings.colSize,
-                type: settings.colType,
-                modified: settings.colModified,
-                created: settings.colCreated,
-                attributes: settings.colAttributes,
-            },
-            tile: gridTile(settings),
-            overscan: settings.overscan,
-            renameSelectsBase: settings.renameSelectsBase,
-            colors,
-            radius: radiusOf(settings),
-            font: fontStack(settings),
-            fontSize: settings.fontSize,
-            hoverEffects: true,
-            gridThumbnails: settings.gridThumbnails,
-            thumbnailCache: settings.thumbnailCache,
-        }),
-        [settings, colors],
-    );
+    const look: Look = {
+        rowHeight: rowHeight(settings),
+        iconSize: settings.iconSize,
+        stroke: settings.iconStroke,
+        iconStyle: settings.iconStyle,
+        tintFolders: settings.tintFolders,
+        colorFiles: settings.colorFileIcons,
+        sharedIcons: settings.systemIconCache,
+        showExtensions: settings.showExtensions,
+        dimHidden: settings.dimHidden,
+        zebra: settings.zebra,
+        rowLines: settings.rowLines,
+        selection: settings.selection,
+        dateFormat: settings.dateFormat,
+        clock24: settings.clock24,
+        sizeUnits: settings.sizeUnits,
+        cols: {
+            size: settings.colSize,
+            type: settings.colType,
+            modified: settings.colModified,
+            created: settings.colCreated,
+            attributes: settings.colAttributes,
+        },
+        tile: gridTile(settings),
+        overscan: settings.overscan,
+        renameSelectsBase: settings.renameSelectsBase,
+        colors,
+        radius: radiusOf(settings),
+        font: fontStack(settings),
+        fontSize: settings.fontSize,
+        hoverEffects: true,
+        gridThumbnails: settings.gridThumbnails,
+        thumbnailCache: settings.thumbnailCache,
+    };
 
     // Where everything goes
 
@@ -332,25 +329,23 @@ function App() {
     const layout = dragging.split ? withSizes(view.layout, dragging.split.id, dragging.split.sizes) : view.layout;
     // With a tab over the panes, where it'd land: worked out as if it were there, in the panes as big as they were laid out, and
     // shown over them, which stay as they are.
-    const landing = useMemo(() => {
-        if (dock === null || !dock.over || !dock.ok || dock.target === null) {
-            return null;
-        }
+    let landing = null;
+    if (dock !== null && dock.over && dock.ok && dock.target !== null) {
         const after = dock.target === '*' ? beside(layout, pane(DOCK_ID), dock.side) : insert(layout, dock.target, pane(DOCK_ID), dock.side);
-        return place(after, { x: 0, y: 0, w: dock.box.w, h: dock.box.h }, gap).panes.get(DOCK_ID) ?? null;
-    }, [dock, layout, gap]);
+        landing = place(after, { x: 0, y: 0, w: dock.box.w, h: dock.box.h }, gap).panes.get(DOCK_ID) ?? null;
+    }
 
     // Where the panes are, as they were last laid out, from the top left of all of them: for which is beside which, whether
     // there's room to split one, and where a tab dragged over them is.
     const panesBox = useRef<any>(null);
     const paneElements = useRef(new Map<string, any>());
-    const placedPane = useStable((id: string, element: any, there: boolean) => {
+    const placedPane = (id: string, element: any, there: boolean) => {
         if (there) {
             paneElements.current.set(id, element);
         } else if (paneElements.current.get(id) === element) {
             paneElements.current.delete(id);
         }
-    });
+    };
     const panesSize = (): { w: number; h: number } => {
         const box = panesBox.current?.getBoundingClientRect?.();
         return box ? { w: box.width, h: box.height } : { w: 0, h: 0 };
@@ -373,8 +368,14 @@ function App() {
     // Tabs, and the panes in each
 
     const setTabs = (update: (was: { tabs: TabState[]; active: number }) => { tabs: TabState[]; active: number }) => setTabState(update);
+    // An update that gives the tab back as it was changes nothing, so nothing renders for it, as when the pane that already
+    // has the keyboard is clicked.
     const withTab = (update: (tab: TabState) => TabState) =>
-        setTabs((was) => ({ ...was, tabs: was.tabs.map((one, at) => (at === was.active ? update(one) : one)) }));
+        setTabs((was) => {
+            const tab = was.tabs[was.active];
+            const next = tab && update(tab);
+            return next === tab ? was : { ...was, tabs: was.tabs.map((one, at) => (at === was.active ? next : one)) };
+        });
 
     // What each pane was first given while it's shown, which it keeps to: what it's at now is its own, and only told here. One
     // that's shown again, after another tab, starts from where it was when it was last told.
@@ -571,7 +572,7 @@ function App() {
     };
 
     const on = {
-        report: useStable((report: PaneReport) => {
+        report: (report: PaneReport) => {
             setTabs((was) => {
                 let changed = false;
                 const tabs = was.tabs.map((one) => {
@@ -593,20 +594,20 @@ function App() {
             if (report.state.id === focusId) {
                 setPeek({ entry: report.entry, count: report.count });
             }
-        }),
-        activate: useStable((id: string) => act.focus(id)),
-        openTab: useStable((path: string) => act.newTab(path)),
+        },
+        activate: (id: string) => act.focus(id),
+        openTab: (path: string) => act.newTab(path),
         // Opening a folder beside where it was clicked, or in a new tab when there's no room beside it.
-        openSplit: useStable((path: string, side: 'right' | 'bottom') => {
+        openSplit: (path: string, side: 'right' | 'bottom') => {
             if (tab.panes.length >= MAX_PANES || roomFor(focusId, side) === null) {
                 act.newTab(path);
                 tell('No room beside it, so it’s opened in a new tab');
                 return;
             }
             act.split(side, path);
-        }),
-        closePane: useStable((id: string) => act.closePane(id)),
-        open: useStable((path: string) => {
+        },
+        closePane: (id: string) => act.closePane(id),
+        open: (path: string) => {
             // The sidebar opens what it's clicked on in the pane that has the keyboard, which is told by its key changing.
             withTab((one) => {
                 const target = focusOf(one);
@@ -620,26 +621,26 @@ function App() {
                     node.kind === 'pane' ? (node.id === target ? pane(made.id) : node) : { ...node, children: node.children.map(swap) };
                 return { ...one, panes, layout: swap(one.layout), focus: made.id };
             });
-        }),
-        unpin: useStable((path: string) => updateSession((was) => ({ ...was, pinned: was.pinned.filter((one) => one !== path) }))),
-        pinned: useStable((pinned: string[]) => updateSession((was) => ({ ...was, pinned }))),
-        order: useStable((sidebarOrder: SidebarOrder) => updateSession((was) => ({ ...was, sidebarOrder }))),
-        select: useStable((index: number) => act.select(index)),
-        close: useStable((index: number) => act.closeTab(index)),
-        move: useStable((from: number, to: number) => act.move(from, to)),
-        newTab: useStable(() => act.newTab()),
-        sidebar: useStable(() => act.sidebar()),
-        preview: useStable(() => act.preview()),
-        layoutMenu: useStable(() => setOverlay((was) => (was === 'layout' ? 'none' : 'layout'))),
-        customize: useStable(() => setOverlay((was) => (was === 'customize' ? 'none' : 'customize'))),
-        closeOverlay: useStable(() => setOverlay('none')),
-        settings: useStable(() => setOverlay('settings')),
-        preset: useStable((preset: Preset) => act.preset(preset)),
-        splitFocused: useStable((side: 'right' | 'bottom') => act.split(side)),
-        even: useStable(() => act.even()),
-        closeFocused: useStable(() => act.closePane()),
+        },
+        unpin: (path: string) => updateSession((was) => ({ ...was, pinned: was.pinned.filter((one) => one !== path) })),
+        pinned: (pinned: string[]) => updateSession((was) => ({ ...was, pinned })),
+        order: (sidebarOrder: SidebarOrder) => updateSession((was) => ({ ...was, sidebarOrder })),
+        select: (index: number) => act.select(index),
+        close: (index: number) => act.closeTab(index),
+        move: (from: number, to: number) => act.move(from, to),
+        newTab: () => act.newTab(),
+        sidebar: () => act.sidebar(),
+        preview: () => act.preview(),
+        layoutMenu: () => setOverlay((was) => (was === 'layout' ? 'none' : 'layout')),
+        customize: () => setOverlay((was) => (was === 'customize' ? 'none' : 'customize')),
+        closeOverlay: () => setOverlay('none'),
+        settings: () => setOverlay('settings'),
+        preset: (preset: Preset) => act.preset(preset),
+        splitFocused: (side: 'right' | 'bottom') => act.split(side),
+        even: () => act.even(),
+        closeFocused: () => act.closePane(),
         // Where a tab being dragged is, which is shown over the panes as it moves; null when it's let go.
-        dock: useStable((at: { index: number; x: number; y: number } | null): boolean => {
+        dock: (at: { index: number; x: number; y: number } | null): boolean => {
             const was = latest.current.dock as Dock | null;
             const next = at === null ? null : dockAt(at);
             const same =
@@ -653,8 +654,8 @@ function App() {
                 setDock(next);
             }
             return next?.over === true;
-        }),
-        dockDrop: useStable((index: number) => {
+        },
+        dockDrop: (index: number) => {
             const where = latest.current.dock as Dock | null;
             if (!where || !where.over || !where.ok || where.target === null || where.index !== index) {
                 return;
@@ -691,7 +692,7 @@ function App() {
                 const tabs = was.tabs.filter((one) => one.id !== moving.id).map((one) => (one.id === host.id ? merged : one));
                 return { tabs, active: tabs.findIndex((one) => one.id === merged.id) };
             });
-        }),
+        },
     };
 
     // What's remembered of the tabs, and the window's title.
@@ -754,12 +755,12 @@ function App() {
 
     const base = useRef<{ width: number; rail: boolean; sizes: number[]; room: number }>({ width: 0, rail: false, sizes: [], room: 1 });
     const resize = {
-        sidebarStart: useStable(() => {
+        sidebarStart: () => {
             base.current = { ...base.current, width: sidebarWidth, rail };
-        }),
+        },
         // It follows the pointer between its narrowest and widest. Pulled well past the narrowest it collapses to a rail, gliding
         // there, and pulled back out of the rail it opens again, gliding to where the pointer is.
-        sidebarMove: useStable((by: number) => {
+        sidebarMove: (by: number) => {
             if (narrowWindow) {
                 return;
             }
@@ -770,8 +771,8 @@ function App() {
                 sidebar: nowRail ? RAIL : Math.round(Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, raw))),
                 rail: nowRail,
             });
-        }),
-        sidebarDone: useStable(() => {
+        },
+        sidebarDone: () => {
             if (dragging.rail !== undefined) {
                 change('sidebarCollapsed', dragging.rail);
                 if (!dragging.rail && dragging.sidebar !== undefined) {
@@ -779,53 +780,49 @@ function App() {
                 }
             }
             setDragging({});
-        }),
-        sidebarReset: useStable(() => act.collapse()),
-        previewStart: useStable(() => {
+        },
+        sidebarReset: () => act.collapse(),
+        previewStart: () => {
             base.current = { ...base.current, width: previewWidth };
-        }),
-        previewMove: useStable((by: number) => setDragging({ preview: Math.round(Math.min(640, Math.max(220, base.current.width - by))) })),
-        previewDone: useStable(() => {
+        },
+        previewMove: (by: number) => setDragging({ preview: Math.round(Math.min(640, Math.max(220, base.current.width - by))) }),
+        previewDone: () => {
             if (dragging.preview !== undefined) change('previewWidth', dragging.preview);
             setDragging({});
-        }),
-        handleStart: useStable((handle: HandleBox) => {
+        },
+        handleStart: (handle: HandleBox) => {
             const split = findSplit(tab.layout, handle.split);
             base.current = { ...base.current, sizes: split ? split.sizes.slice() : [], room: handle.room };
-        }),
-        handleMove: useStable((handle: HandleBox, by: number) => {
+        },
+        handleMove: (handle: HandleBox, by: number) => {
             const sizes = dragged(tab.layout, handle.split, handle.index, base.current.sizes, by, base.current.room, gap);
             setDragging({ split: { id: handle.split, sizes } });
-        }),
-        handleDone: useStable(() => {
+        },
+        handleDone: () => {
             const done = dragging.split;
             if (done) withTab((one) => ({ ...one, layout: withSizes(one.layout, done.id, done.sizes) }));
             setDragging({});
-        }),
+        },
         // A double-click evens out the row or column it's in.
-        handleReset: useStable((handle: HandleBox) => {
+        handleReset: (handle: HandleBox) => {
             const split = findSplit(tab.layout, handle.split);
             if (!split) return;
             withTab((one) => ({ ...one, layout: withSizes(one.layout, handle.split, split.children.map(() => 1)) }));
-        }),
+        },
     };
 
     // Drawing
 
-    const views: TabView[] = useMemo(
-        () =>
-            tabs.map((one) => {
-                const folder = folderOf(one.panes.find((p) => p.id === focusOf(one)));
-                const drive = drives.find((d) => d.path.toLowerCase() === folder.toLowerCase());
-                return {
-                    id: one.id,
-                    title: folder === COMPUTER ? 'This PC' : drive ? (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')' : nameOf(folder),
-                    icon: folder === COMPUTER ? I.ComputerIcon : drive ? driveIcon(drive.kind) : I.FolderIcon,
-                    panes: one.panes.length,
-                };
-            }),
-        [tabs, drives],
-    );
+    const views: TabView[] = tabs.map((one) => {
+        const folder = folderOf(one.panes.find((p) => p.id === focusOf(one)));
+        const drive = drives.find((d) => d.path.toLowerCase() === folder.toLowerCase());
+        return {
+            id: one.id,
+            title: folder === COMPUTER ? 'This PC' : drive ? (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')' : nameOf(folder),
+            icon: folder === COMPUTER ? I.ComputerIcon : drive ? driveIcon(drive.kind) : I.FolderIcon,
+            panes: one.panes.length,
+        };
+    });
     const tabList = (
         <Tabs
             tabs={views}
@@ -854,7 +851,8 @@ function App() {
                 <Pane
                     initial={initialOf(state)}
                     settings={settings}
-                    session={session}
+                    views={session.views}
+                    pinned={session.pinned}
                     drives={drives}
                     look={look}
                     active={state.id === viewFocus}

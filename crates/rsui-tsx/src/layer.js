@@ -47,6 +47,10 @@ globalThis.__jsx = function (type, props, kids, mayHaveKey) {
 // (see `JsProps` in bridge.rs). Elements made anywhere else, as in `node_modules`, are as `__jsx` has them.
 // It's called by a name of its own here, as the compiler takes `__jsxMemo` in a file that isn't the app's, as this one, to be `__jsx`.
 function jsxMemo(type, props, kids, mayHaveKey) {
+    // A tag says so too, for what a page makes of it (see `webDescription`).
+    if (typeof type === 'string') {
+        return { type, key: mayHaveKey === true ? props.key : undefined, props, kids, memo: true };
+    }
     if (typeof type !== 'function' || type === Fragment) {
         return __jsx(type, props, kids, mayHaveKey);
     }
@@ -56,7 +60,16 @@ function jsxMemo(type, props, kids, mayHaveKey) {
     } else if (props === null) {
         props = NO_PROPS;
     }
-    return { type, key, props, kids: null, memo: true };
+    // A page's element says which version of the page's CSS it was made under, as it's only compared with one made under the
+    // same (see `JsProps` in bridge.rs).
+    return { type, key, props, kids: null, memo: type.__rsuiEquivalent === true ? pageMark() : true };
+}
+
+// The page's own mark for an element of it the app's JSX made: see `__pageMark` in web.js.
+let pageMarking = null;
+function pageMark() {
+    pageMarking ??= require('rsui/web').__pageMark;
+    return pageMarking();
 }
 
 globalThis.__jsxMemo = jsxMemo;
@@ -2954,6 +2967,10 @@ function webDescription(description) {
     }
     const made = __jsx(type, description.props ?? NO_PROPS, description.kids);
     made.key = description.key;
+    // What the app's own JSX wrote is still the app's, so that it can be the same as what was written before (see `jsxMemo`).
+    if (description.memo === true && type.__rsuiEquivalent === true) {
+        made.memo = pageMark();
+    }
     return made;
 }
 

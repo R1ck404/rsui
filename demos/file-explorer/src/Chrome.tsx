@@ -1,7 +1,7 @@
 // The window around the panels: its tabs, its own minimize, maximize and close buttons (it has no title bar of its own), the
 // handles that resize the panels, and the popover that customizes how it looks.
 
-import { memo, useMemo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { mainWindow, useWindowState } from 'rsui';
 import * as I from './icons';
 import { ACCENTS, type Settings } from './settings';
@@ -19,7 +19,7 @@ export interface TabView {
     panes: number;
 }
 
-const Tab = memo(function Tab(props: {
+function Tab(props: {
     tab: TabView;
     active: boolean;
     vertical: boolean;
@@ -71,7 +71,7 @@ const Tab = memo(function Tab(props: {
             </button>}
         </div>
     );
-});
+}
 
 /**
  * The tabs, along the top or down the sidebar. A tab can be picked up and moved, following the pointer either way, and the others
@@ -79,7 +79,7 @@ const Tab = memo(function Tab(props: {
  * panes it's being docked instead, beside one of them: `onDock` is told where it is all along, and says when it's over them, and null
  * when the drag's over, and `onDockDrop` is told when it's let go there.
  */
-export const Tabs = memo(function Tabs(props: {
+export function Tabs(props: {
     tabs: TabView[];
     active: number;
     vertical: boolean;
@@ -93,17 +93,13 @@ export const Tabs = memo(function Tabs(props: {
 }) {
     const { tabs, active, vertical, onSelect, onClose, onNew, onMove, onDock, onDockDrop } = props;
     const rail = props.rail === true;
-    const outside = useMemo(
-        () =>
-            onDock
-                ? {
-                      over: (index: number, x: number, y: number) => onDock({ index, x, y }),
-                      drop: (index: number) => onDockDrop?.(index),
-                      ended: () => void onDock(null),
-                  }
-                : undefined,
-        [onDock, onDockDrop],
-    );
+    const outside = onDock
+        ? {
+              over: (index: number, x: number, y: number) => onDock({ index, x, y }),
+              drop: (index: number) => onDockDrop?.(index),
+              ended: () => void onDock(null),
+          }
+        : undefined;
     const reorder = useReorder(
         tabs.map((tab) => tab.id),
         vertical ? 'y' : 'x',
@@ -141,10 +137,10 @@ export const Tabs = memo(function Tabs(props: {
             </button>
         </div>
     );
-});
+}
 
 /** Minimize, maximize and close, drawn as quietly as the rest, since the window has no title bar of its own. */
-export const WindowButtons = memo(function WindowButtons() {
+export function WindowButtons() {
     const state = useWindowState();
     const button = 'flex h-full w-[46px] items-center justify-center text-(--fx-muted) transition-colors duration-(--fx-speed) ';
     return (
@@ -172,13 +168,13 @@ export const WindowButtons = memo(function WindowButtons() {
             </button>
         </div>
     );
-});
+}
 
 /**
  * A handle between two panels, which resizes them as it's dragged: `onMove` is told how far the pointer's gone across since it
  * went down, and `onDone` when it's let go. It's the gap between them, with a line that shows while it's hovered or dragged.
  */
-export const Splitter = memo(function Splitter(props: {
+export function Splitter(props: {
     gap: number;
     onStart: () => void;
     onMove: (by: number) => void;
@@ -224,23 +220,23 @@ export const Splitter = memo(function Splitter(props: {
             />
         </div>
     );
-});
+}
 
-const Row = memo(function Row(props: { label: string; children: any }) {
+function Row(props: { label: string; children: any }) {
     return (
         <div className="flex min-h-9 items-center justify-between gap-4">
             <span className="text-(--fx-muted)">{props.label}</span>
             {props.children}
         </div>
     );
-});
+}
 
 /**
  * How it looks, in one place, as Arc's theme picker is: the theme, the accent, the window's material and how much of the desktop
  * it shows, the frame's tint, density, corners, text size, and where the tabs go. Each changes as it's chosen. Everything else is
  * in the settings, a click away.
  */
-export const Customize = memo(function Customize(props: {
+export function Customize(props: {
     settings: Settings;
     change: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
     onClose: () => void;
@@ -315,4 +311,4 @@ export const Customize = memo(function Customize(props: {
             </div>
         </>
     );
-});
+}

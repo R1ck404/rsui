@@ -595,7 +595,7 @@ pub(crate) fn props_why(
             // Each prop is the same, but some hold an object or a function, and without `memo` that renders again, as React
             // has it (see `JsProps` in bridge.rs).
             format!(
-                "{parent} gave it the same props, but some hold objects or functions, and a component renders again for those unless it's wrapped in `memo`, as in React."
+                "{parent} gave it the same props, but some hold objects or functions, and a component that isn't from the app's own JSX, as a library's, renders again for those, as in React."
             )
         } else {
             format!("{parent} gave it the same props, but not in the same order, which counts as different.")
@@ -625,9 +625,10 @@ fn prop_change(
             let _ = write!(text, " {maker} makes it at {}.", short_place(&made));
         }
         // Made from the same code, it's only a new one, for an element the app's own JSX made, when what it sees changed: see
-        // `Vm::props_equivalent`.
+        // `Vm::props_equivalent`. A handler named as one (`onSomething`) is handed what the new one sees instead, so the advice
+        // is about plain code, not `useCallback`, which apps don't need.
         if same_code {
-            text.push_str(" useCallback would keep the same one, or reading what changes from a ref.");
+            text.push_str(" It sees something that changed. If it's only called when something happens, naming it as a handler (`onSomething`) lets it count as the same.");
         }
         return text;
     }
@@ -644,7 +645,7 @@ fn prop_change(
         }
         if vm.shallow_equal(was, is) {
             return format!(
-                "`{name}` is a new {what} with the same things in it. useMemo would keep the same one."
+                "`{name}` is a new {what} with the same things in it."
             );
         }
         return format!("`{name}` is a different {what}.");

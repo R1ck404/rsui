@@ -1,7 +1,7 @@
 // The parts of a tab's panes that aren't the panes: where each one sits, the handles between them, the outline of where a tab
 // dragged over them would go, and the menu of layouts. How they're laid out is src/layout.ts.
 
-import { memo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { showKey } from './keys';
 import { HANDLE, place, PRESETS, presetLayout, type Handle as HandleBox, type Layout, type Preset, type Rect } from './layout';
 import { leftButton } from './reorder';
@@ -14,7 +14,7 @@ const MOVES = 'duration-(--fx-move) ease-(--fx-ease) ';
  * Where a pane sits: all of its place in the split it's in, which layout gives it. A pane that's `fresh`, just split off another,
  * fades and grows in rather than appearing all at once, from where its `starting:` classes say it starts (CSS's `@starting-style`).
  */
-export const Slot = memo(function Slot(props: { fresh: boolean; children: any }) {
+export function Slot(props: { fresh: boolean; children: any }) {
     const { fresh, children } = props;
     return (
         <div
@@ -26,14 +26,14 @@ export const Slot = memo(function Slot(props: { fresh: boolean; children: any })
             {children}
         </div>
     );
-});
+}
 
 /**
  * A handle between two panes, along a row or down a column of them, in the gap between them, and never thinner than can be caught,
  * however small the gap is. Dragging it moves the edge between them, as far as each can go; a double-click makes the panes it's
  * between, and the rest of that row or column, the same size again.
  */
-export const Handle = memo(function Handle(props: {
+export function Handle(props: {
     handle: HandleBox;
     gap: number;
     onStart: (handle: HandleBox) => void;
@@ -97,14 +97,14 @@ export const Handle = memo(function Handle(props: {
             />
         </div>
     );
-});
+}
 
 /**
  * What's shown over the panes while a tab's being dragged, which stay where they are. Lifted, they're outlined faintly, as somewhere it
  * can go. Over them, a see-through sheet in the accent covers where it'd land, with its folder's name, and glides from place to place
  * as the pointer moves; where there isn't room, it says so instead.
  */
-export const DockLayer = memo(function DockLayer(props: {
+export function DockLayer(props: {
     lifting: boolean;
     landing: Rect | null;
     refused: { rect: Rect; why: string } | null;
@@ -151,7 +151,7 @@ export const DockLayer = memo(function DockLayer(props: {
             ) : null}
         </>
     );
-});
+}
 
 /** A layout drawn small, as its panes' shapes. */
 function Mini(props: { layout: Layout; width: number; height: number; focus?: string }) {
@@ -175,7 +175,7 @@ const PRESET_IDS = ['1', '2', '3', '4'];
  * The layouts a tab can have, drawn as what they look like, and splitting the pane that has the keyboard, closing it, or making them
  * all the same size. What there isn't room for in the window is greyed out.
  */
-export const LayoutMenu = memo(function LayoutMenu(props: {
+export function LayoutMenu(props: {
     settings: Settings;
     layout: Layout;
     focus: string;
@@ -270,14 +270,14 @@ export const LayoutMenu = memo(function LayoutMenu(props: {
             </div>
         </>
     );
-});
+}
 
 /**
  * A short note at the bottom of the window, as when there's no room to split a pane, which goes by itself. It rises in from
  * where `starting:` says, and sinks away before it's taken away (`hidden`, which `transition-discrete` waits for), still
  * saying what it said, which is kept here as nothing else says it by then.
  */
-export const Notice = memo(function Notice(props: { text: string | null }) {
+export function Notice(props: { text: string | null }) {
     const last = useRef('');
     if (props.text) {
         last.current = props.text;
@@ -292,6 +292,6 @@ export const Notice = memo(function Notice(props: { text: string | null }) {
             {last.current}
         </div>
     );
-});
+}
 
 export { HANDLE };

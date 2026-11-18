@@ -1985,8 +1985,24 @@ struct JsProps {
     kind: u64,
     /// Whether the parent gave it a key, which then goes on its element.
     keyed: bool,
-    /// Whether its element was made by an app's own JSX where nothing said `'use no memo'`, which `__jsxMemo` marks. See `eq`.
-    memo: bool,
+    /// Whether its element was made by an app's own JSX where nothing said `'use no memo'`, which `__jsxMemo` marks: `KEPT`
+    /// for a component, and for a page's element the version of the page's CSS it was made under, plus 2 (see `__pageMark` in
+    /// web.js), or 0. See `eq`.
+    memo: u32,
+}
+
+/// What `JsProps::memo` is for a component the app's own JSX made.
+const KEPT: u32 = 1;
+
+/// What an element's `memo` says, for `JsProps::memo`.
+fn memo_mark(said: Value) -> u32 {
+    if said == Value::TRUE {
+        KEPT
+    } else if said.is_number() {
+        said.as_number() as u32
+    } else {
+        0
+    }
 }
 
 impl PartialEq for JsProps {
@@ -2004,6 +2020,14 @@ impl PartialEq for JsProps {
     /// or the same object with methods, it renders whenever its parent does, as either can say something else with no render
     /// (unless it says `memo`), and so does a component that says `'use no memo'`, or a class. What reads a context or a store
     /// renders when that changes, as it would anyway, as its provider or the store tells it to.
+    ///
+    /// A handler made from the same code (`onClick` and the rest) is the same even when it sees something else, as `useEvent`
+    /// has it: what the child has is made to do what the new one does (see `Vm::props_equivalent_handing_on`). And an element of
+    /// a page the app's JSX wrote with a plain tag (`__rsuiEquivalent`, see web.js) is compared in the same way, as React
+    /// Compiler would have kept it, so that a `<div>` given children made again that do the same isn't drawn again: as long as
+    /// the page's CSS is as it was when the old one was made, as what it comes to is only told again to some of what's drawn
+    /// once it changes, and the rest is drawn again by what it's in. What's in its children is compared cautiously, as what's
+    /// in a component's is, so that a component in it given the same ref or object with methods renders.
     fn eq(&self, other: &Self) -> bool {
         let function = self.function.get();
         if function != other.function.get() {
@@ -2019,8 +2043,15 @@ impl PartialEq for JsProps {
             let said_memo = vm
                 .get_property(function, name)
                 .is_ok_and(|said| said == Value::TRUE);
-            if self.memo && other.memo && vm.made_by_app(function) && !vm.says_no_memo(function) {
-                return vm.props_equivalent(old, new, !said_memo, not_kept);
+            let page = said_memo && {
+                let name = vm.atom("__rsuiEquivalent");
+                vm.get_property(function, name).is_ok_and(|said| said == Value::TRUE)
+            };
+            if page && self.memo > KEPT && self.memo == other.memo {
+                return vm.page_props_equivalent_handing_on(old, new, not_kept);
+            }
+            if self.memo == KEPT && other.memo == KEPT && vm.made_by_app(function) && !vm.says_no_memo(function) {
+                return vm.props_equivalent_handing_on(old, new, !said_memo, not_kept);
             }
             vm.shallow_equal(old, new) && (said_memo || vm.holds_no_objects(new))
         })
@@ -2384,8 +2415,8 @@ enum Described {
         key: Option<Key>,
         /// Which of the last render's components this is, with `key`, as [`Cx::child_at`] has it.
         place: u64,
-        /// Whether `__jsxMemo` made it: see `JsProps::memo`.
-        memo: bool,
+        /// What `__jsxMemo` marked it with: see `JsProps::memo`.
+        memo: u32,
     },
     Fragment(Vec<Kid>),
     Host {
@@ -2740,7 +2771,7 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
         } else {
             at.scope.at(at.index)
         };
-        let memo = vm.get_property(description, memo_name)? == Value::TRUE;
+        let memo = memo_mark(vm.get_property(description, memo_name)?);
         return Ok(Described::Component {
             kind: kind_of(vm, kind, function_name),
             function: vm.root(kind),
@@ -4450,7 +4481,7 @@ fn window_root(cx: &mut Cx<'_>, window: &WindowEntry) -> Node {
             props: window.entry.clone(),
             kind,
             keyed: false,
-            memo: false,
+            memo: 0,
         },
         same_kind,
     )
@@ -4495,7 +4526,7 @@ pub fn root(cx: &mut Cx<'_>, _: &Entry) -> Node {
             props,
             kind,
             keyed: false,
-            memo: false,
+            memo: 0,
         },
         same_kind,
     );

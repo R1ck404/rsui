@@ -17488,6 +17488,32 @@ function kindOf(one, tags, key) {
     return tagOf(one) ?? type;
 }
 
+/// Whether a prop given anew says the same to CSS as the one before, for `sameSibling`: a handler (`onClick` and the rest) or a ref
+/// is never an attribute, so another one says nothing new, as a parent that renders makes them again unless it keeps them; and a
+/// `style` holding the same is the same attribute. Anything else that isn't the same value may say something else.
+function sameToCss(name, a, b) {
+    if (typeof a === 'function' && typeof b === 'function') {
+        return name === 'ref' || (name.length > 2 && name.startsWith('on') && name[2] >= 'A' && name[2] <= 'Z');
+    }
+    if (name === 'ref') {
+        return typeof a === 'object' && typeof b === 'object';
+    }
+    if (name !== 'style' || a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
+        return false;
+    }
+    let count = 0;
+    for (const key in a) {
+        if (!Object.is(a[key], b[key])) {
+            return false;
+        }
+        count += 1;
+    }
+    for (const key in b) {
+        count -= 1;
+    }
+    return count === 0;
+}
+
 /// What's inside something, each with where it is among the others, for what's about that.
 /// Whether something before another is as it was, as far as CSS about what comes before something can tell: the same kind of
 /// thing, saying the same, apart from what's in it, though whether there's anything in it counts.
@@ -17508,7 +17534,7 @@ function sameSibling(old, now) {
         if (name === 'children') {
             continue;
         }
-        if (!Object.is(a[name], b[name])) {
+        if (!Object.is(a[name], b[name]) && !sameToCss(name, a[name], b[name])) {
             return false;
         }
         count += 1;
@@ -17685,7 +17711,12 @@ function withNthAlong(children, kept = null) {
         if (one.type.__webStyled === true || one.type.__webField === true) {
             // A page element is told where it is itself, so that what it's in can still put it on a line, and look at it as it
             // is, as it can't through a provider: see `Styled`'s `__nth`.
-            return cloneElement(one, { __nth: value });
+            // One the app's own JSX made still says so (`memo`), as it's the same element told one thing more.
+            const told = cloneElement(one, { __nth: value });
+            if (typeof one.memo === 'number') {
+                told.memo = one.memo;
+            }
+            return told;
         }
         return make(NthContext.Provider, { value, key: one.key ?? 'nth-' + index }, one);
     });
@@ -18878,6 +18909,10 @@ function plainDomElement(tag) {
         const nothing = Object.assign([''], { raw: [''] });
         made = makeStyled(tag)(nothing);
         made.displayName = tag;
+        // What the app's own JSX makes of a plain tag isn't drawn again when what it's given does the same as before, as an element
+        // React Compiler kept isn't, handlers and children made again and all (see `JsProps` in bridge.rs). Not an `<option>`,
+        // whose text is what's chosen, or a field, which is drawn by what's above.
+        made.__rsuiEquivalent = !FIELD_TAGS.has(tag) && tag !== 'option';
         domElements.set(tag, made);
     }
     return made;
@@ -21369,6 +21404,9 @@ installPage();
 module.exports = {
     dom,
     __pageElement: domElement,
+    // What an element of the page the app's JSX made is marked with: the version of the page's CSS, which a sheet changing
+    // changes, plus 2, as 1 is what a component's element says (see `JsProps` in bridge.rs).
+    __pageMark: () => version + 2,
     __elementPortal: (children, container, key) => __jsx(ElementPortal, { container, children, key }, null, key !== undefined && key !== null),
     __addCssFile,
     Details,

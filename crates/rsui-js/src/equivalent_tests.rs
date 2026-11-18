@@ -57,7 +57,7 @@ const PAIRS: &str = r#"
     globalThis.data = [{ entry: data }, { entry: data }];
     globalThis.getters = [{ g: { get x() { return 1; } } }, { g: { get x() { return 1; } } }];
     const deep = (n) => (n === 0 ? 1 : { d: deep(n - 1) });
-    globalThis.tooDeep = [{ v: deep(10) }, { v: deep(10) }];
+    globalThis.tooDeep = [{ v: deep(20) }, { v: deep(20) }];
     globalThis.shallowEnough = [{ v: deep(3) }, { v: deep(3) }];
     const element = (i) => ({ type: 'text', key: undefined, props: { onClick: () => select(i) }, kids: ['a'] });
     globalThis.elements = [{ children: element(1) }, { children: element(1) }];
@@ -68,6 +68,9 @@ const PAIRS: &str = r#"
     const kept = foreign();
     globalThis.foreignKept = [{ children: kept }, { children: kept }];
     globalThis.long = [{ list: Array.from({ length: 100 }, () => 1) }, { list: Array.from({ length: 100 }, () => 1) }];
+    function actions(n) { const act = { next: () => act.go(n), go: (i) => i + n }; return act; }
+    globalThis.cycle = [{ onNext: actions(1).next }, { onNext: actions(1).next }];
+    globalThis.cycleOther = [{ onNext: actions(1).next }, { onNext: actions(2).next }];
 "#;
 
 #[test]
@@ -80,6 +83,14 @@ fn handlers_made_again_from_the_same_code_seeing_the_same_values_are_the_same() 
     assert!(!equivalent(&mut engine, "madeOther", true));
     assert!(equivalent(&mut engine, "bound", true));
     assert!(!equivalent(&mut engine, "boundOther", true));
+}
+
+#[test]
+fn what_refers_to_itself_is_the_same_when_everything_else_in_it_is() {
+    // An object of handlers that each see the object, as the file explorer's `act` is, rather than running out of depth.
+    let mut engine = engine_with(PAIRS, "pairs.js");
+    assert!(equivalent(&mut engine, "cycle", true));
+    assert!(!equivalent(&mut engine, "cycleOther", true));
 }
 
 #[test]
@@ -161,4 +172,72 @@ fn jsx_outside_an_app_file_calls_plain_jsx() {
     assert_eq!(global_text(&mut engine, "made"), "'plain'");
     let mut engine = engine_with(JSX, "a.jsx");
     assert_eq!(global_text(&mut engine, "made"), "'plain'");
+}
+
+/// Handlers in an app's own file, each pair made by two renders that saw different state.
+const HANDLERS: &str = r#"
+    globalThis.opaque = Symbol('opaque');
+    function bar(state) {
+        const run = (what) => what + ' ' + state;
+        return { label: 'bar', onRefresh: () => run('refresh'), refresh: () => run('refresh') };
+    }
+    globalThis.handler = [{ onRefresh: bar(1).onRefresh, label: 'a' }, { onRefresh: bar(2).onRefresh, label: 'a' }];
+    globalThis.notNamedAsOne = [{ refresh: bar(1).refresh }, { refresh: bar(2).refresh }];
+    globalThis.labelChanged = [{ onRefresh: bar(1).onRefresh, label: 'a' }, { onRefresh: bar(2).onRefresh, label: 'b' }];
+    globalThis.otherCode = [{ onClick: () => 1 }, { onClick: () => 2 }];
+    function waiting(state) { return async () => state; }
+    globalThis.async = [{ onClick: waiting(1) }, { onClick: waiting(2) }];
+    const button = (state) => ({ type: 'button', key: undefined, props: { onClick: bar(state).onRefresh }, kids: ['go'], memo: true });
+    globalThis.inChildren = [{ children: [button(1), 'text'] }, { children: [button(2), 'text'] }];
+"#;
+
+fn handlers() -> Engine {
+    let file = std::env::temp_dir().join("app").join("handlers.js");
+    engine_with(HANDLERS, file.to_str().unwrap())
+}
+
+fn handing_on(engine: &mut Engine, name: &str) -> bool {
+    let (a, b) = pair(engine, name);
+    let vm = engine.vm();
+    let opaque = vm.get_global("opaque").unwrap();
+    vm.props_equivalent_handing_on(a, b, true, opaque)
+}
+
+/// What the old props' handler at `path` (a property, or `children.0.props.onClick`) gives when it's called.
+fn old_says(engine: &mut Engine, name: &str, path: &str) -> String {
+    let (mut at, _) = pair(engine, name);
+    let vm = engine.vm();
+    for part in path.split('.') {
+        at = match part.parse::<usize>() {
+            Ok(index) => vm.array_elements(at).unwrap()[index],
+            Err(_) => {
+                let key = vm.atom(part);
+                vm.get_property(at, key).unwrap()
+            }
+        };
+    }
+    let said = vm.call_function(at, Value::UNDEFINED, &[]).unwrap();
+    vm.plain_text(said).unwrap()
+}
+
+#[test]
+fn a_handler_made_from_the_same_code_is_handed_what_the_new_one_sees_and_nothing_else_is() {
+    let mut engine = handlers();
+    assert!(!equivalent(&mut engine, "handler", true));
+    assert_eq!(old_says(&mut engine, "handler", "onRefresh"), "refresh 1");
+    assert!(handing_on(&mut engine, "handler"));
+    // The old function is still the one the child has, doing what the new one does.
+    assert_eq!(old_says(&mut engine, "handler", "onRefresh"), "refresh 2");
+    // Inside an element that's given as children, as a button's `onClick` is.
+    assert!(handing_on(&mut engine, "inChildren"));
+    assert_eq!(old_says(&mut engine, "inChildren", "children.0.props.onClick"), "refresh 2");
+
+    // Only a handler that can be is handed on. A function that isn't named as a handler can be called while rendering, as `renderRow` is.
+    assert!(!handing_on(&mut engine, "notNamedAsOne"));
+    // Other code does something else, and an async one can be waiting part of the way through.
+    assert!(!handing_on(&mut engine, "otherCode"));
+    assert!(!handing_on(&mut engine, "async"));
+    // When something else isn't the same, the child renders with the new one, and the old one is left as it was.
+    assert!(!handing_on(&mut engine, "labelChanged"));
+    assert_eq!(old_says(&mut engine, "labelChanged", "onRefresh"), "refresh 1");
 }

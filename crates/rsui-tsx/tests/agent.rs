@@ -634,19 +634,20 @@ fn a_client_going_away_ends_it() {
 
 #[test]
 fn an_agent_can_ask_why_something_rendered_without_turning_anything_on() {
+    // `pick` rather than `onPick`, which, being a handler, would be handed what it sees rather than render the row.
     let file = app(
         "why",
         r#"
         import { useState } from 'rsui';
-        function Row({ label, onPick }: { label: string; onPick: () => void }) {
-            return <button key={label} onClick={onPick}>{label}</button>;
+        function Row({ label, pick }: { label: string; pick: () => void }) {
+            return <button key={label} onClick={pick}>{label}</button>;
         }
         export default function App() {
             const [count, setCount] = useState(0);
             return (
                 <window>
                     <button key="add" onClick={() => setCount(count + 1)}>Add</button>
-                    <Row label="milk" onPick={() => setCount(count)} />
+                    <Row label="milk" pick={() => setCount(count)} />
                 </window>
             );
         }
@@ -662,7 +663,7 @@ fn an_agent_can_ask_why_something_rendered_without_turning_anything_on() {
     );
     let why = client.ok("ui_why", json!({ "key": "milk" }));
     assert!(
-        why.contains("`onPick` is a new function each time. App makes it at app.tsx:11"),
+        why.contains("`pick` is a new function each time. App makes it at app.tsx:11"),
         "{why}"
     );
     assert!(why.contains("changing nothing"), "{why}");

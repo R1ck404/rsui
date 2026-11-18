@@ -480,6 +480,62 @@ impl Vm {
     /// This never runs any of the program's code: a getter, or anything that isn't a plain object, an array or a function, is
     /// only the same as itself.
     pub fn props_equivalent(&self, old: Value, new: Value, cautious: bool, opaque: Value) -> bool {
+        self.props_equivalent_in(old, new, cautious, &mut Looks::new(EQUIVALENT_LOOKS, opaque))
+    }
+
+    /// [`props_equivalent`](Self::props_equivalent), and also a handler, a prop named as `onClick` is, anywhere in the props or
+    /// in the elements and objects they hold, that's made from the same code as before but sees something else, as one
+    /// calling a function that sees the selection does. That's what `useEvent`, or a ref holding the latest, does by hand:
+    /// what the component has is then made to see what the new one does (its captures are the new one's, in the same place,
+    /// so that it's the same function doing what the new one would), and so whatever has it, as what it drew and its effects,
+    /// calls what the new render made. That's only for a function written in the app's own files, which isn't async or a
+    /// generator, as one of those can be waiting part of the way through, and whose own properties nobody's asked for.
+    ///
+    /// It's for what React's rules say a handler is: something called when something happens, not while rendering, as a
+    /// component that called `onChange` as it rendered would have shown what the old one gave. What else holds the old
+    /// function, as a ref the parent kept it in to call later, calls the new one too.
+    pub fn props_equivalent_handing_on(&mut self, old: Value, new: Value, cautious: bool, opaque: Value) -> bool {
+        let mut looks = Looks::new(EQUIVALENT_LOOKS, opaque);
+        looks.hand_on = true;
+        if !self.props_equivalent_in(old, new, cautious, &mut looks) {
+            return false;
+        }
+        self.hand_on(&mut looks);
+        true
+    }
+
+    /// [`props_equivalent_handing_on`](Self::props_equivalent_handing_on) for an element of a page: the same object it's given
+    /// is the same, as a ref it's attached to or a `style`, but what's in its `children` is compared cautiously, as it would be
+    /// if a component the app's JSX made was given it.
+    pub fn page_props_equivalent_handing_on(&mut self, old: Value, new: Value, opaque: Value) -> bool {
+        let mut looks = Looks::new(EQUIVALENT_LOOKS, opaque);
+        looks.hand_on = true;
+        looks.cautious_in = Some(self.atom("children"));
+        if !self.props_equivalent_in(old, new, false, &mut looks) {
+            return false;
+        }
+        self.hand_on(&mut looks);
+        true
+    }
+
+    /// Makes each old handler noted in `looks` do what the new one does: see
+    /// [`props_equivalent_handing_on`](Self::props_equivalent_handing_on).
+    fn hand_on(&mut self, looks: &mut Looks) {
+        for (old, new) in std::mem::take(&mut looks.handed) {
+            let captures: Vec<Value> = match &self.objects[new.index()].kind {
+                Kind::Function { upvalues, .. } => upvalues.to_vec(),
+                _ => continue,
+            };
+            // Through `objects[..]`, which is the write barrier, as the old function is likely to be old to the collector.
+            if let Kind::Function { upvalues, .. } = &mut self.objects[old.index()].kind {
+                for (at, value) in captures.into_iter().enumerate() {
+                    upvalues.set(at, value);
+                }
+            }
+        }
+    }
+
+    fn props_equivalent_in(&self, old: Value, new: Value, cautious: bool, looks: &mut Looks) -> bool {
         if old == new {
             return true;
         }
@@ -494,15 +550,107 @@ impl Vm {
         {
             return false;
         }
-        let mut looks = Looks {
-            left: EQUIVALENT_LOOKS,
-            opaque,
+        let Some(inside) = looks.cautious_in.take() else {
+            return self.same_slots(first, second, EQUIVALENT_DEPTH, looks, cautious, false);
         };
-        first
-            .slots()
-            .iter()
-            .zip(second.slots())
-            .all(|(x, y)| self.equivalent(*x, *y, EQUIVALENT_DEPTH, &mut looks, cautious))
+        // Each prop by itself, the one named `inside` cautiously.
+        let opaque = looks.opaque;
+        for (at, (x, y)) in first.slots().iter().zip(second.slots()).enumerate() {
+            if *x == opaque || *y == opaque {
+                return false;
+            }
+            let careful = cautious || self.shapes.key_at(first.shape, at as u32) == Some(inside);
+            let handed = looks.handed.len();
+            if self.equivalent(*x, *y, EQUIVALENT_DEPTH, looks, careful) {
+                continue;
+            }
+            looks.handed.truncate(handed);
+            if !(looks.hand_on && self.hands_on(first.shape, at as u32, *x, *y, looks)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether two objects of the same shape hold what's equivalent in each place, for
+    /// [`equivalent`](Self::equivalent), each looked at `below` down. A function's own properties, as its `name`, aren't
+    /// plain ones, as they're not enumerable, but they hold values.
+    fn same_slots(
+        &self,
+        first: &Object,
+        second: &Object,
+        below: u32,
+        looks: &mut Looks,
+        cautious: bool,
+        of_function: bool,
+    ) -> bool {
+        if first.shape != second.shape
+            || self.shapes.is_dict(first.shape)
+            || !(of_function || self.shapes.is_all_plain(first.shape))
+        {
+            return false;
+        }
+        let opaque = looks.opaque;
+        for (at, (x, y)) in first.slots().iter().zip(second.slots()).enumerate() {
+            if *x == opaque || *y == opaque {
+                return false;
+            }
+            let handed = looks.handed.len();
+            if self.equivalent(*x, *y, below, looks, cautious) {
+                continue;
+            }
+            // What was to be handed on inside what turned out not to be the same isn't.
+            looks.handed.truncate(handed);
+            if !(looks.hand_on && !of_function && self.hands_on(first.shape, at as u32, *x, *y, looks)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether `old` and `new`, in the place `at` of objects of `shape`, are a handler that can be handed on: see
+    /// [`props_equivalent_handing_on`](Self::props_equivalent_handing_on). If so it's noted, to be done once everything else
+    /// is the same.
+    fn hands_on(&self, shape: u32, at: u32, old: Value, new: Value, looks: &mut Looks) -> bool {
+        if !old.is_object() || !new.is_object() {
+            return false;
+        }
+        let (first, second) = (&self.objects[old.index()], &self.objects[new.index()]);
+        let (
+            Kind::Function { proto, home, upvalues, .. },
+            Kind::Function { proto: other_proto, home: other_home, upvalues: other_upvalues, .. },
+        ) = (&first.kind, &second.kind)
+        else {
+            return false;
+        };
+        let untouched = |object: &Object| object.flags & LAZY_FUNCTION != 0 && object.slots().is_empty();
+        let code = &self.protos[*proto as usize];
+        if proto != other_proto
+            || home != other_home
+            || upvalues.len() != other_upvalues.len()
+            || !untouched(first)
+            || !untouched(second)
+            || code.says & crate::op::SAYS_APP_FILE == 0
+            || code.flags & (crate::op::IS_ASYNC | crate::op::IS_GENERATOR | crate::op::IS_CLASS) != 0
+        {
+            return false;
+        }
+        let Some(key) = self.shapes.key_at(shape, at) else {
+            return false;
+        };
+        let name = self.atom_text(key);
+        let name = name.as_bytes();
+        if !(name.len() > 2 && name.starts_with(b"on") && name[2].is_ascii_uppercase()) {
+            return false;
+        }
+        // The same function can only be made to do what one new one does.
+        match looks.handed.iter().find(|(was, _)| *was == old) {
+            Some((_, now)) => *now == new,
+            None => {
+                looks.handed.push((old, new));
+                true
+            }
+        }
     }
 
     /// Whether a component function says `'use no memo'`, or is a class, which renders whenever what it's in does, as it
@@ -575,18 +723,29 @@ impl Vm {
             return false;
         }
         looks.left -= 1;
+        // What's already being compared, further up, is taken to be the same here, so that what refers to itself, as an object
+        // of handlers that each see the object, is the same when everything else in it is, rather than running out of depth
+        // going round. That's sound for what's compared here, which only holds values: if nothing anywhere differs, they do the
+        // same whatever path is taken through them.
+        let open = looks.open;
+        if looks.comparing[..open].contains(&(a, b)) {
+            return true;
+        }
+        if open < looks.comparing.len() {
+            looks.comparing[open] = (a, b);
+            looks.open = open + 1;
+        }
+        let same = self.equivalent_inside(a, b, depth, looks, cautious);
+        looks.open = open;
+        same
+    }
+
+    /// What [`equivalent`](Self::equivalent) compares of two objects, once it's looking into them.
+    fn equivalent_inside(&self, a: Value, b: Value, depth: u32, looks: &mut Looks, cautious: bool) -> bool {
         let (first, second) = (&self.objects[a.index()], &self.objects[b.index()]);
         let below = depth - 1;
-        // A function's own properties, as its `name`, aren't plain ones, as they're not enumerable, but they hold values.
-        let same_slots = |looks: &mut Looks, of_function: bool| {
-            let opaque = looks.opaque;
-            first.shape == second.shape
-                && !self.shapes.is_dict(first.shape)
-                && (of_function || self.shapes.is_all_plain(first.shape))
-                && first.slots().iter().zip(second.slots()).all(|(x, y)| {
-                    *x != opaque && *y != opaque && self.equivalent(*x, *y, below, looks, cautious)
-                })
-        };
+        let same_slots =
+            |looks: &mut Looks, of_function: bool| self.same_slots(first, second, below, looks, cautious, of_function);
         match (&first.kind, &second.kind) {
             // Only what an object literal makes, as an instance of a class can keep more than its properties say.
             (Kind::Plain, Kind::Plain) => {
@@ -662,18 +821,43 @@ impl Vm {
     }
 }
 
-/// What's left of what [`Vm::props_equivalent`] can look into, and what says an object is only the same as itself.
+/// What's left of what [`Vm::props_equivalent`] can look into, what says an object is only the same as itself, and the pairs
+/// being compared further up, which are taken to be the same again inside.
 struct Looks {
     left: u32,
     opaque: Value,
+    comparing: [(Value, Value); EQUIVALENT_DEPTH as usize + 1],
+    open: usize,
+    /// Whether a handler made from the same code can be handed on, and those that are to be, the old with the new.
+    hand_on: bool,
+    handed: Vec<(Value, Value)>,
+    /// A prop compared cautiously whatever the rest are, as a page element's `children` are.
+    cautious_in: Option<Atom>,
+}
+
+impl Looks {
+    fn new(left: u32, opaque: Value) -> Looks {
+        Looks {
+            left,
+            opaque,
+            comparing: [(Value::UNDEFINED, Value::UNDEFINED); EQUIVALENT_DEPTH as usize + 1],
+            open: 0,
+            hand_on: false,
+            handed: Vec::new(),
+            cautious_in: None,
+        }
+    }
 }
 
 /// How many objects [`Vm::props_equivalent`] looks into for one component's props, so that comparing costs much less than
-/// rendering would, however much it's given.
-const EQUIVALENT_LOOKS: u32 = 256;
+/// rendering would, however much it's given. The file explorer's panes are given a function that sees an object of 40 handlers,
+/// each seeing what the app's made of its state, which takes about 700.
+const EQUIVALENT_LOOKS: u32 = 1024;
 /// How far down [`Vm::props_equivalent`] looks: far enough for a prop holding an element whose props hold a function that
-/// sees a function, as `children` and handlers made in place do.
-const EQUIVALENT_DEPTH: u32 = 6;
+/// sees a function, as `children` and handlers made in place do, and for a page's `<div>` holding a component given a function
+/// that sees the app's handlers, which see what they're made from (13 in the file explorer). What refers to itself takes no more
+/// for it, as what's being compared further up is taken to be the same.
+const EQUIVALENT_DEPTH: u32 = 16;
 /// The longest array [`Vm::props_equivalent`] compares item by item.
 const EQUIVALENT_ITEMS: usize = 64;
 

@@ -1,7 +1,7 @@
 // The picture for a file or folder: a folder, or a page with what it holds drawn on it, as Finder draws them, or the icon Windows
 // shows for it.
 
-import { memo, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Circle, Path, Rect, Svg } from 'rsui';
 import { files } from 'rsui/desktop';
 import type { Entry, Kind } from './files';
@@ -97,7 +97,7 @@ function askSystemIcon(entry: Entry, key: string, size: number): Promise<string 
     return pending;
 }
 
-const SystemIcon = memo(function SystemIcon(props: { entry: Entry; size: number; shared: boolean; fallback: any }) {
+function SystemIcon(props: { entry: Entry; size: number; shared: boolean; fallback: any }) {
     const { entry, size, shared } = props;
     // Windows' icons come in steps: ask for one a little bigger and let it scale down.
     const asked = size <= 16 ? 16 : size <= 32 ? 32 : size <= 48 ? 48 : 256;
@@ -120,7 +120,7 @@ const SystemIcon = memo(function SystemIcon(props: { entry: Entry; size: number;
         return <Fallback size={size} strokeWidth={1.5} color="#8a8a8a" className="shrink-0" />;
     }
     return <img src={url} width={size} height={size} className="shrink-0" style={{ width: size, height: size }} />;
-});
+}
 
 /** A color with some of it see-through, as `#rrggbbaa`. */
 const alpha = (hex: string, amount: number) => rgba(hex, amount);
@@ -397,7 +397,7 @@ function Page(props: { size: number; kind: Kind; color: string }) {
 /** The kinds whose band says what they are, in letters, when there's room. */
 const LABELLED = new Set<Kind>(['pdf', 'archive', 'file']);
 
-export const FileIcon = memo(function FileIcon(props: {
+export function FileIcon(props: {
     entry: Entry;
     size: number;
     stroke: number;
@@ -442,7 +442,7 @@ export const FileIcon = memo(function FileIcon(props: {
             </text>
         </group>
     );
-});
+}
 
 /** How many icons and thumbnails are kept, for the status bar. */
 export function cachedIconCount(): number {

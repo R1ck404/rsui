@@ -241,6 +241,18 @@ impl Shapes {
         out
     }
 
+    /// The name of the property at `slot` of an object of this shape, if it isn't a dictionary's.
+    pub(crate) fn key_at(&self, shape: u32, slot: u32) -> Option<Atom> {
+        let mut at = &self.items[shape as usize];
+        if at.dict.is_some() {
+            return None;
+        }
+        while at.count > slot + 1 {
+            at = &self.items[at.parent as usize];
+        }
+        (at.count == slot + 1).then_some(at.key)
+    }
+
     /// What [`entries`](Self::entries) gives, put in a list that's given, which is cleared first.
     pub(crate) fn entries_into(&self, shape: u32, out: &mut Vec<(Atom, u32, u8)>) {
         out.clear();
@@ -989,6 +1001,15 @@ impl Upvalues {
         debug_assert_eq!(all.len(), count + 1);
         let all = Box::into_raw(all.into_boxed_slice());
         Self(NonNull::new(all.cast()))
+    }
+
+    /// Puts `value` in the place `at`, where something is already, in the same block, so that a call already reading them
+    /// reads the new one. Whatever stores it has to have gone through the write barrier first.
+    pub(crate) fn set(&mut self, at: usize, value: Value) {
+        assert!(at < self.len(), "an upvalue past the end");
+        let first = self.0.expect("there are some");
+        // SAFETY: the first place holds the count, and `at` is below it.
+        unsafe { first.as_ptr().add(1 + at).write(value) }
     }
 
     /// Where the first of them is. There's nothing to read there unless there are some.

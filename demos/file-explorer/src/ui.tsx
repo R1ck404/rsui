@@ -1,12 +1,10 @@
 // The small controls everything else is made of: quiet icon buttons, switches, segmented choices and a slider-like stepper, drawn
 // in the app's variables so they look the same on the frame and on a panel.
 
-import { memo } from 'react';
-
 type IconType = (props: { size?: number; strokeWidth?: number; className?: string }) => any;
 
 /** A button that's only an icon, with nothing behind it until it's hovered, as Arc's and the Mac's toolbar buttons are. */
-export const IconButton = memo(function IconButton(props: {
+export function IconButton(props: {
     icon: IconType;
     label: string;
     onClick: () => void;
@@ -41,9 +39,9 @@ export const IconButton = memo(function IconButton(props: {
             {showLabel ? <span className="text-[0.92em] whitespace-nowrap">{label}</span> : null}
         </button>
     );
-});
+}
 
-export const Toggle = memo(function Toggle(props: { on: boolean; onChange: (on: boolean) => void; label: string }) {
+export function Toggle(props: { on: boolean; onChange: (on: boolean) => void; label: string }) {
     const { on, onChange, label } = props;
     return (
         <button
@@ -64,7 +62,7 @@ export const Toggle = memo(function Toggle(props: { on: boolean; onChange: (on: 
             />
         </button>
     );
-});
+}
 
 function SegmentedView<T extends string | number>(props: { value: T; options: [T, string][]; onChange: (value: T) => void; small?: boolean }) {
     const { value, options, onChange, small } = props;
@@ -88,10 +86,10 @@ function SegmentedView<T extends string | number>(props: { value: T; options: [T
 }
 
 /** A row of choices, one of them chosen. */
-export const Segmented = memo(SegmentedView) as typeof SegmentedView;
+export const Segmented = SegmentedView;
 
 /** Choices that are icons, as the view switcher is. */
-export const IconSegmented = memo(function IconSegmented(props: {
+export function IconSegmented(props: {
     value: string;
     options: [string, IconType, string][];
     onChange: (value: any) => void;
@@ -115,9 +113,9 @@ export const IconSegmented = memo(function IconSegmented(props: {
             ))}
         </div>
     );
-});
+}
 
-export const Stepper = memo(function Stepper(props: { value: number; min: number; max: number; step: number; unit?: string; onChange: (value: number) => void }) {
+export function Stepper(props: { value: number; min: number; max: number; step: number; unit?: string; onChange: (value: number) => void }) {
     const { value, min, max, step, unit, onChange } = props;
     const set = (next: number) => onChange(Math.min(max, Math.max(min, Math.round(next / step) * step)));
     const share = (value - min) / (max - min);
@@ -151,22 +149,22 @@ export const Stepper = memo(function Stepper(props: { value: number; min: number
             </span>
         </div>
     );
-});
+}
 
-export const Kbd = memo(function Kbd(props: { children: any }) {
+export function Kbd(props: { children: any }) {
     return (
         <span className="rounded-[4px] bg-(--fx-input) px-1.5 py-px font-mono text-[0.85em] text-(--fx-muted)">
             {props.children}
         </span>
     );
-});
+}
 
 /** How full something is, as a bar: a drive, say. Red past 90%. */
-export const UsageBar = memo(function UsageBar(props: { used: number; accent: string; height: number }) {
+export function UsageBar(props: { used: number; accent: string; height: number }) {
     const { used, accent, height } = props;
     return (
         <div className="flex w-full overflow-hidden rounded-full bg-(--fx-press)" style={{ height }}>
             <div className="rounded-full" style={{ width: `${Math.round(used * 100)}%`, height, background: used > 0.9 ? '#ef4444' : accent }} />
         </div>
     );
-});
+}

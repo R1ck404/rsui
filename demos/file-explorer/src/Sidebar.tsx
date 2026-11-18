@@ -2,8 +2,6 @@
 // when they're down the side. What's open now is raised, as the open tab is. Everything in it can be dragged into another order,
 // the sections too, by their headings, and the order is kept.
 
-import { memo } from 'react';
-
 import { app } from 'rsui/desktop';
 import { COMPUTER, formatSize, nameOf, type Drive } from './files';
 import * as I from './icons';
@@ -42,7 +40,7 @@ function dragging(reorder: Reorder, id: string, index: number) {
     };
 }
 
-const Item = memo(function Item(props: {
+function Item(props: {
     name: string;
     icon: any;
     active: boolean;
@@ -93,10 +91,10 @@ const Item = memo(function Item(props: {
             ) : null}
         </button>
     );
-});
+}
 
 /** A pinned folder, as a tile in a grid of them, as Arc's favorites are. */
-const Favorite = memo(function Favorite(props: {
+function Favorite(props: {
     path: string;
     active: boolean;
     stroke: number;
@@ -134,10 +132,10 @@ const Favorite = memo(function Favorite(props: {
             {rail ? null : <span className="w-full truncate text-center text-[0.8em]">{nameOf(path)}</span>}
         </button>
     );
-});
+}
 
 /** A section's heading, which is what the section's dragged by. */
-const Heading = memo(function Heading(props: { children: string; rail: boolean; drag: ReturnType<typeof dragging> }) {
+function Heading(props: { children: string; rail: boolean; drag: ReturnType<typeof dragging> }) {
     const { drag, rail } = props;
     return (
         <div
@@ -156,7 +154,7 @@ const Heading = memo(function Heading(props: { children: string; rail: boolean; 
             />
         </div>
     );
-});
+}
 
 const SECTIONS = ['favorites', 'places', 'drives'];
 
@@ -166,7 +164,7 @@ export interface SidebarOrder {
     drives?: string[];
 }
 
-export const Sidebar = memo(function Sidebar(props: {
+export function Sidebar(props: {
     settings: Settings;
     folder: string;
     pinned: string[];
@@ -319,4 +317,4 @@ export const Sidebar = memo(function Sidebar(props: {
             })}
         </nav>
     );
-});
+}

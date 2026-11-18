@@ -647,6 +647,7 @@ fn a_socket_with_nothing_to_say_does_not_hold_up_the_steps() {
     );
 }
 
+/// The rows are given `pick` rather than `onPick`, which, being a handler, would be handed what it sees rather than render them.
 const WHY: &str = r#"
     import { useState, useRef, useContext, createContext, useCallback } from 'rsui';
     const Theme = createContext('light');
@@ -655,9 +656,9 @@ const WHY: &str = r#"
         const add = useCallback((item: string) => setItems((old) => [...old, item]), []);
         return { items, add };
     }
-    function Row({ label, onPick }: { label: string; onPick: () => void }) {
+    function Row({ label, pick }: { label: string; pick: () => void }) {
         const theme = useContext(Theme);
-        return <button key={label} onClick={onPick}>{label + ' ' + theme}</button>;
+        return <button key={label} onClick={pick}>{label + ' ' + theme}</button>;
     }
     export default function App() {
         const [count, setCount] = useState(0);
@@ -671,7 +672,7 @@ const WHY: &str = r#"
                     <button key="add" onClick={() => setCount(count + 1)}>Add</button>
                     <button key="theme" onClick={() => setTheme('dark')}>Dark</button>
                     <button key="todo" onClick={() => add('eggs')}>Todo</button>
-                    {items.map((item) => <Row key={item} label={item} onPick={() => { picked.current += count; }} />)}
+                    {items.map((item) => <Row key={item} label={item} pick={() => { picked.current += count; }} />)}
                 </window>
             </Theme.Provider>
         );
@@ -691,7 +692,7 @@ fn why_says_what_changed_where_and_names_hooks_by_their_variables() {
         "the state, by name: {out}"
     );
     assert!(
-        out.contains("`onPick` is a new function each time. App makes it at app.tsx:25. useCallback would keep the same one, or reading what changes from a ref."),
+        out.contains("`pick` is a new function each time. App makes it at app.tsx:25. It sees something that changed. If it's only called when something happens, naming it as a handler (`onSomething`) lets it count as the same."),
         "the prop that's new each time, and where it's made: {out}"
     );
     assert!(
@@ -814,7 +815,7 @@ fn profile_says_what_took_the_time_and_why_renders_were_for_nothing() {
         "{out}"
     );
     assert!(
-        out.contains("2× Row: `onPick` is a new function each time. App makes it at app.tsx:25."),
+        out.contains("2× Row: `pick` is a new function each time. App makes it at app.tsx:25."),
         "the reason, counted: {out}"
     );
 }

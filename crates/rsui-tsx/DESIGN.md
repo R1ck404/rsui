@@ -164,9 +164,20 @@ what's made, it notices that what's made again is the same, when the child's pro
   where what's in a `let`'s cell is compared, as each render has its own cells), or `bind` of the same thing with the same
   arguments, or a plain object or array made again holding what's the same in this way, as an element given as `children`, a
   `style={{ ... }}` or an object of handlers is. An instance of a class, a getter, a `Map` and the rest are only the same as
-  themselves. It looks at no more than 256 objects and 6 levels down, and an array of 64 at most, so it costs a fraction of a
-  render, and it never runs any of the app's code. The engine can do this because it knows each closure's code and what it
-  captured, one value or cell for each variable it uses, and nothing else.
+  themselves. What refers to itself, as an object of handlers that each call the others through it, is the same when everything
+  else in it is: a pair already being compared further up is taken to be the same again inside. It looks at no more than 1,024
+  objects and 16 levels down, and an array of 64 at most, so it costs a fraction of a render, and it never runs any of the app's
+  code. The engine can do this because it knows each closure's code and what it captured, one value or cell for each variable it
+  uses, and nothing else.
+- **Handlers that see something new.** A handler, a prop named as `onClick` is (`on` and a capital), made from the same code
+  as the one the child has, is the same even when what it sees has changed, as `() => run('refresh')` does when `run` sees the
+  selection: the child's handler is handed what the new one sees (its captures are set to the new one's, in place,
+  `Vm::props_equivalent_handing_on`), so that it's the same function doing what the new one would, as `useEvent` or a ref holding
+  the latest does by hand. What the child drew and its effects call that, and an effect that depends on the handler doesn't run
+  again, as it wouldn't for `useEvent`. That's only done once everything else in the props is the same, and only for a function
+  written in the app's own files, which isn't async or a generator (one of those can be waiting part of the way through), and
+  whose own properties nobody has asked for. A function named anything else, as `renderRow` or `format`, can be called as the
+  child renders, so it's compared by what it sees.
 - **Where.** The parser makes JSX call `__jsxMemo` (layer.js), which marks a component's element, and the compiler has it call
   `__jsx` instead in a file that isn't the app's own, as one in `node_modules`, so a library's elements are as React has them
   (TanStack Table's `flexRender` gives cells the same `row` object, which says something else once it's selected). Only a marked
@@ -174,6 +185,16 @@ what's made, it notices that what's made again is the same, when the child's pro
   files (each compiled function knows, in its proto's `says`): a library's components, and rsui's own page elements, which read
   the page's CSS as they render, render as they would in React. An element `__jsx` made says so (`memo: NOT_KEPT`), and is
   only the same as itself wherever it's found, as a cell made by `createElement` inside the app's `<div>`.
+- **The page's elements.** A plain tag the app's own JSX wrote, as `<div>` or `<button>`, is compared the same way once it's a
+  page's element (`__rsuiEquivalent` in web.js, which `webDescription` in layer.js and the place each is told keep marked), as
+  React Compiler keeps a `<div>` whose children it kept: a `<div>` given children made again that do the same isn't drawn again,
+  and nor is what's in it. One already wasn't when given the same objects. Only while the page's CSS is as it was when the old
+  one was made, though (each says which version it was made under, `__pageMark`), as a sheet that changes is only told to some
+  of what's drawn and the rest relied on being drawn again by what it's in. And what's in its children is compared as cautiously
+  as a component's props are, so that a component in it given the same ref or object with methods still renders. A field, an
+  `<option>` or a page element a library made renders as before. What a page element passes down (its place among the others, for `:nth-child()` and `a + b`) is the
+  same as before when what's before it only has handlers or refs made again, or a `style` holding the same, as those are never
+  attributes (`sameToCss`), so what's after it isn't drawn again either.
 - **Being careful.** The same object is the same, as React's `memo` and React Compiler have it, as React's rules say what's given
   isn't changed in place, but not when it holds a function or `current`: a ref changes without a render, and an object with
   methods, as TanStack Table's `row`, can say something else when they're called, and a component can do either as it renders.
@@ -181,7 +202,9 @@ what's made, it notices that what's made again is the same, when the child's pro
   itself there. A class renders whenever its parent does. What reads a context or a store (`useSyncExternalStore`, and the
   libraries made on it) is told to render by the provider or the store, whatever its props are, and state still renders what
   it's in. What isn't covered is a component that reads something else that changes as it renders, as a variable outside it, or
-  calls a function it's given that reads one, which React Compiler gets wrong the same way.
+  calls a function it's given that reads one, which React Compiler gets wrong the same way. Nor is a component that calls a
+  handler (`onSomething`) while it renders, and shows what it gives, or code that keeps an old handler to call later expecting
+  what it saw then: React's rules say a handler isn't called while rendering, and the old one now does what the new one does.
 - **Saying no.** `'use no memo'` (or `'use no forget'`), as React Compiler has it, at the top of a file or of a function's body:
   the JSX there calls `__jsx`, and a component that says it renders whenever what it's in does (`Vm::says_no_memo`).
 
@@ -193,16 +216,18 @@ asking for the same thing, but without leaving out refs and objects with methods
 as React's, comparing each prop as `Object.is` does.
 
 What it comes to, moving the selection with the Down key in `demos/file-explorer` on a folder of 5,000 files, headless, with
-each key's frames added up (the median of 40 keys, 3 runs of each):
+each key's frames added up (the median of 40 keys, the middle of 6 runs of each). "Before" is comparing alone, before what refers to itself,
+handlers handed on and the page's elements were:
 
 | | Components rendered | Frame time |
 |---|---|---|
-| The demo as written, with `memo`, `useCallback` and its own `useStable` | 29 before, 23 now | 3.2 ms before, 2.9 ms now |
-| A copy with all of those taken out | 432 before, 101 now | 26.6 ms before, 9.8 ms now |
+| The demo as written, with `memo`, `useCallback` and its own `useStable` | 24 before, 12 now | 3.0 ms before, 1.8 ms now |
+| A copy with all of those taken out | 109 before, 14 now | 10.2 ms before, 2.0 ms now |
 
-What's left in the copy without them is the panel's own page elements (`Styled`), which aren't the app's and so render as they
-would in React when the panel does, and the bar's buttons, whose handlers see what changed (what the panel goes back to, say),
-as they would with React Compiler too.
+What was left in the copy without them was the app's object of handlers that call each other through it, which ran out of
+levels going round; the bar's buttons, whose handlers see what changed; and the panels' `<div>`s, which rendered whenever the
+panel did, and told what's in them where it is anew whenever a handler before it was made again. What's left now is a `<div>` a
+handler made again is in that also holds what changed, which renders, as the hand-written one's does.
 
 A child is the same component as last time if it's in the same place, as in React: where it is in the array of children it's in, with `null`, `false` and `undefined` keeping their places, and the same for each array and element around it. An array or a fragment is one place, with its own places inside. A key takes the place of where it is in its array. A component of another type in a place, or one inside an element of another type, is a new one, and what was there is unmounted.
 
@@ -223,10 +248,10 @@ habits matter once a list gets long, and both of them are in that app:
 - **Keep state as far down as it can go.** What's being typed in a box belongs in a component of its own. Kept in the
   component holding the list, each key renders every row.
 - **Give rows what only changes when they do.** A row skips rendering when what it's given does the same as before (see "Not
-  rendering what would come out the same"), so `onClick={() => pick(index)}` is fine, as long as `pick` doesn't see something
-  that changes each time, as the selection. A handler that sees the selection is different whenever that is, and every row
-  renders. Read it from a ref, or give the row the plain value instead, as `selected={index === selected}`. `memo` and
-  `useCallback` aren't needed for this, but do no harm.
+  rendering what would come out the same"), so `onClick={() => pick(index)}` is fine, even when `pick` sees the selection, as a
+  handler (`onSomething`) made from the same code is handed what the new one sees. A function named otherwise, as `isPicked`,
+  that sees the selection is different whenever that is, and every row renders: give the row the plain value instead, as
+  `selected={index === selected}`. `memo` and `useCallback` aren't needed for this, but do no harm.
 
 A long list of a page's elements, as rows of `<div>`s in something that scrolls, costs what changed and what's seen when the
 selection moves or it scrolls, as far as `rsui/web` can tell: a list rendered again with the same rows, made anew as React makes
@@ -262,7 +287,7 @@ is for one. Pointing at anything says which component made it, how often that's 
 
 ```
 Row rendered 4 times in the last 30 s, 3 of them changing nothing.
-Last: Row (0.1 ms, changed nothing): `onSelect` is a new function each time. App makes it at app.tsx:38. useCallback would keep the same one.
+Last: Row (0.1 ms, changed nothing): `isPicked` is a new function each time. App makes it at app.tsx:38. It sees something that changed. If it's only called when something happens, naming it as a handler (`onSomething`) lets it count as the same.
 ```
 
 The why is in sentences, from what rsui knows rather than what it guesses. Which props aren't the same, and why not: a function made
@@ -359,7 +384,8 @@ isn't being looked at costs the same. A program made with `--pack` doesn't have 
 - There's no `ref` to an element, as `focus(key)` and `autoFocus` on `TextInput` do what they're mostly for. An error while rendering shows
   in place of that component, and the rest carries on, unless an error boundary says otherwise.
 - A component given only plain values skips rendering when they're the same, with no `memo` needed. One the app's own JSX makes
-  skips when what it's given does the same, functions and objects made again too, as with React Compiler. Mutating something
+  skips when what it's given does the same, functions and objects made again too, as with React Compiler, and a handler
+  (`onSomething`) made from the same code is handed what the new one sees rather than rendering it. Mutating something
   inside a prop of a component that skips, and expecting that to show, won't work. So won't reading something that changed
   outside it, when its parent renders. `'use no memo'` in it says it renders whenever its parent does.
 - On rsui's own elements, a click only reaches the one thing it's on, and what's around it doesn't hear about it, unless it says

@@ -1,6 +1,6 @@
 // What's selected, larger: a picture of it as Explorer would show, the start of a text file, and its details.
 
-import { memo, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { createReadStream } from 'fs';
 import { attributesOf, formatDate, formatSize, kindLabel, readFolder, type Entry } from './files';
 import { FileIcon } from './FileIcon';
@@ -28,7 +28,7 @@ function Row(props: { label: string; value: string }) {
     );
 }
 
-export const Preview = memo(function Preview(props: { entry: Entry | null; count: number; settings: Settings; now: number; width: number; colors: { muted: string; accent: string; [other: string]: string } }) {
+export function Preview(props: { entry: Entry | null; count: number; settings: Settings; now: number; width: number; colors: { muted: string; accent: string; [other: string]: string } }) {
     const { entry, count, settings: s, now, colors } = props;
     const picture = useThumbnail(entry && !entry.folder ? entry : null, 512, s.previewImages, s.thumbnailCache, 60);
     const [text, setText] = useState<string | null>(null);
@@ -113,4 +113,4 @@ export const Preview = memo(function Preview(props: { entry: Entry | null; count
             )}
         </aside>
     );
-});
+}
