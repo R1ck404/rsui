@@ -100,6 +100,12 @@ pub(crate) const USES_VIEW_HEIGHT: u32 = 1 << 28;
 /// flexed in a flex box that's as tall as that says, or stretched across a row that is. One in a block, as tall as what's in it,
 /// isn't, though it's laid out at that height. Said by what it's in, as it starts it (`start_item`).
 pub(crate) const DEFINITE_HEIGHT: u32 = 1 << 29;
+/// When this scrolling area was last laid out, a scrollbar that takes room (`scrollbar_room`) was down its side, or along its
+/// bottom. Laying it out again starts from those, as a browser keeps the scrollbars it had: starting with none each time laid
+/// what's in it out at its full width, found it too tall, and laid all of it out again at the width the scrollbar leaves, so
+/// that each change of a long list's scroll area laid out every row in it twice.
+pub(crate) const BAR_DOWN: u32 = 1 << 30;
+pub(crate) const BAR_ACROSS: u32 = 1 << 31;
 /// All that's changed about this box itself since it was laid out is that children have been put in it or taken out, so
 /// where the rest of them go can follow from where they were: see `solve_moved` in the engine.
 pub(crate) const SPLICED: u32 = 1 << 23;
@@ -842,9 +848,44 @@ pub trait LayoutVisitor {
 pub struct Layout {
     root: LayoutBox,
     last_solved: usize,
-    list_sizes: Vec<(usize, f32)>,
+    list_sizes: Vec<(usize, f32, f32)>,
     paragraphs: bool,
+    /// Says that this has gone when it does, for [`Layout::info_of`].
+    gone: Gone,
 }
+
+#[derive(Default, Clone)]
+struct Gone;
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        layouts_changed();
+    }
+}
+
+/// How many times any layout has been changed, or one has gone, which says when what [`Layout::info_of`] kept may not hold.
+static LAYOUTS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn layouts_changed() {
+    LAYOUTS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What scrolls with at least this many things in it has how far they go kept, as working that out looks at each of them.
+const KEEP_INFO_FROM: usize = 64;
+/// How many of those are kept.
+const KEPT_INFOS: usize = 8;
+
+/// Which box, which node and which layout an answer of [`Layout::info_of`] is for.
+type InfoAt = (usize, usize, usize, usize, u64);
+
+thread_local! {
+    /// What [`Layout::info_of`] last worked out for the scrolling areas that have the most in them, by [`InfoAt`]. How far a long
+    /// list's rows go was worked out by looking at each of them, as it was drawn and each time code asked how far it scrolls, which
+    /// it does three times as `scrollIntoView()` brings a row into view: 15 ms of each key that moved the selection in a list of
+    /// 25,000 rows.
+    static KEPT_INFO: std::cell::RefCell<Vec<(InfoAt, Option<ScrollInfo>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 
 #[cfg(test)]
 mod scroll_info_tests {
@@ -1068,6 +1109,14 @@ impl Layout {
     /// text is one, and laying the page out again for it at every frame had the page's `ResizeObserver`s looked at every
     /// frame as well, which made garbage that the window, never quiet while it moves, only collected now and then.
     pub fn apply_needs_layout_since(&mut self, patches: &[Patch], before: Option<&Node>) -> bool {
+        layouts_changed();
+        let needs_layout = self.apply_now(patches, before);
+        // Scrolling moves what's in what scrolls, while this is going on as well as before it.
+        layouts_changed();
+        needs_layout
+    }
+
+    fn apply_now(&mut self, patches: &[Patch], before: Option<&Node>) -> bool {
         let mut needs_layout = false;
         let mut rest = patches;
         while let Some(patch) = rest.first() {
@@ -1116,8 +1165,8 @@ impl Layout {
     /// sink, 3-4 ms a frame, and told the page's `ResizeObserver`s to look at everything they watch each time. Says
     /// whether it did that; when it didn't, the area's laid out again as for any other change. What's placed in the window rather
     /// than in what it's in (on top of everything, or fixed) is placed again. It isn't done for a list, which builds its rows
-    /// from where it is; for what sticks, which is placed from where the area is; for an area that something placed by itself
-    /// inside is placed from outside of; or near the far end, where how far it can go is the layout's to say.
+    /// from where it is; for what sticks, which is placed from where the area is; or for an area that something placed by itself
+    /// inside is placed from outside of.
     fn scrolled_without_layout(&mut self, path: &[u32], name: rsui_core::Symbol, value: &rsui_core::PropValue, before: Option<&Node>) -> bool {
         let names = &*crate::style::NAMES;
         let down = name == names.scroll_y;
@@ -1184,11 +1233,10 @@ impl Layout {
             return false;
         };
         let (was, furthest) = if down { (info.y, info.furthest_y()) } else { (info.x, info.furthest_x()) };
-        // As the layout has it: what isn't past the start is at the start, and nothing goes past the end.
+        // As the layout has it: what isn't past the start is at the start, and nothing goes past the end. How far the end is was
+        // worked out from where what's in it is, as `solve_scroll` has it, so the far end is where laying it out would put it
+        // too: going to the end of a long list from code (`scrollIntoView()` on its last row) laid all of it out again for that.
         let to = if wanted > 0.0 { wanted.min(furthest) } else { 0.0 };
-        if to > furthest - 1.0 && furthest > 0.0 {
-            return false;
-        }
         let by = to - was;
         for child in &mut current.children {
             if down {
@@ -1377,6 +1425,7 @@ impl Layout {
     /// Works out where everything goes, for a window of size `available`. Parts of the
     /// tree that haven't changed since the last time aren't visited.
     pub fn compute(&mut self, root: &Node, available: Size, measure: &mut impl Measure) {
+        layouts_changed();
         self.last_solved = engine::compute(
             &mut self.root,
             root,
@@ -1385,6 +1434,7 @@ impl Layout {
             &mut self.list_sizes,
             &mut self.paragraphs,
         );
+        layouts_changed();
     }
 
     /// Whether any text made of parts has been laid out here, as most programs never have any, and
@@ -1395,8 +1445,9 @@ impl Layout {
 
     /// The virtual lists that the last [`compute`](Self::compute) found have the wrong idea of how
     /// many rows fit in them, as the address of each one's element and how many do, including part
-    /// of a row. Tell them with their `resize` action, then lay out again. This is usually empty.
-    pub fn list_sizes(&self) -> &[(usize, f32)] {
+    /// of a row, and for a grid, how many items fit across (0 for a list that isn't one). Tell them with their `resize` action,
+    /// then lay out again. This is usually empty.
+    pub fn list_sizes(&self) -> &[(usize, f32, f32)] {
         &self.list_sizes
     }
 
@@ -1534,6 +1585,35 @@ impl Layout {
         if !current.has(SCROLLS) || !current.has(HAS_LAYOUT) {
             return None;
         }
+        if current.children.len() < KEEP_INFO_FROM {
+            return Self::info_now(current, element);
+        }
+        // Nothing about a box changes without a layout changing, and a node is never changed, so the same box and node with
+        // nothing changed since come to the same.
+        let at: InfoAt = (
+            std::ptr::from_ref(current) as usize,
+            std::ptr::from_ref(element) as usize,
+            element.props.identity(),
+            element.children.len(),
+            LAYOUTS_CHANGED.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let kept = KEPT_INFO.with(|kept| kept.borrow().iter().find(|(said, _)| *said == at).map(|(_, info)| *info));
+        if let Some(info) = kept {
+            return info;
+        }
+        let info = Self::info_now(current, element);
+        KEPT_INFO.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            kept.retain(|(said, _)| said.4 == at.4);
+            if kept.len() >= KEPT_INFOS {
+                kept.remove(0);
+            }
+            kept.push((at, info));
+        });
+        info
+    }
+
+    fn info_now(current: &LayoutBox, element: &Element) -> Option<ScrollInfo> {
         let (style, list) = Style::read(&element.props);
         let view = Size::new(current.width, current.height);
         if let Some(row_height) = style.row_height {
@@ -1673,6 +1753,70 @@ impl Layout {
 
     /// Calls `visit` with the path and position of every node, parents before their
     /// children, which is the order to draw them in.
+    /// Each node `wanted` says, as far as it goes into, that's within `margin` of being seen: inside the window and each area
+    /// around it that scrolls, each made `margin` bigger on every side, as CSS's `content-visibility: auto` asks of what it skips.
+    /// What's in something that scrolls is only looked at when its own box is near what shows of that, as it's drawn (see
+    /// `visit_scrolled`), so a long list costs a look at each of its rows and no more; what's laid out outside its box isn't
+    /// found from there. `root` must be what this was laid out from. `found` is given each one's path and node.
+    pub fn near_view(
+        &self,
+        root: &Node,
+        margin: f32,
+        wanted: &mut impl FnMut(&Element) -> bool,
+        found: &mut impl FnMut(&[u32], &Element),
+    ) {
+        let window = Rect::new(-margin, -margin, self.root.width + margin * 2.0, self.root.height + margin * 2.0);
+        Self::near_box(&self.root, root, 0.0, 0.0, window, margin, &mut Vec::new(), wanted, found);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn near_box(
+        current: &LayoutBox,
+        node: &Element,
+        parent_x: f32,
+        parent_y: f32,
+        area: Rect,
+        margin: f32,
+        path: &mut Vec<u32>,
+        wanted: &mut impl FnMut(&Element) -> bool,
+        found: &mut impl FnMut(&[u32], &Element),
+    ) {
+        let (x, y) = (parent_x + current.x, parent_y + current.y);
+        let meets = |rect: Rect, area: Rect| {
+            rect.x < area.x + area.width && rect.y < area.y + area.height && rect.x + rect.width > area.x && rect.y + rect.height > area.y
+        };
+        let own = Rect::new(x, y, current.width, current.height);
+        if wanted(node) {
+            if meets(own, area) {
+                found(path, node);
+            }
+            // What's skipped has nothing in it to look at.
+            return;
+        }
+        // What's in something that scrolls shows only inside it, and is near only as far as `margin` past that.
+        let scrolls = current.has(SCROLLS);
+        let inner = if scrolls {
+            let left = area.x.max(x - margin);
+            let top = area.y.max(y - margin);
+            let right = (area.x + area.width).min(x + current.width + margin);
+            let bottom = (area.y + area.height).min(y + current.height + margin);
+            Rect::new(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
+        } else {
+            area
+        };
+        for (index, (child_box, child)) in current.children.iter().zip(&node.children).enumerate() {
+            if scrolls
+                && !child_box.has(IS_OVERLAY)
+                && !meets(Rect::new(x + child_box.x, y + child_box.y, child_box.width, child_box.height), inner)
+            {
+                continue;
+            }
+            path.push(index as u32);
+            rsui_core::stack::deep(|| Self::near_box(child_box, child, x, y, inner, margin, path, wanted, found));
+            path.pop();
+        }
+    }
+
     pub fn walk(&self, mut visit: impl FnMut(&[u32], Rect)) {
         let mut path = Vec::new();
         Self::walk_box(&self.root, 0.0, 0.0, &mut path, &mut visit);

@@ -46,7 +46,7 @@ pub use event::{
     Dispatching, Event, KeyInfo, Modifiers, current_tree, dispatch_started, dispatching, document_listens, listens,
     next_event_serial, set_document_listens, set_wants_drops, wants_drops,
 };
-pub use list::{ListWindow, ScrollAxis, ScrollControl};
+pub use list::{ListOptions, ListWindow, ScrollAxis, ScrollControl};
 pub use remote::Remote;
 pub use runtime::{DispatchError, Runtime};
 pub use trace::{Cause, Handled, Rendered, Trace};

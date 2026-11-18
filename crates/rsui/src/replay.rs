@@ -25,6 +25,8 @@ pub enum Input {
     ButtonUp { x: f32, y: f32, button: PointerButton },
     CancelPress,
     Active(bool),
+    /// The window was minimized (false) or brought back from that (true).
+    Shown(bool),
     Modifiers(Modifiers),
     Key(KeyPress),
     KeyUp(KeyPress),
@@ -135,6 +137,7 @@ impl App {
             Input::ButtonUp { x, y, button } => self.button_up(*x, *y, *button)?,
             Input::CancelPress => self.cancel_press(),
             Input::Active(active) => self.set_active(*active),
+            Input::Shown(shown) => self.set_shown(*shown),
             Input::Modifiers(held) => self.set_modifiers(*held),
             Input::Key(press) => self.key(*press)?,
             Input::KeyUp(press) => self.key_up(*press)?,

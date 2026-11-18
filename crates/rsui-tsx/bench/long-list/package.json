@@ -1,0 +1,10 @@
+{
+  "name": "rsui-long-list-bench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A long list of Tailwind-styled rows, for measuring how a page's long lists draw.",
+  "dependencies": {
+    "tailwindcss": "^4.3.5"
+  },
+  "license": "MIT OR Apache-2.0"
+}

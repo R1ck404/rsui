@@ -1,5 +1,6 @@
 // One side of a tab: a folder, with its history, what's selected, the search, and everything done to files, drawn as a panel of
-// its own. A tab has one of these, or two side by side. Only the one that has the keyboard (`active`) hears it.
+// its own. A tab has one of these, or several beside and above each other. Only the one that has the keyboard (`active`) hears it.
+// It's as big as layout makes it, and only knows how wide that is in the steps that change what it shows: see `useRoom`.
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { clipboard, dialogs, drag, menus, shell, type MenuItem } from 'rsui/desktop';
@@ -10,7 +11,7 @@ import {
     COMPUTER, formatSize, freeName, join, matcher, nameOf, parentOf, readFolder, search, sortEntries, transfer, type Drive, type Entry,
 } from './files';
 import { keyOf } from './keys';
-import { COLUMN_WIDTH, ColumnHeaders, FileList, gridShape, type Handlers, type Look } from './List';
+import { COLUMN_WIDTH, ColumnHeaders, FileList, type Handlers, type Look } from './List';
 import { COMMANDS, type Command, type PaneState, type Session, type Settings, type SortKey, type View } from './settings';
 import { driveIcon } from './Sidebar';
 import { PaneBar } from './Toolbar';
@@ -47,6 +48,87 @@ export const BAR_HEIGHT = 46;
 export const STATUS_HEIGHT = 28;
 export const HEADER_HEIGHT = 30;
 
+/** What a pane's showing that it carries on with when it's made again somewhere else, as it is when it's split the other way. */
+interface Kept {
+    history: { stack: string[]; at: number };
+    query: string;
+    recursive: boolean;
+    selected: Set<string>;
+    cursor: string | null;
+    anchor: string | null;
+}
+
+/** Each pane's, by its id, as it last drew. */
+const kept = new Map<string, Kept>();
+
+/** Lets go of what's kept for panes that aren't in `live`, which are gone. */
+export function forgetPanes(live: Set<string>) {
+    for (const id of [...kept.keys()]) {
+        if (!live.has(id)) {
+            kept.delete(id);
+        }
+    }
+}
+
+/** What a pane shows, for how wide layout's made it: the toolbar's narrower forms, and which columns fit. */
+interface Room {
+    narrow: boolean;
+    tiny: boolean;
+    cols: Look['cols'];
+}
+
+/** The columns that fit `width`: in a narrow panel, as one side of a split is, the least useful go first, so names keep room. */
+function columnsFor(width: number, look: Look): Look['cols'] {
+    const cols = { ...look.cols };
+    const room = (key: keyof typeof cols) => (cols[key] ? COLUMN_WIDTH[key] + 12 : 0);
+    const used = () => (Object.keys(cols) as (keyof typeof cols)[]).reduce((sum, key) => sum + room(key), 0);
+    for (const key of ['attributes', 'created', 'type', 'modified', 'size'] as const) {
+        if (width - used() - look.iconSize - 70 >= 180) {
+            break;
+        }
+        cols[key] = false;
+    }
+    return cols;
+}
+
+function roomFor(width: number, look: Look): Room {
+    return { narrow: width < 620, tiny: width < 440, cols: columnsFor(width, look) };
+}
+
+/**
+ * What `element` has room for, from how wide layout makes it, which is told after it's laid out. Only a change in what that comes
+ * to draws the pane again, not every pixel of a window being resized. Until it's been laid out, it's as wide as there's room for.
+ */
+function useRoom(element: { current: any }, look: Look): Room {
+    const width = useRef<number | null>(null);
+    const [room, setRoom] = useState<Room>(() => roomFor(Infinity, look));
+    const latest = useRef({ look, room });
+    latest.current = { look, room };
+    const update = () => {
+        const next = roomFor(width.current ?? Infinity, latest.current.look);
+        if (JSON.stringify(next) !== JSON.stringify(latest.current.room)) {
+            latest.current.room = next;
+            setRoom(next);
+        }
+    };
+    useEffect(() => {
+        const target = element.current;
+        if (!target || typeof ResizeObserver !== 'function') {
+            return;
+        }
+        const observer = new ResizeObserver((entries: any[]) => {
+            const entry = entries[entries.length - 1];
+            width.current = entry?.contentRect?.width ?? null;
+            update();
+        });
+        observer.observe(target);
+        return () => observer.disconnect();
+    }, []);
+    // The columns asked for, or the size of the icons, can change what fits too.
+    useEffect(update, [look]);
+    return room;
+}
+
 export const Pane = memo(function Pane(props: {
     initial: PaneState;
     settings: Settings;
@@ -55,8 +137,6 @@ export const Pane = memo(function Pane(props: {
     look: Look;
     active: boolean;
     keysOff: boolean;
-    width: number;
-    height: number;
     change: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
     updateSession: (update: (was: Session) => Session) => void;
     onReport: (report: PaneReport) => void;
@@ -67,24 +147,25 @@ export const Pane = memo(function Pane(props: {
     onRefreshDrives: () => void;
     /** Closes this pane, when it's one of several. */
     onClose?: (id: string) => void;
-    /** Whether its size moves to a new one rather than going there at once: when panes are split or closed, not while dragging. */
-    animate?: boolean;
     /** Ringed softly in the accent, as the one of several panes that has the keyboard. */
     marked?: boolean;
 }) {
-    const { initial, settings, session, drives, look, active, keysOff, width, height, change, updateSession } = props;
-    const [history, setHistory] = useState(() => ({ stack: initial.stack, at: initial.at }));
+    const { initial, settings, session, drives, look, active, keysOff, change, updateSession } = props;
+    // Made again somewhere else, it carries on with what it was showing.
+    const [was] = useState(() => kept.get(initial.id));
+    const [history, setHistory] = useState(() => was?.history ?? { stack: initial.stack, at: initial.at });
     const folder = history.stack[history.at];
     const [listing, setListing] = useState<Listing>({ folder: '\0', entries: [], error: null, took: 0 });
     const [reload, setReload] = useState(0);
-    const [query, setQuery] = useState('');
-    const [recursive, setRecursive] = useState(settings.searchRecursive);
+    const [query, setQuery] = useState(was?.query ?? '');
+    const [recursive, setRecursive] = useState(was?.recursive ?? settings.searchRecursive);
     const [found, setFound] = useState<{ entries: Entry[]; searching: boolean; folders: number } | null>(null);
-    const [selected, setSelected] = useState<Set<string>>(() => new Set());
-    const [cursor, setCursor] = useState<string | null>(null);
-    const [anchor, setAnchor] = useState<string | null>(null);
+    const [selected, setSelected] = useState<Set<string>>(() => was?.selected ?? new Set());
+    const [cursor, setCursor] = useState<string | null>(was?.cursor ?? null);
+    const [anchor, setAnchor] = useState<string | null>(was?.anchor ?? null);
     const [renaming, setRenaming] = useState<string | null>(null);
-    const [reveal, setReveal] = useState<{ path: string | null; at: number }>({ path: null, at: 0 });
+    const [reveal, setReveal] = useState<{ path: string | null; at: number }>({ path: was?.cursor ?? null, at: 0 });
+    kept.set(initial.id, { history, query, recursive, selected, cursor, anchor });
     const [editAddressAt, setEditAddressAt] = useState(0);
     const [focusSearchAt, setFocusSearchAt] = useState(0);
     const [notice, setNotice] = useState<string | null>(null);
@@ -523,8 +604,10 @@ export const Pane = memo(function Pane(props: {
     };
 
     // The keyboard is heard on the document, by the side that has it, with whatever this render knows.
+    // How many tiles fit across, and rows on a screen, as the list last said, for the keyboard.
+    const shape = useRef({ perRow: 1, perPage: 10 });
     const latest = useRef<any>(null);
-    latest.current = { run, moveCursor, open, settings, items, cursor, selected, byPath, renaming, view, pickTo, chosen, active, keysOff };
+    latest.current = { run, moveCursor, open, settings, items, cursor, selected, byPath, renaming, view, pickTo, chosen, active, keysOff, shape: shape.current };
     useEffect(() => {
         const heard = (event: any) => {
             const now = latest.current;
@@ -552,7 +635,7 @@ export const Pane = memo(function Pane(props: {
                 return;
             }
             const mods = { ctrl: event.ctrlKey, shift: event.shiftKey };
-            const { perRow, perPage } = gridShape();
+            const { perRow, perPage } = now.shape;
             const across = now.view === 'grid' ? perRow : 1;
             switch (event.key) {
                 case 'ArrowDown': event.preventDefault(); return now.moveCursor(across, mods);
@@ -702,6 +785,10 @@ export const Pane = memo(function Pane(props: {
 
     // What the bar is given, made once.
     const on = {
+        shape: useStable((rows: number, columns: number) => {
+            shape.current.perRow = Math.max(1, columns);
+            shape.current.perPage = Math.max(1, Math.floor(rows) - 1);
+        }),
         back: useStable(() => step(-1)),
         forward: useStable(() => step(1)),
         up: useStable(() => up()),
@@ -726,25 +813,17 @@ export const Pane = memo(function Pane(props: {
         }),
     };
 
-    // The columns that fit: in a narrow panel, as one side of a split is, the least useful go first, so names keep room.
+    const section = useRef<any>(null);
+    const room = useRoom(section, look);
+
+    // The columns that fit, as `useRoom` has them from how wide it's laid out.
     const fitted: Look = useMemo(() => {
-        const cols = { ...look.cols };
-        const room = (key: keyof typeof cols) => (cols[key] ? COLUMN_WIDTH[key] + 12 : 0);
-        const used = () => (Object.keys(cols) as (keyof typeof cols)[]).reduce((sum, key) => sum + room(key), 0);
-        let dropped = false;
-        for (const key of ['attributes', 'created', 'type', 'modified', 'size'] as const) {
-            if (width - used() - look.iconSize - 70 >= 180) {
-                break;
-            }
-            if (cols[key]) {
-                cols[key] = false;
-                dropped = true;
-            }
-        }
+        const cols = room.cols;
+        const dropped = (Object.keys(cols) as (keyof typeof cols)[]).some((key) => cols[key] !== look.cols[key]);
         // The side of a split that doesn't have the keyboard shows what's selected softly, as a window that isn't in front does.
         const soft = !active && look.selection === 'filled';
         return dropped || soft ? { ...look, cols, selection: soft ? 'subtle' : look.selection } : look;
-    }, [look, width, active]);
+    }, [look, room, active]);
 
     // What it says about itself, for its tab, the preview and the window's title.
     const focusEntry = entryAt(cursor) ?? null;
@@ -776,17 +855,15 @@ export const Pane = memo(function Pane(props: {
                 ? ''
                 : 'This folder is empty';
     const headers = view === 'details' && settings.showColumnHeaders && folder !== COMPUTER;
-    const listHeight = height - (settings.showToolbar ? BAR_HEIGHT : 0) - (settings.showStatusBar ? STATUS_HEIGHT : 0) - (headers ? HEADER_HEIGHT : 0);
 
     return (
         <section
+            ref={section}
             className={
-                'flex min-w-0 flex-col overflow-hidden rounded-(--fx-radius-lg) bg-(--fx-card) ' +
+                'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-(--fx-radius-lg) bg-(--fx-card) ' +
                 (props.marked ? 'shadow-[0_0_0_1.5px_var(--fx-accent-soft),var(--fx-card-shadow)] ' : 'shadow-(--fx-card-shadow) ') +
-                (props.animate ? 'transition-[width,height] duration-(--fx-move) ease-(--fx-ease) ' : '') +
                 (active ? '' : 'opacity-[0.985]')
             }
-            style={{ width, height }}
             onPointerDownCapture={on.activate}
             onDragOver={on.dragOver}
             onDrop={on.drop}
@@ -803,8 +880,8 @@ export const Pane = memo(function Pane(props: {
                     searching={found?.searching === true}
                     editAddressAt={editAddressAt}
                     focusSearchAt={focusSearchAt}
-                    narrow={width < 620}
-                    tiny={width < 440}
+                    narrow={room.narrow}
+                    tiny={room.tiny}
                     onClose={props.onClose ? on.close : undefined}
                     onBack={on.back}
                     onForward={on.forward}
@@ -833,8 +910,7 @@ export const Pane = memo(function Pane(props: {
                     empty={emptyText}
                     handlers={handlers}
                     folder={folder}
-                    width={width}
-                    height={listHeight}
+                    onShape={on.shape}
                 />
             )}
             {settings.showStatusBar ? (

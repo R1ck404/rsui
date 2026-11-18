@@ -646,7 +646,7 @@ fn an_agent_can_ask_why_something_rendered_without_turning_anything_on() {
             return (
                 <window>
                     <button key="add" onClick={() => setCount(count + 1)}>Add</button>
-                    <Row label="milk" onPick={() => {}} />
+                    <Row label="milk" onPick={() => setCount(count)} />
                 </window>
             );
         }

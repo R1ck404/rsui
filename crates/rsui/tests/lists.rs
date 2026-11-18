@@ -396,3 +396,160 @@ fn a_list_refuses_a_size_that_makes_no_sense() {
     assert!(resize(PropValue::Int(-3)).is_err());
     assert!(resize(PropValue::Int(3)).is_ok());
 }
+
+// A grid: a list whose rows hold as many items as fit across, which the window works out as it does how many rows fit.
+
+const TILE: f64 = 40.0;
+const GAP: f32 = 10.0;
+
+/// How many items there are, and the item to bring into view.
+type GridSetup = (usize, Option<usize>);
+
+fn grid(cx: &mut Cx, setup: &GridSetup) -> Element {
+    let fit = cx.state(|| (0f64, 0usize, 0usize));
+    let reveal = cx.state(|| setup.1);
+    let list = cx.virtual_list_with(
+        "tiles",
+        ListWindow {
+            len: setup.0,
+            visible: 1,
+            overscan: 0,
+            reveal: cx.get(reveal),
+        },
+        rsui::runtime::ListOptions {
+            item_width: Some(TILE),
+            fits: Some(std::rc::Rc::new(move |cx: &mut Updates<'_>, rows: f64, across: usize| {
+                let (_, _, times) = cx.get(fit);
+                cx.set(fit, (rows, across, times + 1));
+            })),
+        },
+        |cx, index| cx.keyed(index, row, index),
+    );
+    let props = list
+        .props
+        .merged(&Style::new().row_height(ROW).gap(GAP).flex(1.0).into());
+    let (rows, across, times) = cx.get(fit);
+    let root = Element::new(Role::Window)
+        .key("root")
+        .prop("told", format!("{rows} {across} {times}").as_str())
+        .child(Element { props, ..list });
+    cx.on(root, ActionKind::Custom("reveal".into()), move |cx, input| {
+        if let Some(PropValue::Int(item)) = input {
+            cx.set(reveal, Some(*item as usize));
+        }
+    })
+}
+
+fn reveal(app: &mut App, item: i64) {
+    app.runtime_mut()
+        .dispatch(&[], ActionKind::Custom("reveal".into()), Some(PropValue::Int(item)))
+        .expect("it's revealed");
+    app.update();
+    app.scene();
+}
+
+fn grid_app(setup: GridSetup) -> App {
+    let mut app = App::new(grid, setup, TextEngine::new(plain_font()), SIZE, 1.0);
+    app.update();
+    app.scene();
+    app
+}
+
+fn told(app: &App) -> String {
+    match app.runtime().root().props.get("told") {
+        Some(PropValue::Str(text)) => text.to_string(),
+        other => panic!("told is {other:?}"),
+    }
+}
+
+#[test]
+fn a_grid_fits_as_many_across_as_its_width_has_room_for() {
+    let app = grid_app((100, None));
+    // 200 pixels across has room for 4 tiles of 40 with 10 between them (4 * 40 + 3 * 10 = 190), and 100 down for 5 rows of 20.
+    assert_eq!(prop(&app, "across"), 4);
+    assert_eq!(prop(&app, "count"), 25, "100 tiles four across is 25 rows");
+    assert_eq!(built(&app), 5 * 4, "five rows of four");
+    // The sixth is the second of the second row, a row's height less the gap tall.
+    let rect = app.layout().rect(&[0, 5]).expect("it's laid out");
+    assert_eq!((rect.x, rect.y, rect.width, rect.height), (50.0, 20.0, 40.0, 10.0));
+    assert_eq!(told(&app), "5 4 1", "what wants to know is told what fits, once");
+}
+
+#[test]
+fn a_grid_rewraps_when_the_window_changes_width() {
+    let mut app = grid_app((100, None));
+    app.resize((110, 100), 1.0);
+    app.update();
+    app.scene();
+    // 110 has room for 2 (2 * 40 + 10 = 90), not 3 (140).
+    assert_eq!(prop(&app, "across"), 2);
+    assert_eq!(prop(&app, "count"), 50);
+    let rect = app.layout().rect(&[0, 3]).expect("it's laid out");
+    assert_eq!((rect.x, rect.y), (50.0, 20.0), "the fourth is the second of the second row");
+    assert_eq!(told(&app), "5 2 2");
+}
+
+#[test]
+fn a_grid_built_short_of_its_end_ends_where_its_items_do() {
+    // Ten tiles four across are three rows, the last with two.
+    let app = grid_app((10, None));
+    assert_eq!(prop(&app, "count"), 3);
+    assert_eq!(built(&app), 10);
+}
+
+#[test]
+fn a_grid_reveals_an_item_by_the_row_it_is_in() {
+    let mut app = grid_app((100, Some(41)));
+    // It was revealed before the grid knew how many fit across, at the top of a list one across, and it's still at the top,
+    // in row 10 four across.
+    assert_eq!(prop(&app, "first_visible"), 10);
+    assert_eq!(the_list(&app).children[0].key, Some(rsui::core::Key::from(40usize)));
+    // Revealed again once it's measured, item 3 is in the first row, above what shows.
+    reveal(&mut app, 3);
+    assert_eq!(prop(&app, "first_visible"), 0);
+    // And item 99 is in the last row, which is the last of the five that show.
+    reveal(&mut app, 99);
+    assert_eq!(prop(&app, "first_visible"), 20);
+}
+
+#[test]
+fn a_grid_is_told_how_many_fit_across_with_how_many_rows() {
+    let mut app = grid_app((100, None));
+    let path = [0];
+    let mut resize = |value: PropValue| app.runtime_mut().dispatch(&path, ActionKind::Resize, Some(value));
+    assert!(resize(PropValue::from("4.5 3")).is_ok());
+    assert!(resize(PropValue::from("4.5 0")).is_err(), "nothing fits across");
+    assert!(resize(PropValue::from("4.5 3 1")).is_err());
+    assert!(resize(PropValue::from("-1 3")).is_err());
+}
+
+/// A list that's only as tall as what stretches it, in a row as tall as the window, with no idea how many rows fit.
+fn stretched(cx: &mut Cx, _: &()) -> Element {
+    let list = cx.virtual_list(
+        "rows",
+        ListWindow {
+            len: 1000,
+            visible: 0,
+            overscan: 0,
+            reveal: None,
+        },
+        |cx, index| cx.keyed(index, row, index),
+    );
+    let props = list.props.merged(&Style::new().row_height(ROW).width(100.0).into());
+    Element::new(Role::Window).child(
+        Element::new(Role::Group)
+            .props(style!(Style::row().height_percent(80.0)))
+            .child(Element { props, ..list }),
+    )
+}
+
+#[test]
+fn a_list_stretched_by_what_it_is_in_builds_the_rows_that_fit() {
+    let mut app = App::new(stretched, (), TextEngine::new(plain_font()), SIZE, 1.0);
+    app.update();
+    app.scene();
+    // 80% of 100 pixels is 80, which is 4 rows of 20.
+    let list = app.runtime().root().children[0].children[0].clone();
+    assert_eq!(list.children.len(), 4);
+    assert_eq!(app.layout().rect(&[0, 0]).expect("it's laid out").height, 80.0);
+}

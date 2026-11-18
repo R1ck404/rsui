@@ -431,7 +431,7 @@ fn copy_proto(proto: &Proto) -> Proto {
         params: proto.params,
         length: proto.length,
         flags: proto.flags,
-        strict: proto.strict,
+        says: proto.says,
         locals: proto.locals,
         name: proto.name,
         file: proto.file,

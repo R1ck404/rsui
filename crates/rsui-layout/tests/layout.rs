@@ -2516,11 +2516,17 @@ mod scrolled_without_layout {
             assert!(same_rects(&all_rects(&layout), &fresh(&root)), "{scroll}: {:?}\n{:?}", all_rects(&layout), fresh(&root));
             previous = root;
         }
-        // Near the far end, where how far it can go is the layout's to say, it's laid out as before, and comes to the same.
-        let root = page(1e9, 100.0);
-        layout.apply_needs_layout_since(&diff(&previous, &root), Some(&previous));
-        layout.compute(&root, SIZE, &mut metrics);
-        assert!(same_rects(&all_rects(&layout), &fresh(&root)));
+        // Past the far end, it's at the far end, as laying it out puts it, and that's only moving it too.
+        for scroll in [1e9, 220.0, 219.5, 1e9] {
+            let root = page(scroll, 100.0);
+            let needs = layout.apply_needs_layout_since(&diff(&previous, &root), Some(&previous));
+            layout.compute(&root, SIZE, &mut metrics);
+            assert!(!needs, "{scroll}: only moved");
+            assert_eq!(layout.last_solved(), 0, "{scroll}: nothing laid out again");
+            assert!(same_rects(&all_rects(&layout), &fresh(&root)), "{scroll}: {:?}
+{:?}", all_rects(&layout), fresh(&root));
+            previous = root;
+        }
     }
 
     #[test]
@@ -2712,4 +2718,125 @@ mod right_to_left {
         }
     }
 
+}
+mod scrollbars_kept {
+    //! A scrolling area whose scrollbar takes room starts from the scrollbars it had last time when it's laid out again, so what's
+    //! in it is laid out once at the width that leaves, rather than at its full width first and then again: see `BAR_DOWN`.
+    use super::*;
+
+    const SIZE: Size = Size::new(300.0, 200.0);
+
+    /// An area with `rows` rows that are `row_height` tall, each with two parts across, scrolled down `scroll`, and a scrollbar
+    /// that takes 17 across.
+    fn page(rows: usize, row_height: f32, scroll: f64) -> Node {
+        let row = |at: usize| {
+            group(Style::row().height(row_height))
+                .key(format!("row {at}"))
+                .child(group(Style::new().flex(1.0)))
+                .child(group(Style::new().width(40.0)))
+        };
+        let area = group(Style::new().height(200.0).scroll_y(scroll as f32)).prop("scrollbar_room", 17.0).children((0..rows).map(row));
+        Element::new(Role::Window).child(area).into_node()
+    }
+
+    fn fresh(root: &Node) -> Vec<(Vec<u32>, Rect)> {
+        let mut layout = Layout::new();
+        layout.compute(root, SIZE, &mut FixedMetrics::default());
+        all_rects(&layout)
+    }
+
+    /// Lays `root` out again after `previous`, and says how many boxes that solved, checking it comes to what laying it out from
+    /// nothing does.
+    fn again(layout: &mut Layout, previous: &Node, root: &Node) -> usize {
+        layout.apply_needs_layout_since(&diff(previous, root), Some(previous));
+        layout.compute(root, SIZE, &mut FixedMetrics::default());
+        assert!(same_rects(&all_rects(layout), &fresh(root)), "{:?}\n{:?}", all_rects(layout), fresh(root));
+        layout.last_solved()
+    }
+
+    #[test]
+    fn laying_a_long_list_out_again_lays_out_none_of_its_rows() {
+        let mut layout = Layout::new();
+        let first = page(500, 20.0, 0.0);
+        layout.compute(&first, SIZE, &mut FixedMetrics::default());
+        // The rows are as wide as what the scrollbar leaves.
+        assert_eq!(layout.rect(&[0, 0]).map(|rect| rect.width), Some(283.0));
+        // To the far end, which is laid out again: the area itself, and none of the 1,500 boxes in it. Each was laid out twice,
+        // at 300 and at 283 across, before.
+        let end = page(500, 20.0, 1e9);
+        let solved = again(&mut layout, &first, &end);
+        assert!(solved < 10, "{solved} boxes were laid out again");
+    }
+
+    #[test]
+    fn a_scrollbar_that_is_not_needed_any_more_goes() {
+        let mut layout = Layout::new();
+        let long = page(50, 20.0, 0.0);
+        layout.compute(&long, SIZE, &mut FixedMetrics::default());
+        assert_eq!(layout.rect(&[0, 0]).map(|rect| rect.width), Some(283.0));
+        // Rows short enough that all of them show have no scrollbar beside them, as laying them out from nothing has it.
+        let short = page(50, 3.0, 0.0);
+        again(&mut layout, &long, &short);
+        assert_eq!(layout.rect(&[0, 0]).map(|rect| rect.width), Some(300.0));
+        // And taller again, it's back.
+        again(&mut layout, &short, &long);
+        assert_eq!(layout.rect(&[0, 0]).map(|rect| rect.width), Some(283.0));
+    }
+}
+
+mod near_view {
+    //! What's near being seen, as `content-visibility: auto` asks: inside the window and what scrolls around it, each made bigger by
+    //! a margin, with what's in something that scrolls looked at only as far as its rows.
+    use super::*;
+
+    const SIZE: Size = Size::new(300.0, 200.0);
+
+    /// Rows 20 tall, named by where they are, in an area 100 tall that's scrolled down `scroll`, under a box 50 tall. The rows
+    /// from `inside` on have a box in them, which is what's looked for.
+    fn page(scroll: f32) -> Node {
+        let row = |at: usize| group(Style::new().height(20.0)).name(format!("{at}")).child(group(Style::new().height(10.0)).name(format!("in {at}")));
+        let area = group(Style::new().height(100.0).scroll_y(scroll)).children((0..100).map(row));
+        Element::new(Role::Window).child(group(Style::new().height(50.0)).name("above")).child(area).into_node()
+    }
+
+    fn near(root: &Node, margin: f32) -> Vec<String> {
+        let mut layout = Layout::new();
+        layout.compute(root, SIZE, &mut FixedMetrics::default());
+        let mut found = Vec::new();
+        let mut looked = 0;
+        layout.near_view(
+            root,
+            margin,
+            &mut |node| {
+                looked += 1;
+                node.name.parse::<usize>().is_ok()
+            },
+            &mut |path, node| {
+                assert_eq!(path.len(), 2);
+                found.push(node.name.to_string());
+            },
+        );
+        // The window, the box above, the area, and each row, but nothing in the rows.
+        assert!(looked <= 3 + 100, "{looked} looked at");
+        found
+    }
+
+    fn names(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|at| at.to_string()).collect()
+    }
+
+    #[test]
+    fn what_shows_in_what_scrolls_is_near() {
+        // The area shows rows 0 to 4, from 50 to 150 in the window.
+        assert_eq!(near(&page(0.0), 0.0), names(0..5));
+        // Scrolled down 30, row 1 shows at its bottom, and row 6 at its top.
+        assert_eq!(near(&page(30.0), 0.0), names(1..7));
+    }
+
+    #[test]
+    fn a_margin_takes_in_what_is_that_near() {
+        // 40 past what shows of the area, at both ends, is two rows more each way, as far as there are rows.
+        assert_eq!(near(&page(0.0), 40.0), names(0..7));
+        assert_eq!(near(&page(200.0), 40.0), names(8..17));
+    }
 }

@@ -137,6 +137,42 @@ fn a_width_that_is_a_share_moves() {
 }
 
 #[test]
+fn shares_of_a_flex_box_move() {
+    // Panes split by `flex-grow` shares, in a row 300 wide: going from 1 to 5 against a neighbour of 1 takes this one from
+    // 150 to 250, which it glides to with `transition: flex-grow`, as a browser has it.
+    let file = write(
+        "grow",
+        r#"
+        import './app.css';
+        import { useState } from 'react';
+        import { PageWindow } from 'rsui/web';
+        export default function App() {
+            const [wide, setWide] = useState(false);
+            return (
+                <PageWindow><div>
+                    <button key="go" onClick={() => setWide(!wide)}>go</button>
+                    <div key="track" className="track">
+                        <div key="box" className="pane" style={{ flexGrow: wide ? 5 : 1 }} />
+                        <div key="other" className="pane" style={{ flexGrow: 1 }} />
+                    </div>
+                </div></PageWindow>
+            );
+        }
+        "#,
+        r#"
+        .track { width: 300px; height: 10px; display: flex; }
+        .pane { flex-basis: 0; height: 10px; background: red; transition: flex-grow 300ms linear; }
+        "#,
+    );
+    let mut hands = moving(&file);
+    assert!((hands.rect_of("box")[2] - 150.0).abs() < 0.01, "{:?}", hands.rect_of("box"));
+    let there = widths_after_click(&mut hands, "go", 25, |_, _| {});
+    assert!(there.iter().any(|&w| w > 160.0 && w < 240.0), "it's partway at some point: {there:?}");
+    assert!(there.windows(2).all(|pair| pair[1] >= pair[0] - 0.01), "only ever wider: {there:?}");
+    assert!((there.last().unwrap() - 250.0).abs() < 0.01, "and it gets there: {there:?}");
+}
+
+#[test]
 fn a_transition_on_its_way_goes_on_when_only_its_duration_changes() {
     // Mantine's FloatingIndicator sets where it's going on its `style`, then, told its target's size by a `ResizeObserver`,
     // `transitionDuration = '0ms'` and the same place again. As CSS has it, that doesn't stop what's moving: only a new place to

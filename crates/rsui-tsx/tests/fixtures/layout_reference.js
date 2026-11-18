@@ -198,6 +198,15 @@ const layoutReference = (() => {
             look.shrink = 1;
             look.minAuto = true;
         }
+        // What says how small it can be is that small along a flex box, rather than as small as what's in it.
+        if (look.minAuto === true) {
+            if (look.minWidth !== undefined) {
+                look.minWidthSaid = true;
+            }
+            if (look.minHeight !== undefined) {
+                look.minHeightSaid = true;
+            }
+        }
         // A block's children are one under another, and their margins go together; a flex box's or a grid's don't.
         if (look.direction === undefined && look.display === undefined && look.__flex !== true) {
             look.collapseMargins = true;

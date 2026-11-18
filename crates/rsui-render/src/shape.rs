@@ -589,8 +589,12 @@ fn dashed(runs: &[Run], pattern: &[f32], offset: f32) -> Option<Vec<Run>> {
 /// The lines around a path's stroke, with round corners.
 #[cfg(test)]
 fn stroke_lines(runs: &[Run], width: f32, cap: LineCap, lines: &mut Vec<[f32; 4]>) {
-    stroke_lines_joined(runs, width, cap, LineJoin::Round, lines);
+    stroke_lines_joined(runs, width, cap, LineJoin::Round, MITER_LIMIT, lines);
 }
+
+/// How far a mitred corner may reach, in widths of the line, before it's bevelled instead, as SVG's `stroke-miterlimit` is
+/// unless it says.
+const MITER_LIMIT: f32 = 4.0;
 
 /// The lines around a path's stroke, with its corners as `join` says: one outline for each run, its two sides with the ends and
 /// corners between them, as the canvas strokes. That's what a browser fills, and filled, its edges are only ever counted once.
@@ -601,6 +605,7 @@ fn stroke_lines_joined(
     width: f32,
     cap: LineCap,
     join: LineJoin,
+    miter_limit: f32,
     lines: &mut Vec<[f32; 4]>,
 ) {
     use crate::canvas::geom::{Cap, Join, Matrix, Path, StrokeStyle, Stroker};
@@ -632,8 +637,7 @@ fn stroke_lines_joined(
             LineJoin::Round => Join::Round,
             LineJoin::Bevel => Join::Bevel,
         },
-        // SVG's `stroke-miterlimit` is 4 unless it says.
-        miter_limit: 4.0,
+        miter_limit,
         ..StrokeStyle::default()
     };
     Stroker::default().stroke(&path, &style, &Matrix::IDENTITY, lines);
@@ -786,7 +790,7 @@ pub(crate) fn draw_layers(
         }
     };
     for layer in layers.lines() {
-        let mut parts = layer.splitn(9, '\t');
+        let mut parts = layer.splitn(11, '\t');
         let fill = parts.next().unwrap_or("");
         let stroke = parts.next().unwrap_or("");
         let stroke_width = parts
@@ -820,12 +824,21 @@ pub(crate) fn draw_layers(
             Some("bevel") => LineJoin::Bevel,
             _ => LineJoin::Round,
         };
+        // As SVG has it, a limit below 1 is no limit that could be met, and isn't used.
+        let miter_limit = parts
+            .next()
+            .and_then(|limit| limit.trim().parse::<f32>().ok())
+            .filter(|limit| *limit >= 1.0)
+            .unwrap_or(MITER_LIMIT);
+        // SVG's `fill-rule`: whether a part inside another is a hole only when it goes round the other way, as it is unless
+        // something says, or always.
+        let even_odd = parts.next().map(str::trim) == Some("evenodd");
         let runs = trace(d, place);
         if let Some(color) = color_from(fill) {
             lines.clear();
             fill_lines(&runs, &mut lines);
             inside_picture(&mut lines, width, height);
-            let bitmap = rasterizer.fill(&mut lines, LARGEST as usize + 1);
+            let bitmap = rasterizer.fill_by_rule(&lines, LARGEST as usize + 1, even_odd);
             blend_coverage(&mut canvas, (pixels_wide, pixels_high), &bitmap, color);
         }
         if let Some(color) = color_from(stroke) {
@@ -836,10 +849,13 @@ pub(crate) fn draw_layers(
                 stroke_width * place.scale,
                 cap,
                 join,
+                miter_limit,
                 &mut lines,
             );
             inside_picture(&mut lines, width, height);
-            let bitmap = rasterizer.fill(&mut lines, LARGEST as usize + 1);
+            // A stroke's outline goes over itself at every bend and wherever the path crosses itself, and what it covers is
+            // all of that once, as the nonzero rule has it.
+            let bitmap = rasterizer.fill_by_rule(&lines, LARGEST as usize + 1, false);
             blend_coverage(&mut canvas, (pixels_wide, pixels_high), &bitmap, color);
         }
     }
@@ -981,7 +997,7 @@ mod tests {
             fill_lines(&runs, &mut lines);
         }
         inside_picture(&mut lines, size, size);
-        Rasterizer::new().fill(&mut lines, 8192)
+        Rasterizer::new().fill_by_rule(&lines, 8192, false)
     }
 
     #[test]
@@ -1042,8 +1058,8 @@ mod tests {
         }
     }
 
-    fn drawn(lines: &mut Vec<[f32; 4]>) -> rsui_text::GlyphBitmap {
-        Rasterizer::new().fill(lines, 8192)
+    fn drawn(lines: &[[f32; 4]]) -> rsui_text::GlyphBitmap {
+        Rasterizer::new().fill_by_rule(lines, 8192, false)
     }
 
     fn coverage_at(bitmap: &rsui_text::GlyphBitmap, x: i32, y: i32) -> u8 {
@@ -1058,7 +1074,7 @@ mod tests {
     fn filling_covers_exactly_what_is_inside_and_opposite_ways_around_make_a_hole() {
         let mut lines = Vec::new();
         fill_lines(&trace("M2 2 H8 V8 H2 Z", AS_IS), &mut lines);
-        let bitmap = drawn(&mut lines);
+        let bitmap = drawn(&lines);
         assert_eq!(coverage_at(&bitmap, 5, 5), 255);
         assert_eq!(coverage_at(&bitmap, 1, 5), 0);
         assert_eq!(coverage_at(&bitmap, 8, 5), 0);
@@ -1067,9 +1083,153 @@ mod tests {
             &trace("M0 0 H10 V10 H0 Z M3 3 V7 H7 V3 Z", AS_IS),
             &mut lines,
         );
-        let bitmap = drawn(&mut lines);
+        let bitmap = drawn(&lines);
         assert_eq!(coverage_at(&bitmap, 1, 1), 255);
         assert_eq!(coverage_at(&bitmap, 5, 5), 0, "that's the hole");
+    }
+
+    /// How much of each pixel of a picture this size is inside these lines by the nonzero or even-odd rule, worked out the slow
+    /// way, by asking at points spread evenly across each pixel, `samples` each way, which way round the lines go there.
+    fn sampled(lines: &[[f32; 4]], size: usize, samples: usize, even_odd: bool) -> Vec<f32> {
+        let mut covered = vec![0.0f32; size * size];
+        for y in 0..size {
+            for sample_y in 0..samples {
+                let at_y = y as f32 + (sample_y as f32 + 0.5) / samples as f32;
+                // Where each line crosses this height, and which way it goes.
+                let mut crossings: Vec<(f32, i32)> = lines
+                    .iter()
+                    .filter(|line| (line[1] <= at_y) != (line[3] <= at_y))
+                    .map(|line| {
+                        let x = line[0] + (line[2] - line[0]) * ((at_y - line[1]) / (line[3] - line[1]));
+                        (x, if line[3] > line[1] { 1 } else { -1 })
+                    })
+                    .collect();
+                crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for x in 0..size {
+                    for sample_x in 0..samples {
+                        let at_x = x as f32 + (sample_x as f32 + 0.5) / samples as f32;
+                        let winding: i32 = crossings.iter().take_while(|c| c.0 < at_x).map(|c| c.1).sum();
+                        if if even_odd { winding & 1 != 0 } else { winding != 0 } {
+                            covered[y * size + x] += 1.0 / (samples * samples) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        covered
+    }
+
+    /// The most any pixel of `bitmap`, in a picture this size, is off from `expected`, out of 1, which pixel that is, and what
+    /// it was and should have been.
+    fn furthest_from(bitmap: &rsui_text::GlyphBitmap, expected: &[f32], size: usize) -> (f32, (usize, usize), f32, f32) {
+        let mut furthest = (0.0f32, (0, 0), 0.0, 0.0);
+        for y in 0..size {
+            for x in 0..size {
+                let got = f32::from(coverage_at(bitmap, x as i32, y as i32)) / 255.0;
+                let off = (got - expected[y * size + x]).abs();
+                if off > furthest.0 {
+                    furthest = (off, (x, y), got, expected[y * size + x]);
+                }
+            }
+        }
+        furthest
+    }
+
+    #[test]
+    fn parts_over_each_other_are_covered_once_by_the_nonzero_rule() {
+        // Two circles going the same way, one partly over the other, and two squares going the same way, whose edges cross
+        // the same pixels.
+        for d in [
+            "M8 2a6 6 0 1 1 0 12a6 6 0 1 1 0-12Z M13.3 7.1a4.4 4.4 0 1 1 0 8.8a4.4 4.4 0 1 1 0-8.8Z",
+            "M1.5 1.5H10.4V10.4H1.5Z M5.25 5.25H10.6V14.25H5.25Z",
+        ] {
+            let mut lines = Vec::new();
+            fill_lines(&trace(d, AS_IS), &mut lines);
+            let expected = sampled(&lines, 16, 64, false);
+            let bitmap = Rasterizer::new().fill_by_rule(&lines, 8192, false);
+            let off = furthest_from(&bitmap, &expected, 16);
+            assert!(off.0 < 0.02, "{d}: {off:?}");
+            // Adding up how far round each pixel the lines go is a long way off, which is what this was drawn with.
+            let added = Rasterizer::new().fill(&mut lines, 8192);
+            assert!(furthest_from(&added, &expected, 16).0 > 0.05, "{d}");
+        }
+        // Where squares going opposite ways overlap is a hole, as the nonzero rule has it, edges and all.
+        let mut lines = Vec::new();
+        fill_lines(&trace("M1.5 1.5H10.4V10.4H1.5Z M5.25 5.25V14.25H10.6V5.25Z", AS_IS), &mut lines);
+        let expected = sampled(&lines, 16, 64, false);
+        let bitmap = drawn(&lines);
+        assert_eq!(coverage_at(&bitmap, 8, 8), 0);
+        assert!(furthest_from(&bitmap, &expected, 16).0 < 0.02);
+    }
+
+    #[test]
+    fn a_see_through_fill_is_as_strong_where_its_parts_overlap() {
+        let half_red = Color::rgba(255, 0, 0, 128);
+        let picture_of = |d: &str| {
+            let layer = format!("{}
+", shape_layer(d, Some(Some(half_red)), None, LineCap::Butt));
+            draw_layers(&layer, None, false, (16.0, 16.0), Color::BLACK, &mut Rasterizer::new()).unwrap()
+        };
+        // Two squares going the same way. The first ends 0.4 of the way across its last column, and the second 0.6 of the way
+        // across the same column.
+        let both = picture_of("M2 2H9.4V9.4H2Z M6.5 6.5H9.6V14H6.5Z");
+        let second = picture_of("M6.5 6.5H9.6V14H6.5Z");
+        let pixel = |picture: &ColorBitmap, x: usize, y: usize| picture.pixels[(y * 16 + x) * 4..][..4].to_vec();
+        assert_eq!(pixel(&both, 4, 4), pixel(&both, 8, 8), "inside one, and inside both");
+        assert_eq!(pixel(&both, 4, 4), pixel(&both, 8, 12));
+        // That column is as covered as the second square covers it, which covers all the first square does there.
+        assert_eq!(pixel(&both, 9, 8), pixel(&second, 9, 8));
+    }
+
+    #[test]
+    fn by_the_even_odd_rule_a_part_inside_another_is_a_hole_whichever_way_it_goes() {
+        // The inner square goes the same way as the outer one.
+        let d = "M0 0H12V12H0Z M3.5 3.5H8.5V8.5H3.5Z";
+        let mut lines = Vec::new();
+        fill_lines(&trace(d, AS_IS), &mut lines);
+        let bitmap = Rasterizer::new().fill_by_rule(&lines, 8192, true);
+        assert_eq!(coverage_at(&bitmap, 1, 1), 255);
+        assert_eq!(coverage_at(&bitmap, 5, 5), 0, "that's the hole");
+        assert_eq!(coverage_at(&bitmap, 3, 5), 128, "half of that pixel is in the hole");
+        let filled = Rasterizer::new().fill_by_rule(&lines, 8192, false);
+        assert_eq!(coverage_at(&filled, 5, 5), 255, "by the nonzero rule, it isn't");
+        // As a layer says it: after the transform, dashes, their offset, the join and the miter limit.
+        let layer = format!("{}\t\t\t\t\t4\tevenodd\n", shape_layer(d, Some(Some(Color::BLACK)), None, LineCap::Butt));
+        let picture = draw_layers(&layer, None, false, (12.0, 12.0), Color::BLACK, &mut Rasterizer::new()).unwrap();
+        assert_eq!(picture.pixels[(5 * 12 + 5) * 4 + 3], 0);
+        assert_eq!(picture.pixels[(12 + 1) * 4 + 3], 255);
+    }
+
+    #[test]
+    fn icons_whose_parts_overlap_come_out_as_they_should() {
+        // From the Blode icons the file explorer demo uses, at the sizes it shows them, and larger.
+        let icons = [
+            // magnifying-glass-filled's ring and handle.
+            "M11 5c-3.3137 0-6 2.6863-6 6s2.6863 6 6 6 6-2.6863 6-6-2.6863-6-6-6m-8 6c0-4.4183 3.5817-8 8-8s8 3.5817 8 8c0 1.8487-.6271 3.551-1.6801 4.9056l3.3872 3.3873c.3905.3905.3905 1.0237 0 1.4142s-1.0237.3905-1.4142 0l-3.3873-3.3872C14.551 18.3729 12.8487 19 11 19c-4.4183 0-8-3.5817-8-8",
+            // files-filled's back page, where the front page is cut out of it.
+            "M17.8986 18.8987C17.4908 20.6751 15.9002 22 14 22H8c-2.2091 0-4-1.7909-4-4V9c0-1.9001 1.325-3.4908 3.1014-3.8986C7.5092 3.3249 9.0999 2 11 2h3v4c0 1.6569 1.3431 3 3 3h4v6c0 1.9002-1.3249 3.4909-3.1014 3.8987M7 7.2676C6.4022 7.6134 6 8.2597 6 9v9c0 1.1046.8954 2 2 2h6c.7403 0 1.3866-.4022 1.7324-1H11c-2.2091 0-4-1.7909-4-4z",
+            // eye-open-filled, with its pupil cut out.
+            "M12.0001 4c3.8037 0 7.507 2.1067 10.0672 6.1138.7338 1.1484.7338 2.6239 0 3.7723C19.5071 17.8932 15.8038 20 12.0001 20s-7.507-2.1067-10.0672-6.1138c-.7338-1.1484-.7338-2.6239 0-3.7723C4.493 6.1069 8.1964 4 12 4Zm-3.5 8c0-1.933 1.567-3.5 3.5-3.5s3.5 1.567 3.5 3.5-1.567 3.5-3.5 3.5-3.5-1.567-3.5-3.5",
+        ];
+        let mut worst_before = 0.0f32;
+        for d in icons {
+            for size in [16usize, 20, 24, 37] {
+                let place = Placement::to_fit([0.0, 0.0, 24.0, 24.0], size as f32, size as f32);
+                let mut lines = Vec::new();
+                fill_lines(&trace(d, place), &mut lines);
+                inside_picture(&mut lines, size as f32, size as f32);
+                // Each of them says `fill-rule="evenodd"`.
+                let expected = sampled(&lines, size, 32, true);
+                let bitmap = Rasterizer::new().fill_by_rule(&lines, 8192, true);
+                let off = furthest_from(&bitmap, &expected, size);
+                assert!(off.0 < 0.03, "{size}px {d}: {off:?}");
+                let before = furthest_from(&Rasterizer::new().fill(&mut lines, 8192), &expected, size).0;
+                eprintln!("{size}px: {} now, {before} before", off.0);
+                worst_before = worst_before.max(before);
+            }
+        }
+        // What these were drawn with before.
+        assert!(worst_before > 0.05, "{worst_before}");
     }
 
     #[test]
@@ -1081,7 +1241,7 @@ mod tests {
             LineCap::Butt,
             &mut lines,
         );
-        let bitmap = drawn(&mut lines);
+        let bitmap = drawn(&lines);
         assert_eq!(coverage_at(&bitmap, 6, 4), 255);
         assert_eq!(coverage_at(&bitmap, 6, 5), 255);
         assert_eq!(coverage_at(&bitmap, 6, 3), 0);
@@ -1098,7 +1258,7 @@ mod tests {
         let end_of = |cap| {
             let mut lines = Vec::new();
             stroke_lines(&trace("M10 10 H20", AS_IS), 4.0, cap, &mut lines);
-            let bitmap = drawn(&mut lines);
+            let bitmap = drawn(&lines);
             (coverage_at(&bitmap, 8, 9), coverage_at(&bitmap, 8, 11 - 3))
         };
         assert_eq!(end_of(LineCap::Butt).0, 0);
@@ -1118,7 +1278,7 @@ mod tests {
             LineCap::Butt,
             &mut lines,
         );
-        let bitmap = drawn(&mut lines);
+        let bitmap = drawn(&lines);
         assert_eq!(coverage_at(&bitmap, 2, 2), 255);
         assert_eq!(coverage_at(&bitmap, 1, 6), 255);
     }
@@ -1135,7 +1295,7 @@ mod tests {
                 LineCap::Butt,
                 &mut lines,
             );
-            let bitmap = drawn(&mut lines);
+            let bitmap = drawn(&lines);
             let ink: f32 = bitmap.coverage.iter().map(|&amount| f32::from(amount) / 255.0).sum();
             let wanted = std::f32::consts::TAU * 8.0 * width;
             assert!((ink / wanted - 1.0).abs() < 0.02, "{width}: {ink} against {wanted}");
@@ -1206,6 +1366,20 @@ mod tests {
         assert_eq!(layer, "#ff0000ff\tcurrentColor\t2.5\tround\tM0 0");
         let layer = shape_layer("M0 0", None, None, LineCap::Butt);
         assert_eq!(layer, "\t\t0\tbutt\tM0 0");
+    }
+
+    #[test]
+    fn a_corner_is_mitred_as_far_as_its_limit_says_and_bevelled_past_it() {
+        // A corner of about 71 degrees, whose mitre reaches 1.7 widths of the line: inside SVG's limit of 4, and past a limit of 1.
+        let tip = |limit: &str| {
+            let layer = format!("\t#000000ff\t4\tbutt\tM2 30 L20 5 L38 30\t\t\t0\tmiter\t{limit}");
+            let drawn = draw_layers(&layer, None, false, (40.0, 40.0), Color::BLACK, &mut Rasterizer::new()).unwrap();
+            // How much of the pixel 2.5 units above the corner is covered, where only a mitre reaches.
+            drawn.pixels[(2 * 40 + 20) * 4 + 3]
+        };
+        assert!(tip("") > 100, "{}", tip(""));
+        assert!(tip("10") > 100, "{}", tip("10"));
+        assert_eq!(tip("1"), 0);
     }
 
     #[test]

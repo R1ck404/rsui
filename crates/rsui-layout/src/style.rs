@@ -133,6 +133,10 @@ pub struct Style {
     pub(crate) moved: bool,
     /// Doesn't shrink to less than what's in it, as CSS has it, unless it's smaller than that to start with.
     pub(crate) min_auto: bool,
+    /// How narrow or how short it can be was said, as CSS's `min-width: 0` says it, so along a flex box that way, it's that
+    /// rather than what's in it, whatever `min_auto` says.
+    pub(crate) min_width_said: bool,
+    pub(crate) min_height_said: bool,
     /// The margins of what's next to each other in this go together, as CSS's blocks have them: the bigger of the two is the gap.
     pub(crate) collapse_margins: bool,
     /// What's first and last in it keeps its margins inside it, rather than their going out of it, as a CSS box that's a
@@ -199,6 +203,12 @@ impl Default for Style {
 }
 
 impl Style {
+    /// Whether, as an item along a flex box going this way (`row` for across), it's no smaller than what's in it lets it be, as
+    /// CSS's `min-width: auto` has it: unless it doesn't shrink, or said how small it can be that way.
+    pub(crate) const fn keeps_to_content(&self, row: bool) -> bool {
+        self.min_auto && self.shrink > 0.0 && !(if row { self.min_width_said } else { self.min_height_said })
+    }
+
     pub const fn new() -> Self {
         Self {
             direction: Direction::Column,
@@ -233,6 +243,8 @@ impl Style {
             grid: false,
             moved: false,
             min_auto: false,
+            min_width_said: false,
+            min_height_said: false,
             collapse_margins: false,
             keep_margins: false,
             aspect: None,
@@ -465,6 +477,8 @@ pub(crate) struct Names {
     grow: Symbol,
     shrink: Symbol,
     min_auto: Symbol,
+    min_width_said: Symbol,
+    min_height_said: Symbol,
     collapse_margins: Symbol,
     keep_margins: Symbol,
     aspect: Symbol,
@@ -540,6 +554,8 @@ pub(crate) struct Names {
     first_built: Symbol,
     first_visible: Symbol,
     view_rows: Symbol,
+    item_width: Symbol,
+    across: Symbol,
     pub(crate) table_part: Symbol,
     pub(crate) col_span: Symbol,
     pub(crate) row_span: Symbol,
@@ -567,6 +583,8 @@ pub(crate) static NAMES: LazyLock<Names> = LazyLock::new(|| Names {
     grow: Symbol::new("grow"),
     shrink: Symbol::new("shrink"),
     min_auto: Symbol::new("min_auto"),
+    min_width_said: Symbol::new("min_width_said"),
+    min_height_said: Symbol::new("min_height_said"),
     collapse_margins: Symbol::new("collapse_margins"),
     keep_margins: Symbol::new("keep_margins"),
     aspect: Symbol::new("aspect"),
@@ -652,6 +670,8 @@ pub(crate) static NAMES: LazyLock<Names> = LazyLock::new(|| Names {
     first_built: Symbol::new("first_built"),
     first_visible: Symbol::new("first_visible"),
     view_rows: Symbol::new("view_rows"),
+    item_width: Symbol::new("item_width"),
+    across: Symbol::new("across"),
     table_part: Symbol::new("table_part"),
     col_span: Symbol::new("col_span"),
     row_span: Symbol::new("row_span"),
@@ -726,6 +746,8 @@ pub(crate) fn is_layout_prop(name: Symbol) -> bool {
         names.grid_flow,
         names.align_content,
         names.min_auto,
+        names.min_width_said,
+        names.min_height_said,
         names.sticky_top,
         names.sticky_bottom,
         names.collapse_margins,
@@ -755,6 +777,8 @@ pub(crate) fn is_layout_prop(name: Symbol) -> bool {
         names.row_span,
         names.table_fixed,
         names.table_collapse,
+        names.item_width,
+        names.across,
     ]
     .contains(&name)
 }
@@ -959,6 +983,10 @@ pub(crate) struct ListPosition {
     pub(crate) first_visible: f32,
     /// How many rows the list believes fit in it, if it wants to be told.
     pub(crate) view_rows: Option<f32>,
+    /// How wide each item is, for a list that's a grid: its rows hold as many items as fit across, side by side.
+    pub(crate) item_width: Option<f32>,
+    /// How many items the list believes fit across, for a grid, which each of its rows holds.
+    pub(crate) across: f32,
 }
 
 impl Style {
@@ -1069,6 +1097,10 @@ impl Style {
                 style.shrink = pixels(value, name);
             } else if name == names.min_auto {
                 style.min_auto = matches!(value, PropValue::Bool(true));
+            } else if name == names.min_width_said {
+                style.min_width_said = matches!(value, PropValue::Bool(true));
+            } else if name == names.min_height_said {
+                style.min_height_said = matches!(value, PropValue::Bool(true));
             } else if name == names.fit_width {
                 style.fit_width = matches!(value, PropValue::Bool(true));
             } else if name == names.max_width_fit {
@@ -1213,6 +1245,15 @@ impl Style {
                 list.first_visible = number_value(value, name);
             } else if name == names.view_rows {
                 list.view_rows = Some(number_value(value, name));
+            } else if name == names.item_width {
+                // Only a list reads these, so on anything else they're whatever it says they are.
+                if let PropValue::Float(_) | PropValue::Int(_) = value {
+                    list.item_width = Some(number_value(value, name)).filter(|width| *width > 0.0);
+                }
+            } else if name == names.across {
+                if let PropValue::Float(_) | PropValue::Int(_) = value {
+                    list.across = number_value(value, name);
+                }
             }
         }
         if let Some(Placement::At(_, _)) = style.overlay {

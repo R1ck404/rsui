@@ -1,0 +1,20 @@
+size 1000 700
+wait 300
+memory
+clickat 400 60
+press down
+press down
+press end
+press up
+press home
+press end
+wheel 500 300 0 -300
+wheel 500 300 0 -300
+wheel 500 300 0 -300
+press up
+press pagedown
+eval "document.getElementById('rows').scrollTop = 0"
+wheel 500 300 0 300
+wheel 500 300 0 300
+press down
+memory

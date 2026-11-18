@@ -138,9 +138,11 @@ fn a_textarea_is_a_page_element_that_grows_with_its_lines() {
         export default function App() {
             const [said, setSaid] = useState('');
             useEffect(() => {
+                let told = 0;
                 const tell = () => setTimeout(() => {
+                    told += 1;
                     const area = document.querySelector('textarea') as HTMLTextAreaElement | null;
-                    setSaid(area === null ? 'none' : `h=${Math.round(area.getBoundingClientRect().height)} at=${area.selectionStart} v=${JSON.stringify(area.value)}`);
+                    setSaid(area === null ? 'none' : `told=${told} h=${Math.round(area.getBoundingClientRect().height)} at=${area.selectionStart} v=${JSON.stringify(area.value)}`);
                 });
                 window.addEventListener('keyup', tell, true);
                 window.addEventListener('input', tell, true);
@@ -169,13 +171,13 @@ fn a_textarea_is_a_page_element_that_grows_with_its_lines() {
     // Two lines of text that wraps: the first line ends after "aaaa ", where the second starts.
     hands.type_text("aaaa bbbb cccc dddd eeee ffff");
     hands.wait_for("h=");
-    hands.press_key(ctrl(KeyCode::Home));
-    hands.press_key(KeyPress::new(KeyCode::End));
+    press_and_hear(&mut hands, ctrl(KeyCode::Home));
+    press_and_hear(&mut hands, KeyPress::new(KeyCode::End));
     let first_end = said_number(&hands, " at=");
-    hands.press_key(KeyPress::new(KeyCode::Down));
+    press_and_hear(&mut hands, KeyPress::new(KeyCode::Down));
     let below = said_number(&hands, " at=");
     // Down from the end of the first line lands at the end of the second (or on it), never further than the line after.
-    hands.press_key(KeyPress::new(KeyCode::Down));
+    press_and_hear(&mut hands, KeyPress::new(KeyCode::Down));
     let further = said_number(&hands, " at=");
     assert!(first_end > 0 && below > first_end && further >= below, "{first_end} {below} {further}\n{}", hands.app.outline());
     hands.press_key(ctrl(KeyCode::Character('a')));
@@ -185,6 +187,21 @@ fn a_textarea_is_a_page_element_that_grows_with_its_lines() {
     hands.press_key(KeyPress::new(KeyCode::Home));
     hands.press_key(ctrl(KeyCode::Backspace));
     hands.wait_for(r#"v=\"onetwo\""#);
+}
+
+/// Presses a key and waits until the app has said where the caret is since, which it does from a `setTimeout` its `keyup`
+/// listener starts. That timer comes back from the timer thread, so it may be a few frames later: reading what's said straight
+/// after the key would read what the key before it left, which it did, as it raced that thread.
+fn press_and_hear(hands: &mut Hands, key: KeyPress) {
+    let before = said_number(hands, "told=");
+    hands.press_key(key);
+    let started = std::time::Instant::now();
+    while said_number(hands, "told=") <= before {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "nothing said after {key:?}
+{}", hands.app.outline());
+        hands.app.runtime().wait(std::time::Duration::from_millis(5));
+        hands.settle();
+    }
 }
 
 fn said_number(hands: &Hands, after: &str) -> usize {

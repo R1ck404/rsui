@@ -317,6 +317,7 @@ fn kind(input: &Input) -> &'static str {
         Input::ButtonUp { .. } => "buttonup",
         Input::CancelPress => "cancel",
         Input::Active(_) => "active",
+        Input::Shown(_) => "shown",
         Input::Modifiers(_) => "held",
         Input::Key(_) => "key",
         Input::KeyUp(_) => "keyup",
@@ -349,6 +350,8 @@ fn describe(input: &Input) -> String {
         Input::CancelPress => "a press was called off".to_owned(),
         Input::Active(true) => "the window came to the front".to_owned(),
         Input::Active(false) => "another window came to the front".to_owned(),
+        Input::Shown(true) => "the window was brought back".to_owned(),
+        Input::Shown(false) => "the window was minimized".to_owned(),
         Input::Modifiers(held) => {
             let names = held_names(*held);
             if names.is_empty() {
@@ -567,7 +570,7 @@ pub(crate) fn input_json(one: &Recorded) -> Value {
             json!({ "x": x, "y": y, "button": button_name(*button) })
         }
         Input::Leave | Input::CancelPress | Input::Close => json!({}),
-        Input::Active(on) | Input::DarkMode(on) => json!({ "on": on }),
+        Input::Active(on) | Input::Shown(on) | Input::DarkMode(on) => json!({ "on": on }),
         Input::Modifiers(held) => {
             json!({ "ctrl": held.ctrl, "shift": held.shift, "alt": held.alt, "meta": held.meta })
         }
@@ -620,6 +623,7 @@ pub(crate) fn input_from(value: &Value) -> Option<Recorded> {
         },
         "cancel" => Input::CancelPress,
         "active" => Input::Active(on),
+        "shown" => Input::Shown(on),
         "held" => Input::Modifiers(Modifiers {
             ctrl: value["ctrl"].as_bool().unwrap_or(false),
             shift: value["shift"].as_bool().unwrap_or(false),

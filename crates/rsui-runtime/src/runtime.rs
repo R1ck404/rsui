@@ -1103,6 +1103,12 @@ impl Runtime {
         }
     }
 
+    /// Whether a transition or an animation would have moved since this was last asked, but didn't, as animations are off:
+    /// for a tool that drives an app with them off to say once that turning them on would show it.
+    pub fn motion_skipped(&mut self) -> bool {
+        std::mem::take(&mut self.motions.skipped)
+    }
+
     /// Whether another thread has queued a change, or a task from
     /// [`Updates::spawn`] or [`Updates::after`] is still running.
     pub fn has_background_work(&self) -> bool {

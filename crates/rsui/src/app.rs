@@ -564,6 +564,8 @@ pub struct App {
     focus: Option<Focus>,
     /// Whether this window is the one receiving the keyboard.
     active: bool,
+    /// Whether the window can be seen, which is false while it's minimized.
+    shown: bool,
     caret_on: bool,
     caret_changes_left: u32,
     clipboard: Box<dyn Clipboard>,
@@ -733,6 +735,7 @@ impl App {
             tooltip_dismissed: false,
             focus: None,
             active: true,
+            shown: true,
             caret_on: true,
             caret_changes_left: CARET_CHANGES,
             clipboard: Box::new(MemoryClipboard::default()),
@@ -1399,9 +1402,13 @@ impl App {
             &mut Vec::new(),
             &mut found,
         );
-        for (path, rows) in found {
-            // A list refusing this can't be helped, and it'd only be asked again.
-            let input = Some(PropValue::Float(f64::from(rows)));
+        for (path, rows, across) in found {
+            // A list refusing this can't be helped, and it'd only be asked again. A grid is told how many fit across as well.
+            let input = Some(if across > 0.0 {
+                PropValue::from(format!("{rows} {across}").as_str())
+            } else {
+                PropValue::Float(f64::from(rows))
+            });
             let _ = self.runtime.dispatch(&path, ActionKind::Resize, input);
         }
     }
@@ -3349,7 +3356,8 @@ impl App {
     /// The window started or stopped receiving the keyboard. Focus stays where it is, but isn't
     /// shown until the window gets the keyboard back.
     pub fn set_active(&mut self, active: bool) {
-        if self.active != active {
+        let changed = self.active != active;
+        if changed {
             self.active = active;
             // Nothing else that's drawn depends on this, and drawing can mean getting the GPU back.
             if self
@@ -3364,6 +3372,24 @@ impl App {
         }
         if !active {
             self.cancel_press();
+        }
+        if changed {
+            // A page hears it as `blur` and `focus` on its window, as in a browser when another window comes to the front and
+            // this one comes back (see `windowblur` in web.js).
+            let mut event = rsui_runtime::Event::default();
+            self.runtime.deliver_document_event(if active { "windowfocus" } else { "windowblur" }, &mut event);
+            self.runtime.take_stopped();
+        }
+    }
+
+    /// The window was minimized, or brought back from that, which a page hears as `visibilitychange`, with `document.hidden`
+    /// saying which.
+    pub fn set_shown(&mut self, shown: bool) {
+        if self.shown != shown {
+            self.shown = shown;
+            let mut event = rsui_runtime::Event::default();
+            self.runtime.deliver_document_event(if shown { "windowshown" } else { "windowhidden" }, &mut event);
+            self.runtime.take_stopped();
         }
     }
 
@@ -5538,13 +5564,15 @@ fn focusable(node: &Element) -> bool {
     if is_disabled(node) {
         return false;
     }
-    let scrolls = node.actions.contains(ActionKind::Scroll) && scroller_takes_focus(node);
+    // What it is is asked first: whether something that scrolls can have the keyboard because it does looks through everything
+    // in it, which for a list of 25,000 rows with a `tabIndex` of its own was most of what moving its selection cost.
+    let says_not = node.props.get_symbol(symbol!("focusable")) == Some(&PropValue::Bool(false));
+    if !says_not && focusable_by_itself(node) {
+        return true;
+    }
     // That's about what it is, not about it scrolling: a page's `<div>` that scrolls and has nothing in it that can have the
     // keyboard can, as a browser's keyboard-focusable scrollers are, even with an `onFocus` that makes it say it can't.
-    if node.props.get_symbol(symbol!("focusable")) == Some(&PropValue::Bool(false)) {
-        return scrolls;
-    }
-    focusable_by_itself(node) || scrolls
+    node.actions.contains(ActionKind::Scroll) && scroller_takes_focus(node)
 }
 
 /// Whether something that scrolls can have the keyboard because it does: one of rsui's own can, and a page's only when
@@ -5738,13 +5766,13 @@ fn center_along(
 /// only happens when a list's size has changed.
 fn find_lists(
     node: &Node,
-    sizes: &[(usize, f32)],
+    sizes: &[(usize, f32, f32)],
     path: &mut Vec<u32>,
-    found: &mut Vec<(Vec<u32>, f32)>,
+    found: &mut Vec<(Vec<u32>, f32, f32)>,
 ) {
     let address = std::ptr::from_ref::<Element>(node) as usize;
-    if let Some((_, rows)) = sizes.iter().find(|(list, _)| *list == address) {
-        found.push((path.clone(), *rows));
+    if let Some((_, rows, across)) = sizes.iter().find(|(list, _, _)| *list == address) {
+        found.push((path.clone(), *rows, *across));
     }
     for (index, child) in node.children.iter().enumerate() {
         path.push(index as u32);

@@ -1127,13 +1127,12 @@ pub(super) fn install_regexp_symbols(vm: &mut Vm, proto: u32) {
 fn locale_compare(vm: &mut Vm, args: Args) -> Run<Value> {
     let string = this_string(vm, &args)?;
     let other = vm.arg(&args, 0);
-    let other = vm.to_rust_string(other)?;
-    let this = vm.text_of(string).to_rust();
-    // No real collation yet. This puts things in the order people would mostly expect, ignoring case first.
-    let order = this
-        .to_lowercase()
-        .cmp(&other.to_lowercase())
-        .then_with(|| other.cmp(&this));
+    let other = if other.is_string() { other } else { vm.to_js_string(other)? };
+    let locales = vm.arg(&args, 1);
+    let options = vm.arg(&args, 2);
+    // The same order as `Intl.Collator` with the same locales and options.
+    let options = super::collate::options_of(vm, locales, options)?;
+    let order = super::collate::compare(vm.text_of(string), vm.text_of(other), options);
     Ok(Value::int(order as i32))
 }
 

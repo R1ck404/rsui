@@ -120,7 +120,14 @@ own underneath, with its own layout, focus and GPU resources, all on one thread,
 changed in a window is drawn. Closing the main window ends the program, and everything else goes with it.
 
 **A long list:** `<list count={1000000} rowHeight={30} renderRow={(index) => <Row index={index} />} />` only builds the rows in
-view. Keep `renderRow` outside the component, or the rows all render again whenever it does.
+view. Keep `renderRow` outside the component, or the rows all render again whenever it does. It's as big as layout makes it, as
+anything else is, with `grow`, a share, all four sides of `position="absolute"`, or a page's flex box around it, and how many
+rows fit is measured from that as it's laid out, so `visible` is only a guess for before then and nothing has to say how tall it
+is. With `itemWidth` it's a grid that wraps by itself, as a folder's icons do: each row holds as many items that wide as fit
+across, with its `gap` between them, and `renderRow` is given an item's index. `onResize` is told how many rows fit and how many
+items across, the first time and whenever that changes, as the keyboard needs for going down a row or a page, and it's told
+while the window's laid out, so what it changes is drawn in the same frame. Its other handlers, as `onClick`, hear what happens
+on it below its rows, and its `scroll` is its own.
 
 `rsui.d.ts` has the types for editors and `tsc`. Running an app never reads it, as the engine removes types as it parses them.
 `tsconfig.json` needs `"jsx": "react"`, `"jsxFactory": "__jsx"` and `"jsxFragmentFactory": "__Fragment"`.
@@ -141,9 +148,61 @@ A JavaScript timer waits on the runtime's own timer, so a waiting app has no thr
 whatever's running finishes. JavaScript runs on one thread, which is the one the window is on.
 
 A component skips rendering when it's given the same props object, or props that are the same one level down and are all plain
-values: numbers, strings, booleans. Props that hold an object, an array or a function render it again whenever what it's in
-renders, as in React, unless it's wrapped in `memo`, which compares them one level down (see `JsProps` in bridge.rs). A function or
-an array made during a render is a new value, so even with `memo`, what's given one renders again, just as in React.
+values: numbers, strings, booleans. One that an app's own JSX made also skips when what it's given does the same as last time,
+handlers made in place and all, with no `memo` or `useCallback` needed: see below. Anything else given an object, an array or a
+function renders again whenever what it's in renders, as in React, unless it's wrapped in `memo` (see `JsProps` in bridge.rs).
+
+### Not rendering what would come out the same
+
+React Compiler keeps what a component makes, as the JSX elements, the handlers and the objects in them, until what each is made
+from changes, so that a child given what it was given before has the same element, and React doesn't render it. An app gets
+that without writing `memo`, `useMemo` or `useCallback`. rsui does the same thing the other way round: rather than keeping
+what's made, it notices that what's made again is the same, when the child's props are compared.
+
+- **What's the same.** `Vm::props_equivalent` (rsui-js `embed.rs`) says two props objects are when each prop is the same value, or a
+  function made from the same code that sees the same values (`() => select(i)` made again with the same `select` and `i`,
+  where what's in a `let`'s cell is compared, as each render has its own cells), or `bind` of the same thing with the same
+  arguments, or a plain object or array made again holding what's the same in this way, as an element given as `children`, a
+  `style={{ ... }}` or an object of handlers is. An instance of a class, a getter, a `Map` and the rest are only the same as
+  themselves. It looks at no more than 256 objects and 6 levels down, and an array of 64 at most, so it costs a fraction of a
+  render, and it never runs any of the app's code. The engine can do this because it knows each closure's code and what it
+  captured, one value or cell for each variable it uses, and nothing else.
+- **Where.** The parser makes JSX call `__jsxMemo` (layer.js), which marks a component's element, and the compiler has it call
+  `__jsx` instead in a file that isn't the app's own, as one in `node_modules`, so a library's elements are as React has them
+  (TanStack Table's `flexRender` gives cells the same `row` object, which says something else once it's selected). Only a marked
+  element is compared this way, as React Compiler only keeps what it compiled, and only for a component written in the app's own
+  files (each compiled function knows, in its proto's `says`): a library's components, and rsui's own page elements, which read
+  the page's CSS as they render, render as they would in React. An element `__jsx` made says so (`memo: NOT_KEPT`), and is
+  only the same as itself wherever it's found, as a cell made by `createElement` inside the app's `<div>`.
+- **Being careful.** The same object is the same, as React's `memo` and React Compiler have it, as React's rules say what's given
+  isn't changed in place, but not when it holds a function or `current`: a ref changes without a render, and an object with
+  methods, as TanStack Table's `row`, can say something else when they're called, and a component can do either as it renders.
+  (`memo` takes those to be the same, as React's does.) What a handler sees is only read when it's called, so it's the same as
+  itself there. A class renders whenever its parent does. What reads a context or a store (`useSyncExternalStore`, and the
+  libraries made on it) is told to render by the provider or the store, whatever its props are, and state still renders what
+  it's in. What isn't covered is a component that reads something else that changes as it renders, as a variable outside it, or
+  calls a function it's given that reads one, which React Compiler gets wrong the same way.
+- **Saying no.** `'use no memo'` (or `'use no forget'`), as React Compiler has it, at the top of a file or of a function's body:
+  the JSX there calls `__jsx`, and a component that says it renders whenever what it's in does (`Vm::says_no_memo`).
+
+Why not compile it, as React Compiler does: that's working out, for each value in a component, what it's made from, and getting
+that wrong shows something old, where comparing can only cost a render. Comparing also works for what React Compiler can't
+keep, as elements made in a loop or in `renderRow`. What it doesn't save is the parent's own render: what the parent works out
+is worked out again, which `useMemo` is still for when that's slow. A component that says `memo` compares in the same way, as it's
+asking for the same thing, but without leaving out refs and objects with methods; given what wasn't the app's own JSX, `memo` is
+as React's, comparing each prop as `Object.is` does.
+
+What it comes to, moving the selection with the Down key in `demos/file-explorer` on a folder of 5,000 files, headless, with
+each key's frames added up (the median of 40 keys, 3 runs of each):
+
+| | Components rendered | Frame time |
+|---|---|---|
+| The demo as written, with `memo`, `useCallback` and its own `useStable` | 29 before, 23 now | 3.2 ms before, 2.9 ms now |
+| A copy with all of those taken out | 432 before, 101 now | 26.6 ms before, 9.8 ms now |
+
+What's left in the copy without them is the panel's own page elements (`Styled`), which aren't the app's and so render as they
+would in React when the panel does, and the bar's buttons, whose handlers see what changed (what the panel goes back to, say),
+as they would with React Compiler too.
 
 A child is the same component as last time if it's in the same place, as in React: where it is in the array of children it's in, with `null`, `false` and `undefined` keeping their places, and the same for each array and element around it. An array or a fragment is one place, with its own places inside. A key takes the place of where it is in its array. A component of another type in a place, or one inside an element of another type, is a new one, and what was there is unmounted.
 
@@ -163,10 +222,23 @@ habits matter once a list gets long, and both of them are in that app:
 
 - **Keep state as far down as it can go.** What's being typed in a box belongs in a component of its own. Kept in the
   component holding the list, each key renders every row.
-- **Wrap rows in `memo`, and give them the same functions each time.** A row given a function or an object only skips rendering
-  when it's wrapped in `memo` and each prop is the same, and `onClick={() => ...}` in the parent is a new function each time, so it
-  never is. The functions from `useState` and `useReducer` never change, and `useCallback` keeps others. Making a function inside
-  the row itself costs nothing, as it only runs when the row does.
+- **Give rows what only changes when they do.** A row skips rendering when what it's given does the same as before (see "Not
+  rendering what would come out the same"), so `onClick={() => pick(index)}` is fine, as long as `pick` doesn't see something
+  that changes each time, as the selection. A handler that sees the selection is different whenever that is, and every row
+  renders. Read it from a ref, or give the row the plain value instead, as `selected={index === selected}`. `memo` and
+  `useCallback` aren't needed for this, but do no harm.
+
+A long list of a page's elements, as rows of `<div>`s in something that scrolls, costs what changed and what's seen when the
+selection moves or it scrolls, as far as `rsui/web` can tell: a list rendered again with the same rows, made anew as React makes
+them, isn't looked through again for what kind of thing each row is (`keptKids` in `web.js`), `scrollIntoView()` finds only what's
+around a row, and laying the list out again lays out only the rows that changed, with the scrollbar it had. What it costs to start,
+and what it takes, still goes with how many rows there are, as each is styled and made. `content-visibility: auto` on the rows,
+with `contain-intrinsic-size` for how big one is taken to be, has a row far from being seen made as a box of that size with
+nothing in it, until it's within half the window of what shows of it, and then as it is, from then on. Each row is still an
+element of the page, for `querySelectorAll()` and refs, and the list is as long as those sizes make it; what's in a row that
+hasn't been near yet isn't there for code to find, but the text written in it is what its box is named, for agents and screen
+readers. `content-visibility: hidden` is a box of that size until it stops saying so. `bench/long-list` measures a list of each
+kind with no window: see its README.
 
 ## Seeing why it renders
 
@@ -273,9 +345,10 @@ isn't being looked at costs the same. A program made with `--pack` doesn't have 
 - `name` on an element is what agents and screen readers call it. If it has text inside it as well, that's what shows.
 - There's no `ref` to an element, as `focus(key)` and `autoFocus` on `TextInput` do what they're mostly for. An error while rendering shows
   in place of that component, and the rest carries on, unless an error boundary says otherwise.
-- A component given only plain values skips rendering when they're the same, with no `memo` needed. One given objects or
-  functions needs `memo` for that, as in React. Mutating something inside a prop of a component that skips, and expecting that
-  to show, won't work. So won't reading something that changed outside it, when its parent renders.
+- A component given only plain values skips rendering when they're the same, with no `memo` needed. One the app's own JSX makes
+  skips when what it's given does the same, functions and objects made again too, as with React Compiler. Mutating something
+  inside a prop of a component that skips, and expecting that to show, won't work. So won't reading something that changed
+  outside it, when its parent renders. `'use no memo'` in it says it renders whenever its parent does.
 - On rsui's own elements, a click only reaches the one thing it's on, and what's around it doesn't hear about it, unless it says
   `e.passOn()` or what's around it has `onClickCapture`. A page's elements are as a page's are: see "Writing an app as for a page".
 - `localStorage` is kept in `%APPDATA%\rsui-storage`, or the file `RSUI_STORAGE_FILE` says, in one JSON file for each program. The whole file is written
@@ -320,7 +393,8 @@ react-beautiful-dnd and @hello-pangea/dnd. That was by hand and not in the tests
 
 What's different:
 
-- Everything in the first list above about rendering when props change. `memo` gives back what it's given, and so ignores a comparison of its own.
+- Everything in the first list above about rendering when props change, which is as React with React Compiler has it for the
+  app's own code. `memo` gives back what it's given, and so ignores a comparison of its own.
 - `createPortal` shows what's in it where it's written.
 - `use` waits for a promise by throwing it, as code written for `Suspense` does itself, and the `Suspense` nearest it shows its `fallback` until it's settled.
   What was in that `Suspense` starts again then, with new state, as there's nothing to keep it in while it's hidden, where React would keep what was already
@@ -396,6 +470,9 @@ On a page's elements:
   what's being put together by a way of typing, as for Chinese, Japanese and Korean.
 - `onTransitionEnd` and `onAnimationEnd` say when CSS's transitions and animations finish. With nothing moving, as for an agent or a test, that's as soon as they
   start, so nothing that waits for one waits for ever. `onLoad` and `onError` on an `img` say whether it can be read, once what's running now has finished.
+- What comes in and goes out is CSS's too. `@starting-style` (and Tailwind's `starting:`) says where an element that's just been drawn, or shown again after
+  `display: none`, starts its transitions from; what's there from the first doesn't move. `transition-behavior: allow-discrete` (`transition-discrete`) with
+  `display` keeps what's going to `display: none` shown until its transitions are done, and `visibility` always waits for its own. With nothing moving, it goes at once.
 - `tabIndex` makes anything something tab reaches, in the order a page has it, and -1 something that can only be clicked to or given the keyboard with `focus()`.
 - `draggable` is dragged once it's pressed and moved 4 pixels, which isn't a click then: `onDragStart`, `onDrag` and `onDragEnd` on it, and `onDragEnter`,
   `onDragOver`, `onDragLeave` and `onDrop` on what it's over, with `dataTransfer` for what `onDragStart` set. `preventDefault()` in `onDragOver` or `onDragEnter`
@@ -548,6 +625,7 @@ starting with `//` says nothing.
 | `close` | The window's close button, which may ask first |
 | `dialog "path"`, `dialog cancel` | What the next file or folder dialog gets. They never come up, and with nothing said they're cancelled |
 | `size W H` | Makes the window this big |
+| `animations on`, `animations off` | Whether transitions, CSS animations and smooth scrolling play, from that step on, in every window. They're off unless a step says, so each run and its shots come out the same, and a run can settle the app first and then turn them on to watch one. CSS that asks `prefers-reduced-motion` follows. With them off, the first time something would have moved, stderr says once that `animations on` would play it |
 | `shot file.png` | A picture of the window, drawn on the software GPU |
 | `why T` | Why what made `T` last rendered, how often it has, what it's in, and what its hooks hold, by their names |
 | `frames` | Each frame since this was last asked, as what came in, which handler ran, what rendered and why, and how long each part took |

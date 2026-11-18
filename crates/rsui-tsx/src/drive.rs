@@ -203,6 +203,13 @@ pub(crate) struct Desk {
     frames_told: Vec<(u32, u64)>,
     /// Where the pointer last went, for the steps that go on from there (`downat`, `upat` and `moveat` with no place).
     pointer: (f32, f32),
+    /// Whether things move, as `animations on` and `off` say, in every window, those opened later too. Off unless a step says,
+    /// so that what a run sees, and its shots, are the same each time.
+    animations: bool,
+    /// Whether something would have moved while nothing did, or the page's CSS has rules for when nothing moves, and whether
+    /// things have been made to move at any point: see [`Desk::hint_motion`].
+    motion_skipped: bool,
+    animations_ever: bool,
 }
 
 impl Desk {
@@ -252,7 +259,44 @@ impl Desk {
             still: None,
             frames_told: Vec::new(),
             pointer: (0.0, 0.0),
+            animations: false,
+            motion_skipped: false,
+            animations_ever: false,
         })
+    }
+
+    /// Has things move, or go straight to where they're going, in every window, as `animations on` and `off` say, at any step:
+    /// a run can settle the app first and then watch its transitions. The page's code is told too, as CSS that asks
+    /// `prefers-reduced-motion` is worked out from it.
+    pub(crate) fn set_animations(&mut self, on: bool) {
+        self.animations = on;
+        self.animations_ever |= on;
+        for one in &mut self.windows {
+            one.app.set_animations(on);
+        }
+        bridge::motion_changed(on);
+    }
+
+    /// Notes whether something would have moved but didn't, as animations are off, or the page's CSS has rules for when
+    /// nothing moves, for [`Desk::hint_motion`]. After each step, as what's noted is only kept until it's asked.
+    pub(crate) fn note_motion(&mut self) {
+        let mut skipped = bridge::take_motion_held();
+        for one in &mut self.windows {
+            skipped |= one.app.runtime_mut().motion_skipped();
+        }
+        self.motion_skipped |= skipped && !self.animations;
+    }
+
+    /// Says once, on stderr, at the end of a run that never had things move, that something would have, and how to see it:
+    /// a run that turns them on knows already.
+    pub(crate) fn hint_motion(&mut self) {
+        self.note_motion();
+        if self.motion_skipped && !self.animations_ever {
+            self.motion_skipped = false;
+            eprintln!(
+                "rsui-tsx: the app has transitions or animations, which go straight to their end in --do; a step `animations on`, at any point, plays them"
+            );
+        }
     }
 
     /// Applies what's waiting everywhere, and does what's been asked of the windows. Says whether anything happened.
@@ -352,6 +396,10 @@ impl Desk {
             let mut app = (wanted.make)(text, size, 1.0);
             // What's drawn is all there is of a transparent window, as it would be in a real one.
             app.set_see_through(wanted.options.transparent);
+            // Things move in it as they do in the others.
+            if self.animations {
+                app.set_animations(true);
+            }
             self.windows.push(Open {
                 id: wanted.id.0,
                 title: wanted.options.title,
@@ -1632,9 +1680,14 @@ impl Desk {
             }
             ("animations", [on]) if !on.quoted && matches!(on.text.as_str(), "on" | "off") => {
                 // Things move as they would in a window, or go straight to where they're going, as they do here otherwise.
-                for one in &mut self.windows {
-                    one.app.set_animations(on.text == "on");
-                }
+                self.set_animations(on.text == "on");
+            }
+            ("active" | "shown", [on]) if !on.quoted && matches!(on.text.as_str(), "on" | "off") => {
+                // Another window coming to the front (`active off`) and this one coming back, as Alt-Tab does, or the window being
+                // minimized (`shown off`) and brought back, which a page hears as `blur`, `focus` and `visibilitychange`.
+                let on = on.text == "on";
+                let input = if verb == "active" { Input::Active(on) } else { Input::Shown(on) };
+                self.usable()?.app.feed(&input).map_err(|error| error.to_string())?;
             }
             ("size", [width, height]) => {
                 let number = |word: &Word| {
@@ -2102,7 +2155,7 @@ fn print_split() {
     println!("  split {}", parts.join(" "));
 }
 
-pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"PATH\", dialog cancel, size WIDTH HEIGHT, animations on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide. A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT";
+pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"PATH\", dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide. A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT";
 
 /// A word of a step, with whether it was in quotes, which is what makes `"#1"` some text rather than a key.
 #[derive(Debug, Clone)]
@@ -2223,6 +2276,10 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
         return Err(format!("there are no steps. {STEPS}"));
     }
     let mut desk = Desk::open(path, stack_limit, (960, 640))?;
+    // `RSUI_SAMPLE=<file>` samples the steps as it does a window, in a build with `sampling-profile`. It's made after the
+    // app, so it's dropped, and writes what it found, while the engine and its compiled code are still there.
+    #[cfg(all(windows, feature = "sampling-profile"))]
+    let _profile = crate::sampling_profile::NativeProfile::start().map(crate::sampling_profile::FinishOnDrop::new);
     rsui::mark("app made");
     rsui_js::write_startup_times("app made");
     // Things that move as the app starts only do if they're moving by then, as they are in a window.
@@ -2230,11 +2287,10 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
         step.words.len() == 2 && step.words[0].text == "animations" && step.words[1].text == "on"
     });
     if animate_first {
-        for one in &mut desk.windows {
-            one.app.set_animations(true);
-        }
+        desk.set_animations(true);
     }
     desk.settle(STEP_SETTLES_FOR)?;
+    desk.note_motion();
     // Whatever opens straight away is just there, rather than something a step did.
     for one in &mut desk.windows {
         one.seen = Some(one.app.runtime().root().clone());
@@ -2255,6 +2311,7 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
         let started = Instant::now();
         let done = desk.step(step);
         frame_log::note("step", started, format_args!("{}", step.written));
+        desk.note_motion();
         if number == 0 {
             rsui::mark("first step done");
             rsui_js::write_startup_times("first step done");
@@ -2271,6 +2328,7 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
             }
             println!();
             desk.print_all();
+            desk.hint_motion();
             return Err(format!(
                 "step {} failed: {}: {reason}",
                 number + 1,
@@ -2280,6 +2338,7 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
     }
     #[cfg(feature = "counts")]
     crate::bridge::count_mark("after the steps");
+    desk.hint_motion();
     if steps.last().is_none_or(|step| step.words[0].text != "look") && !keep_going {
         println!();
         desk.print_all();

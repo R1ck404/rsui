@@ -59,7 +59,7 @@ const TRAILING_COUNT: u32 = 28;
 const PER_LEADING: u32 = VOWEL_COUNT * TRAILING_COUNT;
 
 /// A code point's canonical combining class, which is 0 for anything that isn't a mark that's put in order.
-fn class(code: u32) -> u8 {
+pub(crate) fn combining_class(code: u32) -> u8 {
     if code < 0x300 {
         return 0;
     }
@@ -123,8 +123,8 @@ fn decompose(code: u32, compatible: bool, out: &mut Vec<(u32, u8)>) {
     }
     let found = if compatible { decomposition(COMPATIBLE, code) } else { None };
     match found.or_else(|| decomposition(CANONICAL, code)) {
-        Some(units) => out.extend(code_points(units).map(|part| (part, class(part)))),
-        None => out.push((code, class(code))),
+        Some(units) => out.extend(code_points(units).map(|part| (part, combining_class(part)))),
+        None => out.push((code, combining_class(code))),
     }
 }
 

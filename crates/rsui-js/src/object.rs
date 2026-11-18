@@ -288,6 +288,12 @@ impl Shapes {
         self.items[shape as usize].all_plain
     }
 
+    /// The prototype of every object with this shape, or `NONE` for null.
+    #[inline]
+    pub(crate) fn proto_of(&self, shape: u32) -> u32 {
+        self.items[shape as usize].proto
+    }
+
     /// Whether an object with this shape has nothing for `for in` to find.
     #[inline]
     pub(crate) fn has_enumerable(&self, shape: u32) -> bool {

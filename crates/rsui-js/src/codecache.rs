@@ -56,7 +56,7 @@ pub(crate) use codec::{read_op, write_op};
 
 const MAGIC: &[u8; 8] = b"RSUICODE";
 /// Changes whenever how the block is written does, though [`BUILD_ID`] would too.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 4;
 
 // How an atom is written.
 const ATOM_INDEX: u8 = 0;
@@ -821,7 +821,7 @@ and is
                     proto.params,
                     proto.length,
                     proto.flags,
-                    proto.strict,
+                    proto.strict(),
                     proto.locals,
                     self.describe_atom(proto.name),
                     proto.captures.iter().map(|c| (c.from_register, c.by_value, c.index)).collect::<Vec<_>>(),
@@ -958,7 +958,7 @@ and is
             body.u16(proto.params);
             body.u8(proto.length);
             body.u8(proto.flags);
-            body.u8(u8::from(proto.strict));
+            body.u8(proto.says);
             body.u8(proto.locals);
             body.u32(tables.atom(proto.name.0));
             body.count(proto.captures.len())?;
@@ -1345,7 +1345,7 @@ and is
             let params = from.u16()?;
             let length = from.u8()?;
             let flags = from.u8()?;
-            let strict = from.u8()? != 0;
+            let says = from.u8()?;
             let locals = from.u8()?;
             let name = atom(from.u32()?)?;
             let captures_count = from.count()?;
@@ -1411,7 +1411,7 @@ and is
                     params,
                     length,
                     flags,
-                    strict,
+                    says,
                     locals,
                     name,
                     file,
@@ -1444,7 +1444,7 @@ and is
             params: 0,
             length: 0,
             flags: 0,
-            strict: false,
+            says: 0,
             locals: 0,
             name: Atom(0),
             file,
@@ -1514,6 +1514,7 @@ fn write_info(out: &mut Out, info: &ModuleInfo) {
         out.u32(*star as u32);
     }
     out.u8(u8::from(info.is_async));
+    out.u8(u8::from(info.only_reexports));
 }
 
 fn write_name(out: &mut Out, name: Option<&str>) {
@@ -1557,6 +1558,7 @@ fn read_info(from: &mut In<'_>) -> Option<ModuleInfo> {
         .map(|_| Some(from.u32()? as usize))
         .collect::<Option<_>>()?;
     let is_async = from.u8()? != 0;
+    let only_reexports = from.u8()? != 0;
     Some(ModuleInfo {
         requested,
         imports,
@@ -1564,6 +1566,7 @@ fn read_info(from: &mut In<'_>) -> Option<ModuleInfo> {
         exports,
         stars,
         is_async,
+        only_reexports,
     })
 }
 

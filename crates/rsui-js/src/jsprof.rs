@@ -64,6 +64,15 @@ pub(crate) fn maybe_sample(vm: &mut crate::vm::Vm) {
     if !take_tick() {
         return;
     }
+    // `RSUI_JSPROF_SKIP_MS` leaves out what runs that long after the first sample, as an app's start, to see what comes later.
+    static SKIP: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
+    let until = SKIP.get_or_init(|| {
+        let skip = std::env::var("RSUI_JSPROF_SKIP_MS").ok()?.parse::<u64>().ok()?;
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(skip))
+    });
+    if until.is_some_and(|until| std::time::Instant::now() < until) {
+        return;
+    }
     let trace = vm.stack_trace();
     let top: Vec<&str> = trace.lines().take(3).map(str::trim).collect();
     let key = top.join("  <-  ");

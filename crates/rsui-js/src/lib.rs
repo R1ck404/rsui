@@ -599,6 +599,8 @@ pub struct JitCode {
 }
 
 #[cfg(test)]
+mod equivalent_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_spec;

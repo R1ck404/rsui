@@ -60,6 +60,12 @@ impl crate::Engine {
 
 #[derive(Default)]
 pub(crate) struct Modules {
+    /// ES modules started since the modules being loaded were, because something asked for a name a module that only
+    /// passes on exports gives from one that was [`Dep::Deferred`]: they're linked and run with the rest. With each, the
+    /// module that named it and which of its names it is, to put back as it was if loading fails.
+    late: Vec<(u32, u32, usize)>,
+    /// Whether the files in each folder are in a package that says they have no side effects, by the folder.
+    side_effects: HashMap<PathBuf, std::rc::Rc<SideEffects>, FixedState>,
     configuration_files: Option<Box<HashSet<PathBuf, FixedState>>>,
     /// Each file that's been started, with the `module` object it has.
     loaded: HashMap<PathBuf, Value, FixedState>,
@@ -192,6 +198,10 @@ pub(crate) struct ModuleInfo {
     pub(crate) stars: Vec<usize>,
     /// Whether it waits at its top, with `await`.
     pub(crate) is_async: bool,
+    /// Whether all it does is pass on what other modules export (`export { a } from`, `export * from`, and imports it
+    /// exports again), with no code of its own. What it passes on from packages that say they have no side effects is
+    /// only loaded when something asks for it: see [`Dep::Deferred`].
+    pub(crate) only_reexports: bool,
 }
 
 impl ModuleInfo {
@@ -245,10 +255,18 @@ struct Record {
     /// Cells for what's imported from a module that isn't an ES module, which can't be known before that has run: by which
     /// module and what name, or `None` for all of it.
     filled: Vec<(usize, Option<String>, Value)>,
+    /// Whether some of what it names may be [`Dep::Deferred`], and its namespace not made yet, until it's needed.
+    partial: bool,
 }
 
 #[derive(Clone)]
 enum Dep {
+    /// A module that a module that only passes on exports names, which hasn't been looked for yet, as nothing has asked
+    /// for what it gives: as a bundler leaves out what nothing uses from a package that says it has no side effects
+    /// (`"sideEffects": false` in its `package.json`). Importing one name from a package whose main file passes on
+    /// thousands of modules loads only the module that name is from. Its namespace (`import * as`, `import()`,
+    /// `require`) needs all of them, so that loads the rest.
+    Deferred,
     Es(u32),
     /// A module that comes with the engine, which is run as soon as it's asked for. Its `module` object.
     Builtin(Value),
@@ -268,6 +286,44 @@ enum State {
     Waiting,
     Done,
     Failed,
+}
+
+/// What a package's `package.json` says about its files' side effects.
+enum SideEffects {
+    /// Nothing, or that they may have them.
+    Some,
+    /// `"sideEffects": false`: none of them has any.
+    None,
+    /// Only the files that match these patterns have them, from the package's folder.
+    Only(PathBuf, Vec<String>),
+}
+
+/// Whether a path matches a pattern of `sideEffects`, as bundlers have them: `*` is anything but a slash, `**` any
+/// folders, `?` one character, and a pattern without a slash is matched against the file's name.
+fn side_effect_pattern_matches(pattern: &str, root: &Path, path: &Path) -> bool {
+    let pattern = pattern.strip_prefix("./").unwrap_or(pattern).replace('\\', "/");
+    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+    let subject = if pattern.contains('/') {
+        relative.as_str()
+    } else {
+        relative.rsplit('/').next().unwrap_or_default()
+    };
+    fn matches(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) if rest.first() == Some(&b'*') => {
+                let rest = &rest[1..];
+                let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                (0..=text.len()).any(|at| (at == 0 || text[at - 1] == b'/') && matches(rest, &text[at..]))
+            }
+            Some((b'*', rest)) => {
+                (0..=text.len()).take_while(|&at| at == 0 || text[at - 1] != b'/').any(|at| matches(rest, &text[at..]))
+            }
+            Some((b'?', rest)) => text.first().is_some_and(|&c| c != b'/') && matches(rest, &text[1..]),
+            Some((&c, rest)) => text.first() == Some(&c) && matches(rest, &text[1..]),
+        }
+    }
+    matches(pattern.as_bytes(), subject.as_bytes())
 }
 
 /// What a name a module exports turned out to be.
@@ -363,6 +419,7 @@ impl Modules {
         self.prepared.clear();
         self.metas.clear();
         self.package_types.clear();
+        self.side_effects.clear();
         // What's on the disk may have changed too.
         self.resolved.clear();
         FOLDERS.with(|folders| folders.borrow_mut().clear());
@@ -1276,6 +1333,12 @@ impl Vm {
             // One that was started as part of loading another may not have been run yet, as when CommonJS that it
             // imports asks for it.
             if let Some(&id) = self.modules.es.get(path) {
+                let late_from = self.modules.late.len();
+                self.complete_module(id)?;
+                let mut started = Vec::new();
+                let linked = self.link_started(&mut started, late_from);
+                self.modules.late.truncate(late_from);
+                linked?;
                 self.evaluate_module(id)?;
             }
             return Ok(found);
@@ -1623,21 +1686,30 @@ impl Vm {
     /// imports it.
     fn load_es_module(&mut self, path: &Path, proto: u32, module: Value) -> Run<()> {
         let mut started = Vec::new();
+        let late_from = self.modules.late.len();
         let made = self
             .start_module(path, proto, module, &mut started)
             .and_then(|id| {
                 let _time = crate::startup::span(crate::startup::Phase::Link, || None);
-                for &one in &started {
-                    self.make_namespace(one)?;
-                }
-                for &one in &started {
-                    self.link_module(one)?;
-                }
+                // What's loaded by itself gives its namespace, which needs all it names.
+                self.complete_module(id)?;
+                self.link_started(&mut started, late_from)?;
                 Ok(id)
             });
         let id = match made {
             Ok(id) => id,
             Err(error) => {
+                for &(one, _, _) in &self.modules.late[late_from..] {
+                    if !started.contains(&one) {
+                        started.push(one);
+                    }
+                }
+                // What named something started late names it as it did before, as that's gone.
+                for (_, by, dep) in self.modules.late.split_off(late_from) {
+                    if let Some(record) = self.modules.records.get_mut(&by) {
+                        record.deps[dep] = Dep::Deferred;
+                    }
+                }
                 // Nothing was run, so none of it happened.
                 for one in started {
                     if let Some(record) = self.modules.records.remove(&one) {
@@ -1651,8 +1723,151 @@ impl Vm {
                 return Err(error);
             }
         };
+        self.modules.late.truncate(late_from);
         self.evaluate_module(id)?;
         Ok(())
+    }
+
+    /// Makes the namespaces of modules that have been started and links them, with any that linking them starts in turn
+    /// (see [`Dep::Deferred`]), which are added to `started`: those in `late` from `late_from` on.
+    fn link_started(&mut self, started: &mut Vec<u32>, late_from: usize) -> Run<()> {
+        let mut named = 0;
+        let mut linked = 0;
+        let mut late = late_from;
+        loop {
+            while late < self.modules.late.len() {
+                started.push(self.modules.late[late].0);
+                late += 1;
+            }
+            if named < started.len() {
+                let one = started[named];
+                named += 1;
+                if !self.record(one).partial {
+                    self.make_namespace(one)?;
+                }
+            } else if linked < started.len() {
+                let one = started[linked];
+                linked += 1;
+                self.link_module(one)?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Loads all that a module that only passes on exports names and hasn't yet, and makes its namespace, which needs
+    /// all of it: for `import * as`, `import()`, `require`, and `export *` of it from a module that doesn't only pass on
+    /// exports. What's started is linked by whatever's loading, or here if nothing is. It does nothing for any other
+    /// module.
+    fn complete_module(&mut self, id: u32) -> Run<()> {
+        if !self.modules.records.get(&id).is_some_and(|record| record.partial) {
+            return Ok(());
+        }
+        self.record(id).partial = false;
+        for dep in 0..self.record(id).deps.len() {
+            if matches!(self.record(id).deps[dep], Dep::Deferred) {
+                self.start_deferred(id, dep)?;
+            }
+            if let Dep::Es(other) = self.record(id).deps[dep] {
+                if self.record(id).info.stars.contains(&dep) {
+                    self.complete_module(other)?;
+                }
+            }
+        }
+        self.make_namespace(id)
+    }
+
+    /// Starts what a module names that was [`Dep::Deferred`], now that something asks for what it gives.
+    fn start_deferred(&mut self, id: u32, dep: usize) -> Run<Dep> {
+        let record = self.record(id);
+        let dir = record.path.parent().unwrap_or(Path::new(".")).to_owned();
+        let name = record.info.requested[dep].clone();
+        let mut started = Vec::new();
+        let found = self.find_dependency(&dir, &name, &mut started)?;
+        self.record(id).deps[dep] = found.clone();
+        self.modules.late.extend(started.into_iter().map(|one| (one, id, dep)));
+        Ok(found)
+    }
+
+    /// What a module names, by its number, starting it first if it was [`Dep::Deferred`].
+    fn dependency(&mut self, id: u32, dep: usize) -> Run<Dep> {
+        match self.record(id).deps[dep].clone() {
+            Dep::Deferred => self.start_deferred(id, dep),
+            found => Ok(found),
+        }
+    }
+
+    /// Whether the module `name` names from a module that only passes on exports can wait to be loaded until something
+    /// asks for what it gives: when its package says it has no side effects. Then not loading it can't be seen, as all
+    /// that loading it would do is make what it exports. A package that doesn't say so may have modules that do
+    /// something as they're loaded (add styles, register themselves, set globals), even where what's passed on is from
+    /// other modules that only pass on exports, as what those pass on can, so those are loaded as the language says.
+    fn may_defer(&mut self, from: &Path, name: &str) -> Run<bool> {
+        let dir = from.parent().unwrap_or(Path::new("."));
+        let relative = name.starts_with("./") || name.starts_with("../");
+        // A file next to this one is in its package, and needn't be looked for to know.
+        if relative
+            && !name.split('/').any(|part| part == "..")
+            && matches!(*self.side_effects_of(dir), SideEffects::None)
+        {
+            return Ok(true);
+        }
+        let path = match self.resolve_module(dir, name, true) {
+            Ok(Resolved::File(path)) => path,
+            // What can't be found is looked for again as it's loaded, to say so then.
+            Ok(Resolved::Builtin(_)) | Err(_) => return Ok(false),
+        };
+        let folder = path.parent().unwrap_or(Path::new(".")).to_owned();
+        Ok(match &*self.side_effects_of(&folder) {
+            SideEffects::None => true,
+            SideEffects::Some => false,
+            SideEffects::Only(root, patterns) => {
+                !patterns.iter().any(|pattern| side_effect_pattern_matches(pattern, root, &path))
+            }
+        })
+    }
+
+    /// What the package of the files in a folder says about their side effects: its nearest `package.json` that has a
+    /// name or `sideEffects`.
+    fn side_effects_of(&mut self, dir: &Path) -> std::rc::Rc<SideEffects> {
+        if let Some(known) = self.modules.side_effects.get(dir) {
+            return known.clone();
+        }
+        let found = if is_file(&dir.join("package.json")) {
+            match self.read_package_json(dir) {
+                Ok(Some(json)) if json.is_object() => {
+                    let said = self.get_named(json, "sideEffects").unwrap_or(Value::UNDEFINED);
+                    let named = self.get_named(json, "name").is_ok_and(|name| name.is_string());
+                    if said.is_bool() {
+                        Some(if self.to_boolean(said) { SideEffects::Some } else { SideEffects::None })
+                    } else if said.is_object() {
+                        let patterns = self.iterate_to_vec(said).unwrap_or_default();
+                        let patterns = patterns
+                            .into_iter()
+                            .filter(|pattern| pattern.is_string())
+                            .map(|pattern| self.text_of(pattern).to_rust())
+                            .collect();
+                        Some(SideEffects::Only(dir.to_owned(), patterns))
+                    } else if named {
+                        Some(SideEffects::Some)
+                    } else {
+                        // A `package.json` with neither, as some packages have in their folders to say what kind of
+                        // module the files are, is part of the package above.
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let found = match (found, dir.parent()) {
+            (Some(found), _) => std::rc::Rc::new(found),
+            (None, Some(parent)) => self.side_effects_of(parent),
+            (None, None) => std::rc::Rc::new(SideEffects::Some),
+        };
+        self.modules.side_effects.insert(dir.to_owned(), found.clone());
+        found
     }
 
     /// A module's first step, and then the first steps of what it imports, as far as they go.
@@ -1671,6 +1886,7 @@ impl Vm {
         let id = self.modules.next_record;
         self.modules.next_record = self.modules.next_record.wrapping_add(1);
         let requested = info.requested.clone();
+        let only_reexports = info.only_reexports;
         self.modules.records.insert(
             id,
             Record {
@@ -1688,6 +1904,7 @@ impl Vm {
                 waiting: 0,
                 error: Value::UNDEFINED,
                 filled: Vec::new(),
+                partial: false,
             },
         );
         self.modules.es.insert(path.to_owned(), id);
@@ -1701,7 +1918,12 @@ impl Vm {
         self.resume_generator(generator, Resume::Next, Value::UNDEFINED)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_owned();
         for name in requested {
-            let dep = self.find_dependency(&dir, &name, started)?;
+            let dep = if only_reexports && self.may_defer(path, &name)? {
+                self.record(id).partial = true;
+                Dep::Deferred
+            } else {
+                self.find_dependency(&dir, &name, started)?
+            };
             self.record(id).deps.push(dep);
         }
         Ok(id)
@@ -1748,6 +1970,12 @@ impl Vm {
     /// Gives a module's namespace a getter for each name it exports, in the order of their code units, as the language
     /// has it. Only names that can be known now are there: what comes from `export *` of CommonJS is added once that's run.
     fn make_namespace(&mut self, id: u32) -> Run<()> {
+        let stars = self.record(id).info.stars.clone();
+        for star in stars {
+            if let Dep::Es(other) = self.dependency(id, star)? {
+                self.complete_module(other)?;
+            }
+        }
         let mut names = Vec::new();
         self.export_names(id, &mut Vec::new(), &mut names);
         names.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
@@ -1861,7 +2089,7 @@ impl Vm {
         let mut found = None;
         let mut commonjs = None;
         for star in stars {
-            let dep = self.record(id).deps[star].clone();
+            let dep = self.dependency(id, star)?;
             let Dep::Es(other) = dep else {
                 commonjs.get_or_insert(star);
                 continue;
@@ -1893,10 +2121,13 @@ impl Vm {
         name: Option<String>,
         seen: &mut Vec<(u32, String)>,
     ) -> Run<Found> {
-        match self.record(id).deps[dep].clone() {
+        match self.dependency(id, dep)? {
+            Dep::Deferred => unreachable!("a module that's asked for is started"),
             Dep::Es(other) => match name {
                 Some(name) => self.resolve_export(other, &name, seen),
                 None => {
+                    // Its namespace needs all it names.
+                    self.complete_module(other)?;
                     let record = self.record(other);
                     if record.namespace_cell.is_undefined() {
                         let namespace = record.namespace;
@@ -1983,6 +2214,8 @@ impl Vm {
             .exports
             .iter()
             .filter_map(|(_, from)| match from {
+                // What's passed on from a module that hasn't been asked for isn't looked at until it is.
+                ExportFrom::Import(dep, _) if matches!(record.deps[*dep], Dep::Deferred) => None,
                 ExportFrom::Import(dep, Some(name)) => Some((*dep, name.clone())),
                 _ => None,
             })
@@ -2018,6 +2251,22 @@ impl Vm {
             return Ok(None);
         };
         match record.state {
+            // A module that only passes on exports may have been asked for more since it ran, which runs now. It's
+            // running again meanwhile, for modules that pass on each other's.
+            State::Done if record.info.only_reexports => {
+                self.record(id).state = State::Running;
+                let mut ran = Ok(None);
+                for dep in 0..self.record(id).deps.len() {
+                    if let Dep::Es(other) = self.record(id).deps[dep] {
+                        ran = self.evaluate_module(other);
+                        if ran.is_err() {
+                            break;
+                        }
+                    }
+                }
+                self.record(id).state = State::Done;
+                return ran.map(|_| None);
+            }
             // What's already running is something that imports this, as modules can import each other.
             State::Done | State::Running | State::Started => return Ok(None),
             State::Waiting => return Ok(Some(record.promise)),
@@ -2039,7 +2288,7 @@ impl Vm {
                 Dep::File(path) => self
                     .load_module(&path)
                     .and_then(|module| self.fill_cells(id, dep, module)),
-                Dep::Builtin(_) => Ok(()),
+                Dep::Builtin(_) | Dep::Deferred => Ok(()),
             };
             if let Err(error) = ran {
                 return self.module_failed(id, error);
@@ -3149,5 +3398,184 @@ mod reading_files_once {
             "import type { A } from './a';\nconsole.log(typeof module);",
         )]);
         assert_eq!(result.as_deref(), Ok("undefined"));
+    }
+}
+
+#[cfg(test)]
+mod deferred_reexports {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A package `pkg` whose main file passes on `export *` from `all.js`, which passes on the default exports of
+    /// `a.js`, `b.js` and `c.js`, each of which says when it runs. `side_effects` is what its `package.json` says.
+    fn package(side_effects: &str) -> Vec<(String, String)> {
+        let mut files = vec![
+            (
+                "node_modules/pkg/package.json".to_owned(),
+                format!(r#"{{ "name": "pkg", "type": "module", "main": "index.js"{side_effects} }}"#),
+            ),
+            ("node_modules/pkg/index.js".to_owned(), "export * from './all.js';\n".to_owned()),
+            (
+                "node_modules/pkg/all.js".to_owned(),
+                "// Made by a script.\nexport { default as A } from './a.js';\nexport { default as B } from './b.js';\nexport { default as C } from './c.js';\n".to_owned(),
+            ),
+        ];
+        for name in ["a", "b", "c"] {
+            files.push((
+                format!("node_modules/pkg/{name}.js"),
+                format!("console.log('{name} ran');\nexport default '{name}';\n"),
+            ));
+        }
+        files
+    }
+
+    /// Runs `main.js` among these files, and gives what it printed or the error, and how many files were read.
+    fn run(files: &[(String, String)]) -> (Result<String, String>, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rsui_js_deferred_{}_{}",
+            std::process::id(),
+            RUNS.fetch_add(1, Ordering::Relaxed)
+        ));
+        for (name, text) in files {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let output = Rc::new(RefCell::new(String::new()));
+        let mut engine = crate::Engine::new();
+        let sink = output.clone();
+        engine.set_printer(move |text| sink.borrow_mut().push_str(text));
+        let before = crate::parser::PARSES.with(std::cell::Cell::get);
+        let result = engine
+            .run_file(&dir.join("main.js"))
+            .map(|_| ())
+            .and_then(|()| engine.run_until_idle())
+            .map_err(|error| error.message);
+        let parses = crate::parser::PARSES.with(std::cell::Cell::get) - before;
+        std::fs::remove_dir_all(&dir).ok();
+        let shown = output.borrow().replace("\r\n", "\n").trim_end().to_owned();
+        (result.map(|()| shown), parses)
+    }
+
+    fn with_main(mut files: Vec<(String, String)>, main: &str) -> Vec<(String, String)> {
+        files.push(("main.js".to_owned(), main.to_owned()));
+        files
+    }
+
+    #[test]
+    fn one_name_loads_only_its_module_from_a_package_without_side_effects() {
+        let files = with_main(package(r#", "sideEffects": false"#), "import { B } from 'pkg';\nconsole.log(B);\n");
+        let (result, parses) = run(&files);
+        assert_eq!(result.as_deref(), Ok("b ran\nb"));
+        // `main.js`, `index.js`, `all.js` and `b.js`.
+        assert_eq!(parses, 4);
+    }
+
+    #[test]
+    fn a_package_that_may_have_side_effects_is_all_run_in_order() {
+        for said in ["", r#", "sideEffects": true"#] {
+            let files = with_main(package(said), "import { B } from 'pkg';\nconsole.log(B);\n");
+            let (result, parses) = run(&files);
+            assert_eq!(result.as_deref(), Ok("a ran\nb ran\nc ran\nb"), "{said}");
+            assert_eq!(parses, 6);
+        }
+    }
+
+    #[test]
+    fn files_that_side_effects_names_are_run() {
+        let files = with_main(package(r#", "sideEffects": ["./c.js"]"#), "import { B } from 'pkg';\nconsole.log(B);\n");
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("b ran\nc ran\nb"));
+        let files = with_main(package(r#", "sideEffects": ["*.css", "**/a.js"]"#), "import { C } from 'pkg';\nconsole.log(C);\n");
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("a ran\nc ran\nc"));
+    }
+
+    #[test]
+    fn a_namespace_has_everything() {
+        let files = with_main(
+            package(r#", "sideEffects": false"#),
+            "import * as all from 'pkg';\nconsole.log(Object.keys(all).join(), all.C);\n",
+        );
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("a ran\nb ran\nc ran\nA,B,C c"));
+    }
+
+    #[test]
+    fn importing_the_package_later_runs_the_rest_then() {
+        let files = with_main(
+            package(r#", "sideEffects": false"#),
+            "import { A } from 'pkg';\nconsole.log(A);\nconst all = await import('pkg');\nconsole.log(Object.keys(all).join(), all.B, all.C);\n",
+        );
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("a ran\na\nb ran\nc ran\nA,B,C b c"));
+        // A module imported later asks for another name, which loads its module then.
+        let mut files = with_main(
+            package(r#", "sideEffects": false"#),
+            "import { A } from 'pkg';\nconsole.log(A);\nconst { C } = await import('./more.js');\nconsole.log(C);\n",
+        );
+        files.push(("more.js".to_owned(), "export { C } from 'pkg';\n".to_owned()));
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("a ran\na\nc ran\nc"));
+    }
+
+    #[test]
+    fn what_is_passed_on_stays_live() {
+        let mut files = package(r#", "sideEffects": false"#);
+        files.push((
+            "node_modules/pkg/count.js".to_owned(),
+            "export let count = 0;\nexport function bump() { count += 1; }\n".to_owned(),
+        ));
+        files[2].1.push_str("export { count, bump } from './count.js';\n");
+        let files = with_main(files, "import { count, bump } from 'pkg';\nbump();\nbump();\nconsole.log(count);\n");
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("2"));
+    }
+
+    #[test]
+    fn modules_can_import_each_other_through_the_package() {
+        let mut files = package(r#", "sideEffects": false"#);
+        // `b.js` uses `A` through the package's main file, which is being loaded as it's asked for.
+        files[4].1 = "import { A } from './index.js';\nconsole.log('b ran');\nexport default () => 'b with ' + A;\n".to_owned();
+        let files = with_main(files, "import { B } from 'pkg';\nconsole.log(B());\n");
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("a ran\nb ran\nb with a"));
+    }
+
+    #[test]
+    fn names_two_stars_give_are_ambiguous_only_when_imported() {
+        let files = vec![
+            (
+                "node_modules/two/package.json".to_owned(),
+                r#"{ "name": "two", "type": "module", "main": "index.js", "sideEffects": false }"#.to_owned(),
+            ),
+            ("node_modules/two/index.js".to_owned(), "export * from './x.js';\nexport * from './y.js';\n".to_owned()),
+            ("node_modules/two/x.js".to_owned(), "export const same = 'x';\nexport const onlyX = 'x';\n".to_owned()),
+            ("node_modules/two/y.js".to_owned(), "export const same = 'y';\nexport const onlyY = 'y';\n".to_owned()),
+        ];
+        let (result, _) = run(&with_main(files.clone(), "import { onlyX, onlyY } from 'two';\nconsole.log(onlyX, onlyY);\n"));
+        assert_eq!(result.as_deref(), Ok("x y"));
+        let (result, _) = run(&with_main(files.clone(), "import { same } from 'two';\nconsole.log(same);\n"));
+        assert!(result.as_ref().is_err_and(|error| error.contains("conflicting star exports")), "{result:?}");
+        let (result, _) = run(&with_main(files.clone(), "import * as all from 'two';\nconsole.log(Object.keys(all).join());\n"));
+        assert_eq!(result.as_deref(), Ok("onlyX,onlyY"));
+        let (result, _) = run(&with_main(files, "import { nothing } from 'two';\nconsole.log(nothing);\n"));
+        assert!(result.as_ref().is_err_and(|error| error.contains("does not provide an export named 'nothing'")), "{result:?}");
+    }
+
+    #[test]
+    fn require_gives_all_of_it() {
+        let mut files = with_main(
+            package(r#", "sideEffects": false"#),
+            "import { A } from 'pkg';\nimport { names } from './old.cjs';\nconsole.log(A, names);\n",
+        );
+        files.push((
+            "old.cjs".to_owned(),
+            "exports.names = Object.keys(require('pkg')).filter((name) => name !== '__esModule').join();\n".to_owned(),
+        ));
+        let (result, _) = run(&files);
+        assert_eq!(result.as_deref(), Ok("a ran\nb ran\nc ran\na A,B,C"));
     }
 }

@@ -1835,8 +1835,9 @@ impl Shaper<'_, '_> {
                 let before = (format & (bit - 1)).count_ones() as usize;
                 match read_u16(table, record + before * 2) {
                     Some(0) | None => 0,
+                    // Where glyphs are shaped, they're placed in whole units.
                     Some(offset) => {
-                        crate::variations::device_delta(table, base + offset as usize, store)
+                        crate::variations::device_delta(table, base + offset as usize, store).round() as i32
                     }
                 }
             };
@@ -1936,7 +1937,7 @@ impl Shaper<'_, '_> {
         {
             let device = |offset: usize| match read_u16(self.table, at + offset) {
                 Some(0) | None => 0,
-                Some(device) => crate::variations::device_delta(self.table, at + device as usize, store),
+                Some(device) => crate::variations::device_delta(self.table, at + device as usize, store).round() as i32,
             };
             x += device(6);
             y += device(8);

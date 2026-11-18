@@ -1,7 +1,7 @@
 // The parts of a tab's panes that aren't the panes: where each one sits, the handles between them, the outline of where a tab
 // dragged over them would go, and the menu of layouts. How they're laid out is src/layout.ts.
 
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import { showKey } from './keys';
 import { HANDLE, place, PRESETS, presetLayout, type Handle as HandleBox, type Layout, type Preset, type Rect } from './layout';
 import { leftButton } from './reorder';
@@ -11,28 +11,17 @@ import type { Settings } from './settings';
 const MOVES = 'duration-(--fx-move) ease-(--fx-ease) ';
 
 /**
- * Where a pane sits. When `animate` is on it glides to a new place, and a pane that's `fresh`, just split off another, fades and
- * grows in rather than appearing all at once.
+ * Where a pane sits: all of its place in the split it's in, which layout gives it. A pane that's `fresh`, just split off another,
+ * fades and grows in rather than appearing all at once, from where its `starting:` classes say it starts (CSS's `@starting-style`).
  */
-export const Slot = memo(function Slot(props: { rect: Rect; animate: boolean; fresh: boolean; children: any }) {
-    const { rect, animate, fresh, children } = props;
-    const [shown, setShown] = useState(!fresh);
-    useEffect(() => {
-        if (shown) {
-            return;
-        }
-        // Drawn once as it starts, so there's something for it to move from.
-        const timer = setTimeout(() => setShown(true), 16);
-        return () => clearTimeout(timer);
-    }, []);
+export const Slot = memo(function Slot(props: { fresh: boolean; children: any }) {
+    const { fresh, children } = props;
     return (
         <div
             className={
-                'absolute ' +
-                (animate || !shown ? 'transition-[left,top,opacity,transform] ' + MOVES : 'transition-[opacity,transform] ' + MOVES) +
-                (shown ? 'opacity-100 [transform:none]' : 'opacity-0 [transform:scale(0.97)]')
+                'flex min-h-0 min-w-0 flex-1 transition-[opacity,transform] ' + MOVES +
+                (fresh ? 'starting:opacity-0 starting:[transform:scale(0.97)]' : '')
             }
-            style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
         >
             {children}
         </div>
@@ -40,22 +29,26 @@ export const Slot = memo(function Slot(props: { rect: Rect; animate: boolean; fr
 });
 
 /**
- * A handle between two panes, along a row or down a column of them. Dragging it moves the edge between them, as far as each can
- * go; a double-click makes the panes it's between, and the rest of that row or column, the same size again.
+ * A handle between two panes, along a row or down a column of them, in the gap between them, and never thinner than can be caught,
+ * however small the gap is. Dragging it moves the edge between them, as far as each can go; a double-click makes the panes it's
+ * between, and the rest of that row or column, the same size again.
  */
 export const Handle = memo(function Handle(props: {
     handle: HandleBox;
-    animate: boolean;
+    gap: number;
     onStart: (handle: HandleBox) => void;
     onMove: (handle: HandleBox, by: number) => void;
     onDone: () => void;
     onReset: (handle: HandleBox) => void;
 }) {
-    const { handle, animate, onStart, onMove, onDone, onReset } = props;
+    const { handle, gap, onStart, onMove, onDone, onReset } = props;
     const from = useRef<number | null>(null);
+    const box = useRef<any>(null);
     const [held, setHeld] = useState(false);
     const row = handle.dir === 'row';
-    const r = handle.rect;
+    const thick = Math.max(gap, HANDLE);
+    // Wider than the gap, it reaches as far into each side.
+    const over = gap < thick ? (gap - thick) / 2 : 0;
     const end = () => {
         if (from.current === null) {
             return;
@@ -66,19 +59,20 @@ export const Handle = memo(function Handle(props: {
     };
     return (
         <div
-            className={
-                'group absolute z-10 flex items-center justify-center ' +
-                (row ? 'cursor-col-resize ' : 'cursor-row-resize ') +
-                (animate ? 'transition-[left,top,width,height] ' + MOVES : '')
-            }
-            style={{ left: r.x, top: r.y, width: r.w, height: r.h }}
+            ref={box}
+            className={'group relative z-10 flex shrink-0 items-center justify-center self-stretch ' + (row ? 'cursor-col-resize' : 'cursor-row-resize')}
+            style={row ? { width: thick, marginLeft: over, marginRight: over } : { height: thick, marginTop: over, marginBottom: over }}
             onPointerDown={(event: any) => {
                 if (!leftButton(event)) {
                     return;
                 }
                 from.current = row ? event.clientX : event.clientY;
                 setHeld(true);
-                onStart(handle);
+                // What a share of the split it's in is in pixels, from how big layout made it, less the gaps in it.
+                const split = box.current?.parentElement?.getBoundingClientRect?.();
+                const length = split ? (row ? split.width : split.height) : 0;
+                const gaps = (box.current?.parentElement?.children?.length ?? 1) >> 1;
+                onStart({ ...handle, room: Math.max(1, length - gap * gaps) });
             }}
             onPointerMove={(event: any) => {
                 if (from.current === null) {
@@ -115,11 +109,12 @@ export const DockLayer = memo(function DockLayer(props: {
     landing: Rect | null;
     refused: { rect: Rect; why: string } | null;
     what: { icon: any; title: string } | null;
-    width: number;
-    height: number;
 }) {
-    const { lifting, landing, refused, what, width, height } = props;
-    // The sheet stays where it last was as it fades, rather than jumping to nowhere first, and starts from there when it's back.
+    const { lifting, landing, refused, what } = props;
+    // The sheet stays where it last was as it fades, rather than jumping to nowhere first, and glides from there when it's back
+    // in the same drag. Once the drag's over it's taken away (`hidden`) when it's faded, which `transition-discrete` waits for,
+    // and it fades in where it lands the next time, from `starting:opacity-0`. Where it was is kept here, as nothing else says
+    // once it's no longer landing anywhere.
     const last = useRef<Rect | null>(landing);
     if (landing) {
         last.current = landing;
@@ -133,13 +128,12 @@ export const DockLayer = memo(function DockLayer(props: {
                     'pointer-events-none absolute inset-0 z-20 rounded-(--fx-radius-lg) border-[1.5px] border-dashed border-(--fx-accent) transition-opacity duration-[180ms] ' +
                     (lifting && !landing && !refused ? 'opacity-50' : 'opacity-0')
                 }
-                style={{ width, height }}
             />
             {sheet ? (
                 <div
                     className={
-                        'pointer-events-none absolute z-30 flex flex-col items-center justify-center gap-1.5 overflow-hidden rounded-(--fx-radius-lg) border-[1.5px] border-(--fx-accent) bg-(--fx-accent-soft) text-(--fx-accent) transition-[left,top,width,height,opacity] duration-[180ms] ease-(--fx-ease) ' +
-                        (landing ? 'opacity-100' : 'opacity-0')
+                        'pointer-events-none absolute z-30 flex-col items-center justify-center gap-1.5 overflow-hidden rounded-(--fx-radius-lg) border-[1.5px] border-(--fx-accent) bg-(--fx-accent-soft) text-(--fx-accent) transition-[left,top,width,height,opacity,display] transition-discrete duration-[180ms] ease-(--fx-ease) starting:opacity-0 ' +
+                        (landing ? 'flex opacity-100' : lifting ? 'flex opacity-0' : 'hidden opacity-0')
                     }
                     style={{ left: sheet.x, top: sheet.y, width: sheet.w, height: sheet.h }}
                 >
@@ -278,7 +272,11 @@ export const LayoutMenu = memo(function LayoutMenu(props: {
     );
 });
 
-/** A short note at the bottom of the window, as when there's no room to split a pane, which goes by itself. */
+/**
+ * A short note at the bottom of the window, as when there's no room to split a pane, which goes by itself. It rises in from
+ * where `starting:` says, and sinks away before it's taken away (`hidden`, which `transition-discrete` waits for), still
+ * saying what it said, which is kept here as nothing else says it by then.
+ */
 export const Notice = memo(function Notice(props: { text: string | null }) {
     const last = useRef('');
     if (props.text) {
@@ -287,8 +285,8 @@ export const Notice = memo(function Notice(props: { text: string | null }) {
     return (
         <div
             className={
-                'pointer-events-none absolute bottom-6 left-1/2 z-50 rounded-full bg-(--fx-pop) px-4 py-2 text-[0.9em] shadow-(--fx-pop-shadow) transition-[opacity,transform] duration-(--fx-move) ease-(--fx-ease) ' +
-                (props.text ? 'opacity-100 [transform:translateX(-50%)]' : 'opacity-0 [transform:translate(-50%,8px)]')
+                'pointer-events-none absolute bottom-6 left-1/2 z-50 rounded-full bg-(--fx-pop) px-4 py-2 text-[0.9em] shadow-(--fx-pop-shadow) transition-[opacity,transform,display] transition-discrete duration-(--fx-move) ease-(--fx-ease) starting:opacity-0 starting:[transform:translate(-50%,8px)] ' +
+                (props.text ? 'opacity-100 [transform:translateX(-50%)]' : 'hidden opacity-0 [transform:translate(-50%,8px)]')
             }
         >
             {last.current}

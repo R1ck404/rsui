@@ -208,6 +208,9 @@ struct WindowState {
     access_fingerprint: Option<AccessFingerprint>,
     /// Whether the system will say when the pointer leaves the window.
     tracking_pointer: bool,
+    /// Whether a mouse button went down in the window's own area and is still down, with the pointer held for it (`SetCapture`),
+    /// so that what was pressed hears where it goes, as on a page, until it's let go of (see `hold_pointer`).
+    pressing: bool,
     /// The first half of a character that arrived in two messages.
     high_surrogate: Option<u16>,
     /// What's being put together by a way of typing came to, once it's done, to say when it ends.
@@ -232,6 +235,24 @@ struct WindowState {
 }
 
 impl WindowState {
+    /// Has the system say when the pointer leaves the window (`WM_MOUSELEAVE`), if it isn't already going to.
+    fn track_pointer(&mut self, window: HWND) {
+        if self.tracking_pointer {
+            return;
+        }
+        self.tracking_pointer = true;
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: window,
+            dwHoverTime: 0,
+        };
+        // SAFETY: `track` is filled in as this asks.
+        unsafe {
+            let _ = TrackMouseEvent(&mut track);
+        }
+    }
+
     fn scale(window: HWND) -> f32 {
         // SAFETY: `window` is the window this is running in.
         unsafe { GetDpiForWindow(window) as f32 / 96.0 }
@@ -1929,6 +1950,10 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             let height = ((lparam.0 >> 16) & 0xFFFF) as u32;
             let minimized = wparam.0 == SIZE_MINIMIZED as usize;
             with_state(window, |state| {
+                // Minimized, or brought back from that, a page hears `visibilitychange`.
+                if state.hidden != minimized {
+                    let _ = state.app.feed(&Input::Shown(!minimized));
+                }
                 state.window_resized(window, minimized, (width, height))
             });
             tell_state_changed(window);
@@ -1975,19 +2000,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     return;
                 }
                 state.pointer_at = Some((x, y));
-                if !state.tracking_pointer {
-                    state.tracking_pointer = true;
-                    let mut track = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: window,
-                        dwHoverTime: 0,
-                    };
-                    // SAFETY: `track` is filled in as this asks.
-                    unsafe {
-                        let _ = TrackMouseEvent(&mut track);
-                    }
-                }
+                state.track_pointer(window);
                 state.need_gpu(window);
                 let held = modifiers_held();
                 {
@@ -2011,6 +2024,12 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_MOUSELEAVE => {
             with_state(window, |state| {
+                // While a press is held, the pointer's still the window's wherever it is, and what was pressed goes on hearing it,
+                // as on a page: the system can say it's left as it goes over where the window's dragged by, or out of the window.
+                // Letting go of the press asks to be told again (see `let_go_of_pointer`).
+                if state.pressing {
+                    return;
+                }
                 state.tracking_pointer = false;
                 state.pointer_at = None;
                 let _ = state.app.feed(&Input::Leave);
@@ -2068,11 +2087,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let _ = state.app.feed(&Input::Down { x, y, clicks });
                 state.update_and_draw(window);
             });
-            // SAFETY: `window` is valid for a message sent to it. Holding the pointer means
-            // this still hears about the button coming up outside the window.
-            unsafe {
-                SetCapture(window);
-            }
+            hold_pointer(window);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -2082,10 +2097,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let _ = state.app.feed(&Input::Up { x, y });
                 state.update_and_draw(window);
             });
-            // SAFETY: this only lets go of the pointer, which is always allowed.
-            unsafe {
-                let _ = ReleaseCapture();
-            }
+            let_go_of_pointer(window, wparam);
             LRESULT(0)
         }
         WINDOWS_WANTED => {
@@ -2177,24 +2189,16 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             };
             let mut hit = HTCLIENT;
             with_state(window, |state| {
-                let edge = if sized && state.before_fullscreen.is_none() {
-                    edge_at(
-                        at.x,
-                        at.y,
-                        client.right,
-                        client.bottom,
-                        frame_thickness(window),
-                    )
-                } else {
-                    None
-                };
-                hit = edge.unwrap_or_else(|| {
-                    if state.app.drags_window_at(at.x as f32, at.y as f32) {
-                        HTCAPTION
-                    } else {
-                        HTCLIENT
-                    }
-                });
+                let edges = sized && state.before_fullscreen.is_none();
+                // A press is only held while the window has the pointer, so that one whose end was missed can't keep the window
+                // from being dragged or resized.
+                // SAFETY: this only asks.
+                let pressing = state.pressing && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() } == window;
+                hit = frameless_hit(
+                    pressing,
+                    || edges.then(|| edge_at(at.x, at.y, client.right, client.bottom, frame_thickness(window))).flatten(),
+                    || state.app.drags_window_at(at.x as f32, at.y as f32),
+                );
             });
             LRESULT(hit as isize)
         }
@@ -2343,6 +2347,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let _ = state.app.feed(&Input::ButtonDown { x, y, button });
                 state.update_and_draw(window);
             });
+            hold_pointer(window);
             // Back and forward say they were dealt with by giving back true.
             LRESULT(isize::from(message == WM_XBUTTONDOWN))
         }
@@ -2355,6 +2360,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let _ = state.app.feed(&Input::ButtonUp { x, y, button });
                 state.update_and_draw(window);
             });
+            let_go_of_pointer(window, wparam);
             LRESULT(isize::from(message == WM_XBUTTONUP))
         }
         WM_MOVE => {
@@ -2368,9 +2374,14 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
         }
         WM_CAPTURECHANGED => {
+            // Something else took the pointer while a press was held, as a resize from an edge (`startResize`) or another window
+            // coming to the front does, so the press is called off. Letting go of it after the buttons came up says nothing new.
             with_state(window, |state| {
-                let _ = state.app.feed(&Input::CancelPress);
-                state.update_and_draw(window);
+                if std::mem::take(&mut state.pressing) {
+                    state.tracking_pointer = false;
+                    let _ = state.app.feed(&Input::CancelPress);
+                    state.update_and_draw(window);
+                }
             });
             LRESULT(0)
         }
@@ -2743,6 +2754,55 @@ fn frame_thickness(window: HWND) -> i32 {
         let dpi = GetDpiForWindow(window);
         GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
     }
+}
+
+/// What a point in a window with no frame is to the system (`WM_NCHITTEST`): an edge it's resized by, where it's dragged by, or
+/// the window's own area. While a press in its own area is held, all of it is its own area. The system asks this of the window that
+/// holds the pointer too, and an answer of anything else there has it say the pointer left (`WM_MOUSELEAVE`) and can have its moves
+/// come as moves over a frame (`WM_NCMOUSEMOVE`), which what was pressed doesn't hear: a tab dragged off itself onto the strip the
+/// window's dragged by stopped following the pointer.
+fn frameless_hit(pressing: bool, edge: impl FnOnce() -> Option<u32>, drags: impl FnOnce() -> bool) -> u32 {
+    if pressing {
+        return HTCLIENT;
+    }
+    edge().unwrap_or_else(|| if drags() { HTCAPTION } else { HTCLIENT })
+}
+
+/// Whether any mouse button is still down, as what comes with a button's message says (`MK_LBUTTON`, `MK_RBUTTON`, `MK_MBUTTON`,
+/// `MK_XBUTTON1` and `MK_XBUTTON2`), which for a button coming up leaves that one out.
+fn buttons_held(wparam: WPARAM) -> bool {
+    const BUTTONS: usize = 0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040;
+    wparam.0 & BUTTONS != 0
+}
+
+/// Holds the pointer for a press in the window's own area, so that what was pressed hears where the pointer goes and the button
+/// coming up, over where the window's dragged by, its edges, or outside it, until no button's down (Pointer Events 3, 9.5).
+fn hold_pointer(window: HWND) {
+    with_state(window, |state| state.pressing = true);
+    // SAFETY: `window` is valid for a message sent to it.
+    unsafe {
+        SetCapture(window);
+    }
+}
+
+/// Lets go of the pointer once no button's down, which isn't the press being called off, and asks to be told when the pointer
+/// leaves again, which the system then says straight away if it's left already.
+fn let_go_of_pointer(window: HWND, wparam: WPARAM) {
+    if buttons_held(wparam) {
+        return;
+    }
+    let mut held = false;
+    with_state(window, |state| held = std::mem::take(&mut state.pressing));
+    if held {
+        // SAFETY: this only lets go of the pointer, which is always allowed.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+    with_state(window, |state| {
+        state.tracking_pointer = false;
+        state.track_pointer(window);
+    });
 }
 
 /// Which edge or corner of a window this is on, with how wide they are, if it's on one.
@@ -3602,6 +3662,7 @@ unsafe fn open_a_window(
             access: None,
             access_fingerprint: None,
             tracking_pointer: false,
+            pressing: false,
             high_surrogate: None,
             composed: None,
             drop_target: false,
@@ -3745,6 +3806,29 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_press_has_all_of_a_frameless_window_be_its_own() {
+        let never = || -> bool { panic!("nothing more is asked while a press is held") };
+        assert_eq!(frameless_hit(true, || panic!("nor its edges"), never), HTCLIENT, "a press held over where it's dragged by");
+        assert_eq!(frameless_hit(false, || None, || true), HTCAPTION, "where it's dragged by, with nothing held");
+        assert_eq!(frameless_hit(false, || None, || false), HTCLIENT);
+        assert_eq!(frameless_hit(false, || Some(HTTOPLEFT), || true), HTTOPLEFT, "an edge comes first");
+        assert_eq!(edge_at(2, 300, 800, 600, 8), Some(HTLEFT));
+        assert_eq!(edge_at(400, 300, 800, 600, 8), None);
+    }
+
+    #[test]
+    fn the_pointer_is_let_go_of_once_no_button_is_down() {
+        // As each button's message has it: what's still down, which for one coming up is the others.
+        assert!(!buttons_held(WPARAM(0)));
+        assert!(!buttons_held(WPARAM(0x0004 | 0x0008)), "shift and ctrl aren't buttons");
+        assert!(buttons_held(WPARAM(0x0001)), "the main button's still down while another comes up");
+        assert!(buttons_held(WPARAM(0x0002)));
+        assert!(buttons_held(WPARAM(0x0010)));
+        assert!(buttons_held(WPARAM(0x0020 | (1 << 16))), "the high word of an extra button's says which it was");
+        assert!(buttons_held(WPARAM(0x0040)));
+    }
 
     #[test]
     fn input_paint_batches_end_at_a_message_time_or_queue_boundary() {

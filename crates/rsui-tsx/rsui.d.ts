@@ -320,6 +320,13 @@ declare module 'rsui' {
         stroke?: string | number;
         strokeWidth?: number;
         strokeLinecap?: 'butt' | 'round' | 'square';
+        /** How a line's corners are drawn. `miter` if nothing says, as SVG has it. */
+        strokeLinejoin?: 'miter' | 'round' | 'bevel';
+        /** How far a mitred corner may reach, in widths of the line, before it's bevelled instead: 4 if nothing says. */
+        strokeMiterlimit?: number;
+        /** Dashes and the gaps between them, as `'4 2'` or `[4, 2]`, starting `strokeDashoffset` along. */
+        strokeDasharray?: string | number[];
+        strokeDashoffset?: number;
         /** As SVG writes it: `'translate(4 2) rotate(45)'`, on this and what's in it. */
         transform?: string;
     }
@@ -336,7 +343,8 @@ declare module 'rsui' {
     export function Line(props: ShapeLook & { x1: number; y1: number; x2: number; y2: number; key?: string | number }): Child;
     export function Polyline(props: ShapeLook & { points: string | [number, number][]; key?: string | number }): Child;
     export function Polygon(props: ShapeLook & { points: string | [number, number][]; key?: string | number }): Child;
-    export function Rect(props: ShapeLook & { x?: number; y?: number; width: number; height: number; rx?: number; key?: string | number }): Child;
+    /** `rx` and `ry` round its corners, across and down: either is the other if only one's said. */
+    export function Rect(props: ShapeLook & { x?: number; y?: number; width: number; height: number; rx?: number; ry?: number; key?: string | number }): Child;
     export function Circle(props: ShapeLook & { cx: number; cy: number; r: number; key?: string | number }): Child;
     export function Ellipse(props: ShapeLook & { cx: number; cy: number; rx: number; ry: number; key?: string | number }): Child;
     /** Whether the system's set to dark or light, which changes along with it, along with the title bar. */
@@ -1674,7 +1682,35 @@ declare const document: PageListening & {
     readonly activeElement: PageElement | null;
     title: string;
 };
-declare const window: PageListening & typeof globalThis & { readonly innerWidth: number; readonly innerHeight: number };
+declare const window: PageListening & typeof globalThis & {
+    readonly innerWidth: number;
+    readonly innerHeight: number;
+    /** Whether a CSS media query holds, as `@media` has it, and `change` when that changes, as when the window's narrower than a width. */
+    matchMedia(query: string): PageMediaQueryList;
+};
+interface PageMediaQueryList {
+    readonly media: string;
+    readonly matches: boolean;
+    onchange: ((event: { matches: boolean; media: string }) => void) | null;
+    addEventListener(type: 'change', listener: (event: { matches: boolean; media: string }) => void): void;
+    removeEventListener(type: 'change', listener: (event: { matches: boolean; media: string }) => void): void;
+}
+interface PageResizeObserverEntry {
+    readonly target: PageElement;
+    readonly contentRect: { x: number; y: number; width: number; height: number; top: number; left: number; right: number; bottom: number };
+    readonly borderBoxSize: readonly { inlineSize: number; blockSize: number }[];
+    readonly contentBoxSize: readonly { inlineSize: number; blockSize: number }[];
+}
+/**
+ * Told how big what it watches is each time that's different once it's been laid out, as a page's is, starting with the first
+ * time. What it changes is drawn in the next frame.
+ */
+declare class ResizeObserver {
+    constructor(callback: (entries: PageResizeObserverEntry[], observer: ResizeObserver) => void);
+    observe(target: PageElement, options?: { box?: 'content-box' | 'border-box' }): void;
+    unobserve(target: PageElement): void;
+    disconnect(): void;
+}
 
 /** A `style` written for a page, by React's names for CSS's properties. */
 type PageStyle = { [property: string]: string | number | undefined };
@@ -1796,18 +1832,33 @@ declare namespace JSX {
     interface IntrinsicAttributes {
         key?: string | number;
     }
+    /**
+     * A long list, which only builds the rows in view. It's as big as layout makes it, as anything else is: `grow`, a size that's
+     * a share, `position="absolute"` with all four sides, or a page's CSS around it, and how many rows fit is measured from that.
+     */
     interface ListProps extends Props {
-        /** How many rows there are. */
+        /** How many rows there are, or in a grid, how many items. */
         count: number;
-        /** How tall each one is. */
+        /** How tall each one is. In a grid, how far one row's top is from the next, which takes in the `gap` between them. */
         rowHeight: number;
-        /** How many to expect to fit, until it's been measured. */
+        /**
+         * Makes it a grid that wraps by itself: its rows hold as many items this wide as fit across, with its `gap` between them,
+         * and `renderRow` is given each item's index rather than a row's. Each item is `rowHeight` less the `gap` tall.
+         */
+        itemWidth?: number;
+        /** How many to expect to fit, until it's been measured, which is as soon as it's laid out. */
         visible?: number;
         /** How many to build beyond what shows. */
         overscan?: number;
-        /** A row to bring into view when this changes, as when the keyboard moves through the list. */
+        /** A row to bring into view when this changes, as when the keyboard moves through the list. In a grid, an item. */
         reveal?: number;
         renderRow: (index: number) => import('rsui').Child;
+        /**
+         * Told how many rows fit, which can be part of one, and how many items fit across (1 if it isn't a grid), when it's first
+         * laid out and each time that changes, as for the keyboard to go a row or a page at a time. It's told as it's laid out,
+         * so what it changes is in the same frame.
+         */
+        onResize?: (rows: number, columns: number) => void;
     }
     interface IntrinsicElements {
         window: Props;
@@ -1897,6 +1948,43 @@ declare namespace JSX {
         td: PageProps<HTMLElement>;
         details: PageProps<HTMLElement> & { open?: boolean };
         summary: PageProps<HTMLElement>;
+        // A picture, written as SVG is, in a page or in rsui's own window alike: drawn as `Svg` and its shapes are, which
+        // these are. What says how something else is drawn (`<defs>`, gradients, `<clipPath>`, masks, filters) isn't drawn.
+        svg: SvgProps & {
+            viewBox?: string;
+            width?: number | string;
+            height?: number | string;
+            xmlns?: string;
+            /** `none` stretches it to fill its box, rather than keeping its shape. */
+            preserveAspectRatio?: string;
+            /** What `currentColor` is in it. */
+            color?: string;
+        };
+        g: SvgProps;
+        path: SvgProps & { d: string };
+        circle: SvgProps & { cx?: number | string; cy?: number | string; r: number | string };
+        ellipse: SvgProps & { cx?: number | string; cy?: number | string; rx: number | string; ry: number | string };
+        rect: SvgProps & { x?: number | string; y?: number | string; width: number | string; height: number | string; rx?: number | string; ry?: number | string };
+        line: SvgProps & { x1?: number | string; y1?: number | string; x2?: number | string; y2?: number | string };
+        polyline: SvgProps & { points: string };
+        polygon: SvgProps & { points: string };
+    }
+    /** How a page's `<svg>` or a shape in it is drawn, as SVG's attributes say, which CSS goes over. On the `<svg>` or a `<g>`, it's
+     * for all that's in it. */
+    interface SvgProps extends PageProps<PageElement> {
+        /** `currentColor` is the `<svg>`'s `color`, and `none` is nothing. */
+        fill?: string;
+        stroke?: string;
+        strokeWidth?: number | string;
+        strokeLinecap?: 'butt' | 'round' | 'square';
+        /** How a line's corners are drawn. `miter` if nothing says. */
+        strokeLinejoin?: 'miter' | 'round' | 'bevel';
+        /** How far a mitred corner may reach, in widths of the line, before it's bevelled instead: 4 if nothing says. */
+        strokeMiterlimit?: number | string;
+        strokeDasharray?: string | number | number[];
+        strokeDashoffset?: number | string;
+        /** As SVG writes it: `'translate(4 2) rotate(45)'`. */
+        transform?: string;
     }
     interface ElementChildrenAttribute {
         children: {};

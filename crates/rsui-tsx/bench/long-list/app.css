@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    font-family: "Segoe UI", sans-serif;
+    user-select: none;
+}
+
+.row-cv {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 28px;
+}

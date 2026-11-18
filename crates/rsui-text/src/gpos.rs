@@ -95,15 +95,16 @@ impl PairKerning {
         self
     }
 
-    /// The adjustment between two glyphs, given the whole font file.
+    /// The adjustment between two glyphs, given the whole font file, in font units, which for a font that varies can be a
+    /// fraction of one.
     pub(crate) fn kerning(
         &self,
         file: &[u8],
         left: u16,
         right: u16,
         varied: Option<Store<'_>>,
-    ) -> i16 {
-        let mut total = 0i16;
+    ) -> f32 {
+        let mut total = 0.0;
         for (index, &first) in self.lookups.iter().enumerate() {
             let end = self
                 .lookups
@@ -112,7 +113,7 @@ impl PairKerning {
             for &subtable in &self.subtables[first as usize..end] {
                 let found = pair_adjustment(file, subtable as usize, left, right, varied);
                 if let Some(Some(value)) = found {
-                    total = total.saturating_add(value);
+                    total += value;
                 }
                 if found.is_some() {
                     break;
@@ -162,7 +163,7 @@ fn pair_adjustment(
     left: u16,
     right: u16,
     varied: Option<Store<'_>>,
-) -> Option<Option<i16>> {
+) -> Option<Option<f32>> {
     let format = read_u16(file, subtable)?;
     let coverage = subtable + read_u16(file, subtable + 2)? as usize;
     let covered = coverage_index(file, coverage, left)?;
@@ -232,7 +233,7 @@ fn x_advance(
     format: u16,
     subtable: usize,
     varied: Option<Store<'_>>,
-) -> Option<i16> {
+) -> Option<f32> {
     const X_PLACEMENT: u16 = 1 << 0;
     const Y_PLACEMENT: u16 = 1 << 1;
     const X_ADVANCE: u16 = 1 << 2;
@@ -242,9 +243,9 @@ fn x_advance(
     }
     let skipped = (format & (X_PLACEMENT | Y_PLACEMENT)).count_ones() as usize;
     let value = if format & X_ADVANCE != 0 {
-        read_i16(file, record + skipped * 2)?
+        f32::from(read_i16(file, record + skipped * 2)?)
     } else {
-        0
+        0.0
     };
     if format & X_ADVANCE_DEVICE == 0 {
         return Some(value);
@@ -257,8 +258,7 @@ fn x_advance(
     if device == 0 {
         return Some(value);
     }
-    let delta = device_delta(file, subtable + device, varied);
-    Some((i32::from(value) + delta).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
+    Some(value + device_delta(file, subtable + device, varied))
 }
 
 /// A glyph's position in a coverage table, if it's there.

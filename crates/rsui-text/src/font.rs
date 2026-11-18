@@ -798,15 +798,18 @@ impl Font {
     }
 
     /// The adjustment between two glyphs next to each other, in font units. Usually
-    /// negative, as in "AV", which would look too far apart otherwise.
-    pub fn kerning(&self, left: u16, right: u16) -> i16 {
+    /// negative, as in "AV", which would look too far apart otherwise. In a font that
+    /// varies, it can be a fraction of a unit where the font is set.
+    pub fn kerning(&self, left: u16, right: u16) -> f32 {
         if let Some(gpos) = &self.gpos {
             return gpos.kerning(self.bytes(), left, right, self.gdef_variations());
         }
-        self.kern
-            .as_ref()
-            .and_then(|range| kern_table_pair(&self.bytes()[range.clone()], left, right))
-            .unwrap_or(0)
+        f32::from(
+            self.kern
+                .as_ref()
+                .and_then(|range| kern_table_pair(&self.bytes()[range.clone()], left, right))
+                .unwrap_or(0),
+        )
     }
 
     /// How far apart two glyphs go, by the font's old `kern` table only. Kerning in the newer place is

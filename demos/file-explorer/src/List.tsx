@@ -55,11 +55,9 @@ export interface Handlers {
 
 export const COLUMN_WIDTH = { size: 92, type: 120, modified: 168, created: 168, attributes: 56 };
 
-// How many tiles fit across, and rows on a screen, as last drawn, for the keyboard.
-let shape = { perRow: 1, perPage: 10 };
-export function gridShape(): { perRow: number; perPage: number } {
-    return shape;
-}
+/** The room around the tiles of a grid, and between them. */
+const GRID_PAD = 10;
+const GRID_GAP = 8;
 
 /** How a row looks for whether it's selected or has the keyboard. */
 function paint(look: Look, selected: boolean, cursor: boolean, odd: boolean) {
@@ -338,44 +336,30 @@ export function FileList(props: {
     now: number;
     empty: string;
     handlers: Handlers;
-    /** How big the list is, as the window and the panels beside it say, for how many tiles fit across. */
-    width: number;
-    height: number;
     folder: string;
+    /** Told how many rows fit, and how many tiles across, as layout has them, for the keyboard. */
+    onShape: (rows: number, columns: number) => void;
 }) {
-    const { items, view, look, selected, cursor, renaming, reveal, now, empty, handlers, width, height, folder } = props;
+    const { items, view, look, selected, cursor, renaming, reveal, now, empty, handlers, folder, onShape } = props;
     const grid = view === 'grid';
-    const perRow = grid ? Math.max(1, Math.floor((width - 20) / (look.tile.width + 8))) : 1;
-    const stride = grid ? look.tile.height + 8 : look.rowHeight + 1;
-    const rows = Math.ceil(items.length / perRow);
-    shape = { perRow, perPage: Math.max(1, Math.floor(height / stride) - 1) };
+    // A grid's rows are as far apart as a tile is tall and the gap under it, and it puts as many tiles across as fit itself.
+    const stride = grid ? look.tile.height + GRID_GAP : look.rowHeight + 1;
 
     // Made again when what the rows show changes, and only then: each row is `memo`, so only the ones that changed draw again.
     const renderRow = useCallback(
         (row: number) => {
             if (grid) {
-                const tiles: any[] = [];
-                for (let column = 0; column < perRow; column += 1) {
-                    const entry = items[row * perRow + column];
-                    if (!entry) {
-                        break;
-                    }
-                    tiles.push(
-                        <Tile
-                            key={entry.path}
-                            entry={entry}
-                            selected={selected.has(entry.path)}
-                            cursor={cursor === entry.path}
-                            renaming={renaming === entry.path}
-                            look={look}
-                            handlers={handlers}
-                        />,
-                    );
-                }
+                const entry = items[row];
                 return (
-                    <row key={'r' + row} gap={8} paddingX={10} height={stride}>
-                        {tiles}
-                    </row>
+                    <Tile
+                        key={entry.path}
+                        entry={entry}
+                        selected={selected.has(entry.path)}
+                        cursor={cursor === entry.path}
+                        renaming={renaming === entry.path}
+                        look={look}
+                        handlers={handlers}
+                    />
                 );
             }
             const entry = items[row];
@@ -395,7 +379,7 @@ export function FileList(props: {
                 </group>
             );
         },
-        [items, selected, cursor, renaming, look, now, view, perRow, stride],
+        [items, selected, cursor, renaming, look, now, view, stride],
     );
 
     if (items.length === 0) {
@@ -413,16 +397,18 @@ export function FileList(props: {
         );
     }
     const index = reveal.path === null ? -1 : items.findIndex((item) => item.path === reveal.path);
-    // The list fills what's around it exactly, so it knows how much of it shows.
+    // The list fills what's around it exactly, which is how big layout makes it, and works out how much of it shows from that.
     return (
         <div className="relative min-h-0 flex-1">
             <list
             key={folder + ':' + view}
-            count={rows}
+            count={items.length}
             rowHeight={stride}
-            visible={Math.ceil(height / stride)}
+            itemWidth={grid ? look.tile.width : undefined}
+            gap={grid ? GRID_GAP : undefined}
+            paddingX={grid ? GRID_PAD : undefined}
             overscan={look.overscan}
-            reveal={index < 0 ? undefined : Math.floor(index / perRow)}
+            reveal={index < 0 ? undefined : index}
             renderRow={renderRow}
             position="absolute"
             top={0}
@@ -430,6 +416,7 @@ export function FileList(props: {
             right={0}
             bottom={0}
             paddingTop={6}
+            onResize={onShape}
             onClick={() => handlers.emptyClick()}
             onDoubleClick={() => handlers.emptyDouble()}
             onContextMenu={() => handlers.context(null)}

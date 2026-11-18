@@ -4334,6 +4334,31 @@ fn intl_is_only_compiled_when_it_is_looked_for_and_is_there_when_it_is() {
     );
 }
 
+/// `Intl.Collator` and `localeCompare` put text in the order Node's (and Edge's) ICU does, with their options; what's
+/// expected is what Node printed.
+#[test]
+fn collators_order_text_as_icu_does() {
+    assert_eq!(
+        run(r#"
+const names = ['b', 'Résumé', 'resume', 'a', 'ä', '_x', 'Z', 'file10', 'file9', 'côte', 'coté', '東京', 'あ', 'ア', 'é'];
+console.log([...names].sort(new Intl.Collator('en').compare).join(' '));
+console.log([...names].sort(new Intl.Collator('en', { numeric: true, sensitivity: 'base' }).compare).join(' '));
+console.log([...names].sort((a, b) => a.localeCompare(b, 'en', { caseFirst: 'upper' })).join(' '));
+console.log('a'.localeCompare('á', undefined, { sensitivity: 'base' }), 'résumé'.localeCompare('resumes'), 'a'.localeCompare('A'));
+const c = new Intl.Collator('en-u-kn', { sensitivity: 'case' });
+const o = c.resolvedOptions();
+console.log(o.numeric, o.sensitivity, o.caseFirst, o.ignorePunctuation, o.usage, c.compare('x2', 'x10'), typeof c.compare, c.compare.length);
+try { new Intl.Collator('en', { sensitivity: 'nope' }); } catch (e) { console.log(e.name); }
+"#),
+        "_x a ä b coté côte é file10 file9 resume Résumé Z あ ア 東京\n\
+         _x a ä b côte coté é file9 file10 Résumé resume Z あ ア 東京\n\
+         _x a ä b coté côte é file10 file9 resume Résumé Z あ ア 東京\n\
+         0 -1 -1\n\
+         true case false false sort -1 function 2\n\
+         RangeError"
+    );
+}
+
 #[test]
 fn an_arrow_function_as_the_first_choice_is_not_taken_for_one_with_a_return_type() {
     assert_eq!(

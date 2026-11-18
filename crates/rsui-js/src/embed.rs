@@ -461,11 +461,221 @@ impl Vm {
             && object.slots().iter().all(|slot| !slot.is_object())
     }
 
+    /// Whether a component given the props `new`, after `old`, would show and do the same, so that it needn't render again, as
+    /// React Compiler has it by keeping the element it made. Each prop is the same value, or does the same thing: a function
+    /// made from the same code that sees the same values (`() => select(i)` made again with the same `select` and `i`), the
+    /// same function given the same things by `bind`, or a plain object or array made again holding what's the same in that
+    /// way, as an element or a `style` written in place is. Nothing more than [`EQUIVALENT_LOOKS`] values deep, or
+    /// [`EQUIVALENT_DEPTH`] down, is looked at, and anything past that isn't the same.
+    ///
+    /// The same object is the same, as it is for React's `memo`, and so it's for code that doesn't change what it's given,
+    /// as React's rules have it: rsui-tsx only asks this of what an app's own JSX made (see `Parser::jsx_name`), and of what
+    /// says `memo`. With `cautious`, for what didn't say `memo`, the same object isn't the same even as itself when it holds a
+    /// function, or `current`, as a ref does: what's in a ref changes without a render, and an object with methods can say
+    /// something else when they're called, as TanStack Table's `row.getIsSelected()` does, while a component can read either
+    /// as it renders. What a closure sees is still the same as itself, as that's only read when it's called. An object holding
+    /// `opaque` is only the same as itself too, which is how rsui-tsx says an element wasn't made by the app's own JSX, so
+    /// that what's in it is only taken to be what it was when it's the same element.
+    ///
+    /// This never runs any of the program's code: a getter, or anything that isn't a plain object, an array or a function, is
+    /// only the same as itself.
+    pub fn props_equivalent(&self, old: Value, new: Value, cautious: bool, opaque: Value) -> bool {
+        if old == new {
+            return true;
+        }
+        if !old.is_object() || !new.is_object() {
+            return self.same_value(old, new);
+        }
+        let (first, second) = (&self.objects[old.index()], &self.objects[new.index()]);
+        if !matches!(first.kind, Kind::Plain)
+            || !matches!(second.kind, Kind::Plain)
+            || first.shape != second.shape
+            || !self.plain_shape(first.shape)
+        {
+            return false;
+        }
+        let mut looks = Looks {
+            left: EQUIVALENT_LOOKS,
+            opaque,
+        };
+        first
+            .slots()
+            .iter()
+            .zip(second.slots())
+            .all(|(x, y)| self.equivalent(*x, *y, EQUIVALENT_DEPTH, &mut looks, cautious))
+    }
+
+    /// Whether a component function says `'use no memo'`, or is a class, which renders whenever what it's in does, as it
+    /// would in React, unless what it's given is the same plain values.
+    pub fn says_no_memo(&self, function: Value) -> bool {
+        if !function.is_object() {
+            return false;
+        }
+        match &self.objects[function.index()].kind {
+            Kind::Function { proto, .. } => {
+                let proto = &self.protos[*proto as usize];
+                proto.no_memo() || proto.flags & crate::op::IS_CLASS != 0
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a function's code is in one of the app's own files, rather than in `node_modules` or what comes with the engine.
+    pub fn made_by_app(&self, function: Value) -> bool {
+        if !function.is_object() {
+            return false;
+        }
+        match &self.objects[function.index()].kind {
+            Kind::Function { proto, .. } => self.protos[*proto as usize].says & crate::op::SAYS_APP_FILE != 0,
+            _ => false,
+        }
+    }
+
+    /// Whether objects of this shape only have properties that hold values, with nothing for a getter to work out.
+    fn plain_shape(&self, shape: u32) -> bool {
+        !self.shapes.is_dict(shape) && self.shapes.is_all_plain(shape)
+    }
+
+    /// Whether this is a plain object with `current` and at most one more property, which is what a ref is.
+    fn holds_current(&self, value: Value) -> bool {
+        if !value.is_object() {
+            return false;
+        }
+        let object = &self.objects[value.index()];
+        matches!(object.kind, Kind::Plain)
+            && object.slots().len() <= 2
+            && self
+                .shapes
+                .entries(object.shape)
+                .iter()
+                .any(|(key, _, _)| self.atom_text(*key) == "current")
+    }
+
+    /// Whether a plain object or an array holds a function, or is a ref, so that it can say something else without being changed
+    /// or given anew.
+    fn can_change_unseen(&self, value: Value) -> bool {
+        if !value.is_object() {
+            return false;
+        }
+        let held: &[Value] = match &self.objects[value.index()].kind {
+            Kind::Plain => self.objects[value.index()].slots(),
+            Kind::Array(items) => items,
+            _ => return false,
+        };
+        held.iter().any(|one| self.is_callable(*one)) || self.holds_current(value)
+    }
+
+    /// Whether two values would do the same, for [`props_equivalent`](Self::props_equivalent), looking at no more than
+    /// `looks` objects and `depth` down, `cautious` as that says.
+    fn equivalent(&self, a: Value, b: Value, depth: u32, looks: &mut Looks, cautious: bool) -> bool {
+        if a == b || self.same_value(a, b) {
+            return !(cautious && self.can_change_unseen(a));
+        }
+        if depth == 0 || looks.left == 0 || !a.is_object() || !b.is_object() {
+            return false;
+        }
+        looks.left -= 1;
+        let (first, second) = (&self.objects[a.index()], &self.objects[b.index()]);
+        let below = depth - 1;
+        // A function's own properties, as its `name`, aren't plain ones, as they're not enumerable, but they hold values.
+        let same_slots = |looks: &mut Looks, of_function: bool| {
+            let opaque = looks.opaque;
+            first.shape == second.shape
+                && !self.shapes.is_dict(first.shape)
+                && (of_function || self.shapes.is_all_plain(first.shape))
+                && first.slots().iter().zip(second.slots()).all(|(x, y)| {
+                    *x != opaque && *y != opaque && self.equivalent(*x, *y, below, looks, cautious)
+                })
+        };
+        match (&first.kind, &second.kind) {
+            // Only what an object literal makes, as an instance of a class can keep more than its properties say.
+            (Kind::Plain, Kind::Plain) => {
+                let proto = self.shapes.proto_of(first.shape);
+                (proto == self.realm.object_proto || proto == NONE) && same_slots(looks, false)
+            }
+            (Kind::Array(x), Kind::Array(y)) => {
+                x.len() == y.len()
+                    && x.len() <= EQUIVALENT_ITEMS
+                    && same_slots(looks, false)
+                    && x
+                        .iter()
+                        .zip(y.iter())
+                        .all(|(x, y)| self.equivalent(*x, *y, below, looks, cautious))
+            }
+            (
+                Kind::Function {
+                    proto,
+                    home,
+                    upvalues,
+                    ..
+                },
+                Kind::Function {
+                    proto: other_proto,
+                    home: other_home,
+                    upvalues: other_upvalues,
+                    ..
+                },
+            ) => {
+                if proto != other_proto || home != other_home || upvalues.len() != other_upvalues.len() {
+                    return false;
+                }
+                // Its own properties are only made when they're asked for, so two that nobody's asked are the same.
+                let untouched = |object: &Object| {
+                    object.flags & LAZY_FUNCTION != 0 && object.slots().is_empty()
+                };
+                if !(untouched(first) && untouched(second)) && !same_slots(looks, true) {
+                    return false;
+                }
+                // What a closure sees is either the value itself, of a variable that's never given another, or the cell
+                // the variable is in, which is compared by what's in it now, as each render has cells of its own.
+                let captures = &self.protos[*proto as usize].captures;
+                upvalues
+                    .iter()
+                    .zip(other_upvalues.iter())
+                    .zip(captures.iter())
+                    .all(|((x, y), capture)| {
+                        if capture.by_value || x == y {
+                            return self.equivalent(*x, *y, below, looks, false);
+                        }
+                        let (x, y) = (self.cells[x.index()], self.cells[y.index()]);
+                        !x.is_empty() && !y.is_empty() && self.equivalent(x, y, below, looks, false)
+                    })
+            }
+            (Kind::Bound(x), Kind::Bound(y)) => {
+                x.args.len() == y.args.len()
+                    && same_slots(looks, true)
+                    && self.equivalent(x.target, y.target, below, looks, false)
+                    && self.equivalent(x.this, y.this, below, looks, false)
+                    && x
+                        .args
+                        .iter()
+                        .zip(y.args.iter())
+                        .all(|(x, y)| self.equivalent(*x, *y, below, looks, false))
+            }
+            _ => false,
+        }
+    }
+
     /// What an error says, with its stack if it has one.
     pub fn error_text(&mut self, error: Value) -> String {
         crate::builtins::inspect_value(self, error)
     }
 }
+
+/// What's left of what [`Vm::props_equivalent`] can look into, and what says an object is only the same as itself.
+struct Looks {
+    left: u32,
+    opaque: Value,
+}
+
+/// How many objects [`Vm::props_equivalent`] looks into for one component's props, so that comparing costs much less than
+/// rendering would, however much it's given.
+const EQUIVALENT_LOOKS: u32 = 256;
+/// How far down [`Vm::props_equivalent`] looks: far enough for a prop holding an element whose props hold a function that
+/// sees a function, as `children` and handlers made in place do.
+const EQUIVALENT_DEPTH: u32 = 6;
+/// The longest array [`Vm::props_equivalent`] compares item by item.
+const EQUIVALENT_ITEMS: usize = 64;
 
 impl crate::Engine {
     /// The engine itself, for what's in this module.

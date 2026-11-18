@@ -205,6 +205,9 @@ struct State {
     stroke_width: f32,
     cap: &'static str,
     join: &'static str,
+    miter_limit: f32,
+    /// Whether it's filled by the even-odd rule, rather than the nonzero one, as `fill-rule` says.
+    even_odd: bool,
     dashes: String,
     dash_offset: f32,
     fill_opacity: f32,
@@ -225,6 +228,8 @@ impl Default for State {
             stroke_width: 1.0,
             cap: "butt",
             join: "miter",
+            miter_limit: 4.0,
+            even_odd: false,
             dashes: String::new(),
             dash_offset: 0.0,
             fill_opacity: 1.0,
@@ -385,6 +390,14 @@ impl Walker<'_> {
                 _ => "miter",
             };
         }
+        if let Some(limit) = self.said(tag, "stroke-miterlimit") {
+            if let Some(limit) = limit.trim().parse::<f32>().ok().filter(|limit| *limit >= 1.0) {
+                state.miter_limit = limit;
+            }
+        }
+        if let Some(rule) = self.said(tag, "fill-rule") {
+            state.even_odd = rule.trim() == "evenodd";
+        }
         if let Some(dashes) = self.said(tag, "stroke-dasharray") {
             state.dashes = if dashes.trim() == "none" {
                 String::new()
@@ -526,14 +539,16 @@ impl Walker<'_> {
             self.layers.push('\n');
         }
         self.layers.push_str(&format!(
-            "{fill}\t{stroke}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{fill}\t{stroke}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             state.stroke_width,
             state.cap,
             flat(d),
             flat(&state.transform),
             state.dashes,
             state.dash_offset,
-            state.join
+            state.join,
+            state.miter_limit,
+            if state.even_odd { "evenodd" } else { "nonzero" }
         ));
     }
 }
@@ -1285,13 +1300,23 @@ mod tests {
         let document = read(DOT).unwrap();
         assert_eq!(
             document.layers,
-            "#3b82f6ff\t\t1\tbutt\tM16 10a6 6 0 1 1 -12 0a6 6 0 1 1 12 0Z\t\t\t0\tmiter"
+            "#3b82f6ff\t\t1\tbutt\tM16 10a6 6 0 1 1 -12 0a6 6 0 1 1 12 0Z\t\t\t0\tmiter\t4\tnonzero"
         );
         let drawn = draw_svg(DOT.as_bytes(), (20, 20)).unwrap();
         assert_eq!((drawn.width, drawn.height), (20, 20));
         let middle = (10 * 20 + 10) * 4;
         assert_eq!(&drawn.pixels[middle..middle + 4], &[0x3b, 0x82, 0xf6, 255]);
         assert_eq!(&drawn.pixels[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_path_can_be_filled_by_the_even_odd_rule() {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><g fill-rule='evenodd'>\
+                   <path d='M0 0H20V20H0Z M5 5H15V15H5Z' fill='#000'/></g></svg>";
+        assert!(read(svg).unwrap().layers.ends_with("\tevenodd"));
+        let drawn = draw_svg(svg.as_bytes(), (20, 20)).unwrap();
+        assert_eq!(drawn.pixels[(2 * 20 + 2) * 4 + 3], 255);
+        assert_eq!(drawn.pixels[(10 * 20 + 10) * 4 + 3], 0, "the hole");
     }
 
     #[test]
@@ -1303,7 +1328,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             document.layers,
-            "\t#ff0000ff\t2\tbutt\tM0 0h4v4h-4Z\ttranslate(5 5) rotate(90) translate(-5 -5)\t\t0\tround"
+            "\t#ff0000ff\t2\tbutt\tM0 0h4v4h-4Z\ttranslate(5 5) rotate(90) translate(-5 -5)\t\t0\tround\t4\tnonzero"
         );
     }
 

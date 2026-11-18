@@ -2,6 +2,11 @@
 
 mod array;
 mod bigint;
+pub(crate) mod collate;
+#[rustfmt::skip]
+mod collate_han;
+#[rustfmt::skip]
+mod collate_tables;
 mod collections;
 mod date;
 pub(crate) mod disposal;

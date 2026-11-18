@@ -3856,7 +3856,7 @@ impl Vm {
         } else {
             Vec::new()
         };
-        let strict = self.protos[frame.proto as usize].strict;
+        let strict = self.protos[frame.proto as usize].strict();
         let shape = if strict || self.arguments_shape == NONE {
             self.realm.object_shape
         } else {
@@ -3930,7 +3930,7 @@ impl Vm {
     pub(crate) fn forgive_refusal(&mut self) -> bool {
         let refused = std::mem::replace(&mut self.write_refused, false);
         let frame = self.frames.last().expect("there's a frame running");
-        refused && !self.protos[frame.proto as usize].strict
+        refused && !self.protos[frame.proto as usize].strict()
     }
 
     pub(crate) fn tdz_error(&mut self, index: u16) -> Value {

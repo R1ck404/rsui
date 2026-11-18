@@ -260,6 +260,8 @@ pub(crate) struct Compiler<'a, 'v> {
     module: Option<crate::modules::ModuleInfo>,
     /// The source what's being compiled is in, by its number, for the text of its functions. See `source_text.rs`.
     source: u32,
+    /// Whether the file is one of the app's own, once that's been asked: see [`Compiler::jsx_factory`].
+    app_file: Option<bool>,
 }
 
 /// What a module's `export default` of something that isn't a declaration is kept in. No name that can be written is this.
@@ -932,7 +934,33 @@ impl<'a, 'v> Compiler<'a, 'v> {
             outer_strict: false,
             module: None,
             source: crate::source_text::NO_SOURCE,
+            app_file: None,
         }
+    }
+
+    /// What JSX calls here. The parser has an element call `__jsxMemo` or `__jsxPageMemo` where nothing says `'use no memo'`
+    /// (see `Parser::jsx_name`), which lets a component it makes skip rendering when it's given what does the same as last
+    /// time. That's only for an app's own files: one in `node_modules`, or code that isn't in a file, calls `__jsx` or
+    /// `__jsxPage`, as what's there was written to be rendered whenever what it's in is, as React has it. That's any mention of
+    /// the name there, so what defines `__jsxMemo` calls it by another.
+    fn jsx_factory(&mut self, name: &'a str) -> &'a str {
+        let plain = match name {
+            "__jsxMemo" => "__jsx",
+            "__jsxPageMemo" => "__jsxPage",
+            _ => return name,
+        };
+        if self.app_file() { name } else { plain }
+    }
+
+    /// Whether what's compiled is in one of the app's own files: a real path, outside `node_modules`.
+    fn app_file(&mut self) -> bool {
+        *self.app_file.get_or_insert_with(|| {
+            let path = std::path::PathBuf::from(self.vm.atom_text(self.file));
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|part| part.as_os_str().eq_ignore_ascii_case("node_modules"))
+        })
     }
 
     /// Says which source what's compiled is in, so each function can say what its text is.
@@ -1676,6 +1704,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
             captures.push(*capture);
             capture_names.push(self.vm.intern_str(name));
         }
+        let app_file = self.app_file();
         let proto = Proto {
             start,
             cache_base,
@@ -1684,7 +1713,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
             locals: (state.clear.min(state.max_reg) - 1 - params).min(u32::from(ALL_LOCALS)) as u8,
             length,
             flags,
-            strict: state.strict,
+            says: Proto::says_of(state.strict, function.no_memo, app_file),
             name,
             file: self.file,
             captures: captures.into_boxed_slice(),
@@ -1846,6 +1875,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
                 private_scopes,
             )
         };
+        let app_file = self.app_file();
         let waiting = Proto {
             start: NOT_COMPILED,
             cache_base: 0,
@@ -1854,7 +1884,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
             locals: 0,
             length,
             flags: flags | KEEPS_ARGS,
-            strict,
+            says: Proto::says_of(strict, function.no_memo, app_file),
             name,
             file: self.file,
             captures: captures.into_boxed_slice(),
@@ -2746,6 +2776,15 @@ impl<'a, 'v> Compiler<'a, 'v> {
             }
         }
         info.locals = locals.iter().map(|name| (*name).to_owned()).collect();
+        // A module that only passes on what others export runs no code of its own: what it imports and exports again
+        // is all there is to it.
+        info.only_reexports = locals.is_empty()
+            && body.iter().all(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Import(_) | Stmt::ExportFrom(_) | Stmt::Export(ExportName::List(_)) | Stmt::Line(_)
+                ) || matches!(statement, Stmt::Block(inner) if inner.is_empty())
+            });
         let mut vars = Vec::new();
         collect_vars(body, &mut vars);
         for (local, _) in &imported {
@@ -4474,6 +4513,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
             }
             Expr::Ident(name, line) => {
                 self.mark_line(*line);
+                let name = self.jsx_factory(name);
                 self.read_var(name, dst)?;
             }
             Expr::PrivateName(name) => {

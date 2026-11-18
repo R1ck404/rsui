@@ -16,6 +16,8 @@ use crate::font::{read_i16, read_u16, read_u32};
 
 /// One in 2.14 fixed point.
 const ONE: i32 = 1 << 14;
+/// The same in 16.16 fixed point, which a coordinate is worked out in before it's rounded to 2.14.
+const FIXED_ONE: i32 = 1 << 16;
 
 /// How many points a glyph can have for its variations to be worked out. A glyph can't have more than 65 535 points, and
 /// this leaves room for the four that only say where it starts and ends.
@@ -108,7 +110,10 @@ pub(crate) fn named_instances(fvar: &[u8]) -> Vec<NamedInstance> {
     .unwrap_or_default()
 }
 
-/// Where `value` is along an axis, from -1 at its least through 0 at its default to 1 at its most, in 2.14 fixed point.
+/// Where `value` is along an axis, from -1 at its least through 0 at its default to 1 at its most, in 16.16 fixed point.
+/// The specification works it out in that, and moves it through `avar` in that too, before it's rounded to the 2.14 that
+/// regions and tuples are in, as [`to_f2dot14`] does. HarfBuzz does, and so Edge: rounded to 2.14 first, a weight of 650 in
+/// Segoe UI Variable came out a 16384th short, which moved its kerning by a 200th of a unit.
 pub(crate) fn normalize(axis: &VariationAxis, value: f32) -> i32 {
     let value = if value.is_nan() {
         axis.default
@@ -122,10 +127,15 @@ pub(crate) fn normalize(axis: &VariationAxis, value: f32) -> i32 {
     } else {
         0.0
     };
-    (normal * ONE as f32).round() as i32
+    (normal * FIXED_ONE as f32).round() as i32
 }
 
-/// Moves a coordinate along one axis as `avar` says, if it has anything for that axis.
+/// A coordinate in 16.16 fixed point rounded to 2.14, as the specification has it.
+pub(crate) fn to_f2dot14(coordinate: i32) -> i32 {
+    ((coordinate + 2) >> 2).clamp(-ONE, ONE)
+}
+
+/// Moves a coordinate along one axis as `avar` says, if it has anything for that axis, both in 16.16 fixed point.
 pub(crate) fn map_through_avar(avar: &[u8], axis: usize, coordinate: i32) -> i32 {
     (|| {
         let count = read_u16(avar, 6)? as usize;
@@ -137,11 +147,12 @@ pub(crate) fn map_through_avar(avar: &[u8], axis: usize, coordinate: i32) -> i32
             at += 2 + read_u16(avar, at)? as usize * 4;
         }
         let maps = read_u16(avar, at)? as usize;
+        // Its points are in 2.14, which is a quarter of as many as 16.16.
         let pair = |index: usize| -> Option<(i32, i32)> {
             let record = at + 2 + index * 4;
             Some((
-                i32::from(read_i16(avar, record)?),
-                i32::from(read_i16(avar, record + 2)?),
+                i32::from(read_i16(avar, record)?) << 2,
+                i32::from(read_i16(avar, record + 2)?) << 2,
             ))
         };
         if maps == 0 {
@@ -163,13 +174,13 @@ pub(crate) fn map_through_avar(avar: &[u8], axis: usize, coordinate: i32) -> i32
         if before_from == from {
             return Some(before_to);
         }
-        let moved = before_to as f32
-            + (to - before_to) as f32 * (coordinate - before_from) as f32
-                / (from - before_from) as f32;
+        let moved = before_to as f64
+            + (to - before_to) as f64 * (coordinate - before_from) as f64
+                / (from - before_from) as f64;
         Some(moved.round() as i32)
     })()
     .unwrap_or(coordinate)
-    .clamp(-ONE, ONE)
+    .clamp(-FIXED_ONE, FIXED_ONE)
 }
 
 /// How much of what one region or tuple says applies, along one axis, as an item variation store reckons it.
@@ -275,16 +286,17 @@ impl Store<'_> {
     }
 }
 
-/// What one of `GPOS`'s device tables says its value changes by, rounded to whole units, if it's one that points into
-/// `GDEF`'s store rather than one for hinting.
-pub(crate) fn device_delta(table: &[u8], device: usize, store: Store<'_>) -> i32 {
+/// What one of `GPOS`'s device tables says its value changes by, if it's one that points into `GDEF`'s store rather than
+/// one for hinting. It's kept as the fraction of a unit it can be, as HarfBuzz keeps it, and so Edge: rounded to whole units,
+/// kerning was up to half of one off, which is 0.024 pixels a pair at 100 pixels in a font of 2048 units.
+pub(crate) fn device_delta(table: &[u8], device: usize, store: Store<'_>) -> f32 {
     match (
         read_u16(table, device),
         read_u16(table, device + 2),
         read_u16(table, device + 4),
     ) {
-        (Some(outer), Some(inner), Some(0x8000)) => store.delta(outer, inner).round() as i32,
-        _ => 0,
+        (Some(outer), Some(inner), Some(0x8000)) => store.delta(outer, inner),
+        _ => 0.0,
     }
 }
 
@@ -761,7 +773,7 @@ impl Variation {
             .enumerate()
             .map(|(index, (axis, &value))| {
                 let normal = normalize(axis, value);
-                avar.map_or(normal, |avar| map_through_avar(avar, index, normal))
+                to_f2dot14(avar.map_or(normal, |avar| map_through_avar(avar, index, normal)))
             })
             .collect();
         let scalars = |store: Option<&[u8]>| -> Vec<f32> {
@@ -801,18 +813,21 @@ mod tests {
     fn values_normalize_to_either_side_of_the_default() {
         let weight = axis(300.0, 400.0, 700.0);
         assert_eq!(normalize(&weight, 400.0), 0);
-        assert_eq!(normalize(&weight, 700.0), ONE);
-        assert_eq!(normalize(&weight, 300.0), -ONE);
-        assert_eq!(normalize(&weight, 350.0), -ONE / 2);
-        // 600 is two thirds of the way, rounded to the nearest 2.14 number.
-        assert_eq!(normalize(&weight, 600.0), 10923);
-        assert_eq!(normalize(&weight, 1000.0), ONE);
+        assert_eq!(normalize(&weight, 700.0), FIXED_ONE);
+        assert_eq!(normalize(&weight, 300.0), -FIXED_ONE);
+        assert_eq!(normalize(&weight, 350.0), -FIXED_ONE / 2);
+        // 600 is two thirds of the way, rounded to the nearest 16.16 number, and then to the nearest 2.14 one.
+        assert_eq!(normalize(&weight, 600.0), 43691);
+        assert_eq!(to_f2dot14(normalize(&weight, 600.0)), 10923);
+        assert_eq!(normalize(&weight, 1000.0), FIXED_ONE);
         assert_eq!(normalize(&weight, f32::NAN), 0);
         let size = axis(5.0, 10.5, 36.0);
         assert_eq!(
-            normalize(&size, 8.0),
+            to_f2dot14(normalize(&size, 8.0)),
             (-2.5f32 / 5.5 * 16384.0).round() as i32
         );
+        assert_eq!(to_f2dot14(-FIXED_ONE), -ONE);
+        assert_eq!(to_f2dot14(2), 1, "halfway rounds up");
     }
 
     /// An `avar` with one axis, mapping 0 to 0, two thirds to a half, and the ends to themselves, as Segoe UI
@@ -840,22 +855,29 @@ mod tests {
     #[test]
     fn avar_maps_between_its_points() {
         let avar = avar();
-        assert_eq!(map_through_avar(&avar, 0, 0), 0);
-        assert_eq!(map_through_avar(&avar, 0, 10923), 8192);
-        assert_eq!(map_through_avar(&avar, 0, ONE), ONE);
-        assert_eq!(map_through_avar(&avar, 0, -4096), -4096);
+        let map = |coordinate: i32| map_through_avar(&avar, 0, coordinate);
+        assert_eq!(map(0), 0);
+        assert_eq!(map(10923 << 2), 8192 << 2);
+        assert_eq!(map(FIXED_ONE), FIXED_ONE);
+        assert_eq!(map(-4096 << 2), -4096 << 2);
         // Halfway from two thirds to one is halfway from a half to one.
-        let between = (10923 + ONE) / 2;
-        assert!((map_through_avar(&avar, 0, between) - (8192 + ONE) / 2).abs() <= 1);
+        let between = ((10923 << 2) + FIXED_ONE) / 2;
+        assert!((map(between) - ((8192 << 2) + FIXED_ONE) / 2).abs() <= 1);
         // A third of the way to two thirds is a third of the way to a half.
-        assert_eq!(
-            map_through_avar(&avar, 0, 3641),
-            (8192.0f32 / 3.0).round() as i32
-        );
+        assert_eq!(to_f2dot14(map(3641 << 2)), (8192.0f32 / 3.0).round() as i32);
         // An axis with no points, or past the ones it lists, stays as it is.
         assert_eq!(map_through_avar(&avar, 1, 5000), 5000);
         assert_eq!(map_through_avar(&avar, 7, 5000), 5000);
         assert_eq!(map_through_avar(&[0, 1], 0, 5000), 5000);
+    }
+
+    #[test]
+    fn a_coordinate_is_rounded_to_2_14_only_after_avar() {
+        // A weight of 650 in Segoe UI Variable is 0.8333 of the way to its most, 13653 in 2.14, which `avar` maps to
+        // 12287.25, so 12287. In 16.16 all the way it's 12287.75, so 12288, as HarfBuzz has it.
+        let weight = axis(300.0, 400.0, 700.0);
+        let avar = avar();
+        assert_eq!(to_f2dot14(map_through_avar(&avar, 0, normalize(&weight, 650.0))), 12288);
     }
 
     #[test]

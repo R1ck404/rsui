@@ -15,7 +15,7 @@ use rsui_js::{Args, HostFunction, Value, Vm};
 
 use crate::bridge::node_value;
 
-pub(crate) const FUNCTIONS: [(&str, HostFunction); 23] = [
+pub(crate) const FUNCTIONS: [(&str, HostFunction); 24] = [
     ("treeNow", host_tree_now),
     ("stillNow", host_still_now),
     ("chainsNow", host_chains_now),
@@ -39,7 +39,34 @@ pub(crate) const FUNCTIONS: [(&str, HostFunction); 23] = [
     ("selectorReceiptSafeIntrinsics", crate::selector_receipt::safe_intrinsics),
     ("selectorReceiptSafePrograms", crate::selector_receipt::safe_programs),
     ("pageChainOf", host_page_chain_of),
+    ("nearView", host_near_view),
 ];
+
+/// `nearView(margin)`: the keys of the page's elements whose contents are being skipped (`content_skipped`, which `content-visibility:
+/// auto` gives them in `web.js`) that are within `margin` of being seen, in the window or what scrolls around them, as the window last
+/// laid them out. What's in a long list that scrolls is only looked at as far as its rows: see `Layout::near_view`.
+fn host_near_view(vm: &mut Vm, args: Args) -> Result<Value, Value> {
+    let margin = args.get(vm, 0).as_number();
+    let margin = if margin.is_finite() { margin.max(0.0) as f32 } else { 0.0 };
+    let skipped = symbol!("content_skipped");
+    let keys: Vec<String> = rsui::geometry::ask(|root, layout| {
+        let mut keys = Vec::new();
+        layout.near_view(
+            root,
+            margin,
+            &mut |node| node.props.get_symbol(skipped) == Some(&PropValue::Bool(true)),
+            &mut |_, node| {
+                if let Some(key) = dom_key(node) {
+                    keys.push(key.to_owned());
+                }
+            },
+        );
+        Some(keys)
+    })
+    .unwrap_or_default();
+    let items = keys.iter().map(|key| vm.new_string(key)).collect();
+    Ok(vm.new_array(items))
+}
 
 /// `treeNow()`: a number for the tree as it is now, which is another once anything in it has changed, for what keeps something it
 /// worked out from the tree for as long as it's the same.

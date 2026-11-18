@@ -8,6 +8,10 @@
 // Everything between them can be dragged to resize it, and the sidebar dragged narrower than it goes collapses to a rail of
 // icons. How it all looks is in Customize (Ctrl+K), with every other setting a click further.
 //
+// None of it knows how big the window is: it's all flex boxes, which the page lays out, and the panes are as big as their shares
+// of the splits they're in (src/Splits.tsx). So a window that's resized, or a handle that's dragged, moves everything at once,
+// while a share that changes, as when a pane's split or closed, glides there.
+//
 // Folders are read in one pass on another thread (rsui's `files.list`), only the rows on screen are drawn, and each row renders
 // again only when something about it changed: see src/Pane.tsx and src/List.tsx. How a tab's panes are laid out is
 // src/layout.ts.
@@ -26,8 +30,9 @@ import {
     remove, sideAt, smallest, splitId, tidy, withSizes, type Handle as HandleBox, type Layout, type Preset, type Rect, type Side,
 } from './src/layout';
 import type { Look } from './src/List';
-import { Pane, useStable, WINDOW_COMMANDS, type PaneReport } from './src/Pane';
-import { DockLayer, Handle, LayoutMenu, Notice, Slot } from './src/Panes';
+import { forgetPanes, Pane, useStable, WINDOW_COMMANDS, type PaneReport } from './src/Pane';
+import { DockLayer, LayoutMenu, Notice, Slot } from './src/Panes';
+import { Splits } from './src/Splits';
 import { Preview } from './src/Preview';
 import {
     COMMANDS, loadSession, loadSettings, saveSession, saveSettings, type Command, type PaneState, type Session, type Settings, type TabState,
@@ -57,8 +62,23 @@ const COLLAPSE_BELOW = 112;
 const EXPAND_ABOVE = 136;
 /** A window narrower than this has the sidebar collapsed, whatever it's set to, so the panes keep their room. */
 const RAIL_WINDOW = 760;
-/** How long panels are moving to new places, after a split or the like, before they go back to following what changes at once. */
-const MOVING_FOR = 420;
+
+/** Whether the window is narrower than `width`, as CSS's `@media (max-width)` has it, which is told again only when that changes. */
+function useNarrowerThan(width: number): boolean {
+    const query = `(max-width: ${width - 1}px)`;
+    const [narrow, setNarrow] = useState(() => window.matchMedia?.(query).matches === true);
+    useEffect(() => {
+        const media = window.matchMedia?.(query);
+        if (!media) {
+            return;
+        }
+        const changed = () => setNarrow(media.matches === true);
+        media.addEventListener('change', changed);
+        changed();
+        return () => media.removeEventListener('change', changed);
+    }, [query]);
+    return narrow;
+}
 
 let made = 0;
 const uid = () => Date.now().toString(36) + (made++).toString(36);
@@ -188,6 +208,8 @@ interface Dock {
     ok: boolean;
     why: string;
     rect: Rect | null;
+    /** How big the panes were, as laid out, for where it'd land. */
+    box: { w: number; h: number };
 }
 
 /** The place a dragged tab's held open among the panes. */
@@ -204,7 +226,7 @@ function App() {
     const [peek, setPeek] = useState<{ entry: PaneReport['entry']; count: number }>({ entry: null, count: 0 });
     const [dragging, setDragging] = useState<Dragging>({});
     const [dock, setDock] = useState<Dock | null>(null);
-    const [windowSize, setWindowSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+    const narrowWindow = useNarrowerThan(RAIL_WINDOW);
 
     // Settings and what's remembered
 
@@ -235,11 +257,6 @@ function App() {
     const colors = useMemo(() => colorsOf(settings, dark), [settings, dark]);
     applyVariables(cssVariables(settings, colors));
     useEffect(() => {
-        const resized = () => setWindowSize({ width: window.innerWidth, height: window.innerHeight });
-        window.addEventListener('resize', resized);
-        return () => window.removeEventListener('resize', resized);
-    }, []);
-    useEffect(() => {
         try {
             mainWindow.setBackdrop(settings.backdrop);
         } catch {
@@ -250,17 +267,6 @@ function App() {
     useEffect(() => {
         refreshDrives();
     }, []);
-
-    // Panels gliding to new places and sizes, for a moment after something's split, closed, collapsed or shown, and not otherwise:
-    // not while a window's resized or a handle dragged, which follow the pointer at once.
-    const [moving, setMoving] = useState(false);
-    const movingTimer = useRef<any>(null);
-    const glide = useCallback(() => {
-        setMoving(true);
-        clearTimeout(movingTimer.current);
-        movingTimer.current = setTimeout(() => setMoving(false), MOVING_FOR);
-    }, []);
-    useEffect(() => () => clearTimeout(movingTimer.current), []);
 
     // A note that goes by itself, as when there's no room to split a pane.
     const [notice, setNotice] = useState<string | null>(null);
@@ -317,27 +323,52 @@ function App() {
     const focused = tab.panes.find((one) => one.id === focusId)!;
     // Tabs down the side need a sidebar to be in; without one, they're along the top.
     const tabsOnSide = settings.tabsAt === 'side' && settings.showSidebar;
-    const narrowWindow = windowSize.width < RAIL_WINDOW;
     const rail = dragging.rail ?? (settings.sidebarCollapsed || narrowWindow);
     const sidebarWidth = !settings.showSidebar ? 0 : dragging.sidebar ?? (rail ? RAIL : settings.sidebarWidth);
     const previewWidth = settings.showPreview ? dragging.preview ?? settings.previewWidth : 0;
     const strip = settings.tabsAt === 'top' || !tabsOnSide ? 44 : 40;
-    const bodyHeight = Math.max(120, windowSize.height - strip - gap);
-    // The handles beside the sidebar and the preview are the gaps there, and one's there when the sidebar's hidden too, as the gap.
-    const panesWidth = Math.max(160, windowSize.width - sidebarWidth - gap - (settings.showPreview ? previewWidth + gap : 0) - gap);
     const view = tab;
     const viewFocus = focusOf(view);
     const layout = dragging.split ? withSizes(view.layout, dragging.split.id, dragging.split.sizes) : view.layout;
-    // With a tab over the panes, where it'd land: worked out as if it were there, and shown over them, which stay as they are.
+    // With a tab over the panes, where it'd land: worked out as if it were there, in the panes as big as they were laid out, and
+    // shown over them, which stay as they are.
     const landing = useMemo(() => {
         if (dock === null || !dock.over || !dock.ok || dock.target === null) {
             return null;
         }
         const after = dock.target === '*' ? beside(layout, pane(DOCK_ID), dock.side) : insert(layout, dock.target, pane(DOCK_ID), dock.side);
-        return place(after, { x: 0, y: 0, w: panesWidth, h: bodyHeight }, gap).panes.get(DOCK_ID) ?? null;
-    }, [dock, layout, panesWidth, bodyHeight, gap]);
-    const placed = useMemo(() => place(layout, { x: 0, y: 0, w: panesWidth, h: bodyHeight }, gap), [layout, panesWidth, bodyHeight, gap]);
-    const animate = moving && dragging.split === undefined && dragging.sidebar === undefined;
+        return place(after, { x: 0, y: 0, w: dock.box.w, h: dock.box.h }, gap).panes.get(DOCK_ID) ?? null;
+    }, [dock, layout, gap]);
+
+    // Where the panes are, as they were last laid out, from the top left of all of them: for which is beside which, whether
+    // there's room to split one, and where a tab dragged over them is.
+    const panesBox = useRef<any>(null);
+    const paneElements = useRef(new Map<string, any>());
+    const placedPane = useStable((id: string, element: any, there: boolean) => {
+        if (there) {
+            paneElements.current.set(id, element);
+        } else if (paneElements.current.get(id) === element) {
+            paneElements.current.delete(id);
+        }
+    });
+    const panesSize = (): { w: number; h: number } => {
+        const box = panesBox.current?.getBoundingClientRect?.();
+        return box ? { w: box.width, h: box.height } : { w: 0, h: 0 };
+    };
+    const paneRects = (): Map<string, Rect> => {
+        const rects = new Map<string, Rect>();
+        const box = panesBox.current?.getBoundingClientRect?.();
+        if (!box) {
+            return rects;
+        }
+        for (const [id, element] of paneElements.current) {
+            const rect = element?.getBoundingClientRect?.();
+            if (rect) {
+                rects.set(id, { x: rect.left - box.left, y: rect.top - box.top, w: rect.width, h: rect.height });
+            }
+        }
+        return rects;
+    };
 
     // Tabs, and the panes in each
 
@@ -354,6 +385,10 @@ function App() {
             firsts.current.delete(id);
         }
     }
+    // What a pane keeps while it's moved from one split to another is let go once it's in no tab at all.
+    useEffect(() => {
+        forgetPanes(new Set(tabs.flatMap((one) => one.panes.map((p) => p.id))));
+    }, [tabs]);
     const initialOf = (state: PaneState) => {
         if (!firsts.current.has(state.id)) {
             firsts.current.set(state.id, state);
@@ -368,7 +403,7 @@ function App() {
 
     /** Where a pane beside `target` can go: on `side` if there's room, or the other way if there's room for that, or nowhere. */
     const roomFor = (target: string, side: Side, node: Layout = pane('')): Side | null => {
-        const rect = placed.panes.get(target);
+        const rect = paneRects().get(target);
         if (fits(rect, side, gap, node)) {
             return side;
         }
@@ -378,7 +413,8 @@ function App() {
     const presetFits = (preset: Preset) => {
         const count = PRESETS.find((one) => one.id === preset)?.count ?? 1;
         const shape = presetLayout(preset, Array.from({ length: count }, (_, at) => String(at)));
-        return smallest(shape, 'row', gap) <= panesWidth && smallest(shape, 'column', gap) <= bodyHeight;
+        const room = panesSize();
+        return smallest(shape, 'row', gap) <= room.w && smallest(shape, 'column', gap) <= room.h;
     };
 
     const act = {
@@ -420,7 +456,6 @@ function App() {
             }
             const made = paneAt(path ?? folderOf(tab.panes.find((one) => one.id === target)));
             fresh.current.add(made.id);
-            glide();
             withTab((one) => ({ ...one, panes: [...one.panes, made], layout: insert(one.layout, target, pane(made.id), where), focus: made.id }));
             return true;
         },
@@ -433,7 +468,6 @@ function App() {
                 return;
             }
             const takes = heir(tab.layout, id) ?? paneIds(next)[0];
-            glide();
             withTab((one) => ({ ...one, panes: one.panes.filter((p) => p.id !== id), layout: next, focus: one.focus === id ? takes : one.focus }));
         },
         preset: (preset: Preset) => {
@@ -451,7 +485,6 @@ function App() {
             const added = Array.from({ length: count - keep.length }, () => paneAt(folderOf(focused)));
             added.forEach((one) => fresh.current.add(one.id));
             const next = presetLayout(preset, [...keep, ...added.map((one) => one.id)]);
-            glide();
             withTab((one) => ({
                 ...one,
                 panes: [...one.panes.filter((p) => keep.includes(p.id)), ...added],
@@ -460,7 +493,6 @@ function App() {
             }));
         },
         even: () => {
-            glide();
             withTab((one) => ({ ...one, layout: evened(one.layout) }));
         },
         focus: (id: string) => withTab((one) => (one.focus === id || !one.panes.some((p) => p.id === id) ? one : { ...one, focus: id })),
@@ -469,17 +501,15 @@ function App() {
             act.focus(order[(order.indexOf(focusId) + 1) % order.length]);
         },
         paneToward: (side: Side) => {
-            const next = neighbor(placed.panes, focusId, side);
+            const next = neighbor(paneRects(), focusId, side);
             if (next) {
                 act.focus(next);
             }
         },
         sidebar: () => {
-            glide();
             change('showSidebar', !settings.showSidebar);
         },
         collapse: () => {
-            glide();
             if (!settings.showSidebar) {
                 change('showSidebar', true);
                 return;
@@ -491,17 +521,18 @@ function App() {
             change('sidebarCollapsed', !settings.sidebarCollapsed);
         },
         preview: () => {
-            glide();
             change('showPreview', !settings.showPreview);
         },
     };
 
     // A tab being dragged: where it'd go, from where the pointer is over the panes, as they are without it.
-    const panesBox = useRef<any>(null);
     const dockAt = (at: { index: number; x: number; y: number }): Dock => {
         const from = tabs[at.index];
-        const none: Dock = { index: at.index, id: from?.id ?? '', over: false, target: null, side: 'right', ok: false, why: '', rect: null };
         const box = panesBox.current?.getBoundingClientRect?.();
+        const none: Dock = {
+            index: at.index, id: from?.id ?? '', over: false, target: null, side: 'right', ok: false, why: '', rect: null,
+            box: { w: box?.width ?? 0, h: box?.height ?? 0 },
+        };
         // Over the panes only while they're shown: not behind the settings.
         if (!from || !box || latest.current?.overlay === 'settings') {
             return none;
@@ -509,7 +540,7 @@ function App() {
         const node = from.layout;
         const count = from.panes.length;
         const [x, y] = [at.x - box.left, at.y - box.top];
-        const whole = { x: 0, y: 0, w: panesWidth, h: bodyHeight };
+        const whole = { x: 0, y: 0, w: box.width, h: box.height };
         if (x < 0 || y < 0 || x >= whole.w || y >= whole.h) {
             return none;
         }
@@ -521,7 +552,7 @@ function App() {
         if (into.panes.length + count > MAX_PANES) {
             return { ...none, over: true, rect: whole, side: sideAt(whole, x, y), why: `A tab can have ${MAX_PANES} panes at most` };
         }
-        const rects = place(into.layout, whole, gap).panes;
+        const rects = paneRects();
         // Near the outer edge of several panes, it goes beside all of them.
         const edge = Math.min(x, y, whole.w - x, whole.h - y) < DOCK_EDGE;
         if (edge && into.panes.length > 1) {
@@ -615,7 +646,8 @@ function App() {
                 was !== null &&
                 next !== null &&
                 (['index', 'id', 'over', 'target', 'side', 'ok', 'why'] as const).every((key) => was[key] === next[key]) &&
-                JSON.stringify(was.rect) === JSON.stringify(next.rect);
+                JSON.stringify(was.rect) === JSON.stringify(next.rect) &&
+                JSON.stringify(was.box) === JSON.stringify(next.box);
             if (!same && !(was === null && next === null)) {
                 latest.current.dock = next;
                 setDock(next);
@@ -636,7 +668,6 @@ function App() {
                 return;
             }
             from.panes.forEach((one) => fresh.current.add(one.id));
-            glide();
             setTabs((was) => {
                 const moving = was.tabs.find((one) => one.id === from.id);
                 const host = was.tabs[was.active];
@@ -735,9 +766,6 @@ function App() {
             const raw = base.current.width + by;
             const wasRail = dragging.rail ?? base.current.rail;
             const nowRail = wasRail ? raw < EXPAND_ABOVE : raw < COLLAPSE_BELOW;
-            if (nowRail !== wasRail) {
-                glide();
-            }
             setDragging({
                 sidebar: nowRail ? RAIL : Math.round(Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, raw))),
                 rail: nowRail,
@@ -778,7 +806,6 @@ function App() {
         handleReset: useStable((handle: HandleBox) => {
             const split = findSplit(tab.layout, handle.split);
             if (!split) return;
-            glide();
             withTab((one) => ({ ...one, layout: withSizes(one.layout, handle.split, split.children.map(() => 1)) }));
         }),
     };
@@ -815,7 +842,36 @@ function App() {
     );
     const stroke = settings.iconStroke + 0.15;
     const several = tab.panes.length > 1;
-    const focusRect = placed.panes.get(focusId);
+    // Where the pane with the keyboard is, as it was laid out, for whether the layout menu can split it.
+    const focusRect = overlay === 'layout' ? paneRects().get(focusId) : undefined;
+    const drawPane = (id: string) => {
+        const state = view.panes.find((one) => one.id === id);
+        if (!state) {
+            return null;
+        }
+        return (
+            <Slot fresh={fresh.current.has(state.id)}>
+                <Pane
+                    initial={initialOf(state)}
+                    settings={settings}
+                    session={session}
+                    drives={drives}
+                    look={look}
+                    active={state.id === viewFocus}
+                    keysOff={overlay !== 'none'}
+                    marked={view.panes.length > 1 && state.id === viewFocus}
+                    change={change}
+                    updateSession={updateSession}
+                    onReport={on.report}
+                    onActivate={on.activate}
+                    onOpenTab={on.openTab}
+                    onOpenSplit={on.openSplit}
+                    onClose={view.panes.length > 1 ? on.closePane : undefined}
+                    onRefreshDrives={refreshDrives}
+                />
+            </Slot>
+        );
+    };
 
     return (
         <div className={'relative flex h-screen flex-col overflow-hidden bg-(--fx-frame) text-(--fx-text) ' + (dark ? 'dark' : '')}>
@@ -854,7 +910,8 @@ function App() {
                             drives={drives}
                             width={sidebarWidth}
                             rail={rail}
-                            animate={moving}
+                            // It follows the pointer while it's dragged, but glides into the rail.
+                            animate={dragging.sidebar === undefined || dragging.rail === true}
                             order={session.sidebarOrder ?? NO_ORDER}
                             tabs={tabsOnSide ? tabList : undefined}
                             onOpen={on.open}
@@ -870,61 +927,25 @@ function App() {
                             onDone={resize.sidebarDone}
                             onReset={resize.sidebarReset}
                         />
-                        <div
-                            ref={panesBox}
-                            className={'relative shrink-0 self-start ' + (moving ? 'transition-[width] duration-(--fx-move) ease-(--fx-ease)' : '')}
-                            style={{ width: panesWidth, height: bodyHeight }}
-                        >
-                            {view.panes.map((state) => {
-                                const rect = placed.panes.get(state.id);
-                                if (!rect) {
-                                    return null;
-                                }
-                                return (
-                                    <Slot key={state.id} rect={rect} animate={animate} fresh={fresh.current.has(state.id)}>
-                                        <Pane
-                                            initial={initialOf(state)}
-                                            settings={settings}
-                                            session={session}
-                                            drives={drives}
-                                            look={look}
-                                            active={state.id === viewFocus}
-                                            keysOff={overlay !== 'none'}
-                                            width={rect.w}
-                                            height={rect.h}
-                                            animate={animate}
-                                            marked={view.panes.length > 1 && state.id === viewFocus}
-                                            change={change}
-                                            updateSession={updateSession}
-                                            onReport={on.report}
-                                            onActivate={on.activate}
-                                            onOpenTab={on.openTab}
-                                            onOpenSplit={on.openSplit}
-                                            onClose={view.panes.length > 1 ? on.closePane : undefined}
-                                            onRefreshDrives={refreshDrives}
-                                        />
-                                    </Slot>
-                                );
-                            })}
-                            {placed.handles.map((handle) => (
-                                <Handle
-                                    key={handle.split + ':' + handle.index}
-                                    handle={handle}
-                                    animate={animate}
-                                    onStart={resize.handleStart}
-                                    onMove={resize.handleMove}
-                                    onDone={resize.handleDone}
-                                    onReset={resize.handleReset}
-                                />
-                            ))}
+                        <div ref={panesBox} className="relative flex min-h-0 min-w-[160px] flex-1">
+                            <Splits
+                                layout={layout}
+                                gap={gap}
+                                held={dragging.split?.id ?? null}
+                                fresh={(id) => fresh.current.has(id)}
+                                pane={drawPane}
+                                placed={placedPane}
+                                onStart={resize.handleStart}
+                                onMove={resize.handleMove}
+                                onDone={resize.handleDone}
+                                onReset={resize.handleReset}
+                            />
                             {/* Only a tab that could go there shows they're somewhere it can go: not the one that's open. */}
                             <DockLayer
                                 lifting={dock !== null && dock.id !== tab.id}
                                 landing={landing}
                                 refused={dock && dock.over && !dock.ok && dock.why && dock.rect ? { rect: dock.rect, why: dock.why } : null}
                                 what={dock && views[dock.index] ? { icon: views[dock.index].icon, title: views[dock.index].title } : null}
-                                width={panesWidth}
-                                height={bodyHeight}
                             />
                         </div>
                         {settings.showPreview ? (

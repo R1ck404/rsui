@@ -20,6 +20,11 @@ globalThis.__Fragment = Fragment;
 // Rust walks it as it would the list itself (`child_in` in bridge.rs).
 globalThis.__Reordered = Object.freeze({ reordered: true });
 
+// What a component's element says when the app's own JSX didn't make it, as when a library did (see `__jsxMemo`): it's only the
+// same as itself when it's in what another component's given, as what it holds may have been changed in place, as TanStack
+// Table's cells have it (see `Vm::props_equivalent`).
+const NOT_KEPT = Symbol('rsui.notKept');
+
 globalThis.__jsx = function (type, props, kids, mayHaveKey) {
     const key = mayHaveKey === true ? props.key : undefined;
     if (typeof type === 'function' && type !== Fragment) {
@@ -28,7 +33,7 @@ globalThis.__jsx = function (type, props, kids, mayHaveKey) {
         } else if (props === null) {
             props = NO_PROPS;
         }
-        return { type, key, props, kids: null };
+        return { type, key, props, kids: null, memo: NOT_KEPT };
     }
     // A context is its own provider, as `<Theme value="dark">`, which is how React 19 has it.
     if (typeof type === 'object' && type !== null && typeof type.Provider === 'function') {
@@ -36,6 +41,25 @@ globalThis.__jsx = function (type, props, kids, mayHaveKey) {
     }
     return { type, key, props, kids };
 };
+
+// What JSX in an app's own files calls, where nothing says 'use no memo': `__jsx`, with a component's element marked `memo`, so
+// that it doesn't render again when what it's given does the same as before, as React Compiler has it by keeping the element
+// (see `JsProps` in bridge.rs). Elements made anywhere else, as in `node_modules`, are as `__jsx` has them.
+// It's called by a name of its own here, as the compiler takes `__jsxMemo` in a file that isn't the app's, as this one, to be `__jsx`.
+function jsxMemo(type, props, kids, mayHaveKey) {
+    if (typeof type !== 'function' || type === Fragment) {
+        return __jsx(type, props, kids, mayHaveKey);
+    }
+    const key = mayHaveKey === true ? props.key : undefined;
+    if (kids !== undefined && kids !== null && kids.length > 0) {
+        props = { ...props, children: kids.length === 1 ? kids[0] : kids };
+    } else if (props === null) {
+        props = NO_PROPS;
+    }
+    return { type, key, props, kids: null, memo: true };
+}
+
+globalThis.__jsxMemo = jsxMemo;
 
 // What JSX calls in a file written for a page, which has a tag rsui has too, as a `<button>` beside a `<div>`: each of a page's tags
 // is the page's, drawn as its CSS says, and anything else is as `__jsx` has it. `rsui/web` is loaded the first time.
@@ -45,6 +69,14 @@ globalThis.__jsxPage = function (type, props, kids, mayHaveKey) {
         type = pageElement(type) ?? type;
     }
     return __jsx(type, props, kids, mayHaveKey);
+};
+
+globalThis.__jsxPageMemo = function (type, props, kids, mayHaveKey) {
+    if (typeof type === 'string') {
+        pageElement ??= require('rsui/web').__pageElement;
+        type = pageElement(type) ?? type;
+    }
+    return jsxMemo(type, props, kids, mayHaveKey);
 };
 
 // What `import './app.css'` does: the page's CSS, as a bundler has it, which is `rsui/web`'s. `import styles from './a.module.css'`
@@ -1721,13 +1753,17 @@ function pathOf(type, props) {
     }
     if (type === Rect) {
         const [x, y, width, height] = [n(props.x), n(props.y), n(props.width), n(props.height)];
-        const radius = Math.min(n(props.rx ?? props.radius), width / 2, height / 2);
-        if (radius <= 0) {
+        // Its corners' radii across and down, either of which is the other when only one's said, as SVG has them.
+        const saidX = props.rx ?? props.radius ?? props.ry;
+        const saidY = props.ry ?? props.rx ?? props.radius;
+        const rx = Math.min(n(saidX), width / 2);
+        const ry = Math.min(n(saidY), height / 2);
+        if (!(rx > 0 && ry > 0)) {
             return `M${x} ${y}h${width}v${height}h${-width}Z`;
         }
-        const r = `a${radius} ${radius} 0 0 1`;
-        const [across, down] = [width - 2 * radius, height - 2 * radius];
-        return `M${x + radius} ${y}h${across}${r} ${radius} ${radius}v${down}${r} ${-radius} ${radius}h${-across}${r} ${-radius} ${-radius}v${-down}${r} ${radius} ${-radius}Z`;
+        const r = `a${rx} ${ry} 0 0 1`;
+        const [across, down] = [width - 2 * rx, height - 2 * ry];
+        return `M${x + rx} ${y}h${across}${r} ${rx} ${ry}v${down}${r} ${-rx} ${ry}h${-across}${r} ${-rx} ${-ry}v${-down}${r} ${rx} ${-ry}Z`;
     }
     if (type === Circle || type === Ellipse) {
         const [cx, cy] = [n(props.cx), n(props.cy)];
@@ -1774,8 +1810,10 @@ function addLayers(kids, around, layers) {
         return;
     }
     const props = kids.props ?? NO_PROPS;
+    // What's in it, which an element written in lower case, as a page's `<g>` is, keeps by itself rather than in its props.
+    const inside = kids.kids ?? props.children;
     if (kids.type === Fragment) {
-        addLayers(kids.kids ?? props.children, around, layers);
+        addLayers(inside, around, layers);
         return;
     }
     // What's in the picture, as a page has it as elements, for what asks about them, which `around.found` is told.
@@ -1799,6 +1837,8 @@ function addLayers(kids, around, layers) {
         strokeWidth: part.strokeWidth ?? props.strokeWidth ?? around.strokeWidth,
         strokeLinecap: part.strokeLinecap ?? props.strokeLinecap ?? around.strokeLinecap,
         strokeLinejoin: part.strokeLinejoin ?? props.strokeLinejoin ?? around.strokeLinejoin,
+        strokeMiterlimit: part.strokeMiterlimit ?? props.strokeMiterlimit ?? around.strokeMiterlimit,
+        fillRule: part.fillRule ?? props.fillRule ?? around.fillRule,
         strokeDasharray: part.strokeDasharray ?? props.strokeDasharray ?? around.strokeDasharray,
         strokeDashoffset: part.strokeDashoffset ?? props.strokeDashoffset ?? around.strokeDashoffset,
         textAnchor: part.textAnchor ?? props.textAnchor ?? around.textAnchor,
@@ -1814,7 +1854,7 @@ function addLayers(kids, around, layers) {
     // Its font, as CSS and its attributes say, passed down as SVG's text properties are.
     own.font = svgFont(around.font, part, props);
     if (shape === G || SVG_GROUPS.has(shape)) {
-        addLayers(props.children, own, layers);
+        addLayers(inside, own, layers);
         return;
     }
     // A `<tspan>` is drawn by the `<text>` it's in, and is only gone through here for what's in the picture.
@@ -1823,7 +1863,7 @@ function addLayers(kids, around, layers) {
             addText(props, own, layers);
         }
         if (at >= 0) {
-            addLayers(props.children, { ...own, found: around.found, foundAt: at }, []);
+            addLayers(inside, { ...own, found: around.found, foundAt: at }, []);
         }
         return;
     }
@@ -1837,7 +1877,7 @@ function addLayers(kids, around, layers) {
                 console.warn(`rsui: <${shape}> in an <svg> can't be drawn here, so it's left out`);
             }
             if (at >= 0) {
-                addLayers(props.children, { ...own, found: around.found, foundAt: at }, []);
+                addLayers(inside, { ...own, found: around.found, foundAt: at }, []);
             }
             return;
         }
@@ -1845,7 +1885,9 @@ function addLayers(kids, around, layers) {
     }
     const fill = own.fill === undefined ? 'currentColor' : colorText(own.fill);
     const offset = parseFloat(own.strokeDashoffset ?? 0);
-    const line = [fill, colorText(own.stroke), own.strokeWidth ?? 1, own.strokeLinecap ?? 'butt', d, own.transform ?? '', dashText(own.strokeDasharray), Number.isFinite(offset) ? offset : 0, own.strokeLinejoin ?? 'miter'];
+    // How far a mitred corner reaches before it's bevelled, in widths of the line, which is 4 unless it says.
+    const limit = parseFloat(own.strokeMiterlimit ?? 4);
+    const line = [fill, colorText(own.stroke), own.strokeWidth ?? 1, own.strokeLinecap ?? 'butt', d, own.transform ?? '', dashText(own.strokeDasharray), Number.isFinite(offset) ? offset : 0, own.strokeLinejoin ?? 'miter', Number.isFinite(limit) && limit >= 1 ? limit : 4, own.fillRule === 'evenodd' ? 'evenodd' : 'nonzero'];
     layers.push(line.join('\t').replace(/\n/g, ' '));
 }
 
@@ -1972,7 +2014,7 @@ const svgSaid = new Set();
 
 /// A shape: `<Svg viewBox="0 0 24 24"><Path d="M2 2H22V22Z" /></Svg>`. `fill`, `stroke`, `strokeWidth` and `strokeLinecap` go
 /// on what's inside or on this, for all of it. `currentColor`, which is what fills if nothing says, is this one's `color`.
-function Svg({ viewBox, fill, stroke, strokeWidth, strokeLinecap, strokeLinejoin, strokeDasharray, strokeDashoffset, preserveAspectRatio, __parts: parts, __elements: told, children, ...props }) {
+function Svg({ viewBox, fill, fillRule, stroke, strokeWidth, strokeLinecap, strokeLinejoin, strokeMiterlimit, strokeDasharray, strokeDashoffset, preserveAspectRatio, __parts: parts, __elements: told, children, ...props }) {
     // The components in it render with it, keeping their hooks: see `svgExpanded`. A picture with none, as an icon is, is read
     // as it's written.
     const instance = current;
@@ -1993,7 +2035,7 @@ function Svg({ viewBox, fill, stroke, strokeWidth, strokeLinecap, strokeLinejoin
     // What's in it, each with what it's in, for a page's `<svg>`, whose elements code can look for.
     const found = told === undefined ? undefined : [];
     const font = { fontSize: props.fontSize, fontFamily: props.fontFamily, fontWeight: props.fontWeight, fontStyle: props.fontStyle };
-    addLayers(children, { fill, stroke, strokeWidth, strokeLinecap, strokeLinejoin, strokeDasharray, strokeDashoffset, parts, moves, found, foundAt: -1, font }, layers);
+    addLayers(children, { fill, fillRule, stroke, strokeWidth, strokeLinecap, strokeLinejoin, strokeMiterlimit, strokeDasharray, strokeDashoffset, parts, moves, found, foundAt: -1, font }, layers);
     told?.(found);
     // Stretched to fill its box either way, rather than kept as it's shaped, as SVG's `preserveAspectRatio="none"` says.
     if (preserveAspectRatio === 'none') {
@@ -2930,7 +2972,7 @@ function newClickEvent(within, info) {
 // What's listening on a page's `document` and `window`, from 'rsui/web', if that's been loaded.
 let documentHeard = null;
 
-globalThis.__rsuiInternals = { rejected, setTracing(on) { tracing = on; }, describeHooks, restoreState, desktopEvent: (id, value) => desktopEvents?.(id, value), webDescription, newClickEvent, newEvent, rsuiEvents: (given) => require('rsui/events').rsuiEvents(given), documentEvent: (kind, event, prevented) => documentHeard?.(kind, event, prevented), passClick: PASS_CLICK, pasted, colorSchemeChanged, windowResized, WindowRoot, newInstance, render, flushEffects, commitEffects, unmount, setReloading(on) { reloading = on; } };
+globalThis.__rsuiInternals = { rejected, setTracing(on) { tracing = on; }, describeHooks, restoreState, desktopEvent: (id, value) => desktopEvents?.(id, value), webDescription, newClickEvent, newEvent, rsuiEvents: (given) => require('rsui/events').rsuiEvents(given), documentEvent: (kind, event, prevented) => documentHeard?.(kind, event, prevented), passClick: PASS_CLICK, notKept: NOT_KEPT, pasted, colorSchemeChanged, windowResized, WindowRoot, newInstance, render, flushEffects, commitEffects, unmount, setReloading(on) { reloading = on; } };
 
 /// A promise that was rejected with nothing to catch it, once everything that was waiting has run, as Rust says. The window hears
 /// `unhandledrejection` about it, as a browser's does, and it's logged unless something there calls `preventDefault()`. The app
@@ -3257,6 +3299,16 @@ module.exports = {
     __pagePortal: (children, key) => __jsx(PagePortal, { children, key }, null, key !== undefined && key !== null),
     __desktopEvents(hear) {
         desktopEvents = hear;
+    },
+    // For 'rsui/web', which Rust tells when a window comes to the front or goes behind another, or is minimized or brought back.
+    // A real window's state is the system's, which may say so already; one that's only in memory, as in a test, is what this says
+    // it is now. Either way what's listening hears it if it's changed.
+    __windowChanged(id, changes) {
+        const real = host.windowState(id);
+        if (real === null || real === undefined) {
+            Object.assign(windowKnown(id), changes);
+        }
+        windowStateChanged(id);
     },
     // For `rsui/dom-globals`' `matchMedia`, which is told when the system goes from light to dark or back.
     __onColorScheme(hear) {

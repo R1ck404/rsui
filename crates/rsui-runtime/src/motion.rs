@@ -24,6 +24,16 @@
 //! 1 opacity n 1
 //! ```
 //!
+//! `starting` says where an element's transitions start from when it's first shown, as CSS's `@starting-style` does: one prop
+//! to a line, its name, its kind and its value, as an `animation`'s keyframes have them. It's only for what wasn't there to
+//! be seen before, or is in the place of something that said it was `unshown` (`display: none`), and not for what's there
+//! from the first: that has nothing to move from, and doesn't.
+//!
+//! ```text
+//! opacity n 0
+//! transform s scale(0.95)
+//! ```
+//!
 //! What's drawn is what's moving, and the element keeps what it says it is underneath, to go back to.
 
 use std::sync::{Arc as StdArc, LazyLock};
@@ -35,11 +45,15 @@ use triomphe::Arc;
 struct Names {
     transitions: Symbol,
     animation: Symbol,
+    starting: Symbol,
+    unshown: Symbol,
 }
 
 static NAMES: LazyLock<Names> = LazyLock::new(|| Names {
     transitions: Symbol::new("transitions"),
     animation: Symbol::new("animation"),
+    starting: Symbol::new("starting"),
+    unshown: Symbol::new("unshown"),
 });
 
 /// Displayed values may differ from the last declared target. Such nodes must
@@ -74,6 +88,29 @@ impl Kind {
             _ => None,
         }
     }
+
+    /// A value of this kind, as a keyframe or `starting` writes it.
+    fn value(self, text: &str) -> Option<PropValue> {
+        Some(match self {
+            Self::Number => PropValue::Float(text.parse().ok()?),
+            Self::Color => PropValue::Int(text.parse().ok()?),
+            Self::Text => PropValue::from(text),
+            // A line each, which are `;` between here.
+            Self::Shadows => PropValue::from(text.replace(';', "\n").as_str()),
+        })
+    }
+}
+
+/// Where `starting` says a prop starts from, if it says.
+fn starting_value(text: &str, prop: Symbol) -> Option<PropValue> {
+    text.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ' ');
+        let (name, kind) = (parts.next()?, parts.next()?);
+        if name != prop.as_str() {
+            return None;
+        }
+        Kind::parse(kind)?.value(parts.next()?.trim())
+    })
 }
 
 /// How something speeds up and slows down, as CSS's timing functions say.
@@ -794,13 +831,7 @@ impl Plan {
             let (Ok(offset), Some(kind)) = (offset.parse::<f64>(), Kind::parse(kind)) else {
                 continue;
             };
-            let value = match kind {
-                Kind::Number => PropValue::Float(value.parse().ok()?),
-                Kind::Color => PropValue::Int(value.parse().ok()?),
-                Kind::Text => PropValue::from(value),
-                // A line each, which are `;` between here.
-                Kind::Shadows => PropValue::from(value.replace(';', "\n").as_str()),
-            };
+            let value = kind.value(value)?;
             let name = Symbol::new(name);
             match props.iter_mut().find(|(prop, _, _)| *prop == name) {
                 Some((_, _, frames)) => frames.push((offset.clamp(0.0, 1.0), value)),
@@ -1163,6 +1194,14 @@ pub(crate) struct Motions {
     pub(crate) ended: Vec<(Vec<u32>, Option<Key>, Text)>,
     /// What's started or stopped moving, as `ended` has it, held until everything that's changing has been drawn.
     pub(crate) held: Vec<(Vec<u32>, Option<Key>, Text)>,
+    /// Whether a transition or an animation would have moved since this was last asked, but went straight to where it was
+    /// going, as nothing moves: for telling an agent that `animations on` would show it (see [`Runtime::motion_skipped`]).
+    ///
+    /// [`Runtime::motion_skipped`]: crate::Runtime::motion_skipped
+    pub(crate) skipped: bool,
+    /// Whether what's being seen to is the tree as it was to begin with, whose elements were there from the first, and don't
+    /// start from what `starting` says.
+    first_look: bool,
 }
 
 /// What something offers to hear that it's finished moving, as CSS's `transitionend` and `animationend` are.
@@ -1223,8 +1262,10 @@ impl Motions {
         if let Some(old) = old {
             self.rebase(path, old, new);
         }
+        self.first_look = old.is_none();
         let mut at = path.to_vec();
         self.visit(&mut at, old, new, now, moving);
+        self.first_look = false;
     }
 
     /// Keyed siblings can change position while the same CSS animation keeps
@@ -1461,6 +1502,9 @@ impl Motions {
                     // With nothing moving, it's finished as soon as it starts, which what's waiting for that hears.
                     let started_now = old.and_then(|old| old.props.get_symbol(NAMES.animation))
                         != animation;
+                    if !moving && started_now && !plan.duration.is_zero() && !plan.props.is_empty() {
+                        self.skipped = true;
+                    }
                     if !moving
                         && started_now
                         && plan.times.is_finite()
@@ -1485,6 +1529,14 @@ impl Motions {
             _ => Vec::new(),
         };
         let mut changes: Vec<(Symbol, PropValue)> = Vec::new();
+        // What's just been made, or is shown in the place of what wasn't (`display: none`), has nothing to move from but what
+        // `starting` says, as CSS Transitions 2 has it.
+        let fresh = !self.first_look
+            && old.is_none_or(|old| old.props.get_symbol(NAMES.unshown).is_some());
+        let starting = match new.props.get_symbol(NAMES.starting) {
+            Some(PropValue::Str(text)) if fresh => Some(text.clone()),
+            _ => None,
+        };
         // What's told it's stopped and started, by the CSS properties each stands for, told once each, after this.
         let mut cancelled: Vec<String> = Vec::new();
         let mut started: Vec<String> = Vec::new();
@@ -1500,6 +1552,9 @@ impl Motions {
             let shown = old.and_then(|old| old.props.get_symbol(rule.prop)).cloned();
             // What wasn't there before only moves from what it is when nothing says, if that's known.
             let shown = match (&shown, old) {
+                _ if fresh => starting
+                    .as_ref()
+                    .and_then(|text| starting_value(text.as_str(), rule.prop)),
                 (None, Some(_)) => when_unsaid(rule.kind, rule.prop),
                 _ => shown,
             };
@@ -1509,7 +1564,7 @@ impl Motions {
             // What's on its way is where it's got to by now, as CSS has a running transition's value, rather than where it was
             // last drawn: the keyboard leaving a button before a frame was drawn turns its ring back from where it had got to.
             let shown = match existing {
-                Some(index) if moving => self.places[index]
+                Some(index) if moving && !fresh => self.places[index]
                     .moved_values_at(now)
                     .0
                     .into_iter()
@@ -1538,6 +1593,13 @@ impl Motions {
                     self.places.remove(index);
                 }
                 // With nothing moving, what would have moved is where it's going at once, and that's the end of it.
+                if !moving
+                    && !rule.duration.is_zero()
+                    && shown != target
+                    && between(rule.kind, &shown, &target, 0.5).is_some()
+                {
+                    self.skipped = true;
+                }
                 if !moving
                     && !rule.duration.is_zero()
                     && shown != target

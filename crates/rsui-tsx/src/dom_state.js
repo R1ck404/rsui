@@ -5,7 +5,7 @@
 
 function install(internals) {
     const world = globalThis;
-    const { rsui, page, mediaApplies, resizeListeners, PageElement, keyboardOut, focusedNow, tellFocus } = internals;
+    const { rsui, page, mediaApplies, resizeListeners, motionListeners, PageElement, keyboardOut, focusedNow, tellFocus } = internals;
     const main = rsui.mainWindow;
     const desktop = () => require('rsui/desktop');
     const { FocusEvent, MediaQueryListEvent } = require('rsui/dom-events');
@@ -150,6 +150,7 @@ function install(internals) {
         }
         watching = true;
         resizeListeners.add(lookAgain);
+        motionListeners?.add(lookAgain);
         rsui.__onColorScheme?.(lookAgain);
         desktop().system.onChange(lookAgain);
     };

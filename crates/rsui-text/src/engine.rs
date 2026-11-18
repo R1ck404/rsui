@@ -612,7 +612,7 @@ pub(crate) struct Face {
     pub(crate) font: Arc<Font>,
     /// The glyph and advance for each ASCII character, which is nearly all text.
     ascii: Box<[(u16, f32); 128]>,
-    kerning: Box<[(u32, i16); KERNING_CACHE_SIZE]>,
+    kerning: Box<[(u32, f32); KERNING_CACHE_SIZE]>,
     /// What ASCII text could do in this font, worked out when first needed.
     ascii_rules: Option<Box<AsciiRules>>,
     /// What to run for each script and direction that's come up.
@@ -632,7 +632,7 @@ impl Face {
         Self {
             font: Arc::new(font),
             ascii,
-            kerning: Box::new([(NO_PAIR, 0); KERNING_CACHE_SIZE]),
+            kerning: Box::new([(NO_PAIR, 0.0); KERNING_CACHE_SIZE]),
             ascii_rules: None,
             plans: Vec::new(),
         }
@@ -652,7 +652,7 @@ impl Face {
         Some(Self {
             font: Arc::clone(&self.font),
             ascii,
-            kerning: Box::new([(NO_PAIR, 0); KERNING_CACHE_SIZE]),
+            kerning: Box::new([(NO_PAIR, 0.0); KERNING_CACHE_SIZE]),
             ascii_rules: None,
             plans: Vec::new(),
         })
@@ -700,7 +700,7 @@ impl Face {
         }
     }
 
-    fn kerning(&mut self, left: u16, right: u16) -> i16 {
+    fn kerning(&mut self, left: u16, right: u16) -> f32 {
         let pair = (u32::from(left) << 16) | u32::from(right);
         let slot = (pair.wrapping_mul(0x9E37_79B1) >> 23) as usize % KERNING_CACHE_SIZE;
         let entry = &mut self.kerning[slot];
@@ -1817,7 +1817,7 @@ impl TextEngine {
             let mut x = pen;
             if let Some((previous_face, previous_glyph)) = previous {
                 if previous_face == face {
-                    let kerning = f32::from(self.faces[face].kerning(previous_glyph, glyph));
+                    let kerning = self.faces[face].kerning(previous_glyph, glyph);
                     x += kerning * scale;
                     units += kerning;
                 }
@@ -2085,7 +2085,7 @@ impl TextEngine {
             let mut x = pen;
             if let Some((previous_face, previous_glyph)) = previous {
                 if previous_face == face {
-                    x += f32::from(self.faces[face].kerning(previous_glyph, glyph)) * scale;
+                    x += self.faces[face].kerning(previous_glyph, glyph) * scale;
                 }
             }
             if x > to {
@@ -2297,7 +2297,7 @@ impl TextEngine {
             let mut x = pen;
             if let Some((previous_face, previous_glyph)) = previous {
                 if previous_face == face {
-                    x += f32::from(self.faces[face].kerning(previous_glyph, glyph)) * scale;
+                    x += self.faces[face].kerning(previous_glyph, glyph) * scale;
                 }
             }
             if !visit(byte, x) {
@@ -2357,7 +2357,7 @@ impl TextEngine {
         if let Some(previous) = previous {
             let (previous_face, previous_glyph) = self.find_glyph(primary, previous);
             if previous_face == face {
-                units += f32::from(self.faces[face].kerning(previous_glyph, glyph));
+                units += self.faces[face].kerning(previous_glyph, glyph);
             }
         }
         units * size / f32::from(self.faces[face].font.metrics().units_per_em)
@@ -2382,7 +2382,7 @@ impl TextEngine {
             let mut x = pen;
             if let Some((previous_face, previous_glyph)) = previous {
                 if previous_face == face {
-                    x += f32::from(self.faces[face].kerning(previous_glyph, glyph)) * scale;
+                    x += self.faces[face].kerning(previous_glyph, glyph) * scale;
                 }
             }
             glyphs.push(PlacedGlyph {

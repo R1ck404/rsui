@@ -671,7 +671,7 @@ const WHY: &str = r#"
                     <button key="add" onClick={() => setCount(count + 1)}>Add</button>
                     <button key="theme" onClick={() => setTheme('dark')}>Dark</button>
                     <button key="todo" onClick={() => add('eggs')}>Todo</button>
-                    {items.map((item) => <Row key={item} label={item} onPick={() => { picked.current++; }} />)}
+                    {items.map((item) => <Row key={item} label={item} onPick={() => { picked.current += count; }} />)}
                 </window>
             </Theme.Provider>
         );
@@ -691,7 +691,7 @@ fn why_says_what_changed_where_and_names_hooks_by_their_variables() {
         "the state, by name: {out}"
     );
     assert!(
-        out.contains("`onPick` is a new function each time. App makes it at app.tsx:25. useCallback would keep the same one."),
+        out.contains("`onPick` is a new function each time. App makes it at app.tsx:25. useCallback would keep the same one, or reading what changes from a ref."),
         "the prop that's new each time, and where it's made: {out}"
     );
     assert!(
@@ -932,6 +932,98 @@ fn a_transition_that_starts_while_a_step_settles_finishes_while_waiting() {
         after.contains("only how things look changed"),
         "it faded in while waiting: {out}"
     );
+}
+
+#[test]
+fn animations_can_be_turned_on_after_the_app_has_settled() {
+    // A run settles the app first, with nothing moving, and only then watches a transition play. A page's CSS was worked out
+    // while nothing moved, so its `@media (prefers-reduced-motion: reduce)` rule held, and the `transition: none` in it stayed
+    // whenever `animations on` came, and `matchMedia` never heard it change.
+    let file = app(
+        "animations-later",
+        r#"
+        import { PageWindow } from 'rsui/web';
+        import { useEffect, useState } from 'react';
+        const css = `
+            .box { transition: opacity 2000ms linear; width: 100px; height: 40px; background: red; }
+            @media (prefers-reduced-motion: reduce) { .box { transition: none; } }
+        `;
+        export default function App() {
+            const [shown, setShown] = useState(false);
+            const [heard, setHeard] = useState('nothing heard');
+            useEffect(() => {
+                const list = matchMedia('(prefers-reduced-motion: reduce)');
+                list.addEventListener('change', (event) => setHeard(event.matches ? 'motion reduced' : 'motion full'));
+            }, []);
+            return (
+                <PageWindow>
+                    <style>{css}</style>
+                    <button id="show" onClick={() => setShown(true)}>Show</button>
+                    <div className="box" style={{ opacity: shown ? 1 : 0 }}>Box</div>
+                    <p>{heard}</p>
+                </PageWindow>
+            );
+        }
+        "#,
+    );
+    let output = run(&file, r#"wait 50; animations on; expect "motion full"; click #show; wait 300; animations off; expect "motion reduced""#);
+    let out = said(&output);
+    assert!(output.status.success(), "{out}\n{}", complained(&output));
+    let after = out.split("> wait 300").nth(1).unwrap_or_default();
+    assert!(after.contains("only how things look changed"), "it faded in while waiting: {out}");
+    // With them on, nothing went straight to its end, so there's nothing to say about it.
+    assert!(!complained(&output).contains("animations on"), "{}", complained(&output));
+    // Off, which it is unless a step says otherwise, it's at once, and the run is told once that `animations on` would play it.
+    let output = run(&file, r#"click #show; wait 300; eval "document.querySelector('.box').style.opacity = '0'"; wait 300"#);
+    let out = said(&output);
+    let after = out.split("> wait 300").nth(1).unwrap_or_default();
+    assert!(!after.contains("only how things look changed"), "{out}");
+    let hints = complained(&output).matches("animations on").count();
+    assert_eq!(hints, 1, "{}", complained(&output));
+    // A transition with no such rule, which went straight to its end, is said too.
+    let plain = app(
+        "animations-hint",
+        r#"
+        import 'rsui/web';
+        import { useState } from 'react';
+        export default function App() {
+            const [shown, setShown] = useState(false);
+            return (
+                <div>
+                    <button id="show" onClick={() => setShown(true)}>Show</button>
+                    <div style={{ transition: 'opacity 200ms', opacity: shown ? 1 : 0 }}>Box</div>
+                </div>
+            );
+        }
+        "#,
+    );
+    let output = run(&plain, "look");
+    assert!(!complained(&output).contains("animations on"), "nothing moved yet: {}", complained(&output));
+    let output = run(&plain, "click #show");
+    assert_eq!(complained(&output).matches("animations on").count(), 1, "{}", complained(&output));
+}
+
+#[test]
+fn a_lowercase_svg_draws_what_is_in_its_groups_with_their_joins() {
+    // A `<g>` written in lower case keeps what's in it by itself rather than in its props, and the picture left it all out:
+    // nothing was drawn. Each shape says how its corners join and how far a mitre goes, as SVG has it, which is 4 unless said.
+    let shapes = r#"
+        <svg width={48} height={48} viewBox="0 0 24 24" fill="none" stroke="red" strokeWidth={2} strokeLinejoin="round">
+            <g>
+                <path d="M3 21 L12 3 L21 21" strokeLinejoin="miter" strokeMiterlimit={10} />
+                <g><circle cx={12} cy={14} r={3} /></g>
+            </g>
+        </svg>
+    "#;
+    for (name, source) in [
+        ("svg-page", format!("import {{ PageWindow }} from 'rsui/web';\nexport default function App() {{ return <PageWindow>{shapes}</PageWindow>; }}\n")),
+        ("svg-native", format!("export default function App() {{ return <window padding={{8}}>{shapes}</window>; }}\n")),
+    ] {
+        let file = app(name, &source);
+        let out = works(&file, "look");
+        assert!(out.contains(r"M3 21 L12 3 L21 21\t\t\t0\tmiter\t10"), "{name}: {out}");
+        assert!(out.contains(r"\t0\tround\t4"), "{name}: {out}");
+    }
 }
 
 #[test]

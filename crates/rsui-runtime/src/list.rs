@@ -17,6 +17,28 @@ pub struct ListWindow {
     pub reveal: Option<usize>,
 }
 
+/// What [`Cx::virtual_list_with`] is told beyond which part of the list to build.
+#[derive(Clone, Default)]
+pub struct ListOptions {
+    /// Makes it a grid, whose children are items rather than rows, each this wide: each row holds as many as fit across it, which
+    /// the window measures as it measures how many rows fit. The list's `gap` is between them, across and down. The window's
+    /// `len` is then how many items there are, its `reveal` is an item, and what `row` is given is an item's index.
+    pub item_width: Option<f64>,
+    /// Told how many rows fit, including part of one, and how many items fit across (1 for a list that isn't a grid), each time
+    /// the window measures something different, starting with the first time it's laid out.
+    pub fits: Option<std::rc::Rc<dyn Fn(&mut Updates<'_>, f64, usize)>>,
+}
+
+impl std::fmt::Debug for ListOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ListOptions")
+            .field("item_width", &self.item_width)
+            .field("fits", &self.fits.is_some())
+            .finish()
+    }
+}
+
 /// What [`Cx::scroll_area_with`] is told beyond what a scrolling area does by itself: where code wants it to go, and what hears
 /// that it's moved.
 #[derive(Clone, Default)]
@@ -181,19 +203,45 @@ impl Cx<'_> {
         &mut self,
         key: impl Into<Key>,
         window: ListWindow,
+        row: impl FnMut(&mut Cx<'_>, usize) -> Node,
+    ) -> Element {
+        self.virtual_list_with(key, window, ListOptions::default(), row)
+    }
+
+    /// [`virtual_list`](Self::virtual_list), which can be a grid, and can tell what wants to know how much fits in it, as
+    /// `options` says. A grid's `count` is how many rows it has, and its `across` how many items each holds, which its
+    /// `resize` action takes after how many rows fit, as `"12.5 4"`.
+    pub fn virtual_list_with(
+        &mut self,
+        key: impl Into<Key>,
+        window: ListWindow,
+        options: ListOptions,
         mut row: impl FnMut(&mut Cx<'_>, usize) -> Node,
     ) -> Element {
         let offset = self.state(|| 0f64);
         let measured = self.state(|| None::<f64>);
         let revealed = self.state(|| None::<usize>);
+        let measured_across = self.state(|| None::<usize>);
+        let grid = options.item_width.filter(|width| width.is_finite() && *width > 0.0);
+        // Until it's measured, a grid is one item across, and the window always says how many fit then.
+        let across = if grid.is_some() { self.get(measured_across).unwrap_or(1).max(1) } else { 1 };
+        let items = window.len;
+        let rows_len = items.div_ceil(across);
+        // What's revealed is an item, which is in the row that holds it.
+        let reveal_item = window.reveal;
+        let window = ListWindow {
+            len: rows_len,
+            reveal: window.reveal.map(|item| item / across),
+            ..window
+        };
         let view_rows = self.get(measured).unwrap_or(window.visible as f64);
         // The end of the list only needs whole rows to show, so its last row is never cut off,
         // while every row that shows at all has to be built, even if only part of it fits.
         let whole_rows = (view_rows.floor() as usize).max(1);
         let any_rows = view_rows.ceil() as usize;
         let last_top = window.len.saturating_sub(whole_rows);
-        if window.reveal != self.get(revealed) {
-            self.set(revealed, window.reveal);
+        if reveal_item != self.get(revealed) {
+            self.set(revealed, reveal_item);
             if let Some(row) = window.reveal {
                 let top = self.get(offset);
                 if (row as f64) < top {
@@ -213,31 +261,69 @@ impl Cx<'_> {
             .saturating_add(window.overscan)
             .min(window.len);
 
-        let rows: Vec<Node> = (first_built..end).map(|index| row(self, index)).collect();
-        let element = Element::new(Role::List)
-            .key(key)
-            .props(Props::from([
-                (symbol!("count"), PropValue::Int(window.len as i64)),
-                (
-                    symbol!("first_visible"),
-                    if partway {
-                        PropValue::Float(position)
-                    } else {
-                        PropValue::Int(first_visible as i64)
-                    },
-                ),
-                (symbol!("first_built"), PropValue::Int(first_built as i64)),
-                (symbol!("view_rows"), PropValue::Float(view_rows)),
-            ]))
-            .children(rows);
-        let element = self.on(element, ActionKind::Resize, move |cx, input| match input {
-            Some(PropValue::Float(rows)) if rows.is_finite() && *rows >= 0.0 => {
-                cx.set(measured, Some(*rows));
+        let rows: Vec<Node> = if grid.is_some() {
+            // A grid's rows are its items, a row of them at a time.
+            (first_built * across..(end * across).min(items)).map(|index| row(self, index)).collect()
+        } else {
+            (first_built..end).map(|index| row(self, index)).collect()
+        };
+        // What wants to be told how much fits is told the first time too, so until then the window's told it's not been measured.
+        let told_rows = match self.get(measured) {
+            Some(rows) => rows,
+            None if options.fits.is_some() => -1.0,
+            None => view_rows,
+        };
+        let mut props = Props::from([
+            (symbol!("count"), PropValue::Int(window.len as i64)),
+            (
+                symbol!("first_visible"),
+                if partway {
+                    PropValue::Float(position)
+                } else {
+                    PropValue::Int(first_visible as i64)
+                },
+            ),
+            (symbol!("first_built"), PropValue::Int(first_built as i64)),
+            (symbol!("view_rows"), PropValue::Float(told_rows)),
+        ]);
+        if let Some(width) = grid {
+            props.insert(symbol!("item_width"), PropValue::Float(width));
+            props.insert(symbol!("across"), PropValue::Int(self.get(measured_across).map_or(0, |across| across as i64)));
+        }
+        let element = Element::new(Role::List).key(key).props(props).children(rows);
+        let fits = options.fits;
+        let element = self.on(element, ActionKind::Resize, move |cx, input| {
+            let read = |text: &str| -> Option<f64> { text.parse::<f64>().ok().filter(|rows| rows.is_finite() && *rows >= 0.0) };
+            let (rows, across) = match input {
+                Some(PropValue::Float(rows)) if rows.is_finite() && *rows >= 0.0 => (*rows, None),
+                Some(PropValue::Int(rows)) if *rows >= 0 => (*rows as f64, None),
+                // A grid's says how many fit across too.
+                Some(PropValue::Str(text)) => {
+                    let mut words = text.split(' ');
+                    match (words.next().and_then(read), words.next().and_then(read), words.next()) {
+                        (Some(rows), Some(across), None) if across >= 1.0 => (rows, Some(across as usize)),
+                        _ => return cx.reject("resize needs how many rows fit, and for a grid how many fit across"),
+                    }
+                }
+                _ => return cx.reject("resize needs how many rows fit, which isn't negative"),
+            };
+            let was = (cx.get(measured), cx.get(measured_across));
+            cx.set(measured, Some(rows));
+            if let Some(now) = across {
+                cx.set(measured_across, Some(now));
+                // A grid that wraps again keeps the item that was at its top in view: it's in a different row now.
+                let before = was.1.unwrap_or(1).max(1);
+                if now != before {
+                    let top = cx.get(offset);
+                    cx.set(offset, (top * before as f64 / now as f64).floor());
+                }
             }
-            Some(PropValue::Int(rows)) if *rows >= 0 => {
-                cx.set(measured, Some(*rows as f64));
+            let now = (Some(rows), across.or(was.1));
+            if let Some(fits) = &fits
+                && now != was
+            {
+                fits(cx, rows, if grid.is_some() { now.1.unwrap_or(1) } else { 1 });
             }
-            _ => cx.reject("resize needs how many rows fit, which isn't negative"),
         });
         self.on(element, ActionKind::Scroll, move |cx, input| match input {
             Some(PropValue::Int(row)) if *row >= 0 => {

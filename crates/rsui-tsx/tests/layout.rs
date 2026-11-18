@@ -179,3 +179,116 @@ fn none_of_this_clutters_what_an_agent_reads() {
         assert!(!outline.contains(name), "{name} is in\n{outline}");
     }
 }
+
+#[test]
+fn a_list_with_an_item_width_is_a_grid_that_says_what_fits() {
+    let mut hands = open(
+        "grid-list",
+        r#"
+        import { useState } from 'rsui';
+        const renderRow = (index) => <group><group key={'t' + index} grow={1} /></group>;
+        export default function App() {
+            const [fit, setFit] = useState('none');
+            const [clicks, setClicks] = useState(0);
+            return (
+                <window>
+                    <text key="fit" height={20}>{fit + ' ' + clicks}</text>
+                    <list key="tiles" count={6} rowHeight={40} itemWidth={90} gap={10} grow={1} renderRow={renderRow}
+                        onResize={(rows, columns) => setFit(rows + 'x' + columns)} onClick={() => setClicks(clicks + 1)} />
+                </window>
+            );
+        }
+        "#,
+    );
+    // 400 across has room for 4 of 90 with 10 between them, and the 280 under the text for 7 rows of 40, however few it has.
+    hands.settle();
+    assert!(hands.says("7x4 0"), "{}", hands.app.outline());
+    // The sixth is the second of the second row, as tall as a row less the gap.
+    assert_eq!(rect_of(&mut hands, "t5"), (100.0, 60.0, 90.0, 30.0));
+    // Below its items, a click is the list's own.
+    hands.click_at(200.0, 250.0);
+    assert!(hands.says("7x4 1"), "{}", hands.app.outline());
+    hands.app.resize((250, 300), 1.0);
+    hands.settle();
+    assert!(hands.says("7x2 1"), "{}", hands.app.outline());
+    assert_eq!(rect_of(&mut hands, "t5"), (100.0, 100.0, 90.0, 30.0));
+}
+
+#[test]
+fn a_list_sized_by_a_page_builds_the_rows_that_fit_it() {
+    let mut hands = open(
+        "page-list",
+        r#"
+        import { PageWindow } from 'rsui/web';
+        const renderRow = (index) => <group><group key={'r' + index} grow={1} /></group>;
+        export default function App() {
+            return (
+                <PageWindow>
+                    <div style={{ display: 'flex', flexDirection: 'column', height: 300 }}>
+                        <div style={{ height: 100, flexShrink: 0 }} />
+                        <div key="room" style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+                            <list key="rows" count={1000} rowHeight={20} overscan={0} renderRow={renderRow} position="absolute" top={0} left={0} right={0} bottom={0} />
+                        </div>
+                    </div>
+                </PageWindow>
+            );
+        }
+        "#,
+    );
+    // What it's in is the 200 under the first, which has room for 10 rows: those are built, and no more.
+    assert_eq!(rect_of(&mut hands, "rows").3, 200.0);
+    assert!(hands.has("r9") && !hands.has("r10"), "{}", hands.app.outline());
+}
+
+#[test]
+fn what_says_how_narrow_it_can_be_shares_a_flex_box_by_its_shares() {
+    // Panes side by side, each `flex-grow: 1; flex-basis: 0; min-width: 0`, with something wider than its share inside: as a
+    // browser has it, each is its share, as `min-width: 0` turns off being as wide as what's in it. Down a column, how tall
+    // something can be wasn't said, so there it's still as tall as what's in it.
+    let mut hands = open(
+        "said-least",
+        r#"
+        import { PageWindow } from 'rsui/web';
+        const wide = <div style={{ width: 400, height: 30, flexShrink: 0 }} />;
+        export default function App() {
+            return (
+                <PageWindow>
+                    <div style={{ display: 'flex', width: 300, height: 20 }}>
+                        <div key="a" style={{ flexBasis: 0, flexGrow: 1, minWidth: 0 }}>{wide}</div>
+                        <div key="b" style={{ flex: '1 1 0%', minWidth: 0, display: 'flex' }}>{wide}</div>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', width: 300, height: 20 }}>
+                        <div key="c" style={{ flexBasis: 0, flexGrow: 1, minWidth: 0 }}>{wide}</div>
+                    </div>
+                </PageWindow>
+            );
+        }
+        "#,
+    );
+    assert_eq!(rect_of(&mut hands, "a").2, 150.0);
+    assert_eq!(rect_of(&mut hands, "b").2, 150.0);
+    assert_eq!(rect_of(&mut hands, "c").3, 30.0);
+}
+
+#[test]
+fn growing_by_less_than_one_between_them_takes_only_that_share() {
+    // As CSS has it: one item growing by 0.5 in a row of 300 is 150, and two growing by 0.25 each are 75 each, which is what lets
+    // a pane whose neighbour's closed glide from its share to all of the room as its share grows.
+    let mut hands = open(
+        "small-shares",
+        r#"
+        export default function App() {
+            return (
+                <window>
+                    <row width={300} height={20}><group key="half" grow={0.5} basis={0} /></row>
+                    <row width={300} height={20}><group key="quarter" grow={0.25} basis={0} /><group grow={0.25} basis={0} /></row>
+                    <row width={300} height={20}><group key="whole" grow={2} basis={0} /><group grow={1} basis={0} /></row>
+                </window>
+            );
+        }
+        "#,
+    );
+    assert_eq!(rect_of(&mut hands, "half").2, 150.0);
+    assert_eq!(rect_of(&mut hands, "quarter").2, 75.0);
+    assert_eq!(rect_of(&mut hands, "whole").2, 200.0);
+}

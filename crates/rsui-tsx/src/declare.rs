@@ -2203,6 +2203,7 @@ impl<'v> Declarer<'v> {
             "stroke-width" => self.set_number(props, name, value, font_size, "strokeWidth"),
             "stroke-linecap" => props.set("strokeLinecap", owned(value)),
             "stroke-linejoin" => props.set("strokeLinejoin", owned(value)),
+            "stroke-miterlimit" => props.set("strokeMiterlimit", owned(value)),
             "stroke-dasharray" => props.set("strokeDasharray", owned(value)),
             "stroke-dashoffset" => {
                 self.set_number(props, name, value, font_size, "strokeDashoffset")
@@ -2673,6 +2674,12 @@ impl<'v> Declarer<'v> {
                 }
             }
             "visibility" => props.set("__visibility", owned(value)),
+            // Whether what's in it is drawn while it's far from being seen, and how big it's taken to be while it isn't: see
+            // `contentVisibility` in web.js, which reads these as they're written.
+            "content-visibility" => props.set("__contentVisibility", owned(value)),
+            "contain-intrinsic-size" => props.set("__intrinsicSize", owned(value)),
+            "contain-intrinsic-height" | "contain-intrinsic-block-size" => props.set("__intrinsicHeight", owned(value)),
+            "contain-intrinsic-width" | "contain-intrinsic-inline-size" => props.set("__intrinsicWidth", owned(value)),
             // Kept for the page's selection to go by (see `selectsText` in web.js), and nothing else.
             "user-select" | "-webkit-user-select" => props.set("__userSelect", owned(value)),
             "appearance" | "-webkit-appearance" | "-moz-appearance" => {
@@ -2795,7 +2802,8 @@ impl<'v> Declarer<'v> {
             "transition-property"
             | "transition-duration"
             | "transition-delay"
-            | "transition-timing-function" => {
+            | "transition-timing-function"
+            | "transition-behavior" => {
                 let parts = self.new_parts(props.get("__transitionParts"), name, value);
                 props.set("__transitionParts", parts);
             }
@@ -2887,6 +2895,8 @@ impl<'v> Declarer<'v> {
             // Fine adjustments to a font's own features, of which what's usual is what's here.
             "font-feature-settings" | "font-variation-settings" | "font-kerning" | "font-optical-sizing"
                 if matches!(value, "normal" | "auto" | "inherit" | "initial" | "unset") => {}
+            // What `@starting-style` says, which `web.js` keeps by itself (see `startingBlock` there).
+            _ if name.starts_with("-rsui-starting-") => {}
             _ => {
                 if let Some(physical) = logical(name) {
                     return self.declare_logical(props, physical, value, font_size);

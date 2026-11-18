@@ -624,8 +624,10 @@ fn prop_change(
             let maker = maker_of(vm, &made, around).unwrap_or_else(|| parent.to_owned());
             let _ = write!(text, " {maker} makes it at {}.", short_place(&made));
         }
+        // Made from the same code, it's only a new one, for an element the app's own JSX made, when what it sees changed: see
+        // `Vm::props_equivalent`.
         if same_code {
-            text.push_str(" useCallback would keep the same one.");
+            text.push_str(" useCallback would keep the same one, or reading what changes from a ref.");
         }
         return text;
     }

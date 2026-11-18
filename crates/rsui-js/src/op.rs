@@ -954,6 +954,15 @@ pub(crate) const IS_ASYNC: u8 = 64;
 /// A method, which has no `prototype` of its own and can't be used with `new`.
 pub(crate) const IS_METHOD: u8 = 128;
 
+/// In a [`Proto`]'s `says`: whether it's strict code.
+pub(crate) const SAYS_STRICT: u8 = 1;
+/// In a [`Proto`]'s `says`: whether its code says `'use no memo'`, so that as a component it renders whenever what it's in
+/// does, unless its props are the same plain values. See [`crate::Vm::says_no_memo`].
+pub(crate) const SAYS_NO_MEMO: u8 = 2;
+/// In a [`Proto`]'s `says`: whether it's in one of an app's own files, rather than in `node_modules` or what comes with the
+/// engine, so that as a component it can skip rendering when it's given what does the same. See [`crate::Vm::made_by_app`].
+pub(crate) const SAYS_APP_FILE: u8 = 4;
+
 /// What a [`Proto`]'s `start` is until it's compiled, which is the first time it's called. It has `KEEPS_ARGS` until
 /// then too, so that every way into it goes through `Vm::enter_function`, which compiles it.
 pub(crate) const NOT_COMPILED: u32 = u32::MAX;
@@ -967,7 +976,8 @@ pub(crate) struct Proto {
     pub(crate) params: u16,
     pub(crate) length: u8,
     pub(crate) flags: u8,
-    pub(crate) strict: bool,
+    /// What its code says of itself, as [`SAYS_STRICT`] and [`SAYS_NO_MEMO`], in one byte so that a proto stays 88 bytes.
+    pub(crate) says: u8,
     /// How many registers after the parameters are the function's own variables, which a call makes undefined as
     /// it does the parameters it has no argument for, or [`ALL_LOCALS`]. See [`Proto::clear`].
     pub(crate) locals: u8,
@@ -995,6 +1005,24 @@ pub(crate) struct DebugVar {
 pub(crate) const ALL_LOCALS: u8 = u8::MAX;
 
 impl Proto {
+    /// What `says` is for code that's strict or not, says `'use no memo'` or not, and is in an app's own file or not.
+    pub(crate) fn says_of(strict: bool, no_memo: bool, app_file: bool) -> u8 {
+        (if strict { SAYS_STRICT } else { 0 })
+            | (if no_memo { SAYS_NO_MEMO } else { 0 })
+            | (if app_file { SAYS_APP_FILE } else { 0 })
+    }
+
+    /// Whether it's strict code.
+    #[inline(always)]
+    pub(crate) fn strict(&self) -> bool {
+        self.says & SAYS_STRICT != 0
+    }
+
+    /// Whether its code says `'use no memo'`.
+    pub(crate) fn no_memo(&self) -> bool {
+        self.says & SAYS_NO_MEMO != 0
+    }
+
     /// How many registers from the bottom a call has to make undefined where no argument was given: `this`, the
     /// parameters and the function's own variables. The rest are temporaries and block variables, which are always
     /// written before they're read, so they can keep what an earlier call left there (see `Vm::wipe_above_top`).

@@ -43,6 +43,23 @@ impl NativeProfile {
     }
 }
 
+/// Finishes a profile when it's dropped, for runs that can end at any of several places.
+pub(crate) struct FinishOnDrop(Option<NativeProfile>);
+
+impl FinishOnDrop {
+    pub(crate) fn new(profile: NativeProfile) -> Self {
+        Self(Some(profile))
+    }
+}
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        if let Some(profile) = self.0.take() {
+            profile.finish();
+        }
+    }
+}
+
 /// With the JIT: which compiled instruction each sample was in, or under (in a helper it called), as compiled code has
 /// no unwind information and the sampler's report can only call it `?!?`. By function, then by instruction.
 #[cfg(feature = "jit")]

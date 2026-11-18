@@ -129,7 +129,7 @@ pub(crate) fn compute<M: Measure>(
     node: &Node,
     available: Size,
     measure: &mut M,
-    list_sizes: &mut Vec<(usize, f32)>,
+    list_sizes: &mut Vec<(usize, f32, f32)>,
     paragraphs: &mut bool,
 ) -> usize {
     list_sizes.clear();
@@ -309,9 +309,9 @@ struct Pass<'a, M> {
     paragraphs: &'a mut bool,
     window_width: f32,
     window_height: f32,
-    /// Lists that have the wrong idea of how many rows fit in them, by the address of their
-    /// element, and how many do.
-    list_sizes: &'a mut Vec<(usize, f32)>,
+    /// Lists that have the wrong idea of how many rows fit in them, or for a grid, how many items fit across, by the address
+    /// of their element, and how many do (0 across for a list that isn't a grid).
+    list_sizes: &'a mut Vec<(usize, f32, f32)>,
 }
 
 impl<M: Measure> Pass<'_, M> {
@@ -1207,7 +1207,7 @@ impl<M: Measure> Pass<'_, M> {
                 || item.style.scroll_y.is_some()
                 || (!child.props.is_empty() && crate::tree::clips(child))
                 || (child.role == rsui_core::Role::Image && child.props.get("src").is_none());
-            item.style.min_auto && item.style.shrink > 0.0 && !clips
+            item.style.keeps_to_content(row) && !clips
         }) {
             // Across, that's as narrow as it can be, which for text is its longest word. Down, it's as tall as it is.
             let shaped = self.picture_along(&node.children[item.index], item.cross_axis, row);
@@ -1315,7 +1315,9 @@ impl<M: Measure> Pass<'_, M> {
         )
     }
 
-    /// A virtual list: rows of one height, placed by the list's scroll position.
+    /// A virtual list: rows of one height, placed by the list's scroll position. A list with an `item_width` is a grid, whose
+    /// children are items rather than rows: each row has `across` of them side by side, `item_width` wide and as tall as a row
+    /// less the `gap`, which is between them both ways, and how many fit across is worked out here, as how many rows fit is.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn solve_list(
@@ -1341,6 +1343,12 @@ impl<M: Measure> Pass<'_, M> {
         );
         let width = if key.width.exact {
             key.width.value
+        } else if let Some(item_width) = list.item_width {
+            // A grid takes all the room it's given, to fit as many across as it can, and is one item wide where there's no limit,
+            // or when it's asked how narrow it can be.
+            let room = key.width.value;
+            let least = item_width + pad_x;
+            resolve_auto(key.width, if room.is_finite() && room >= 0.0 { room.max(least) } else { least }, style.min_width, style.max_width)
         } else {
             // A list is as wide as its widest row, among those that exist right now.
             let mut widest = 0f32;
@@ -1354,29 +1362,50 @@ impl<M: Measure> Pass<'_, M> {
             resolve_auto(key.width, widest + pad_x, style.min_width, style.max_width)
         };
         if mode == Mode::Layout {
+            let row_width = (width - pad_x).max(0.0);
+            // How many items fit across a grid's row, each with the gap after it but the last.
+            let fit_across = list
+                .item_width
+                .map(|item_width| ((row_width + style.gap) / (item_width + style.gap)).floor().max(1.0));
             // Rows beyond the window can't be seen, so however tall the list wants to be, it
             // isn't worth building them. A list with no limit on its height would build them all.
             if let Some(told) = list.view_rows {
                 if row_height > 0.0 {
                     let fit = ((height - pad_y).min(self.window_height) / row_height).max(0.0);
-                    if (fit - told).abs() > 0.001 {
+                    let across_wrong = fit_across.is_some_and(|across| across != list.across);
+                    if (fit - told).abs() > 0.001 || across_wrong {
                         self.list_sizes
-                            .push((std::ptr::from_ref(node) as usize, fit));
+                            .push((std::ptr::from_ref(node) as usize, fit, fit_across.unwrap_or(0.0)));
                     }
                 }
             }
-            let row_width = (width - pad_x).max(0.0);
-            let row_key = Key {
-                width: Axis::exact(row_width),
-                height: Axis::exact(row_height),
-            };
             let top = style.padding_top + (list.first_built - list.first_visible) * row_height;
-            for (index, (child_box, child)) in
-                current.children.iter_mut().zip(&node.children).enumerate()
-            {
-                self.solve(child_box, child, row_key, Mode::Layout);
-                child_box.x = style.padding_left;
-                child_box.y = top + index as f32 * row_height;
+            if let Some(item_width) = list.item_width {
+                // Its items, a row of them at a time, as many as it was built with across, which is what fits once it's been told.
+                let across = (list.across.max(1.0)) as usize;
+                let item_key = Key {
+                    width: Axis::exact(item_width),
+                    height: Axis::exact((row_height - style.gap).max(0.0)),
+                };
+                for (index, (child_box, child)) in
+                    current.children.iter_mut().zip(&node.children).enumerate()
+                {
+                    self.solve(child_box, child, item_key, Mode::Layout);
+                    child_box.x = style.padding_left + (index % across) as f32 * (item_width + style.gap);
+                    child_box.y = top + (index / across) as f32 * row_height;
+                }
+            } else {
+                let row_key = Key {
+                    width: Axis::exact(row_width),
+                    height: Axis::exact(row_height),
+                };
+                for (index, (child_box, child)) in
+                    current.children.iter_mut().zip(&node.children).enumerate()
+                {
+                    self.solve(child_box, child, row_key, Mode::Layout);
+                    child_box.x = style.padding_left;
+                    child_box.y = top + index as f32 * row_height;
+                }
             }
         }
         Size::new(width, height)
@@ -1455,7 +1484,16 @@ impl<M: Measure> Pass<'_, M> {
         if mode == Mode::Measure {
             return own;
         }
-        let mut taken = (0.0f32, 0.0f32);
+        // What the scrollbars took last time, which is mostly what they take now: see `BAR_DOWN`.
+        let mut taken = if room > 0.0 {
+            (
+                if current.has(crate::tree::BAR_DOWN) { room } else { 0.0 },
+                if current.has(crate::tree::BAR_ACROSS) { room } else { 0.0 },
+            )
+        } else {
+            (0.0f32, 0.0f32)
+        };
+        let mut kept = taken != (0.0, 0.0);
         let across_fills = crate::tree::fills_across(node);
         let content = loop {
             // Content shorter than the area still fills it, so that what's flexible can use the room.
@@ -1500,23 +1538,33 @@ impl<M: Measure> Pass<'_, M> {
                 break content;
             }
             // A bar down the side when it's too tall, which takes room across, and one along the bottom when it's too wide.
+            let needs = (
+                style.scroll_y.is_some() && content.height > view_height + 0.5,
+                style.scroll_x.is_some() && content.width > view_width + 0.5,
+            );
+            // A bar kept from last time that what's in it doesn't need any more goes, and they're worked out from none, as the
+            // first time, as only ever adding them can't take one away.
+            if kept && ((taken.0 > 0.0 && !needs.0) || (taken.1 > 0.0 && !needs.1)) {
+                kept = false;
+                taken = (0.0, 0.0);
+                continue;
+            }
             let wanted = (
-                if style.scroll_y.is_some() && content.height > view_height + 0.5 {
-                    room
-                } else {
-                    taken.0
-                },
-                if style.scroll_x.is_some() && content.width > view_width + 0.5 {
-                    room
-                } else {
-                    taken.1
-                },
+                if needs.0 { room } else { taken.0 },
+                if needs.1 { room } else { taken.1 },
             );
             if wanted == taken {
                 break content;
             }
             taken = wanted;
         };
+        current.flags &= !(crate::tree::BAR_DOWN | crate::tree::BAR_ACROSS);
+        if taken.0 > 0.0 {
+            current.flags |= crate::tree::BAR_DOWN;
+        }
+        if taken.1 > 0.0 {
+            current.flags |= crate::tree::BAR_ACROSS;
+        }
         let moved = |scroll: Option<f32>, content: f32, own: f32| {
             let furthest = (content - own).max(0.0);
             let scroll = scroll.unwrap_or(0.0);
@@ -1755,12 +1803,11 @@ impl<M: Measure> Pass<'_, M> {
         let used_now = items.iter().map(|item| item.main).sum::<f32>();
         if items
             .iter()
-            .any(|item| item.style.min_auto && item.style.shrink > 0.0)
+            .any(|item| item.style.keeps_to_content(row))
             && (used_now > room_left
                 || (used_now < room_left
                     && items.iter().any(|item| {
-                        item.style.min_auto
-                            && item.style.shrink > 0.0
+                        item.style.keeps_to_content(row)
                             && item.style.grow > 0.0
                             && item.style.basis.is_some()
                             && matches!(lengths(&item.style, row).0, Length::Auto)
@@ -2053,7 +2100,7 @@ impl<M: Measure> Pass<'_, M> {
         // `min-width: auto`), however little it starts from, as `flex: 1` starts from nothing: buttons that each grow from
         // nothing still go on as many lines as their words need.
         if items.iter().any(|item| {
-            item.style.min_auto && item.style.shrink > 0.0 && item.style.basis.is_some()
+            item.style.keeps_to_content(row) && item.style.basis.is_some()
         }) {
             self.keep_to_content(current, node, &mut items, row);
         }
@@ -2115,7 +2162,7 @@ impl<M: Measure> Pass<'_, M> {
             if too_big
                 && items[line.clone()]
                     .iter()
-                    .any(|item| item.style.min_auto && item.style.shrink > 0.0)
+                    .any(|item| item.style.keeps_to_content(row))
             {
                 // Each no smaller than what's in it lets it be, as an inline-block `<span>` too wide for its line is, which
                 // goes past the end of the line, as CSS has it.
@@ -3305,9 +3352,14 @@ fn share_space(items: &mut [Item], space: f32) {
                 };
             }
         }
-        let left = space - settled;
+        let mut left = space - settled;
         if factors <= 0.0 {
             break;
+        }
+        // Growing by less than one between them, they only take that share of the room, as CSS has it, so that what's growing
+        // to its share from nothing, or from a smaller one, isn't all of it at once.
+        if growing && factors < 1.0 {
+            left *= factors;
         }
         let mut over = 0.0;
         for item in items.iter_mut().filter(|item| !item.frozen) {

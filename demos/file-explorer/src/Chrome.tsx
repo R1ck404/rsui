@@ -5,7 +5,7 @@ import { memo, useMemo, useRef, useState } from 'react';
 import { mainWindow, useWindowState } from 'rsui';
 import * as I from './icons';
 import { ACCENTS, type Settings } from './settings';
-import { leftButton } from './reorder';
+import { leftButton, useReorder, type Reorder } from './reorder';
 import { IconButton, Segmented, Stepper, Toggle } from './ui';
 
 type IconType = (props: { size?: number; strokeWidth?: number; className?: string }) => any;
@@ -26,26 +26,23 @@ const Tab = memo(function Tab(props: {
     rail: boolean;
     index: number;
     lifted: { dx: number; dy: number; out: boolean } | null;
-    holder: (id: string, element: any) => void;
+    reorder: Reorder;
     onSelect: (index: number) => void;
     onClose: (index: number) => void;
-    onGrab: (index: number, x: number, y: number) => void;
-    onDrag: (x: number, y: number) => void;
-    onDrop: () => void;
 }) {
-    const { tab, active, vertical, rail, index, lifted, holder, onSelect, onClose, onGrab, onDrag, onDrop } = props;
+    const { tab, active, vertical, rail, index, lifted, reorder, onSelect, onClose } = props;
     const Icon = tab.icon;
     return (
         <div
-            ref={(element: any) => holder(tab.id, element)}
+            ref={reorder.ref(tab.id)}
             role="tab"
             aria-selected={active}
             title={tab.title}
-            onClick={() => onSelect(index)}
+            onClick={() => !reorder.wasDrag() && onSelect(index)}
             onAuxClick={(event: any) => event.button === 1 && onClose(index)}
-            onPointerDown={(event: any) => leftButton(event) && onGrab(index, event.clientX, event.clientY)}
-            onPointerMove={(event: any) => (typeof event.buttons !== 'number' || (event.buttons & 1) !== 0 ? onDrag(event.clientX, event.clientY) : onDrop())}
-            onPointerUp={onDrop}
+            onPointerDown={(event: any) => reorder.down(index, event)}
+            onPointerMove={reorder.move}
+            onPointerUp={reorder.up}
             className={
                 'group relative flex min-w-0 items-center gap-2 overflow-hidden rounded-(--fx-radius-lg) pr-1 pl-2.5 ' +
                 (lifted ? 'z-50 shadow-(--fx-pop-shadow) ' + (lifted.out ? 'opacity-90 ' : '') : 'transition-colors duration-(--fx-speed) ') +
@@ -76,14 +73,11 @@ const Tab = memo(function Tab(props: {
     );
 });
 
-/** How far a tab's pulled before it's being dragged rather than clicked. */
-const DRAG_AFTER = 5;
-
 /**
  * The tabs, along the top or down the sidebar. A tab can be picked up and moved, following the pointer either way, and the others
- * make room as it passes them, along the row or down the column, which is the order it's dropped in. Over the panes it's being
- * docked instead, beside one of them: `onDock` is told where it is all along, and says when it's over them, and `onDockDrop` is told
- * when it's let go there.
+ * make room as it passes them, along the row or down the column, which is the order it's dropped in (see `useReorder`). Over the
+ * panes it's being docked instead, beside one of them: `onDock` is told where it is all along, and says when it's over them, and null
+ * when the drag's over, and `onDockDrop` is told when it's let go there.
  */
 export const Tabs = memo(function Tabs(props: {
     tabs: TabView[];
@@ -94,158 +88,27 @@ export const Tabs = memo(function Tabs(props: {
     onClose: (index: number) => void;
     onNew: () => void;
     onMove: (from: number, to: number) => void;
-    /** Told where a tab being dragged is, and null when it's let go: whether it's over the panes, to be docked there. */
     onDock?: (at: { index: number; x: number; y: number } | null) => boolean;
     onDockDrop?: (index: number) => void;
 }) {
-    const { tabs, active, vertical, onSelect, onClose, onNew, onMove } = props;
+    const { tabs, active, vertical, onSelect, onClose, onNew, onMove, onDock, onDockDrop } = props;
     const rail = props.rail === true;
-    const elements = useRef(new Map<string, any>());
-    const held = useRef<{
-        id: string;
-        start: number;
-        at: number;
-        x: number;
-        y: number;
-        slots: { x: number; y: number; w: number; h: number }[];
-        moved: boolean;
-        out: boolean;
-    } | null>(null);
-    const dropped = useRef(false);
-    // While a tab's held, the window's told where the pointer goes too, so that it isn't lost when what's under it is something else.
-    const following = useRef<(() => void) | null>(null);
-    const [lifted, setLifted] = useState<{ id: string; dx: number; dy: number; out: boolean } | null>(null);
-    const latest = useRef({ tabs, onMove, onSelect, vertical, onDock: props.onDock, onDockDrop: props.onDockDrop });
-    latest.current = { tabs, onMove, onSelect, vertical, onDock: props.onDock, onDockDrop: props.onDockDrop };
-
-    const on = useMemo(
-        () => ({
-            holder: (id: string, element: any) => {
-                if (element) {
-                    elements.current.set(id, element);
-                } else {
-                    elements.current.delete(id);
-                }
-            },
-            grab: (index: number, x: number, y: number) => {
-                const now = latest.current;
-                // Where each tab is now, which are the places the one picked up can go.
-                const slots = now.tabs.map((one) => {
-                    const box = elements.current.get(one.id)?.getBoundingClientRect?.();
-                    return box ? { x: box.left, y: box.top, w: box.width, h: box.height } : { x: 0, y: 0, w: 0, h: 0 };
-                });
-                held.current = { id: now.tabs[index].id, start: index, at: index, x, y, slots, moved: false, out: false };
-                following.current?.();
-                const moved = (event: any) => {
-                    if (typeof event.buttons === 'number' && (event.buttons & 1) === 0) {
-                        on.drop();
-                    } else {
-                        on.drag(event.clientX, event.clientY);
-                    }
-                };
-                const up = () => on.drop();
-                const target: any = window;
-                target.addEventListener('pointermove', moved);
-                target.addEventListener('pointerup', up);
-                // Escape puts it back where it was picked up, and so does the window losing the pointer, as to another window.
-                const key = (event: any) => {
-                    if (event.key === 'Escape' && held.current !== null) {
-                        event.preventDefault?.();
-                        event.stopPropagation?.();
-                        on.cancel();
-                    }
-                };
-                const away = () => on.cancel();
-                target.addEventListener('keydown', key, true);
-                target.addEventListener('blur', away);
-                following.current = () => {
-                    target.removeEventListener('pointermove', moved);
-                    target.removeEventListener('pointerup', up);
-                    target.removeEventListener('keydown', key, true);
-                    target.removeEventListener('blur', away);
-                    following.current = null;
-                };
-            },
-            drag: (x: number, y: number) => {
-                const grip = held.current;
-                if (grip === null) {
-                    return;
-                }
-                const [dx, dy] = [x - grip.x, y - grip.y];
-                if (!grip.moved && Math.abs(dx) + Math.abs(dy) < DRAG_AFTER) {
-                    return;
-                }
-                grip.moved = true;
-                const now = latest.current;
-                // Over the panes, it's being docked there, which the window shows, rather than moved among the tabs.
-                const out = now.onDock?.({ index: grip.at, x, y }) === true;
-                grip.out = out;
-                if (out) {
-                    const [home, here] = [grip.slots[grip.start], grip.slots[grip.at]];
-                    setLifted({ id: grip.id, dx: dx - (here.x - home.x), dy: dy - (here.y - home.y), out: true });
-                    return;
-                }
-                // The place under the pointer, along the way the tabs go.
-                const along = now.vertical ? y : x;
-                let to = grip.at;
-                grip.slots.forEach((slot, at) => {
-                    const [from, size] = now.vertical ? [slot.y, slot.h] : [slot.x, slot.w];
-                    if (size > 0 && along >= from && along < from + size) {
-                        to = at;
-                    }
-                });
-                if (to !== grip.at) {
-                    now.onMove(grip.at, to);
-                    grip.at = to;
-                }
-                // It follows the pointer from wherever its place is now.
-                const [home, here] = [grip.slots[grip.start], grip.slots[grip.at]];
-                setLifted({ id: grip.id, dx: dx - (here.x - home.x), dy: dy - (here.y - home.y), out: false });
-            },
-            // Let go of without doing anything: back where it was, and the click that ends it isn't one.
-            cancel: () => {
-                const grip = held.current;
-                following.current?.();
-                if (grip === null) {
-                    return;
-                }
-                held.current = null;
-                dropped.current = grip.moved;
-                setLifted(null);
-                if (grip.moved) {
-                    if (grip.at !== grip.start) {
-                        latest.current.onMove(grip.at, grip.start);
-                    }
-                    latest.current.onDock?.(null);
-                }
-            },
-            drop: () => {
-                const grip = held.current;
-                following.current?.();
-                // Heard on the tab and on the window both: only the first counts.
-                if (grip === null) {
-                    return;
-                }
-                dropped.current = grip.moved === true;
-                held.current = null;
-                setLifted(null);
-                if (grip?.moved) {
-                    if (grip.out) {
-                        latest.current.onDockDrop?.(grip.at);
-                    }
-                    latest.current.onDock?.(null);
-                }
-            },
-            select: (index: number) => {
-                // The click that ends a drag isn't one.
-                if (dropped.current) {
-                    dropped.current = false;
-                    return;
-                }
-                latest.current.onSelect(index);
-            },
-        }),
-        [],
+    const outside = useMemo(
+        () =>
+            onDock
+                ? {
+                      over: (index: number, x: number, y: number) => onDock({ index, x, y }),
+                      drop: (index: number) => onDockDrop?.(index),
+                      ended: () => void onDock(null),
+                  }
+                : undefined,
+        [onDock, onDockDrop],
+    );
+    const reorder = useReorder(
+        tabs.map((tab) => tab.id),
+        vertical ? 'y' : 'x',
+        onMove,
+        outside,
     );
 
     return (
@@ -258,13 +121,10 @@ export const Tabs = memo(function Tabs(props: {
                     active={index === active}
                     vertical={vertical}
                     rail={rail}
-                    lifted={lifted !== null && lifted.id === tab.id ? lifted : null}
-                    holder={on.holder}
-                    onSelect={on.select}
+                    lifted={reorder.lifted(tab.id)}
+                    reorder={reorder}
+                    onSelect={onSelect}
                     onClose={onClose}
-                    onGrab={on.grab}
-                    onDrag={on.drag}
-                    onDrop={on.drop}
                 />
             ))}
             <button

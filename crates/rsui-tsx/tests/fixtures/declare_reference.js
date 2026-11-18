@@ -1759,6 +1759,20 @@ function declareOneSaid(props, name, value, fontSize, given) {
         case 'visibility':
             props.__visibility = value;
             break;
+        case 'content-visibility':
+            props.__contentVisibility = value;
+            break;
+        case 'contain-intrinsic-size':
+            props.__intrinsicSize = value;
+            break;
+        case 'contain-intrinsic-height':
+        case 'contain-intrinsic-block-size':
+            props.__intrinsicHeight = value;
+            break;
+        case 'contain-intrinsic-width':
+        case 'contain-intrinsic-inline-size':
+            props.__intrinsicWidth = value;
+            break;
         case 'user-select':
         case '-webkit-user-select':
             props.__userSelect = value;

@@ -140,18 +140,53 @@ fn named_places_measure_as_edge_has_them() {
     for (family, weight, widths) in EDGE {
         for (text, edge) in TEXTS.iter().zip(widths) {
             let ours = width(&mut engine, text, style(family, *weight));
-            // Within one 64th of a pixel, which is as near as Edge says. Kerning changes by fractions of the font's units
-            // in Edge, where shaping here goes by whole ones, which can be up to half of one, 0.024 pixels, a pair.
-            let near = if text.contains(' ') {
-                (ours - edge).abs() < 0.05
-            } else {
-                ours <= *edge + 0.001 && ours > *edge - 1.0 / 64.0 - 0.001
-            };
+            // Within one 64th of a pixel, which is as near as Edge says, kerning too, which changes by fractions of the
+            // font's units where it's set along its axes.
+            let near = ours <= *edge + 0.001 && ours > *edge - 1.0 / 64.0 - 0.001;
             if !near {
                 wrong.push(format!(
                     "{family} {weight:?} {text:?}: {ours} where Edge has {edge}"
                 ));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn kerning_changes_by_fractions_of_a_unit_as_harfbuzz_has_it() {
+    if !installed() {
+        return;
+    }
+    // From HarfBuzz 15 (uharfbuzz 0.57), which Edge shapes with: the pair's first glyph's advance with `kern` on, less
+    // without it, in units of the font's 2048, at 1024 times that so as not to round. Kerning in a font that varies changes
+    // by what GDEF's store says, which HarfBuzz doesn't round, and nor does this; rounded, each was up to half a unit off.
+    #[rustfmt::skip]
+    let expected: &[(f32, f32, &str, f32)] = &[
+        (300.0, 8.0, "AT", -129.273_44),
+        (650.0, 36.0, "Ya", -193.5),
+        (650.0, 36.0, "Ty", -86.5),
+        (550.0, 5.0, "AT", -100.5),
+        (500.0, 36.0, "f,", 67.5),
+        (450.0, 14.0, "f,", 34.485_35),
+        (450.0, 12.0, "Tr", -176.514_65),
+        (500.0, 14.0, "Ya", -191.519_53),
+        (700.0, 14.0, "Ty", -53.470_703),
+        (300.0, 20.0, "Ty", -117.470_703),
+        (550.0, 20.0, "f,", 104.534_18),
+        // At the font's own places, whole units, as ever.
+        (700.0, 36.0, "To", -200.0),
+        (400.0, 10.5, "AT", -147.0),
+    ];
+    let mut font = Font::open(FILE).expect("it opens");
+    let mut wrong = Vec::new();
+    for &(weight, size, pair, harfbuzz) in expected {
+        font.set_variations(&[(*b"wght", weight), (*b"opsz", size)]);
+        let mut glyphs = pair.chars().map(|character| font.glyph(character).expect("it has this"));
+        let (left, right) = (glyphs.next().unwrap(), glyphs.next().unwrap());
+        let ours = font.kerning(left, right);
+        if (ours - harfbuzz).abs() > 0.002 {
+            wrong.push(format!("{pair} at {weight} {size}: {ours}, where HarfBuzz has {harfbuzz}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

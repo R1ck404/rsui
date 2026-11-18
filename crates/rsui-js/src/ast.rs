@@ -574,6 +574,10 @@ pub(crate) struct Function<'a> {
     /// `function` or `async`, a method's name or what's before it but `static`, an arrow's parameters, or a class's
     /// `class`, for its constructor. `(0, 0)` for one that's made up, as a class's fields are.
     pub(crate) source: (u32, u32),
+    /// Whether it, or what it's in, says `'use no memo'`: the JSX in it isn't kept from rendering when it's given what it
+    /// was before, and nor is it, as a component, beyond what its props being the same plain values does. See
+    /// [`crate::Vm::props_equivalent`].
+    pub(crate) no_memo: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

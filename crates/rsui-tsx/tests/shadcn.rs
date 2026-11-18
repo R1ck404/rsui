@@ -240,6 +240,26 @@ function Chart() {
     }
 }
 
+/// Icons such as Blode's cut holes in their shapes with `fillRule="evenodd"`, on the path or on what it's in, where both parts go
+/// round the same way: by the nonzero rule, as everything is unless it says, that's filled.
+#[test]
+fn an_svg_path_can_be_filled_by_the_even_odd_rule() {
+    let before = r##"const e = React.createElement;
+const square = 'M0 0H100V100H0Z M30 30H70V70H30Z';
+function Icons() {
+    return e('svg', { width: 300, height: 100, viewBox: '0 0 300 100' },
+        e('path', { fill: '#ff0000', fillRule: 'evenodd', d: square }),
+        e('g', { fillRule: 'evenodd', transform: 'translate(100 0)' }, e('path', { fill: '#ff0000', d: square })),
+        e('path', { fill: '#ff0000', d: square, transform: 'translate(200 0)' }));
+}"##;
+    let (pixels, laid_out) = drawn("svg-even-odd", "", before, "<Icons />", (300, 100));
+    for left in [0, 100] {
+        assert_eq!(at(&pixels, 300, (left + 10, 10)), [255, 0, 0], "{left}\n{laid_out}");
+        assert_eq!(at(&pixels, 300, (left + 50, 50)), [255, 255, 255], "a hole at {left}\n{laid_out}");
+    }
+    assert_eq!(at(&pixels, 300, (250, 50)), [255, 0, 0], "no hole by the nonzero rule\n{laid_out}");
+}
+
 /// A disabled Button is `opacity: 0.5` on a dark background with light text: it's faded as a whole, so the text is as light as the
 /// background is dark, rather than the background showing through the text.
 #[test]

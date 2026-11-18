@@ -1337,6 +1337,8 @@ pub(super) fn add_natives(vm: &mut Vm, out: Value) {
         ("setTime", 2, set_time),
         ("setTimeOf", 2, set_time_of),
         ("locale", 0, user_locale),
+        ("collator", 2, super::collate::make_compare),
+        ("collatorOptions", 1, super::collate::compare_options),
         ("hash", 2, hash),
         ("pbkdf2", 5, pbkdf2_native),
         ("machine", 0, machine),

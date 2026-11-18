@@ -69,6 +69,8 @@ struct FunctionState {
     allows_new_target: bool,
     /// Whether this is what's in a class's static block or field, where `await` can't be a name.
     in_class_init: bool,
+    /// Whether it or a function it's in says `'use no memo'`, so that its JSX calls `__jsx` rather than `__jsxMemo`.
+    no_memo: bool,
 }
 
 /// What `this`, `arguments` and `new.target` are numbered, which are always the first names.
@@ -274,6 +276,7 @@ impl<'a> Parser<'a> {
                 uses_this: false,
                 line: 1,
                 source: (0, 0),
+                no_memo: false,
             },
             says_module: self.said_module,
         })
@@ -403,6 +406,7 @@ fn parse_file_as<'a>(
         uses_this,
         line: 1,
         source: (0, 0),
+        no_memo: false,
     };
     let returned = Stmt::Return(Some(memory.node(Expr::Function(memory.node(function)))));
     let mut state = parser.functions.pop().unwrap_or_default();
@@ -422,6 +426,7 @@ fn parse_file_as<'a>(
             uses_this: false,
             line: 1,
             source: (0, 0),
+            no_memo: false,
         },
         says_module: false,
     }))
@@ -501,6 +506,7 @@ impl<'a> Parser<'a> {
                 uses_this: false,
                 line: 1,
                 source: (0, 0),
+                no_memo: false,
             },
             says_module: self.said_module,
         };
@@ -622,14 +628,17 @@ impl<'a> Parser<'a> {
         self.functions.last().is_some_and(|state| state.strict)
     }
 
-    /// Looks ahead at the strings that start a body, for `"use strict"`. It doesn't go past any of them.
+    /// Looks ahead at the strings that start a body, for `"use strict"`, and for `"use no memo"`, which React Compiler
+    /// also knows as `"use no forget"`. It doesn't go past any of them.
     fn directives(&mut self) -> Parsed<bool> {
         let saved = self.save();
         let mut found = false;
+        let mut no_memo = false;
         while let Tok::String = self.tok.kind {
             let written =
                 &self.lexer.source[self.tok.start as usize + 1..self.tok.end as usize - 1];
             let is_strict = written == "use strict";
+            let says_no_memo = matches!(written, "use no memo" | "use no forget");
             let had_octal = self.tok.legacy_octal;
             self.advance()?;
             let ends_statement = self.is(";")
@@ -646,10 +655,14 @@ impl<'a> Parser<'a> {
             if is_strict {
                 found = true;
             }
+            no_memo |= says_no_memo;
         }
         self.restore(saved);
         if found {
             self.state().strict = true;
+        }
+        if no_memo {
+            self.state().no_memo = true;
         }
         Ok(found)
     }
@@ -802,6 +815,7 @@ impl<'a> Parser<'a> {
     fn begin_function(&mut self, is_async: bool, is_generator: bool, is_arrow: bool) {
         let parent = self.functions.last();
         let strict = parent.is_some_and(|parent| parent.strict);
+        let no_memo = parent.is_some_and(|parent| parent.no_memo);
         // An arrow is part of what it's in, as far as all this goes.
         let (allows_super_property, allows_super_call, allows_new_target, in_class_init) =
             if is_arrow {
@@ -826,6 +840,7 @@ impl<'a> Parser<'a> {
             allows_super_call,
             allows_new_target,
             in_class_init,
+            no_memo,
             ..FunctionState::default()
         });
     }
@@ -2385,6 +2400,7 @@ impl<'a> Parser<'a> {
         let uses_own_name = name.is_some_and(|name| self.mentions(name));
         let uses_this = self.mentions("this");
         self.note_declared(&params, rest.as_ref(), &body);
+        let no_memo = self.state().no_memo;
         let (inner_names, uses_arguments, outer_names) = self.end_function();
         Ok(Some(Function {
             name,
@@ -2401,6 +2417,7 @@ impl<'a> Parser<'a> {
             uses_this,
             line,
             source: (start, self.prev_end),
+            no_memo,
         }))
     }
 
@@ -2743,6 +2760,7 @@ impl<'a> Parser<'a> {
                     uses_this: false,
                     line,
                     source: (0, 0),
+                    no_memo: false,
                 })));
                 continue;
             }
@@ -2909,6 +2927,7 @@ impl<'a> Parser<'a> {
                     uses_this: false,
                     line,
                     source: (0, 0),
+                    no_memo: false,
                 })));
             } else {
                 field_statements.push(statement);
@@ -2967,6 +2986,7 @@ impl<'a> Parser<'a> {
                 uses_this: false,
                 line,
                 source: (0, 0),
+                no_memo: false,
             })
         });
         let constructor = constructor.unwrap_or_else(|| self.default_constructor(is_derived, line));
@@ -3031,6 +3051,7 @@ impl<'a> Parser<'a> {
                 uses_this: true,
                 line,
                 source: (0, 0),
+                no_memo: false,
             });
         }
         let [Some(getter), Some(setter)] = made else {
@@ -3106,6 +3127,7 @@ impl<'a> Parser<'a> {
             uses_this: false,
             line,
             source: (0, 0),
+            no_memo: false,
         }
     }
 
@@ -3224,6 +3246,7 @@ impl<'a> Parser<'a> {
             ))]
         };
         self.note_declared(&params, rest.as_ref(), &body);
+        let no_memo = self.state().no_memo;
         let (inner_names, uses_arguments, outer_names) = self.end_function();
         Ok(Expr::Function(self.memory.node(Function {
             name: None,
@@ -3240,6 +3263,7 @@ impl<'a> Parser<'a> {
             uses_this: false,
             line,
             source: (start, self.prev_end),
+            no_memo,
         })))
     }
 
@@ -4389,9 +4413,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// What JSX calls in this file.
+    /// What JSX calls in this file. An element made where nothing says `'use no memo'` calls the `Memo` one, which marks
+    /// a component's element as one that needn't render again when what it's given does the same as before: see
+    /// [`crate::Vm::props_equivalent`]. The compiler calls the plain one instead in a file that isn't an app's own, as one in
+    /// `node_modules` (see `Compiler::jsx_factory`).
     fn jsx_name(&self) -> &'static str {
-        if self.page_jsx { "__jsxPage" } else { "__jsx" }
+        let no_memo = self.functions.last().is_some_and(|state| state.no_memo);
+        match (self.page_jsx, no_memo) {
+            (true, true) => "__jsxPage",
+            (true, false) => "__jsxPageMemo",
+            (false, true) => "__jsx",
+            (false, false) => "__jsxMemo",
+        }
     }
 
     /// Reads what's inside an element, and its closing tag, stopping on the final `>`.

@@ -87,6 +87,8 @@ names! {
     grow = "grow",
     basis = "basis",
     min_auto = "minAuto",
+    min_width_said = "minWidthSaid",
+    min_height_said = "minHeightSaid",
     auto_top = "__autoTop",
     auto_right = "__autoRight",
     auto_bottom = "__autoBottom",
@@ -930,6 +932,16 @@ impl Cx<'_, '_> {
             // `flex: 1` starts from nothing, and is still no smaller than what's in it, as CSS's `min-width: auto` has it, as
             // Mantine's segmented control's labels are each as wide as they are.
             look.set(n.min_auto, Value::TRUE);
+        }
+        // What says how small it can be is that small along a flex box, rather than as small as what's in it, as `min-w-0` on a
+        // pane with `flex-grow: 1; flex-basis: 0` beside another is half the room, however wide its toolbar.
+        if look.is_true(n.min_auto) {
+            if !look.is_undefined(n.min_width) {
+                look.set(n.min_width_said, Value::TRUE);
+            }
+            if !look.is_undefined(n.min_height) {
+                look.set(n.min_height_said, Value::TRUE);
+            }
         }
         if look.is_undefined(n.direction) && look.is_undefined(n.display) && !look.is_true(n.flex) {
             look.set(n.collapse_margins, Value::TRUE);

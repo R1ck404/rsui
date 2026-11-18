@@ -185,43 +185,29 @@ class DateTimeFormat {
     }
 }
 
-// Comparing numbers in text by what they are, so that `2` goes before `10`, if that's asked for.
-function compareNumbers(a, b, compareText) {
-    const pieces = /\d+|\D+/g;
-    const first = a.match(pieces) ?? [];
-    const second = b.match(pieces) ?? [];
-    for (let at = 0; at < Math.min(first.length, second.length); at += 1) {
-        const [x, y] = [first[at], second[at]];
-        const order = /^\d/.test(x) && /^\d/.test(y) ? Number(x) - Number(y) : compareText(x, y);
-        if (order !== 0) {
-            return Math.sign(order);
-        }
-    }
-    return Math.sign(first.length - second.length);
-}
-
+// Comparing text as ICU does, with CLDR's root order: `compare` is a function in Rust that keeps its options with it, so
+// that sorting with it calls straight into Rust. Every language gets the root order, which is English's.
 class Collator {
-    constructor(locales, options = {}) {
-        const locale = Array.isArray(locales) ? locales[0] : locales;
-        const loose = options.sensitivity === 'base' || options.sensitivity === 'accent';
-        const plain = (text) => {
-            const folded = loose ? text.toLowerCase() : text;
-            return options.sensitivity === 'base' ? folded.normalize('NFD').replace(/[̀-ͯ]/g, '') : folded;
-        };
-        const compareText = (a, b) => plain(a).localeCompare(plain(b), locale);
-        this.compare = (a, b) => {
-            const [x, y] = [String(a), String(b)];
-            return options.numeric ? compareNumbers(x, y, compareText) : compareText(x, y);
-        };
-        this.resolvedOptions = () => ({
-            locale: locale ?? systemLocale(),
-            usage: options.usage ?? 'sort',
-            sensitivity: options.sensitivity ?? 'variant',
-            ignorePunctuation: false,
-            collation: 'default',
-            numeric: Boolean(options.numeric),
-            caseFirst: 'false',
-        });
+    #compare;
+    #locale;
+    #usage;
+    constructor(locales, options = undefined) {
+        this.#locale = Array.isArray(locales) ? locales[0] : locales;
+        this.#usage = options?.usage ?? 'sort';
+        if (this.#usage !== 'sort' && this.#usage !== 'search') {
+            throw new RangeError(`Value ${this.#usage} out of range for Intl.Collator options property usage`);
+        }
+        this.#compare = __fs.collator(locales, options);
+    }
+
+    get compare() {
+        return this.#compare;
+    }
+
+    resolvedOptions() {
+        const [numeric, sensitivity, caseFirst, ignorePunctuation] = __fs.collatorOptions(this.#compare);
+        const locale = this.#locale === undefined ? systemLocale() : String(this.#locale).replace(/-u-.*$/i, '');
+        return { locale, usage: this.#usage, sensitivity, ignorePunctuation, collation: 'default', numeric, caseFirst };
     }
 
     static supportedLocalesOf(locales) {

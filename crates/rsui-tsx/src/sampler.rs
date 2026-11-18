@@ -61,7 +61,10 @@ unsafe extern "system" {
     fn GetModuleFileNameW(module: isize, name: *mut u16, size: u32) -> u32;
 }
 
-#[link(name = "dbghelp")]
+// From the library itself rather than its import library, as it's loaded late (`/DELAYLOAD` in .cargo/config.toml): the
+// import library would give it a second table of what's called in it, besides the one rsui-alloc's declarations give.
+// See tests/imports.rs.
+#[link(name = "dbghelp.dll", kind = "raw-dylib", modifiers = "+verbatim")]
 unsafe extern "system" {
     fn SymInitializeW(process: isize, search: *const u16, invade: i32) -> i32;
     fn SymSetOptions(options: u32) -> u32;

@@ -108,9 +108,9 @@ fn kerning_comes_from_the_old_table() {
         kern: true,
         ..Options::default()
     });
-    assert_eq!(font.kerning(1, 2), -100);
-    assert_eq!(font.kerning(2, 1), 0);
-    assert_eq!(font.kerning(1, 1), 0);
+    assert_eq!(font.kerning(1, 2), -100.0);
+    assert_eq!(font.kerning(2, 1), 0.0);
+    assert_eq!(font.kerning(1, 1), 0.0);
 }
 
 #[test]
@@ -119,15 +119,15 @@ fn kerning_comes_from_gpos_pairs_and_classes() {
         gpos: true,
         ..Options::default()
     });
-    assert_eq!(font.kerning(1, 2), -50, "from a list of pairs");
+    assert_eq!(font.kerning(1, 2), -50.0, "from a list of pairs");
     assert_eq!(
         font.kerning(1, 4),
-        -30,
+        -30.0,
         "from the next list, if not in the first"
     );
-    assert_eq!(font.kerning(2, 1), -70, "from classes");
-    assert_eq!(font.kerning(2, 2), 0);
-    assert_eq!(font.kerning(5, 1), 0);
+    assert_eq!(font.kerning(2, 1), -70.0, "from classes");
+    assert_eq!(font.kerning(2, 2), 0.0);
+    assert_eq!(font.kerning(5, 1), 0.0);
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn gpos_wins_over_the_old_table() {
         kern: true,
         ..Options::default()
     });
-    assert_eq!(font.kerning(1, 2), -50);
+    assert_eq!(font.kerning(1, 2), -50.0);
 }
 
 #[derive(Default)]

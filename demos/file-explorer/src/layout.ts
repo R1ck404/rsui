@@ -25,8 +25,10 @@ export interface Handle {
     split: string;
     index: number;
     dir: Dir;
-    rect: Rect;
-    /** The pixels the split's sizes are shares of, which is how far a share moves for a pixel of drag. */
+    /** Where it is, as `place` works it out. The handles that are shown are where layout puts them, in the gaps. */
+    rect?: Rect;
+    /** The pixels the split's sizes are shares of, which is how far a share moves for a pixel of drag, as it's measured when a
+     * drag starts. */
     room: number;
 }
 
@@ -225,7 +227,11 @@ function lengths(room: number, sizes: number[], gap: number): number[] {
     });
 }
 
-/** Where each pane goes in `rect`, and the handles between them. */
+/**
+ * Where each pane would go in `rect`, and the handles between them. The panes that are shown are laid out by the page, as flex
+ * boxes with these sizes as their shares (see src/Splits.tsx); this is for what isn't there to be laid out, as where a tab dropped
+ * on them would land, and the small pictures of layouts in the menu.
+ */
 export function place(layout: Layout, rect: Rect, gap: number): { panes: Map<string, Rect>; handles: Handle[] } {
     const panes = new Map<string, Rect>();
     const handles: Handle[] = [];

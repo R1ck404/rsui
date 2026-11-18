@@ -803,9 +803,137 @@ const resizeWatches = new Set();
 /// Whether something's been watched since the window was last laid out, which it's told about even if nothing's laid out again.
 let resizeFirst = false;
 
+// `content-visibility`, as a page has it. Something that's `auto` is drawn as a box of the size `contain-intrinsic-size` says, with
+// nothing in it, while it's far from being seen: what's in it isn't styled, made or laid out, which for a list of thousands of
+// rows is most of what they cost, and of what they take. Once it's near being seen, within half the window of what shows of it in
+// the window and what scrolls around it, as Chromium has it, what's in it is drawn, and stays drawn from then on, so what's in it
+// keeps its state as it goes out of view again: what it costs to lay out and draw there is only what's seen, as for anything
+// else. Something `hidden` is a box of that size with nothing in it for as long as it says so, and what was in it starts again
+// when it stops saying it. The box it has meanwhile is named for the text in what it skips, as far as that's written out in it
+// rather than made by its components, so that what looks for that text, as an agent or a screen reader does, still finds it.
+
+/// The page's elements that are skipping what's in them until they're near being seen, by their keys.
+const skippingLives = new Map();
+/// How far from being seen something's taken to be near it, as a share of the bigger of the window's width and height.
+const NEAR_VIEW = 0.5;
+
+/// What's in `live` as drawn, as its `content-visibility` says, or `null` for what it was given. It takes what CSS said about that
+/// out of `look`, as that's nothing for the rest.
+function contentVisibility(look, live, children) {
+    const said = look.__contentVisibility;
+    const sizes = [look.__intrinsicSize, look.__intrinsicWidth, look.__intrinsicHeight];
+    delete look.__contentVisibility;
+    delete look.__intrinsicSize;
+    delete look.__intrinsicWidth;
+    delete look.__intrinsicHeight;
+    const how = typeof said === 'string' ? said.trim().toLowerCase() : 'visible';
+    if ((how !== 'auto' && how !== 'hidden') || (how === 'auto' && live.contentSeen === true)) {
+        if (skippingLives.get(live.domKey) === live) {
+            skippingLives.delete(live.domKey);
+        }
+        return null;
+    }
+    // It's looked for by its key, which it only has further on in its first render: see `skipsUntilNear`.
+    live.skipsUntilNear = how === 'auto';
+    if (how === 'hidden') {
+        live.contentSeen = false;
+    }
+    const [width, height] = intrinsicSize(sizes, typeof look.fontSize === 'number' ? look.fontSize : 16);
+    const name = how === 'auto' ? textWrittenIn(children).replace(/\s+/g, ' ').trim() : '';
+    const box = { key: '__skipped', shrink: 0 };
+    if (width !== undefined) {
+        box.width = width;
+    }
+    if (height !== undefined) {
+        box.height = height;
+    }
+    if (name !== '') {
+        box.name = name;
+    }
+    return [make('group', box)];
+}
+
+/// Has what `live` skips looked at each time the window's laid out or scrolled, while it's skipping it until it's near being seen.
+function skipsUntilNear(live) {
+    if (live.skipsUntilNear === true && live.domKey !== undefined) {
+        const first = skippingLives.size === 0;
+        skippingLives.set(live.domKey, live);
+        if (first) {
+            lookForResizes();
+        }
+    } else if (skippingLives.get(live.domKey) === live) {
+        skippingLives.delete(live.domKey);
+    }
+}
+
+/// How wide and tall `contain-intrinsic-size` and the rest say something that's skipping what's in it is, as `[width, height]`,
+/// each `undefined` for what they leave as nothing. `auto` before a size, which is for the size it was last drawn at, comes to that
+/// size, as once it's been drawn it's drawn from then on.
+function intrinsicSize([both, width, height], fontSize) {
+    const read = (said) => {
+        if (typeof said !== 'string') {
+            return undefined;
+        }
+        const words = said.trim().toLowerCase().split(/\s+/).filter((word) => word !== 'auto' && word !== '');
+        return words.length === 0 || words[0] === 'none' ? [] : words;
+    };
+    const one = (word) => {
+        if (word === undefined || word === 'none') {
+            return undefined;
+        }
+        const size = length(word, fontSize);
+        return typeof size === 'number' && Number.isFinite(size) && size >= 0 ? size : undefined;
+    };
+    const sizes = read(both) ?? [];
+    let [across, down] = [one(sizes[0]), one(sizes[1] ?? sizes[0])];
+    const ownWidth = read(width);
+    const ownHeight = read(height);
+    if (ownWidth !== undefined) {
+        across = one(ownWidth[0]);
+    }
+    if (ownHeight !== undefined) {
+        down = one(ownHeight[0]);
+    }
+    return [across, down];
+}
+
+/// The text written in what's given, as far as it's text and the page's own tags with text in them, for naming what skips it.
+function textWrittenIn(children) {
+    if (children === null || children === undefined || typeof children === 'boolean') {
+        return '';
+    }
+    if (typeof children === 'string' || typeof children === 'number') {
+        return String(children);
+    }
+    if (Array.isArray(children)) {
+        return children.map(textWrittenIn).join('');
+    }
+    // The page's own tags are made with a component of their own for each, which says which tag it is. What's in one is apart from
+    // what's beside it.
+    if (isValidElement(children) && (typeof children.type !== 'function' || children.type.__webTag !== undefined)) {
+        return ' ' + textWrittenIn(children.kids ?? children.props?.children) + ' ';
+    }
+    return '';
+}
+
+/// Draws what's in each of the elements that are skipping it that's near being seen now, as the window last laid it out.
+function showNear() {
+    const margin = Math.max(globalThis.innerWidth ?? 0, globalThis.innerHeight ?? 0) * NEAR_VIEW;
+    const keys = rsuiHostMethods.nearView(margin);
+    for (const key of keys ?? []) {
+        const live = skippingLives.get(key);
+        if (live === undefined) {
+            continue;
+        }
+        skippingLives.delete(key);
+        live.contentSeen = true;
+        live.redraw();
+    }
+}
+
 /// Has what's watched looked at after each time the window's laid out, while there's anything watched.
 function lookForResizes() {
-    const wanted = resizeWatches.size !== 0 || afterLayout.size !== 0 || hasWatched.size !== 0 || containerWatched.size !== 0;
+    const wanted = resizeWatches.size !== 0 || afterLayout.size !== 0 || hasWatched.size !== 0 || containerWatched.size !== 0 || skippingLives.size !== 0;
     rsuiHostMethods.wantLaidOut(wanted);
     globalThis.__rsuiLaidOut = wanted ? laidOut : undefined;
 }
@@ -814,6 +942,9 @@ function lookForResizes() {
 const afterLayout = new Set();
 
 function laidOut() {
+    if (skippingLives.size !== 0) {
+        showNear();
+    }
     if (resizeWatches.size !== 0) {
         checkResizes();
     }
@@ -1002,13 +1133,55 @@ function lookFrom(declarations) {
 /// The names of the variables that something on an element sets.
 const elementVariables = new Set();
 
+// Starting styles (CSS Transitions 2): what's in `@starting-style` is where an element that's just been drawn, or shown again
+// after `display: none`, starts its transitions from. Each declaration in it is said as `-rsui-starting-NAME`, which goes through
+// the cascade as any other declaration does, so that what says more about the element, or comes later, says what it starts from,
+// and comes to `__starting NAME` on its look (see `declareBlock`), which `startingOf` makes into the runtime's `starting`.
+
+/// What a declaration from `@starting-style` is called once it's out of it.
+const STARTING = '-rsui-starting-';
+
+/// What's in a `@starting-style`, and what's in the rules in it, said as `STARTING` has it. The variables it sets itself are put
+/// into what uses them here, as Tailwind 4's `starting:scale-95` sets `--tw-scale-x` and says `scale: var(--tw-scale-x) ...` in
+/// the same rule: they're only what it starts from, and not the element's variables.
+function startingBlock(block) {
+    const own = new Map();
+    for (const [name, value] of block?.declarations ?? []) {
+        if (name.startsWith('--')) {
+            own.set(name, value);
+        }
+    }
+    const put = (value) => (own.size === 0 || !value.includes('var(') ? value
+        : value.replace(/var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*))?\)/g, (whole, name, otherwise) => own.get(name) ?? otherwise ?? whole));
+    return {
+        declarations: (block?.declarations ?? []).filter(([name]) => !name.startsWith('--'))
+            .map(([name, value, important]) => [name.startsWith(STARTING) ? name : STARTING + name, put(value), important]),
+        rules: (block?.rules ?? []).map((rule) => ({ selector: rule.selector, block: startingBlock(rule.block) })),
+    };
+}
+
 /// What some declarations come to as props: what Rust makes of them, with what they say about variables kept too, as `--name`,
 /// and each that uses a variable an element can set kept as it was written, as `__var name`, with what it came to here.
 function declareBlock(declarations, fontSize) {
+    let starting = false;
     for (const [name] of declarations) {
         if (name.startsWith('--')) {
             elementVariables.add(name);
+        } else if (name.startsWith(STARTING)) {
+            starting = true;
         }
+    }
+    if (starting) {
+        // What `@starting-style` says is kept as it's written, as `__starting NAME`, for `startingOf` to work out once it's
+        // known what the element's variables are, and the rest is said as usual.
+        const props = declareBlock(declarations.filter(([name]) => !name.startsWith(STARTING)), fontSize);
+        for (const [name, value] of declarations) {
+            if (name.startsWith(STARTING)) {
+                props['__starting ' + name.slice(STARTING.length)] = value;
+            }
+        }
+        props.__startingSaid = true;
+        return props;
     }
     const waits = (value) => value.includes('var(') && namesIn(value).some((one) => elementVariables.has(one));
     let waiting = declarations.filter(([name, value]) => !name.startsWith('--') && waits(value));
@@ -1460,7 +1633,7 @@ function withTransformParts(look) {
     const parts = [];
     const said = (value) => value !== undefined && value !== 'none';
     if (said(look.__translate)) {
-        const [x, y = '0px'] = words(look.__translate);
+        const [x, y = '0px'] = words(look.__translate).map(pixelsOf);
         parts.push('translate(' + x + ', ' + y + ')');
     }
     if (said(look.__rotate)) {
@@ -1488,7 +1661,22 @@ function withTransformParts(look) {
 /// An angle, in degrees, from what CSS says, with `calc()` worked out: `calc(90deg * -1)` is -90.
 function angleOf(text) {
     const DEGREES = { deg: 1, rad: 180 / Math.PI, turn: 360, grad: 0.9 };
-    const plain = text.replace(/calc\(/g, '(').replace(/(-?[0-9.]+)(deg|rad|turn|grad)\b/g, (_, number, unit) => String(Number(number) * DEGREES[unit]));
+    return measureOf(text.replace(/(-?[0-9.]+)(deg|rad|turn|grad)\b/g, (_, number, unit) => String(Number(number) * DEGREES[unit])));
+}
+
+/// A length in pixels, with a `calc()` of pixels worked out, as Tailwind 4's `translate-x-4` comes to (`calc(4px * 4)` once its
+/// `--spacing` is put in), so that it moves from and to a number. What has a share of the box in it is left as it is.
+function pixelsOf(text) {
+    if (!text.includes('calc(')) {
+        return text;
+    }
+    const pixels = measureOf(text.replace(/(-?[0-9.]+)px\b/g, '$1'));
+    return pixels === undefined ? text : pixels + 'px';
+}
+
+/// What a `calc()`, or a plain number, comes to, once its units have been taken out.
+function measureOf(text) {
+    const plain = text.replace(/calc\(/g, '(');
     if (!/^[0-9.+\-*/()\s]+$/.test(plain)) {
         return undefined;
     }
@@ -2393,6 +2581,8 @@ function needsOf(pseudo) {
 /// What `settle` does, for an element: with what its own variables come to, and its transform put together, first.
 function settleElement(look) {
     withElementVariables(look, null);
+    // Only an element of the page that's drawn by itself starts transitions from what `@starting-style` says (see `startingOf`).
+    withoutStarting(look);
     return settle(withTransformParts(look));
 }
 
@@ -2470,6 +2660,8 @@ function addAtRule(out, rule, steps, fontSize) {
         addBlock(out, rule.block, [...steps.slice(0, -1), merged], fontSize);
     } else if (text.startsWith('@property')) {
         registerProperty(rule.selector.slice(9).trim(), rule.block);
+    } else if (text.startsWith('@starting-style')) {
+        addBlock(out, startingBlock(rule.block), steps, fontSize);
     } else if (/^@(-webkit-|-moz-|-o-|-ms-)?keyframes/.test(text)) {
         addKeyframes(rule.selector, rule.block);
     } else if (!SAYS_NOTHING_HERE.test(text)) {
@@ -2608,6 +2800,8 @@ function inCascadeOrder(rules) {
                 walk(containerRules(block.rules, selector.slice(10)), layer);
             } else if (lower.startsWith('@property')) {
                 registerProperty(selector.slice(9).trim(), block);
+            } else if (lower.startsWith('@starting-style')) {
+                walk(startingBlock(block).rules, layer);
             } else if (selector.startsWith('@')) {
                 into(layer).push(rule);
             } else {
@@ -2641,6 +2835,11 @@ function unnested(selector, block) {
             } else if (lower.startsWith('@layer')) {
                 own.block.declarations.push(...inner.block.declarations);
                 inside(inner.block.rules);
+            } else if (lower.startsWith('@starting-style')) {
+                // What the rule it's in starts its transitions from, as Tailwind 4's `starting:` would have it if it were nested.
+                const starting = startingBlock(inner.block);
+                own.block.declarations.push(...starting.declarations);
+                inside(starting.rules);
             } else if (lower.startsWith('@container')) {
                 // What it says itself is about the rule it's in, where the query holds, as a rule of its own.
                 const prelude = inner.selector.slice(10);
@@ -2900,6 +3099,8 @@ function checkContainerWatched() {
 let sizeQueries = false;
 /// What `window.addEventListener('resize', ...)` was given.
 const resizeListeners = new Set();
+/// What's told when things start or stop moving (`prefers-reduced-motion`), as `matchMedia`'s lists are: see `motionChanged`.
+const motionListeners = new Set();
 
 function mediaApplies(text) {
     // A list of queries, as `screen and (min-width: 769px), print` is, holds if any of them does.
@@ -2911,6 +3112,10 @@ function mediaApplies(text) {
 /// when their outer condition changes and the sheet is compiled again.
 function sheetMediaApplies(text) {
     const holds = mediaApplies(text);
+    if (/prefers-reduced-motion/i.test(text) && !rsuiHostMethods.animationsOn()) {
+        // CSS that has things move differently when they move at all, which `--do` says `animations on` would show.
+        rsuiHostMethods.motionHeld();
+    }
     (sheet.mediaQueries ??= new Map()).set(text, holds);
     return holds;
 }
@@ -2953,6 +3158,33 @@ function resizedCss() {
         restyle.page = true;
         declared += 1;
         restyled();
+    }
+}
+
+/// Things have started or stopped moving, as `animations on` and `off` in `--do` say, or the system's setting does: CSS that
+/// asks `prefers-reduced-motion` is worked out again, and what's watching hears. Otherwise a sheet worked out while nothing
+/// moved, as everything is before an agent's run turns animations on, kept `transition: none` from a
+/// `@media (prefers-reduced-motion: reduce)` rule for good, and its transitions never played.
+function motionChanged() {
+    let mediaChanged = false;
+    for (const one of sheets) {
+        for (const [query, was] of one.mediaQueries ?? []) {
+            if (!/prefers-reduced-motion/i.test(query)) {
+                continue;
+            }
+            const now = mediaApplies(query);
+            if (now !== was) {
+                one.mediaQueries.set(query, now);
+                mediaChanged = true;
+            }
+        }
+    }
+    if (mediaChanged) {
+        refillSheets();
+        changed();
+    }
+    for (const listener of motionListeners) {
+        listener();
     }
 }
 
@@ -7571,6 +7803,10 @@ const MOVING = {
     // A share of what it's in, as `width: var(--progress-section-size)` comes to (`80%`), is `width_percent` (see `props.rs`).
     width: [['width', 'width', 'n', ['width']], ['__widthShare', 'width_percent', 'n', ['width']]],
     height: [['height', 'height', 'n', ['height']], ['__heightShare', 'height_percent', 'n', ['height']]],
+    // How a flex box shares its room out, so that what's split by `flex-grow` shares glides to its new shares.
+    'flex-grow': [['grow', 'grow', 'n', ['flex-grow']]],
+    'flex-shrink': [['shrink', 'shrink', 'n', ['flex-shrink']]],
+    'flex-basis': [['basis', 'basis', 'n', ['flex-basis']]],
     'min-width': [['minWidth', 'min_width', 'n', ['min-width']]],
     'max-width': [['maxWidth', 'max_width', 'n', ['max-width']]],
     'min-height': [['minHeight', 'min_height', 'n', ['min-height']]],
@@ -7596,6 +7832,7 @@ const MOVING = {
     'background-position': [['backgroundPosition', 'background_position', 's', ['background-position']]],
 };
 MOVING.outline = [...MOVING['outline-color'], ...MOVING['outline-width'], ...MOVING['outline-offset']];
+MOVING.flex = [...MOVING['flex-grow'], ...MOVING['flex-shrink'], ...MOVING['flex-basis']];
 for (const side of SIDES) {
     MOVING['padding-' + side.toLowerCase()] = [['padding' + side, 'padding_' + side.toLowerCase(), 'n', ['padding-' + side.toLowerCase()]]];
     MOVING['margin-' + side.toLowerCase()] = [['margin' + side, 'margin_' + side.toLowerCase(), 'n', ['margin-' + side.toLowerCase()]]];
@@ -7617,6 +7854,12 @@ for (const [logical, start, end] of [['inline', 'Left', 'Right'], ['block', 'Top
 }
 /// Each prop that can move, by how it's written here.
 const MOVING_PROPS = new Map(Object.values(MOVING).flat().map((entry) => [entry[0], entry]));
+// CSS's own `translate`, `rotate` and `scale` are put together into the transform (see `withTransformParts`), so a transition of
+// any of them is the transform's, as Tailwind 4's `transition: scale 150ms` for its `hover:scale-110` is. These come after
+// `MOVING_PROPS`, which has each prop once.
+for (const part of ['translate', 'rotate', 'scale']) {
+    MOVING[part] = MOVING.transform;
+}
 /// What a shape's parts say that moves, which moves the whole shape's layers.
 const SHAPE_MOVING = new Set(['all', 'fill', 'stroke', 'stroke-width', 'stroke-dasharray', 'stroke-dashoffset']);
 
@@ -7657,12 +7900,16 @@ const isEasing = (word) => EASINGS.has(word) || /^(cubic-bezier|steps)\(/.test(w
 function transitionsOf(look) {
     const out = [];
     for (const one of topLevel(look.__transition ?? '', ',')) {
-        const rule = { property: 'all', duration: 0, delay: 0, easing: 'ease' };
+        const rule = { property: 'all', duration: 0, delay: 0, easing: 'ease', discrete: false };
         let times = 0;
         for (const word of topLevel(one, ' ')) {
             const seconds = secondsOf(word);
             if (seconds !== undefined) {
                 rule[times++ === 0 ? 'duration' : 'delay'] = seconds;
+            } else if (word === 'allow-discrete' || word === 'normal') {
+                // `transition-behavior`, which says whether what can't move between its values, as `display`, changes at the
+                // start or end of the time it's given (see `leavesShown`).
+                rule.discrete = word === 'allow-discrete';
             } else if (isEasing(word)) {
                 rule.easing = word;
             } else {
@@ -7681,10 +7928,12 @@ function transitionsOf(look) {
     if (properties !== undefined) {
         out.length = 0;
         for (const property of properties) {
-            out.push({ property: property.toLowerCase(), duration: 0, delay: 0, easing: 'ease' });
+            out.push({ property: property.toLowerCase(), duration: 0, delay: 0, easing: 'ease', discrete: false });
         }
     }
-    for (const [name, key, read] of [['transition-duration', 'duration', secondsOf], ['transition-delay', 'delay', secondsOf], ['transition-timing-function', 'easing', (word) => word]]) {
+    const behavior = (word) => (word === 'allow-discrete' ? true : word === 'normal' ? false : undefined);
+    for (const [name, key, read] of [['transition-duration', 'duration', secondsOf], ['transition-delay', 'delay', secondsOf], ['transition-timing-function', 'easing', (word) => word],
+        ['transition-behavior', 'discrete', behavior]]) {
         const values = list(name);
         if (values !== undefined) {
             out.forEach((rule, at) => {
@@ -7775,15 +8024,18 @@ function motionValue(kind, value, entry = '') {
 /// Turns what CSS says moves into the props rsui's runtime plays: `transitions` and `animation`.
 function motionProps(look, variables = null) {
     if (look.__transition !== undefined || look.__transitionParts !== undefined) {
-        const lines = [];
+        // A prop once, as the last that names it says, as CSS has it: Tailwind's `transition-transform` is `transform, translate,
+        // scale, rotate`, which are all the one transform here.
+        const lines = new Map();
         for (const rule of transitionsOf(look)) {
             const entries = rule.property === 'all' ? [...MOVING_PROPS.values()] : MOVING[rule.property] ?? [];
             for (const [, name, kind, longhands] of entries) {
-                lines.push(`${name} ${kind} ${rule.duration} ${rule.delay} ${rule.easing}|${longhands.join(',')}`);
+                lines.delete(name);
+                lines.set(name, `${name} ${kind} ${rule.duration} ${rule.delay} ${rule.easing}|${longhands.join(',')}`);
             }
         }
-        if (lines.length > 0) {
-            look.transitions = lines.join('\n');
+        if (lines.size > 0) {
+            look.transitions = [...lines.values()].join('\n');
         }
     }
     delete look.__transition;
@@ -7798,6 +8050,11 @@ function motionProps(look, variables = null) {
                 // var(--mantine-scale)) 0`, is what they stand for.
                 const declarations = frame.declarations.map((one) => (one[1].includes('var(') ? [one[0], withVariables(one[1], 0, variables), ...one.slice(2)] : one));
                 const said = natives.cssDeclare(declarations, 16, remSize, declaring, true);
+                // A keyframe's `translate`, `rotate` and `scale` are its transform, as an element's are.
+                if (said.__translate !== undefined || said.__rotate !== undefined || said.__scale !== undefined) {
+                    withTransformParts(said);
+                    said.transform ??= 'none';
+                }
                 for (const key of Object.keys(said)) {
                     const entry = MOVING_PROPS.get(key);
                     const value = entry === undefined ? undefined : motionValue(entry[2], said[key], entry[1]);
@@ -8132,6 +8389,100 @@ function motionOf(look, variables = null) {
     return [said.transitions, said.animation];
 }
 
+/// What `@starting-style` says an element's transitions start from, as the runtime's `starting` has it (see `motion.rs`): a line
+/// for each prop that can move, with its kind and value, as an `animation`'s keyframes have them. The `__starting` props are
+/// taken off the look, as nothing else draws them. It's `undefined` where nothing's said.
+function startingOf(look, variables = null) {
+    if (look.__startingSaid !== true) {
+        return undefined;
+    }
+    delete look.__startingSaid;
+    const declarations = [];
+    for (const key of Object.keys(look)) {
+        if (key.startsWith('__starting ')) {
+            const value = look[key];
+            delete look[key];
+            if (typeof value === 'string') {
+                declarations.push([key.slice(11), value.includes('var(') ? withVariables(value, 0, variables) : value]);
+            }
+        }
+    }
+    if (declarations.length === 0) {
+        return undefined;
+    }
+    const said = withTransformParts(natives.cssDeclare(declarations, 16, remSize, declaring));
+    const lines = [];
+    for (const key of Object.keys(said)) {
+        const entry = MOVING_PROPS.get(key);
+        const value = entry === undefined ? undefined : motionValue(entry[2], said[key], entry[1]);
+        if (value !== undefined) {
+            lines.push(`${entry[1]} ${entry[2]} ${value}`);
+        }
+    }
+    return lines.length > 0 ? lines.join('\n') : undefined;
+}
+
+/// Takes what `@starting-style` said off a look that doesn't start transitions from it.
+function withoutStarting(look) {
+    if (look.__startingSaid === true) {
+        startingOf(look);
+    }
+    return look;
+}
+
+/// Whether an element that CSS says isn't shown any more (`what` is `display` going to `none`, or `visibility` going to `hidden`)
+/// is still shown, as it is while its transitions take it away, where its `transition` says that changes at their end:
+/// `transition-behavior: allow-discrete` with `display` (or `all`), and `visibility`, which always does (CSS Transitions 2). It's
+/// drawn again when that's over. Where nothing moves, as with `animations off`, it goes at once.
+function leavesShown(live, look, what) {
+    // `true` while it's leaving, and `false` once it's left, until it's shown again (see `shownAgain`).
+    const leaving = live.leaving?.[what];
+    if (leaving !== undefined) {
+        return leaving.going;
+    }
+    // Only what was shown the last time it was drawn has anything to leave from.
+    if (live.shownWas?.[what] !== true || (look.__transition === undefined && look.__transitionParts === undefined) || !rsuiHostMethods.animationsOn()) {
+        return false;
+    }
+    let longest = 0;
+    for (const rule of transitionsOf(look)) {
+        const covers = rule.property === what || (rule.property === 'all' && (what === 'visibility' || rule.discrete));
+        if (covers && (what === 'visibility' || rule.discrete)) {
+            longest = Math.max(longest, rule.duration + rule.delay);
+        }
+    }
+    if (longest <= 0) {
+        return false;
+    }
+    const going = { going: true };
+    (live.leaving ??= {})[what] = going;
+    setTimeout(() => {
+        // Unless it's been shown again since, which leaves it as it is.
+        if (live.leaving?.[what] === going) {
+            going.going = false;
+            live.redraw?.();
+        }
+    }, longest * 1000);
+    return true;
+}
+
+/// Notes whether CSS says an element is shown, by `display` and `visibility`, and whether it's drawn as shown, for `leavesShown`:
+/// what CSS says is shown again has nothing more to leave, and what's drawn as shown has something to leave from.
+function shownAgain(live, saidDisplay, saidVisibility, drawnDisplay, drawnVisibility) {
+    if (live.leaving !== undefined) {
+        if (saidDisplay) {
+            live.leaving.display = undefined;
+        }
+        if (saidVisibility) {
+            live.leaving.visibility = undefined;
+        }
+    }
+    const was = live.shownWas;
+    if (was === undefined || was.display !== drawnDisplay || was.visibility !== drawnVisibility) {
+        live.shownWas = { display: drawnDisplay, visibility: drawnVisibility };
+    }
+}
+
 /// How a shape's parts' transitions move its layers: `{ duration, delay, easing }` for the longest, or `undefined`.
 function shapeMoves(look) {
     let longest;
@@ -8220,6 +8571,9 @@ function makeStyled(target, settings = {}) {
                     }
                     forgetNotShown(live);
                     forgetSvgParts(live.domKey);
+                    if (skippingLives.get(live.domKey) === live) {
+                        skippingLives.delete(live.domKey);
+                    }
                     const forgotHas = hasWatched.delete(live);
                     if (forgotHas) hasRecipesChanged();
                     if (forgotHas | containerWatched.delete(live)) {
@@ -8581,7 +8935,24 @@ function makeStyled(target, settings = {}) {
             // An `<option>` and an `<optgroup>` aren't drawn by themselves: the `<select>` they're in draws what's chosen and its
             // list, as a browser's does. They're still elements of the page, for `select.options` and selectors.
             const listPart = isHost && (tag === 'option' || tag === 'optgroup');
-            const notShownNow = listPart || look.__hidden === true || (props.hidden === true && look.__hidden !== false);
+            const saidNotShown = listPart || look.__hidden === true || (props.hidden === true && look.__hidden !== false);
+            let notShownNow = saidNotShown;
+            // What's going to `display: none` or `visibility: hidden` stays shown while its transitions take it away, where its
+            // `transition` says so (see `leavesShown`).
+            const moves = look.__transition !== undefined || look.__transitionParts !== undefined;
+            if (isHost && (moves || live.shownWas !== undefined)) {
+                if (saidNotShown && !listPart && moves && leavesShown(live, look, 'display')) {
+                    notShownNow = false;
+                    delete look.__hidden;
+                }
+                const saidHidden = look.__visibility === 'hidden';
+                let drawnHidden = saidHidden;
+                if (saidHidden && moves && leavesShown(live, look, 'visibility')) {
+                    drawnHidden = false;
+                    delete look.__visibility;
+                }
+                shownAgain(live, !saidNotShown, !saidHidden, !notShownNow, !drawnHidden);
+            }
             if (notShownNow && !isHost) {
                 return null;
             }
@@ -8623,6 +8994,12 @@ function makeStyled(target, settings = {}) {
                 // What a portal into it puts there comes after what React gave it, as react-dom appends a portal's children to its
                 // container: Radix Select's chosen item's text in its `SelectValue`.
                 children = [...Children.toArray(children ?? []), ...live.portalKids.values()];
+            }
+            // What CSS says to skip while it's far from being seen (`content-visibility`) has a box of the size it says in place of
+            // what's in it until then, and what's in it from then on: see `contentVisibility`.
+            const skipping = isHost ? contentVisibility(look, live, children) : null;
+            if (skipping !== null) {
+                children = skipping;
             }
             if (isHost && (look.__flex === true || look.display === 'grid') && !keepsSpaces(look.__whiteSpace)) {
                 // Text in a flex box or a grid is a box of its own, with no spaces at its ends, and only spaces is nothing.
@@ -9000,6 +9377,8 @@ function makeStyled(target, settings = {}) {
             // A keyframe's variables are what they are on the element itself, as Radix's accordion's `height:
             // var(--radix-accordion-content-height)` is what it sets on the content it opens.
             const [transitions, moving] = motionOf(look, ownVariables(variablesInside, variablesAbove));
+            // Where its transitions start from when it's first drawn, or shown again, if `@starting-style` says.
+            const starting = transitions === undefined ? void withoutStarting(look) : startingOf(look, ownVariables(variablesInside, variablesAbove));
             // What isn't shown (`display: none`) plays no animation, as on a page: it starts once it's shown.
             const animation = notShownNow ? undefined : moving;
             // What animation it plays, for `getComputedStyle()` and `animationend` to say, and to say it's started or been
@@ -9067,12 +9446,20 @@ function makeStyled(target, settings = {}) {
             // What it's drawn with and what moves it, for what code stops with its `style` before it's drawn again (see `stillForReads`).
             live.placedOut = out;
             live.placedAnimation = animation;
+            if (starting !== undefined) {
+                out.starting = starting;
+            }
             if (live.stillSaid === true) {
                 live.stillSaid = false;
             }
             if (look.__visibility !== undefined) {
                 // Drawn as nothing, which can't be clicked (see `layout.rs`), and said as what it was, for `getComputedStyle()`.
                 out[LOOK_VISIBILITY] = String(look.__visibility);
+            }
+            if (skipping !== null) {
+                // For Rust to find, to say when it's near being seen: see `nearView` in geometry.rs.
+                out.contentSkipped = true;
+                skipsUntilNear(live);
             }
             if (isHost && !fieldset) {
                 // What's placed by itself in an element that isn't positioned is placed from the nearest one around it that is, as
@@ -9220,8 +9607,10 @@ function makeStyled(target, settings = {}) {
                 if (tag === 'optgroup') {
                     return Children.toArray(given.children).filter((one) => isValidElement(one));
                 }
+                // It's said to be `unshown`, so that what's drawn in its place once it's shown again has nothing to move from but
+                // what `@starting-style` says (see `motion.rs`).
                 return isHost && live.domKey !== undefined
-                    ? make('group', { domKey: live.domKey, overlay: 'fill', inert: true,
+                    ? make('group', { domKey: live.domKey, overlay: 'fill', inert: true, unshown: true,
                         ...(typeof rest.className === 'string' ? { class: rest.className } : null),
                         ...(typeof rest.id === 'string' ? { domId: rest.id } : null) })
                     : null;
@@ -9855,7 +10244,8 @@ function keepsKids(tag, look, nested, parts, kept) {
 function keptSignature(look, inner, kids) {
     const type = isValidElement(kids[0]) ? kids[0].type : undefined;
     const flow = typeof type === 'function' ? [type.__webFlowSeen, type.__webInline, type.__webText, type.__webStyled, type.__webField, type.__webTag] : [];
-    return [look.__whiteSpace, inner, version, declared, kindsForgotten, ofType, complexFloats(), complexLineBoxes(), flowLearnedCount, type, ...flow];
+    // The kind comes first, where `keptType` finds it.
+    return [type, look.__whiteSpace, inner, version, declared, kindsForgotten, ofType, complexFloats(), complexLineBoxes(), flowLearnedCount, ...flow];
 }
 
 function sameSaid(a, b) {
@@ -9877,7 +10267,7 @@ function sameList(a, b) {
 
 /// Whether everything in a list is an element of the kind `said` was worked out for, with a key of its own.
 function keptType(list, said) {
-    const type = said[8];
+    const type = said[0];
     if (typeof type !== 'function') {
         return false;
     }
@@ -9889,9 +10279,39 @@ function keptType(list, said) {
     return true;
 }
 
-/// What's in a block, as what was kept for it, when only some of it has been put in or taken out since, or `null`. What's the same
-/// at its start and its end is found by looking at each, which is all it costs: what's between is what's new, which is looked at
-/// as `Styled` would.
+/// Whether `kid` is, to what `keptKids` works out, what `was` was: the same element, or one React made again in a render, of the same
+/// kind with the same key and children, given the same props one by one. Everything it looks at about one comes from those.
+function sameKid(was, kid) {
+    if (was === kid) {
+        return true;
+    }
+    if (!isValidElement(was) || !isValidElement(kid) || was.type !== kid.type || was.key !== kid.key || was.kids !== kid.kids) {
+        return false;
+    }
+    const [before, now] = [was.props, kid.props];
+    if (before === now) {
+        return true;
+    }
+    if (before === null || now === null || typeof before !== 'object' || typeof now !== 'object') {
+        return false;
+    }
+    let count = 0;
+    for (const name in before) {
+        if (!Object.is(before[name], now[name])) {
+            return false;
+        }
+        count += 1;
+    }
+    for (const _ in now) {
+        count -= 1;
+    }
+    return count === 0;
+}
+
+/// What's in a block, as what was kept for it, when only some of it has changed since, or `null`. What's the same is found by
+/// looking at each, which is all it costs: what's new is looked at as `Styled` would. With as many as before, that's each in its
+/// place, as moving the selection in a long list makes two rows far apart again; otherwise it's what's the same at its start and
+/// its end, and what's between is what's new.
 function keptKids(kept, kids, said, tag, inner) {
     const last = kept.kids;
     if (last === undefined || !sameSaid(last.said, said)) {
@@ -9901,16 +10321,26 @@ function keptKids(kept, kids, said, tag, inner) {
     if (old === kids) {
         return kids;
     }
-    const most = Math.min(old.length, kids.length);
-    let start = 0;
-    while (start < most && old[start] === kids[start]) {
-        start += 1;
+    let added;
+    if (old.length === kids.length) {
+        added = [];
+        for (let at = 0; at < kids.length; at += 1) {
+            if (!sameKid(old[at], kids[at])) {
+                added.push(kids[at]);
+            }
+        }
+    } else {
+        const most = Math.min(old.length, kids.length);
+        let start = 0;
+        while (start < most && sameKid(old[start], kids[start])) {
+            start += 1;
+        }
+        let end = 0;
+        while (end < most - start && sameKid(old[old.length - 1 - end], kids[kids.length - 1 - end])) {
+            end += 1;
+        }
+        added = kids.slice(start, kids.length - end);
     }
-    let end = 0;
-    while (end < most - start && old[old.length - 1 - end] === kids[kids.length - 1 - end]) {
-        end += 1;
-    }
-    const added = kids.slice(start, kids.length - end);
     if (added.length > 0) {
         if (!keptType(added, said) || natives.cssChildren(layout, added, ALONG, tag) || anyFloats(added, inner)
             || natives.cssChildren(layout, added, LINE_BOXES) || (inner !== null && complexLineBoxes() && added.some((child) => lineBoxFromAbove(child, inner)))
@@ -14095,6 +14525,10 @@ function scrollObserved(live, type) {
 /// what's listening on it, and its `onScroll`. It doesn't go on up from there. The page's own scrolling is the document's, which
 /// `window` hears about after.
 function tellScrolled(live, type = 'scroll') {
+    if (type === 'scroll' && skippingLives.size !== 0) {
+        // What's been scrolled near is drawn as it is, as the next frame shows it.
+        showNear();
+    }
     if (type === 'scroll') {
         // Once it's stopped moving, which is when no more of it's come for a little while, it says so with `scrollend`, as a
         // browser does.
@@ -14159,7 +14593,9 @@ function scrollPlace(first, second) {
 function scrollIntoView(element, how) {
     const block = how === false ? 'end' : how?.block ?? 'start';
     const inline = how?.inline ?? 'nearest';
-    let node = nodeOf(element);
+    // Only what it's in is looked at, which is found from the chain to it rather than the whole page made again, as that was most
+    // of what moving the selection in a list of 25,000 rows cost: see `nodeUpOf`.
+    let node = nodeUpOf(element, '*');
     if (node === undefined) {
         return;
     }
@@ -16116,6 +16552,16 @@ rsui.__hearDocument((kind, event, prevented) => {
         keyboardBackInPage();
         return;
     }
+    // The window came to the front or went behind another, or was minimized or brought back, which `rsui/dom-state` tells the
+    // page as `focus`, `blur` and `visibilitychange`, as the window's state changes.
+    if (kind === 'windowfocus' || kind === 'windowblur') {
+        rsui.__windowChanged(0, { focused: kind === 'windowfocus' });
+        return;
+    }
+    if (kind === 'windowshown' || kind === 'windowhidden') {
+        rsui.__windowChanged(0, { minimized: kind === 'windowhidden' });
+        return;
+    }
     if (event === undefined) {
         return;
     }
@@ -17088,7 +17534,7 @@ function useShapeParts() {
 }
 
 /// How a shape is drawn, as CSS and SVG's attributes both say it.
-const SHAPE_LOOKS = ['fill', 'stroke', 'strokeWidth', 'strokeLinecap', 'strokeLinejoin', 'strokeDasharray', 'strokeDashoffset'];
+const SHAPE_LOOKS = ['fill', 'stroke', 'strokeWidth', 'strokeLinecap', 'strokeLinejoin', 'strokeMiterlimit', 'strokeDasharray', 'strokeDashoffset'];
 
 /// What CSS says about each part of a shape, by its id, its tag, its classes and attributes and its own `style`, given the rules that
 /// come down to the shape and the variables set around it.
@@ -18726,6 +19172,10 @@ function addPageRule(rule) {
             }
         } else if (/^@property/i.test(selector)) {
             registerProperty(selector.slice(9).trim(), rule.block);
+        } else if (/^@starting-style/i.test(selector)) {
+            for (const inner of startingBlock(rule.block).rules) {
+                addPageRule(inner);
+            }
         } else if (/^@(-webkit-|-moz-|-o-|-ms-)?keyframes/i.test(selector)) {
             addKeyframes(selector, rule.block);
         } else if (!SAYS_NOTHING_HERE.test(selector.toLowerCase())) {
@@ -20478,6 +20928,8 @@ function installPage() {
             listener({ type: 'resize' });
         }
     };
+    // And so does CSS that asks whether things move, when that changes: see `motionChanged`.
+    world.__rsuiMotionChanged = motionChanged;
     for (const [name, at] of [['innerWidth', 0], ['innerHeight', 1], ['outerWidth', 0], ['outerHeight', 1]]) {
         Object.defineProperty(world, name, { get: () => (world.__rsuiPageSize ?? [800, 600])[at], configurable: true });
     }
@@ -20554,7 +21006,7 @@ const DOM_CLASSES = ['MutationObserver', 'Range', 'StaticRange', 'Text', 'Commen
 /// What `rsui/dom-globals` needs from in here to make the page's globals.
 const domInternals = {
     rsui, elementClasses, computedStyleOf, fillFormData, domPack, page, listenOn, unlistenOn, tellWindow, pageScrollTo, pageScrollBy,
-    pageScrollState, pageScrollOffsets, location, history, resizeListeners, onPageRendered: (listener) => renderListeners.add(listener), mediaApplies,
+    pageScrollState, pageScrollOffsets, location, history, resizeListeners, motionListeners, onPageRendered: (listener) => renderListeners.add(listener), mediaApplies,
     PageElement, ResizeObserver: PageResizeObserver,
     // For the window's focus: whether Tab has taken the keyboard out of the page, and what has it, which hears it go and come
     // back with the window's.

@@ -84,6 +84,8 @@ struct Internals {
     window_resized: Root,
     window_root: Root,
     fragment: Root,
+    /// What `__jsx` puts in a component's element, as it wasn't made by the app's own JSX: see `JsProps::eq`.
+    not_kept: Root,
     /// What a component gives back to be drawn in another order: see `__Reordered` in layer.js.
     reordered: Root,
     order_name: Atom,
@@ -93,6 +95,8 @@ struct Internals {
     key_name: Atom,
     props_name: Atom,
     kids_name: Atom,
+    /// What `__jsxMemo` marks a component's element with (see layer.js).
+    memo_name: Atom,
     function_name: Atom,
     count_name: Atom,
     visible_name: Atom,
@@ -166,6 +170,9 @@ struct Host {
     jobs_waiting: Cell<bool>,
     now_ms: Cell<f64>,
     animations_on: Cell<bool>,
+    /// Whether the page's CSS has rules for when things don't move (`prefers-reduced-motion`), which held as nothing does: see
+    /// [`take_motion_held`].
+    motion_held: Cell<bool>,
     /// Whether what a component gives back that's more than one thing fills what it's in, for code written for a page.
     fragments_fill: Cell<bool>,
     /// Whether text has been asked to be drawn the way the system draws it, as it is on a page.
@@ -1077,6 +1084,18 @@ fn host_animations_on(_: &mut Vm, _: Args) -> Result<Value, Value> {
     Ok(Value::bool(HOST.with(|host| host.animations_on.get())))
 }
 
+/// `motionHeld()`: the page's CSS has a rule about `prefers-reduced-motion`, worked out while nothing moves.
+fn host_motion_held(_: &mut Vm, _: Args) -> Result<Value, Value> {
+    HOST.with(|host| host.motion_held.set(true));
+    Ok(Value::UNDEFINED)
+}
+
+/// Whether the page's CSS has worked out a rule about `prefers-reduced-motion` while nothing moved, since this was last asked,
+/// which is CSS that would have things move with animations on: for `--do` to say so.
+pub(crate) fn take_motion_held() -> bool {
+    HOST.with(|host| host.motion_held.replace(false))
+}
+
 /// The modules an app can import that come with this, by the names they're imported by.
 pub(crate) const HOST_MODULES: &[(&str, &str)] = &[
     ("rsui", LAYER),
@@ -1137,7 +1156,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
     let failed = |engine: &mut Engine, error: Value| engine.error_message(error).message;
     let vm = engine.vm();
     let natives = vm.new_object();
-    let functions: [(&str, rsui_js::HostFunction); 35] = [
+    let functions: [(&str, rsui_js::HostFunction); 36] = [
         ("wantDrops", host_want_drops),
         ("stopEvent", host_stop_event),
         ("passEvent", host_pass_event),
@@ -1171,6 +1190,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
         ("windowScale", host_window_scale),
         ("now", host_now),
         ("animationsOn", host_animations_on),
+        ("motionHeld", host_motion_held),
         ("loadedBuiltins", host_loaded_builtins),
         ("mainTitle", host_main_title),
     ];
@@ -1253,6 +1273,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
             window_resized: read(vm, from, "windowResized")?,
             window_root: read(vm, from, "WindowRoot")?,
             fragment: vm.root(fragment),
+            not_kept: read(vm, from, "notKept")?,
             reordered: vm.root(reordered),
             order_name: vm.atom("order"),
             type_name: vm.atom("type"),
@@ -1260,6 +1281,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
             key_name: vm.atom("key"),
             props_name: vm.atom("props"),
             kids_name: vm.atom("kids"),
+            memo_name: vm.atom("memo"),
             function_name: vm.atom("name"),
             count_name: vm.atom("count"),
             visible_name: vm.atom("visible"),
@@ -1936,6 +1958,8 @@ struct JsProps {
     kind: u64,
     /// Whether the parent gave it a key, which then goes on its element.
     keyed: bool,
+    /// Whether its element was made by an app's own JSX where nothing said `'use no memo'`, which `__jsxMemo` marks. See `eq`.
+    memo: bool,
 }
 
 impl PartialEq for JsProps {
@@ -1944,21 +1968,35 @@ impl PartialEq for JsProps {
     /// draws an element of a page (`__rsuiShallow`, see web.js), and props that are the same and hold no objects or functions, which
     /// can't say anything else without being given anew. Props that hold an object can: TanStack Table's cells are given the same
     /// `row` each time, which says it's selected once it is, and a checkbox in one that wasn't rendered again kept its old state.
+    ///
+    /// An element an app's own JSX made, which `memo` says, doesn't render either when what it's given does the same as before,
+    /// as React Compiler has it by keeping the element: a handler made again with the same code seeing the same values, or an
+    /// object or element made again holding the same (see `Vm::props_equivalent`). Then the parent needn't keep its functions
+    /// with `useCallback`, or wrap the child in `memo`. That's only for a component written in the app's own files, as one from
+    /// a library, or rsui's own page elements, can read what changes without a render, as the page's CSS. Given the same ref,
+    /// or the same object with methods, it renders whenever its parent does, as either can say something else with no render
+    /// (unless it says `memo`), and so does a component that says `'use no memo'`, or a class. What reads a context or a store
+    /// renders when that changes, as it would anyway, as its provider or the store tells it to.
     fn eq(&self, other: &Self) -> bool {
         let function = self.function.get();
         if function != other.function.get() {
             return false;
         }
         let (old, new) = (self.props.get(), other.props.get());
-        old == new
-            || with_vm(|vm| {
-                vm.shallow_equal(old, new)
-                    && (vm.holds_no_objects(new) || {
-                        let name = vm.atom("__rsuiShallow");
-                        vm.get_property(function, name)
-                            .is_ok_and(|said| said == Value::TRUE)
-                    })
-            })
+        if old == new {
+            return true;
+        }
+        let not_kept = with_internals(|internals| internals.not_kept.get());
+        with_vm(|vm| {
+            let name = vm.atom("__rsuiShallow");
+            let said_memo = vm
+                .get_property(function, name)
+                .is_ok_and(|said| said == Value::TRUE);
+            if self.memo && other.memo && vm.made_by_app(function) && !vm.says_no_memo(function) {
+                return vm.props_equivalent(old, new, !said_memo, not_kept);
+            }
+            vm.shallow_equal(old, new) && (said_memo || vm.holds_no_objects(new))
+        })
     }
 }
 
@@ -2307,6 +2345,8 @@ enum Described {
         key: Option<Key>,
         /// Which of the last render's components this is, with `key`, as [`Cx::child_at`] has it.
         place: u64,
+        /// Whether `__jsxMemo` made it: see `JsProps::memo`.
+        memo: bool,
     },
     Fragment(Vec<Kid>),
     Host {
@@ -2635,8 +2675,14 @@ fn reordered_in(
 
 /// What `at` is, which is where it is among what its component renders.
 fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
-    let (names, props_name, function_name) =
-        with_internals(|internals| (names(), internals.props_name, internals.function_name));
+    let (names, props_name, function_name, memo_name) = with_internals(|internals| {
+        (
+            names(),
+            internals.props_name,
+            internals.function_name,
+            internals.memo_name,
+        )
+    });
     let (description, kind) = (at.value, at.kind);
     let key = vm.get_property(description, names.key_name)?;
     let key = key_from(vm, key);
@@ -2655,12 +2701,14 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
         } else {
             at.scope.at(at.index)
         };
+        let memo = vm.get_property(description, memo_name)? == Value::TRUE;
         return Ok(Described::Component {
             kind: kind_of(vm, kind, function_name),
             function: vm.root(kind),
             props: vm.root(props),
             key,
             place: place.0,
+            memo,
         });
     }
     let (role, is_row, names_with_text, inside) = {
@@ -3109,6 +3157,7 @@ fn build_node(
             kind,
             key,
             place,
+            memo,
         }) => {
             let keyed = key.is_some();
             let props = JsProps {
@@ -3116,6 +3165,7 @@ fn build_node(
                 props,
                 kind,
                 keyed,
+                memo,
             };
             cx.child_at(key, place, js_component, props, same_kind)
         }
@@ -3258,6 +3308,11 @@ fn build_host(
             }
         }
     }
+    wire_handlers(cx, element, handlers)
+}
+
+/// `element` with each of `handlers` called when what it's for happens to it.
+fn wire_handlers(cx: &mut Cx<'_>, mut element: Element, handlers: Vec<(ActionKind, Root)>) -> Element {
     for (action, function) in handlers {
         element = cx.on(element, action, move |updates, input| {
             if updates.tracing() {
@@ -3788,6 +3843,16 @@ pub(crate) fn evaluate(code: &str) -> Result<String, String> {
     said
 }
 
+/// Tells the app's code that things have started or stopped moving, as `animations on` and `off` in `--do` say, which no
+/// component's rendering would tell it: CSS that asks `prefers-reduced-motion` is worked out again, and `matchMedia` lists
+/// watching it hear (`__rsuiMotionChanged` in web.js).
+pub(crate) fn motion_changed(on: bool) {
+    let was = HOST.with(|host| host.animations_on.replace(on));
+    if was != on {
+        let _ = evaluate("globalThis.__rsuiMotionChanged?.()");
+    }
+}
+
 /// What code run from outside the app, as a console's, leaves to do: what it set going, and what it changed or asked for.
 fn after_outside_code(updates: &mut Updates<'_>) {
     pump(updates);
@@ -4107,7 +4172,42 @@ fn list_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
             }
         };
         let owner = props.owner.clone();
-        let list = cx.virtual_list(
+        let mut gathered = gathered;
+        // A list with an `itemWidth` is a grid of items that wraps itself, as many across as fit.
+        static ITEM_WIDTH: LazyLock<Symbol> = LazyLock::new(|| Symbol::new("item_width"));
+        let item_width = gathered.entries.iter().find(|(name, _)| *name == *ITEM_WIDTH).and_then(|(_, value)| match value {
+            rsui::core::PropValue::Float(width) => Some(*width),
+            rsui::core::PropValue::Int(width) => Some(*width as f64),
+            _ => None,
+        });
+        gathered.entries.retain(|(name, _)| *name != *ITEM_WIDTH);
+        // `onResize` is told how many rows fit and how many items across, as the window measures them, which is the list's own
+        // `resize`. Its `scroll` is its own too, so an `onScroll` given it isn't called.
+        let mut fits = None;
+        gathered.handlers.retain(|(action, function)| match action {
+            ActionKind::Resize => {
+                fits = Some(function.clone());
+                false
+            }
+            ActionKind::Scroll => false,
+            _ => true,
+        });
+        let fits = fits.map(|told| {
+            std::rc::Rc::new(move |updates: &mut Updates<'_>, rows: f64, across: usize| {
+                let failed = with_vm_letting_go(|vm| {
+                    let args = [Value::number(rows), Value::number(across as f64)];
+                    vm.call_function(told.get(), Value::UNDEFINED, &args)
+                        .err()
+                        .map(|error| vm.error_text(error))
+                });
+                if let Some(message) = failed {
+                    report(message);
+                }
+                pass_on_what_was_said(updates);
+                pump(updates);
+            }) as std::rc::Rc<dyn Fn(&mut Updates<'_>, f64, usize)>
+        });
+        let list = cx.virtual_list_with(
             key.unwrap_or_else(|| Key::from("list")),
             ListWindow {
                 len,
@@ -4115,6 +4215,7 @@ fn list_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
                 overscan,
                 reveal,
             },
+            rsui::runtime::ListOptions { item_width, fits },
             |cx, index| {
                 cx.keyed(
                     index,
@@ -4128,10 +4229,12 @@ fn list_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
             },
         );
         let style: Props = gathered.entries.into_iter().collect();
-        Element {
+        let list = Element {
             props: style.merged(&list.props),
             ..list
-        }
+        };
+        // What else it's given to hear, as a click on it below its rows, which anything else would hear.
+        wire_handlers(cx, list, gathered.handlers)
     })
 }
 
@@ -4302,6 +4405,7 @@ fn window_root(cx: &mut Cx<'_>, window: &WindowEntry) -> Node {
             props: window.entry.clone(),
             kind,
             keyed: false,
+            memo: false,
         },
         same_kind,
     )
@@ -4346,6 +4450,7 @@ pub fn root(cx: &mut Cx<'_>, _: &Entry) -> Node {
             props,
             kind,
             keyed: false,
+            memo: false,
         },
         same_kind,
     );

@@ -31,7 +31,8 @@ nothing else to install. Set `FILE_EXPLORER_START` to a folder to open there, in
 - A sidebar that collapses to a rail of icons when you drag it narrower than it goes (or `Ctrl+Shift+B`), and on its own in a narrow
   window
 - Panels glide to their new places and sizes when you split, close, collapse or hide something, and follow the pointer at once
-  while you drag
+  while you drag or resize the window. Nothing in the app knows how big the window is: the panes are flex boxes, each as big as
+  its share of the split it's in, so the page lays them out, and what glides is a share (`flex-grow`), not a size
 - Its own title bar, with the window's buttons beside the tabs, and Windows 11's Mica or Acrylic showing through the frame
 - Details, list and grid views, with thumbnails of photos, videos and documents in the grid
 - A sidebar with pinned folders as favorites, places, and every drive with how full it is
@@ -116,7 +117,8 @@ What makes the difference:
 - **Sorting without comparing strings.** Since the names arrive in order, sorting by name or by any other column is a comparison of
   numbers. `Intl.Collator` took 651 ms for the same folder.
 - **Native rows.** The list is rsui's own `<list>`, which only builds the rows on screen and scrolls them in Rust, and each row is
-  made of `<row>` and `<text>`. Everything around it is Tailwind. With rows built from styled `<div>`s, jumping to the end of
+  made of `<row>` and `<text>`. It's as big as layout makes it, and works out what fits from that; the grid is the same `<list>`
+  with an `itemWidth`, which wraps its tiles itself and says how many fit across, for the arrow keys. Everything around it is Tailwind. With rows built from styled `<div>`s, jumping to the end of
   WinSxS took a 73 ms frame instead of 7 ms.
 - **Rows that skip work.** Rows and panels are wrapped in `memo`, and get the same functions on every render, so moving the selection
   redraws two rows.
@@ -129,7 +131,8 @@ What makes the difference:
 |---|---|
 | `app.tsx` | The window: settings, tabs and their panes, resizing the panels, the window's own shortcuts, and the layout |
 | `src/layout.ts` | How a tab's panes are laid out: a tree of rows and columns, splitting, closing, resizing and the ready-made layouts |
-| `src/Panes.tsx` | Where each pane sits, the handles between them, where a dragged tab would dock, and the Layout menu |
+| `src/Splits.tsx` | That tree drawn as flex boxes, each part its share of its split, with a handle in each gap |
+| `src/Panes.tsx` | Each pane's place, the handles between them, where a dragged tab would dock, and the Layout menu |
 | `src/Pane.tsx` | One folder in a tab: its history, reading it, searching, selecting, doing things to files, its keyboard and menus |
 | `src/Chrome.tsx` | The tabs, the window's buttons, the handles between panels, and Customize |
 | `src/settings.ts` | Every setting, its default, and how the settings screen shows it |
