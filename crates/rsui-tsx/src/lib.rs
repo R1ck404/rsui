@@ -450,6 +450,7 @@ pub fn pack_with_options(
                 if code_cache {
                     bridge::keep_compiled_code();
                 }
+                bridge::start_packing();
                 load(&app, STACK / 8 * 7).map_err(Error::Script)?;
                 // What's only loaded once it's wanted, as `lazy(() => import("./Page"))` has it, is packed too, with what it loads.
                 let graph = if let Some(build) = &mut build {

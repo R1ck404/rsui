@@ -1234,6 +1234,12 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
     for (name, value) in std::env::vars() {
         engine.set_env(&name, &value);
     }
+    // Libraries choose their build by `process.env.NODE_ENV`, which a bundler fills in as `production` for what it
+    // builds, whatever the machine it's run on has. A packed app is that, and so is the app while it's being packed,
+    // which then finds the very files it will.
+    if runs_packed() {
+        engine.set_env("NODE_ENV", "production");
+    }
     let failed = |engine: &mut Engine, error: Value| engine.error_message(error).message;
     let vm = engine.vm();
     let natives = vm.new_object();
@@ -1445,7 +1451,7 @@ pub fn load(path: &Path, stack_limit: usize) -> Result<Entry, String> {
     let internals = set_up_layer(&mut engine)?;
     rsui::mark("layer set up");
     // An app's code is a page's, which Vite gives `import.meta.env`, where Node gives modules none.
-    let env = crate::vite_env::import_meta_env(path, rsui_js::running_packed());
+    let env = crate::vite_env::import_meta_env(path, runs_packed());
     let entries: Vec<(&str, rsui_js::MetaEnvValue)> = env
         .iter()
         .map(|(key, value)| (key.as_str(), value.clone()))
@@ -1681,6 +1687,19 @@ pub(crate) fn take_compiled_code() -> Option<rsui_js::CompiledCode> {
 thread_local! {
     /// What the app needs that isn't code it loads, which packing it has to take too, as what its CSS tools made.
     static PACK_ALSO: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// Whether the app on this thread is being run to be packed.
+    static PACKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Says the app this thread loads next is being packed, so it runs as it will once it is: see [`runs_packed`].
+pub(crate) fn start_packing() {
+    PACKING.with(|on| on.set(true));
+}
+
+/// Whether the app runs as a packed one does: it is one, or it's being run to be packed. What it loads then has to be
+/// what it will load once it's packed, as only that goes in the program.
+pub(crate) fn runs_packed() -> bool {
+    rsui_js::running_packed() || PACKING.with(std::cell::Cell::get)
 }
 
 /// Has packing the app on this thread take this file too.

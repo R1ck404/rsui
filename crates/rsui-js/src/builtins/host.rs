@@ -12,7 +12,7 @@ mod path;
 mod path_posix;
 mod path_win32;
 mod watch;
-mod zlib;
+pub(crate) mod zlib;
 
 // Files, for `node/fs.js`. Each thing it can do can happen right away, or on another thread with a promise for how it
 // went, and it's the same code either way.

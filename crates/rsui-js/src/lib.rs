@@ -31,6 +31,7 @@ mod jsprof;
 mod keeping;
 mod lexer;
 mod modules;
+mod narrow;
 mod net;
 mod object;
 mod op;

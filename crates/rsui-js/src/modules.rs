@@ -202,6 +202,9 @@ pub(crate) struct ModuleInfo {
     /// exports again), with no code of its own. What it passes on from packages that say they have no side effects is
     /// only loaded when something asks for it: see [`Dep::Deferred`].
     pub(crate) only_reexports: bool,
+    /// The namespaces it imports (`import * as`) that it only ever reads these names of, by the number of the import:
+    /// see [`crate::narrow`]. Such a namespace only needs those names, which only loads what they're from.
+    pub(crate) narrowed: Vec<(usize, Vec<String>)>,
 }
 
 impl ModuleInfo {
@@ -2141,6 +2144,50 @@ impl Vm {
         }
     }
 
+    /// A cell holding a namespace of the module `id` names as its `dep`th with only these names, for a module that reads
+    /// nothing else of it (see [`crate::narrow`]), so it can't tell this from the whole one. Each name is found as
+    /// importing it by name finds it, which loads only the module it's from. `None` where that wouldn't load any less,
+    /// or where a name is from `export *` of CommonJS, which a whole namespace copies when that's run: the whole
+    /// namespace is given then, as it always was.
+    fn narrow_namespace(&mut self, id: u32, dep: usize, names: &[String]) -> Run<Option<Value>> {
+        let Dep::Es(other) = self.dependency(id, dep)? else {
+            return Ok(None);
+        };
+        // What's been loaded whole has all its namespace already.
+        if !self.record(other).partial {
+            return Ok(None);
+        }
+        let mut cells = Vec::with_capacity(names.len());
+        for name in names {
+            match self.resolve_export(other, name, &mut Vec::new())? {
+                Found::Cell(cell) if self.is_commonjs_star_cell(cell) => return Ok(None),
+                Found::Cell(cell) => cells.push((name, cell)),
+                // A namespace has no such name, so reading it gives `undefined`, as it does here.
+                Found::Missing | Found::Ambiguous => {}
+            }
+        }
+        // The cells are held by the modules they're from. Nothing runs from here on, so what's made here can't be
+        // collected before it's held.
+        let target = self.new_object_with_proto(NONE, Kind::Plain);
+        for (name, cell) in cells {
+            let key = self.intern_str(name);
+            let getter = self.new_native(key, 0, binding_getter, cell, false);
+            self.define_accessor(target.handle(), key, Some(getter), None, ENUMERABLE);
+        }
+        let namespace = self.new_namespace(target);
+        Ok(Some(self.new_cell(namespace)))
+    }
+
+    /// Whether a cell is one of those for a name from `export *` of a module that isn't an ES module.
+    fn is_commonjs_star_cell(&self, cell: Value) -> bool {
+        self.modules.records.values().any(|record| {
+            record
+                .filled
+                .iter()
+                .any(|(dep, _, filled)| *filled == cell && record.info.stars.contains(dep))
+        })
+    }
+
     /// What TypeScript imports by a name that isn't exported, which can only be a type, as the app wouldn't have compiled
     /// otherwise, and TypeScript leaves an import that's only used as a type out. It's a cell that's always undefined, kept
     /// with the module's other cells.
@@ -2944,6 +2991,20 @@ fn import_binding(vm: &mut Vm, args: Args) -> Run<Value> {
     let (dep, name) = record.info.imports[entry].clone();
     let from = record.info.requested[dep].clone();
     let typescript = is_typescript(&record.path);
+    let narrowed = match name {
+        None => record
+            .info
+            .narrowed
+            .iter()
+            .find(|(at, _)| *at == entry)
+            .map(|(_, names)| names.clone()),
+        Some(_) => None,
+    };
+    if let Some(names) = narrowed {
+        if let Some(cell) = vm.narrow_namespace(id, dep, &names)? {
+            return Ok(cell);
+        }
+    }
     match vm.binding_from(id, dep, name.clone(), &mut Vec::new())? {
         Found::Cell(cell) => Ok(cell),
         Found::Missing if typescript => Ok(vm.type_cell(id, name.as_deref().unwrap_or_default())),
@@ -3501,6 +3562,77 @@ mod deferred_reexports {
         );
         let (result, _) = run(&files);
         assert_eq!(result.as_deref(), Ok("a ran\nb ran\nc ran\nA,B,C c"));
+    }
+
+    #[test]
+    fn a_namespace_that_only_has_names_read_loads_only_those() {
+        let main = "import * as all from 'pkg';\nconsole.log(all.B, all['B'], all.Nothing);\n";
+        let (result, parses) = run(&with_main(package(r#", "sideEffects": false"#), main));
+        assert_eq!(result.as_deref(), Ok("b ran\nb b undefined"));
+        // `main.js`, `index.js`, `all.js` and `b.js`, as for `import { B }`.
+        assert_eq!(parses, 4);
+        // In functions too, which are compiled later, and through what's read.
+        let main = "import * as all from 'pkg';\nexport function show() { return [all.C, all.C.length]; }\nconsole.log(show().join());\n";
+        let (result, parses) = run(&with_main(package(r#", "sideEffects": false"#), main));
+        assert_eq!(result.as_deref(), Ok("c ran\nc,1"));
+        assert_eq!(parses, 4);
+        // A package that may have side effects is all run, in order, as before.
+        let main = "import * as all from 'pkg';\nconsole.log(all.B);\n";
+        let (result, _) = run(&with_main(package(""), main));
+        assert_eq!(result.as_deref(), Ok("a ran\nb ran\nc ran\nb"));
+    }
+
+    #[test]
+    fn a_namespace_that_goes_anywhere_has_everything() {
+        for main in [
+            "function show(it) { return it.B; }\nconsole.log(show(all));\n",
+            "const name = 'B';\nconsole.log(all[name]);\n",
+            "console.log(all.B, typeof all === 'object' ? '' : 'no');\n",
+            "console.log(all.B);\nexport { all };\n",
+        ] {
+            let main = format!("import * as all from 'pkg';\n{main}");
+            let (result, parses) = run(&with_main(package(r#", "sideEffects": false"#), &main));
+            assert!(result.as_deref().is_ok_and(|shown| shown.starts_with("a ran\nb ran\nc ran\nb")), "{main}: {result:?}");
+            assert_eq!(parses, 6, "{main}");
+        }
+    }
+
+    #[test]
+    fn a_narrowed_namespace_reads_what_the_whole_one_would() {
+        // What's read stays live.
+        let mut files = package(r#", "sideEffects": false"#);
+        files.push((
+            "node_modules/pkg/count.js".to_owned(),
+            "export let count = 0;\nexport function bump() { count += 1; }\n".to_owned(),
+        ));
+        files[2].1.push_str("export { count, bump } from './count.js';\n");
+        let main = "import * as p from 'pkg';\nconst bump = p.bump;\nbump();\nbump();\nconsole.log(p.count);\n";
+        let (result, _) = run(&with_main(files, main));
+        assert_eq!(result.as_deref(), Ok("2"));
+        // A name two stars give is in neither, rather than an error, as a namespace has it.
+        let files = vec![
+            (
+                "node_modules/two/package.json".to_owned(),
+                r#"{ "name": "two", "type": "module", "main": "index.js", "sideEffects": false }"#.to_owned(),
+            ),
+            ("node_modules/two/index.js".to_owned(), "export * from './x.js';\nexport * from './y.js';\n".to_owned()),
+            ("node_modules/two/x.js".to_owned(), "export const same = 'x';\nexport const onlyX = 'x';\n".to_owned()),
+            ("node_modules/two/y.js".to_owned(), "export const same = 'y';\nexport const onlyY = 'y';\n".to_owned()),
+        ];
+        let main = "import * as two from 'two';\nconsole.log(two.same, two.onlyX, two.onlyY);\n";
+        let (result, _) = run(&with_main(files, main));
+        assert_eq!(result.as_deref(), Ok("undefined x y"));
+        // A whole namespace asked for later has everything, and the narrowed one still reads the same.
+        let main = "import * as all from 'pkg';\nconsole.log(all.A);\nconst whole = await import('pkg');\nconsole.log(Object.keys(whole).join(), all.A, whole.A === all.A);\n";
+        let (result, _) = run(&with_main(package(r#", "sideEffects": false"#), main));
+        assert_eq!(result.as_deref(), Ok("a ran\na\nb ran\nc ran\nA,B,C a true"));
+        // What's read before it's been given a value can't be, as for the whole namespace.
+        let mut files = package(r#", "sideEffects": false"#);
+        files[4].1 = "import * as all from './index.js';\nconsole.log('b ran');\nexport default () => 'b with ' + all.A;\nexport const early = (() => { try { return all.C; } catch (error) { return error.constructor.name; } })();\n".to_owned();
+        files[2].1.push_str("export { early } from './b.js';\n");
+        let main = "import * as all from 'pkg';\nconsole.log(all.B(), all.early);\n";
+        let (result, _) = run(&with_main(files, main));
+        assert_eq!(result.as_deref(), Ok("a ran\nb ran\nc ran\nb with a ReferenceError"));
     }
 
     #[test]

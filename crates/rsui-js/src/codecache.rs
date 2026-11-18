@@ -56,7 +56,7 @@ pub(crate) use codec::{read_op, write_op};
 
 const MAGIC: &[u8; 8] = b"RSUICODE";
 /// Changes whenever how the block is written does, though [`BUILD_ID`] would too.
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 
 // How an atom is written.
 const ATOM_INDEX: u8 = 0;
@@ -1516,6 +1516,14 @@ fn write_info(out: &mut Out, info: &ModuleInfo) {
     }
     out.u8(u8::from(info.is_async));
     out.u8(u8::from(info.only_reexports));
+    out.u32(info.narrowed.len() as u32);
+    for (entry, names) in &info.narrowed {
+        out.u32(*entry as u32);
+        out.u32(names.len() as u32);
+        for name in names {
+            out.text(name);
+        }
+    }
 }
 
 fn write_name(out: &mut Out, name: Option<&str>) {
@@ -1560,6 +1568,15 @@ fn read_info(from: &mut In<'_>) -> Option<ModuleInfo> {
         .collect::<Option<_>>()?;
     let is_async = from.u8()? != 0;
     let only_reexports = from.u8()? != 0;
+    let narrowed = (0..from.count()?)
+        .map(|_| {
+            let entry = from.u32()? as usize;
+            let names = (0..from.count()?)
+                .map(|_| from.text().map(str::to_owned))
+                .collect::<Option<_>>()?;
+            Some((entry, names))
+        })
+        .collect::<Option<_>>()?;
     Some(ModuleInfo {
         requested,
         imports,
@@ -1568,6 +1585,7 @@ fn read_info(from: &mut In<'_>) -> Option<ModuleInfo> {
         stars,
         is_async,
         only_reexports,
+        narrowed,
     })
 }
 

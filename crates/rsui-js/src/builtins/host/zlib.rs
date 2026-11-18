@@ -21,6 +21,87 @@ use deflate::{Deflater, Flush};
 use huffman::Stop;
 use inflate::Inflater;
 
+/// `bytes` as one Zstandard frame at `level`, with `dictionary` (raw content) as what came before, for the engine's own
+/// use, as for the files a packed program keeps (see packed.rs).
+pub(crate) fn zstd_frame(bytes: &[u8], level: i32, dictionary: Option<&[u8]>) -> Vec<u8> {
+    let mut encoder = zstd::Encoder::new(level, Vec::new(), Some(bytes.len() as u64), dictionary.map(<[u8]>::to_vec));
+    let mut out = Vec::new();
+    // Writing all of something that's all there, with a dictionary that's only content, can't fail.
+    encoder
+        .push(bytes, 2, &mut out)
+        .expect("a whole frame is written");
+    out
+}
+
+/// The `size` bytes a Zstandard frame from [`zstd_frame`] holds, with the same `dictionary`, or `None` if that isn't
+/// what's there.
+pub(crate) fn zstd_unframe(frame: &[u8], size: usize, dictionary: Option<&[u8]>) -> Option<Vec<u8>> {
+    let mut decoder = zstd::Decoder::new(dictionary.map(<[u8]>::to_vec), 0).ok()?;
+    let mut out = Vec::with_capacity(size);
+    decoder.push(frame, &mut out).ok()?;
+    (out.len() == size).then_some(out)
+}
+
+#[cfg(test)]
+mod frame_tests {
+    #[test]
+    fn a_frame_gives_back_what_went_in() {
+        let text = "export default createLucideIcon('StarIcon', ForwardRef);\n".repeat(40);
+        for dictionary in [None, Some(b"createLucideIcon ForwardRef export default".as_slice())] {
+            let frame = super::zstd_frame(text.as_bytes(), 19, dictionary);
+            assert!(frame.len() < text.len() / 4, "{}", frame.len());
+            assert_eq!(super::zstd_unframe(&frame, text.len(), dictionary).as_deref(), Some(text.as_bytes()));
+        }
+        assert_eq!(super::zstd_unframe(b"not a frame", 11, None), None);
+        let frame = super::zstd_frame(b"cut short", 3, None);
+        assert_eq!(super::zstd_unframe(&frame[..frame.len() - 1], 9, None), None);
+        assert_eq!(super::zstd_unframe(&frame, 8, None), None);
+    }
+
+    /// How small the files in `RSUI_ZSTD_TRY` (a folder) come out, each alone and with a dictionary from a sample of
+    /// them, and how long that takes. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, on a folder that has to be given"]
+    fn how_small_files_come_out() {
+        let Some(folder) = std::env::var_os("RSUI_ZSTD_TRY") else { return };
+        let mut files: Vec<Vec<u8>> = std::fs::read_dir(folder)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ending| ending == "js"))
+            .map(|entry| std::fs::read(entry.path()).unwrap())
+            .collect();
+        files.sort();
+        let raw: usize = files.iter().map(Vec::len).sum();
+        let mut sample = Vec::new();
+        for file in files.iter().step_by((files.len() / 200).max(1)) {
+            sample.extend_from_slice(file);
+            if sample.len() > 110 * 1024 {
+                break;
+            }
+        }
+        for level in [3, 9, 19] {
+            for dictionary in [None, Some(sample.as_slice())] {
+                let started = std::time::Instant::now();
+                let made: usize = files.iter().map(|file| super::zstd_frame(file, level, dictionary).len()).sum();
+                let took = started.elapsed();
+                let started = std::time::Instant::now();
+                for file in files.iter().take(500) {
+                    let frame = super::zstd_frame(file, level, dictionary);
+                    assert_eq!(super::zstd_unframe(&frame, file.len(), dictionary).as_deref(), Some(file.as_slice()));
+                }
+                let _ = started;
+                println!(
+                    "level {level:2} dictionary {:5}: {} files, {raw} bytes to {made} ({:.1}x, + {} of dictionary), {took:?}",
+                    dictionary.is_some(),
+                    files.len(),
+                    raw as f64 / made as f64,
+                    dictionary.map_or(0, <[u8]>::len)
+                );
+            }
+        }
+    }
+}
+
 /// What's around the DEFLATE data.
 #[derive(Clone, Copy)]
 pub(super) enum Wrap {

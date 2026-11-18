@@ -9,6 +9,11 @@
 //! ```
 //!
 //! What the files compiled to when the program was packed is one block, which codecache.rs writes and reads.
+//!
+//! A package is packed whole, as it can load more of itself later than packing saw, but most of it never is. Its code
+//! that didn't run when the program was packed is kept squeezed (Zstandard, with a dictionary of a sample of such files,
+//! which is kept once, as each is small), and only made whole again if it's read. What did run is as it was, so a program
+//! starts as quickly, and every file is still there, so it does everything it did.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -19,11 +24,20 @@ use std::sync::OnceLock;
 const MAGIC: &[u8; 8] = b"RSUIPACK";
 const FOOTER: u64 = 8 + 8 + 8;
 
+/// How hard squeezing what's kept squeezed tries. It's done once, as the program's packed.
+const SQUEEZE_LEVEL: i32 = 9;
+/// How much of the files that are squeezed is taken for the dictionary they're squeezed with.
+const DICTIONARY_SIZE: usize = 110 * 1024;
+
 struct PackedFiles {
     /// The program, open for reading what's in it, which each file is read from where it is.
     program: File,
-    /// Where each file is in the program, by its path as [`key`] writes it.
-    files: HashMap<String, (u64, u32)>,
+    /// Where each file is in the program, by its path as [`key`] writes it, how long it is, and how long it's kept,
+    /// squeezed, or 0 if it's kept as it is.
+    files: HashMap<String, (u64, u32, u32)>,
+    /// Where the dictionary that squeezed files need is, and how long it is, and the dictionary once it's been read.
+    dictionary: Option<(u64, u64)>,
+    dictionary_read: OnceLock<Option<Vec<u8>>>,
     /// Every folder that has any of them in it.
     folders: HashSet<String>,
     /// The files that were run when the program was packed, in the order they were.
@@ -43,8 +57,8 @@ struct PackedFiles {
 
 static PACKED: OnceLock<PackedFiles> = OnceLock::new();
 
-/// A file's path, and how far into the program it starts and how long it is.
-type PackedFile = (String, (u64, u32));
+/// A file's path, and how far into the program it starts, how long it is, and how long it's kept (0 for as it is).
+type PackedFile = (String, (u64, u32, u32));
 
 /// A folder that was a link when the program was packed, and the folder it led to.
 pub type PackedLink = (PathBuf, PathBuf);
@@ -59,6 +73,7 @@ struct PackedList {
     links: Vec<(String, String)>,
     code: Option<(u64, u64)>,
     diagnostics: bool,
+    dictionary: Option<(u64, u64)>,
 }
 
 /// A path as files are looked up by, with what can be worked out from it worked out. Letters are all
@@ -132,6 +147,8 @@ pub fn open_packed_files() -> Option<PathBuf> {
         root: root.to_owned(),
         code: list.code,
         diagnostics: list.diagnostics,
+        dictionary: list.dictionary,
+        dictionary_read: OnceLock::new(),
     };
     let add_folders = |path: &Path, folders: &mut HashSet<String>| {
         let mut folder = path.parent();
@@ -184,7 +201,7 @@ fn read_list(program: &Path) -> Option<PackedList> {
         let path = read_text(&mut rest)?.to_owned();
         let place = read_u64(&mut rest)?;
         let size = read_u32(&mut rest)?;
-        files.push((path, (place, size)));
+        files.push((path, (place, size, 0)));
     }
     // A program packed before this was kept doesn't have it.
     let mut run_order = Vec::new();
@@ -215,6 +232,26 @@ fn read_list(program: &Path) -> Option<PackedList> {
         }
         _ => None,
     };
+    let diagnostics = read_u32(&mut rest).unwrap_or(0) & 1 != 0;
+    // Nor this: the files that are kept squeezed, by their number in the list, with how long each is kept, and the
+    // dictionary they need.
+    let mut dictionary = None;
+    if let (Some(place), Some(size)) = (read_u64(&mut rest), read_u64(&mut rest)) {
+        if place.checked_add(size)? > at {
+            return None;
+        }
+        dictionary = (size > 0).then_some((place, size));
+        let count = read_u32(&mut rest)?;
+        for _ in 0..count {
+            let index = read_u32(&mut rest)? as usize;
+            let kept = read_u32(&mut rest)?;
+            let (_, (place, _, stored)) = files.get_mut(index)?;
+            if place.checked_add(u64::from(kept))? > at {
+                return None;
+            }
+            *stored = kept;
+        }
+    }
     Some(PackedList {
         entry,
         files,
@@ -222,7 +259,8 @@ fn read_list(program: &Path) -> Option<PackedList> {
         builtins,
         links,
         code,
-        diagnostics: read_u32(&mut rest).unwrap_or(0) & 1 != 0,
+        diagnostics,
+        dictionary,
     })
 }
 
@@ -278,16 +316,34 @@ pub fn append_packed_files_with_diagnostics(
     add_text(&mut list, &inside(root, entry)?);
     list.extend_from_slice(&(files.len() as u32).to_le_bytes());
     let mut sizes = HashMap::with_capacity(files.len());
-    for path in files {
+    let ran: HashSet<&PathBuf> = run_order.iter().collect();
+    let squeezed_ones: Vec<bool> = files
+        .iter()
+        .map(|path| may_squeeze(path) && !ran.contains(path) && path != entry)
+        .collect();
+    let dictionary = squeeze_dictionary(files, &squeezed_ones)?;
+    let dictionary_place = at;
+    to.write_all(&dictionary)?;
+    at += dictionary.len() as u64;
+    let mut squeezed = Vec::new();
+    for (index, path) in files.iter().enumerate() {
         let bytes = crate::source_overlay::bytes(path)?;
-        to.write_all(&bytes)?;
+        let size = u32::try_from(bytes.len())
+            .map_err(|_| io::Error::other(format!("{} is too big to pack", path.display())))?;
+        // What's kept squeezed has to be worth it: a tenth smaller at least.
+        let frame = (squeezed_ones[index] && !dictionary.is_empty())
+            .then(|| crate::builtins::host::zlib::zstd_frame(&bytes, SQUEEZE_LEVEL, Some(&dictionary)))
+            .filter(|frame| frame.len() < bytes.len() / 10 * 9);
+        let kept = frame.as_deref().unwrap_or(&bytes);
+        to.write_all(kept)?;
         add_text(&mut list, &inside(root, path)?);
         list.extend_from_slice(&at.to_le_bytes());
-        list.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        at += bytes.len() as u64;
-        if let Ok(size) = u32::try_from(bytes.len()) {
-            sizes.insert(path.clone(), size);
+        list.extend_from_slice(&size.to_le_bytes());
+        if frame.is_some() {
+            squeezed.push((index as u32, kept.len() as u32));
         }
+        at += kept.len() as u64;
+        sizes.insert(path.clone(), size);
     }
     let code = code
         .filter(|code| !code.is_empty())
@@ -318,11 +374,83 @@ pub fn append_packed_files_with_diagnostics(
     list.extend_from_slice(&code_place.to_le_bytes());
     list.extend_from_slice(&(code.as_ref().map_or(0, Vec::len) as u64).to_le_bytes());
     list.extend_from_slice(&u32::from(diagnostics).to_le_bytes());
+    list.extend_from_slice(&dictionary_place.to_le_bytes());
+    list.extend_from_slice(&(dictionary.len() as u64).to_le_bytes());
+    list.extend_from_slice(&(squeezed.len() as u32).to_le_bytes());
+    for (index, kept) in &squeezed {
+        list.extend_from_slice(&index.to_le_bytes());
+        list.extend_from_slice(&kept.to_le_bytes());
+    }
     to.write_all(&list)?;
     to.write_all(&at.to_le_bytes())?;
     to.write_all(&(list.len() as u64).to_le_bytes())?;
     to.write_all(MAGIC)?;
     Ok(())
+}
+
+/// Whether a file may be kept squeezed, if it didn't run when the program was packed: a package's code, which it may
+/// load later, but mostly never does. Its `package.json` is read to find its files, and pictures, fonts and sounds are
+/// mostly squeezed already, so those are kept as they are, as is everything an app has of its own.
+fn may_squeeze(path: &Path) -> bool {
+    const KINDS: [&str; 9] = ["js", "mjs", "cjs", "json", "ts", "mts", "cts", "tsx", "jsx"];
+    let in_package = path
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("node_modules"));
+    let kind = path
+        .extension()
+        .is_some_and(|ending| KINDS.iter().any(|kind| ending.eq_ignore_ascii_case(kind)));
+    let is_manifest = path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("package.json"));
+    in_package && kind && !is_manifest
+}
+
+/// The dictionary that the files to be squeezed are squeezed with: some of each of them, from all through the list, as
+/// files near each other in a package are much alike. Empty if there's nothing to squeeze.
+fn squeeze_dictionary(files: &[PathBuf], squeezed: &[bool]) -> io::Result<Vec<u8>> {
+    let wanted: Vec<&PathBuf> = files
+        .iter()
+        .zip(squeezed)
+        .filter_map(|(path, &squeeze)| squeeze.then_some(path))
+        .collect();
+    let mut dictionary = Vec::new();
+    if wanted.is_empty() {
+        return Ok(dictionary);
+    }
+    // A file in every so many, until there's enough, so the sample is from all of them rather than the first few.
+    let step = (wanted.len() / 256).max(1);
+    for path in wanted.iter().step_by(step) {
+        let bytes = crate::source_overlay::bytes(path)?;
+        let room = DICTIONARY_SIZE - dictionary.len();
+        dictionary.extend_from_slice(&bytes[..bytes.len().min(room).min(4096)]);
+        if dictionary.len() >= DICTIONARY_SIZE {
+            break;
+        }
+    }
+    Ok(dictionary)
+}
+
+/// What a file in the program has in it, made whole again if it's kept squeezed.
+fn packed_bytes(packed: &PackedFiles, &(place, size, kept): &(u64, u32, u32)) -> io::Result<Vec<u8>> {
+    if kept == 0 {
+        let mut bytes = vec![0; size as usize];
+        read_at(&packed.program, &mut bytes, place)?;
+        return Ok(bytes);
+    }
+    let broken = || io::Error::new(io::ErrorKind::InvalidData, "a file inside the program is damaged");
+    let dictionary = packed
+        .dictionary_read
+        .get_or_init(|| {
+            let (place, size) = packed.dictionary?;
+            let mut bytes = vec![0; usize::try_from(size).ok()?];
+            read_at(&packed.program, &mut bytes, place).ok()?;
+            Some(bytes)
+        })
+        .as_deref()
+        .ok_or_else(broken)?;
+    let mut frame = vec![0; kept as usize];
+    read_at(&packed.program, &mut frame, place)?;
+    crate::builtins::host::zlib::zstd_unframe(&frame, size as usize, Some(dictionary)).ok_or_else(broken)
 }
 
 /// Where `path` really is, with any folder in it that was a link when the program was packed swapped for the one it led
@@ -386,10 +514,8 @@ fn packed_key(packed: &PackedFiles, path: &Path) -> String {
 /// What's in a file inside this program, if it's a packed program and the file's in it.
 pub fn read_packed_file(path: &Path) -> Option<Vec<u8>> {
     let packed = PACKED.get()?;
-    let &(place, size) = packed.files.get(&packed_key(packed, path))?;
-    let mut bytes = vec![0; size as usize];
-    read_at(&packed.program, &mut bytes, place).ok()?;
-    Some(bytes)
+    let found = packed.files.get(&packed_key(packed, path))?;
+    packed_bytes(packed, found).ok()
 }
 
 /// The block of compiled code inside this program, if it's packed with one, and the folder its files' paths are from.
@@ -425,7 +551,7 @@ pub(crate) fn packed_size(path: &Path) -> Option<u32> {
     packed
         .files
         .get(&packed_key(packed, path))
-        .map(|&(_, size)| size)
+        .map(|&(_, size, _)| size)
 }
 
 /// Whether there's a file here, inside the program.
@@ -445,9 +571,8 @@ pub(crate) fn is_packed_folder(path: &Path) -> bool {
 /// What's in a file, from inside the program if it's there, and otherwise from the disk.
 pub(crate) fn read_file(path: &Path) -> io::Result<String> {
     if let Some(packed) = PACKED.get() {
-        if let Some(&(place, size)) = packed.files.get(&packed_key(packed, path)) {
-            let mut bytes = vec![0; size as usize];
-            read_at(&packed.program, &mut bytes, place)?;
+        if let Some(found) = packed.files.get(&packed_key(packed, path)) {
+            let bytes = packed_bytes(packed, found)?;
             return Ok(match String::from_utf8(bytes) {
                 Ok(text) => text,
                 Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
@@ -549,7 +674,9 @@ mod tests {
         assert_eq!(list.files[1].0, r"sub\other.js");
         assert_eq!(list.code, None);
         let bytes = std::fs::read(&program).unwrap();
-        let (place, size) = list.files[1].1;
+        let (place, size, kept) = list.files[1].1;
+        // What isn't in a package is kept as it is.
+        assert_eq!(kept, 0);
         let found = &bytes[place as usize..place as usize + size as usize];
         assert_eq!(std::str::from_utf8(found).unwrap(), "\u{4F60} other");
         // A file with nothing on it, or something too short to say, is just a program.
@@ -594,6 +721,8 @@ mod tests {
             root: PathBuf::new(),
             code: None,
             diagnostics: false,
+            dictionary: None,
+            dictionary_read: OnceLock::new(),
         };
         let through = |path: &str| through_links(&packed, Path::new(path));
         assert_eq!(
@@ -625,6 +754,85 @@ mod tests {
         assert_eq!(through(r"C:\app\node_modules\other\index.js"), None);
         assert_eq!(through(r"C:\app\src\node_modules"), None);
         assert_eq!(through(r"C:\app\node_modules\@scope"), None);
+    }
+
+    #[test]
+    fn a_packages_code_that_didnt_run_is_kept_squeezed_and_reads_the_same() {
+        let folder = std::env::temp_dir().join(format!("rsui-packed-squeezed-{}", std::process::id()));
+        let package = folder.join("node_modules").join("icons");
+        std::fs::create_dir_all(&package).unwrap();
+        let mut files = vec![folder.join("main.tsx"), package.join("package.json"), package.join("index.js")];
+        std::fs::write(&files[0], "import { Star } from 'icons';").unwrap();
+        std::fs::write(&files[1], r#"{ "name": "icons", "sideEffects": false, "description": "a package of icons, each its own module" }"#).unwrap();
+        std::fs::write(&files[2], "export { default as Star } from './star.js';\n".repeat(30)).unwrap();
+        for name in ["star", "moon", "sun", "cloud", "tiny"] {
+            let path = package.join(format!("{name}.js"));
+            let text = if name == "tiny" {
+                "x".to_owned()
+            } else {
+                format!("import {{ make }} from './make.js';\nexport default make('{name}', 'M13.91 2.19c-.76-1.59-3.05-1.59-3.82 0L8.07 6.37a.11.11 0 0 1-.09.06l-4.63.6');\n").repeat(8)
+            };
+            std::fs::write(&path, text).unwrap();
+            files.push(path);
+        }
+        files.sort();
+        let entry = folder.join("main.tsx");
+        let ran = [entry.clone(), package.join("index.js"), package.join("star.js")];
+        let program = folder.join("program.exe");
+        std::fs::write(&program, b"what the program is").unwrap();
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&program).unwrap();
+        append_packed_files(&mut file, &folder, &entry, &files, &ran, &[], &[], None).unwrap();
+        drop(file);
+        let list = read_list(&program).unwrap();
+        assert!(list.dictionary.is_some());
+        let packed = PackedFiles {
+            program: File::open(&program).unwrap(),
+            files: list.files.iter().map(|(path, place)| (key(&folder.join(path)), *place)).collect(),
+            folders: HashSet::new(),
+            run_order: Vec::new(),
+            builtins: Vec::new(),
+            links: HashMap::new(),
+            root: folder.clone(),
+            code: None,
+            diagnostics: false,
+            dictionary: list.dictionary,
+            dictionary_read: OnceLock::new(),
+        };
+        for path in &files {
+            let found = packed.files[&key(path)];
+            let squeezed = found.2 != 0;
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // What ran, what isn't a package's code, its manifest, and what wouldn't get smaller are as they are.
+            let expected = matches!(name.as_str(), "moon.js" | "sun.js" | "cloud.js");
+            assert_eq!(squeezed, expected, "{name}");
+            if squeezed {
+                assert!(found.2 < found.1 / 2, "{name}: {found:?}");
+            }
+            assert_eq!(packed_bytes(&packed, &found).unwrap(), std::fs::read(path).unwrap(), "{name}");
+        }
+        // A squeezed file that's been damaged isn't read as what it was, as one kept as it is wouldn't be. (Neither has
+        // a sum of its own to be checked against.)
+        let mut bytes = std::fs::read(&program).unwrap();
+        let moon = packed.files[&key(&package.join("moon.js"))];
+        bytes[moon.0 as usize + moon.2 as usize / 2] ^= 0x55;
+        drop(packed);
+        std::fs::write(&program, &bytes).unwrap();
+        let packed = PackedFiles {
+            program: File::open(&program).unwrap(),
+            files: HashMap::new(),
+            folders: HashSet::new(),
+            run_order: Vec::new(),
+            builtins: Vec::new(),
+            links: HashMap::new(),
+            root: folder.clone(),
+            code: None,
+            diagnostics: false,
+            dictionary: list.dictionary,
+            dictionary_read: OnceLock::new(),
+        };
+        assert!(packed_bytes(&packed, &moon).map_or(true, |read| read != std::fs::read(package.join("moon.js")).unwrap()));
+        drop(packed);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

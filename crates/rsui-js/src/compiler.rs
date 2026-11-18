@@ -3225,6 +3225,9 @@ impl<'a, 'v> Compiler<'a, 'v> {
                     }
                     if let Some(local) = parts.all {
                         imported.push((local, info.imports.len()));
+                        if let Some(names) = crate::narrow::namespace_reads(body, local) {
+                            info.narrowed.push((info.imports.len(), names));
+                        }
                         info.imports.push((from, None));
                     }
                     for (name, local) in parts.named {
