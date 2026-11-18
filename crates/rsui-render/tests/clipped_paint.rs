@@ -125,6 +125,7 @@ fn clips_match_unchanged_traversal_across_history_and_fresh_layouts() {
                 assert_eq!(scene.batches, other.batches, "batches {special} {step}");
                 assert_eq!(scene.transforms, other.transforms);
                 assert_eq!(scene.filters, other.filters);
+                assert_eq!(scene.round_clips, other.round_clips);
                 gpu.render(scene, Color::WHITE).unwrap();
                 full.render(other, Color::WHITE).unwrap();
                 assert_eq!(

@@ -16,10 +16,15 @@ fn global(engine: &mut Engine, name: &str) -> Value {
 
 /// Renders the component named `component` with the props `props` names, as rsui-tsx does, and gives what it read.
 fn render(engine: &mut Engine, owner: u32, component: &str, props: &str) -> u32 {
+    render_with(engine, owner, component, props, false)
+}
+
+/// [`render`], cautiously or not, as rsui-tsx renders a component that didn't say `memo` cautiously.
+fn render_with(engine: &mut Engine, owner: u32, component: &str, props: &str, cautious: bool) -> u32 {
     let function = global(engine, component);
     let props = global(engine, props);
     let vm = engine.vm();
-    let id = vm.start_reads(owner, function, props, true, false);
+    let id = vm.start_reads(owner, function, props, true, cautious);
     vm.call_function(function, Value::UNDEFINED, &[props]).unwrap();
     vm.end_reads();
     id
@@ -311,6 +316,92 @@ fn a_function_kept_below_follows_one_that_did_the_same_kept_above() {
     assert!(vm.props_equivalent_handing_on(again, moved, true, Value::UNDEFINED));
     assert_eq!(vm.take_unheld_readers(), vec![7]);
     assert_eq!(call(&mut engine, "callFirst"), "active b");
+}
+
+const MODEL: &str = r#"
+    function model(n) {
+        return { n, add: () => n + 1 };
+    }
+    function Bar(props) {
+        return { type: 'button', props: { onClick: props.model.add } };
+    }
+    globalThis.Bar = Bar;
+    globalThis.first = { model: model(1) };
+    globalThis.second = { model: model(2) };
+    globalThis.drawn = { onClick: first.model.add };
+    globalThis.drawnNow = { onClick: second.model.add };
+    globalThis.clickDrawn = () => String(drawn.onClick());
+"#;
+
+#[test]
+fn what_read_a_handler_from_an_object_with_methods_is_looked_at_again_once_and_left_as_it_is() {
+    let mut engine = engine_with(MODEL);
+    // Given a new model, which it read a function from and so is only the same as itself, it renders again.
+    let first = render_with(&mut engine, 7, "Bar", "first", true);
+    assert!(!same(&mut engine, first, "second"));
+    engine.vm().drop_reads(first);
+    let _again = render_with(&mut engine, 7, "Bar", "second", true);
+    // The button it drew keeps the handler it was first given, which is handed the new one. What read that, with the props
+    // it has now, reads the same: handing on changes nothing else of the model.
+    let (drawn, now) = (global(&mut engine, "drawn"), global(&mut engine, "drawnNow"));
+    let vm = engine.vm();
+    assert!(vm.page_props_equivalent_handing_on(drawn, now, Value::UNDEFINED));
+    assert!(vm.take_unheld_readers().is_empty());
+    // The button's handed the same one each time what drew it renders, which it already does what that does.
+    let key = vm.atom("onClick");
+    let (old, new) = (vm.get_property(drawn, key).unwrap(), vm.get_property(now, key).unwrap());
+    assert!(!vm.join_handed(old, new));
+    assert!(vm.page_props_equivalent_handing_on(drawn, now, Value::UNDEFINED));
+    assert!(vm.take_unheld_readers().is_empty());
+    assert_eq!(call(&mut engine, "clickDrawn"), "3");
+}
+
+const SHARING: &str = r#"
+    function make(n) {
+        return () => n;
+    }
+    globalThis.made = [];
+    globalThis.makePair = (i) => {
+        globalThis.drawn = { onClick: make(i) };
+        globalThis.drawnNow = { onClick: make(i + 1) };
+        made.push(drawn, drawnNow);
+    };
+    globalThis.kept = [];
+    globalThis.keepSome = () => {
+        for (let i = 0; i < 4096; i++) kept.push({ i });
+    };
+    globalThis.letGo = () => {
+        globalThis.drawn = null;
+        globalThis.drawnNow = null;
+        globalThis.made = [];
+    };
+    globalThis.clickDrawn = () => String(drawn.onClick());
+"#;
+
+/// Makes `count` handlers from `from` on, each handed on to one that sees the next number.
+fn hand_on_pairs(engine: &mut Engine, from: i32, count: i32) {
+    let make = global(engine, "makePair");
+    for i in from..from + count {
+        let vm = engine.vm();
+        vm.call_function(make, Value::UNDEFINED, &[Value::int(i)]).unwrap();
+        let (drawn, now) = (global(engine, "drawn"), global(engine, "drawnNow"));
+        assert!(engine.vm().props_equivalent_handing_on(drawn, now, true, Value::UNDEFINED));
+    }
+}
+
+#[test]
+fn closures_that_shared_what_they_captured_are_forgotten_once_they_have_gone() {
+    let mut engine = engine_with(SHARING);
+    hand_on_pairs(&mut engine, 0, 20_000);
+    // What's kept after them stops the list of objects being cut short, so that their places are given back.
+    call(&mut engine, "keepSome");
+    call(&mut engine, "letGo");
+    engine.collect_garbage_when_quiet();
+    assert!(engine.footprint().objects.given_back_pages > 100, "{}", engine.footprint());
+    // Closures made now are given the blocks of captured variables those had, and handing on looks for what shares
+    // theirs, which mustn't be the closures that have gone.
+    hand_on_pairs(&mut engine, 20_000, 20_000);
+    assert_eq!(call(&mut engine, "clickDrawn"), "40000");
 }
 
 const PAINTED: &str = r#"

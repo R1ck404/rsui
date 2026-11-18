@@ -47,6 +47,7 @@ mod selector_receipt;
 mod trace_file;
 mod vite_env;
 mod watch;
+mod webview;
 mod why;
 
 use std::path::{Path, PathBuf};
@@ -139,6 +140,10 @@ pub fn run(path: impl AsRef<Path>, options: Options) -> Result<(), Error> {
 fn run_here(path: &Path, options: Options) -> Result<(), Error> {
     // This is a program that's really running, and what it asks for at the top of its main file really happens.
     native::allow_real_effects();
+    // Windows knows it as this app, and not only as the program running it, before it has a window: see `set_app_id`.
+    if let Err(error) = rsui::desktop::set_app_id(&format!("rsui.{}", bridge::name_of_app(path))) {
+        eprintln!("rsui-tsx: Windows wasn't told which app this is: {error}");
+    }
     // Someone working on it can see what renders and why, and save it. Someone it's been handed to has no use for that.
     rsui::allow_inspector(!rsui_js::running_packed() || rsui_js::packed_diagnostics());
     rsui::inspect::set_trace_saver(trace_file::save_beside_app);

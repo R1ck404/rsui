@@ -30,6 +30,7 @@ fn scene() -> Scene {
         image: 0,
         transform: 0,
         filter: 0,
+        round: 0,
     }];
     Scene {
         quads,
@@ -213,6 +214,7 @@ fn separate_opacity_groups_reuse_one_target_and_restore_image_filtering() {
         image: 0,
         transform: 0,
         filter: 0,
+        round: 0,
     });
     next.layers.push(Layer {
         first: 1,
@@ -238,6 +240,7 @@ fn separate_opacity_groups_reuse_one_target_and_restore_image_filtering() {
         image: 17,
         transform: 0,
         filter: 0,
+        round: 0,
     });
     next.image_uploads.push(rsui_render::ImageUpload {
         id: 17,
@@ -320,6 +323,7 @@ fn bounded_opacity_damage_matches_full_redraw_across_buffer_history() {
                     image: 0,
                     transform: 0,
                     filter: 0,
+                    round: 0,
                 },
             );
             next.quads.push(Quad {
@@ -335,6 +339,7 @@ fn bounded_opacity_damage_matches_full_redraw_across_buffer_history() {
                 image: 0,
                 transform: 0,
                 filter: 0,
+                round: 0,
             });
             next.layers[0] = Layer {
                 first: 1,

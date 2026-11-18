@@ -27,6 +27,15 @@ cbuffer Frame : register(b0) {
     float filtered;
     float filter_opacity;
     float2 unused_three;
+    // Round corners what's drawn is cut off at, as CSS's `overflow: hidden` with `border-radius` has it, or a box with round
+    // corners it's kept out of, as a shadow is from under what it's behind, filled from the first: each one's left, top, right
+    // and bottom edges, how far across and down its top left and top right corners go, then its bottom right and bottom left,
+    // and whether it keeps what's inside (1) or outside (-1) or isn't there (0), and whether it's measured on the screen (1),
+    // rather than before what's drawn is turned or resized (0).
+    float4 round_edges[2];
+    float4 round_top[2];
+    float4 round_bottom[2];
+    float4 round_how[2];
 };
 
 Texture2D<float> atlas : register(t0);
@@ -49,6 +58,8 @@ struct Pixel {
     float2 uv : UV;
     // For a shadow inside something, how far in its edge starts, and 1, or nothing for anything else.
     nointerpolation float2 inset : INSET;
+    // Where this is before it's turned or resized, then on the screen, in pixels, for what's cut off at round corners.
+    float4 at : AT;
 };
 
 // What a shadow inside something is marked with, in place of a glyph's width in the atlas, which is never this big.
@@ -56,9 +67,10 @@ static const uint INSET_MARK = 65534;
 
 Pixel vs(Instance input) {
     float2 corner = float2(input.corner & 1, input.corner >> 1);
-    float2 position = input.rect.xy + corner * input.rect.zw;
-    position = transform.xy * position.x + transform.zw * position.y + moved;
+    float2 before = input.rect.xy + corner * input.rect.zw;
+    float2 position = transform.xy * before.x + transform.zw * before.y + moved;
     Pixel output;
+    output.at = float4(before, position);
     output.position = float4(position / viewport * float2(2, -2) + float2(-1, 1), 0, 1);
     output.color = input.color;
     output.local = (corner - 0.5) * input.rect.zw;
@@ -154,6 +166,43 @@ float4 inset_shadow(Pixel input) {
     return input.color * rounded_cover(input.local, input.shape.xy, input.shape.z) * (1 - hole);
 }
 
+// How much of a pixel at `at` is inside a box with round corners, from its edges and how far across and down each corner goes,
+// with distances in pixels `sharp` times as big on the screen. A corner whose curve is part of an ellipse is measured from that
+// closely enough for its edge to be as smooth.
+float round_clip_cover(float2 at, float4 edges, float4 top, float4 bottom, float sharp) {
+    float2 middle = (edges.xy + edges.zw) / 2;
+    float2 half_size = (edges.zw - edges.xy) / 2;
+    float2 local = at - middle;
+    float2 curve = local.y < 0 ? (local.x < 0 ? top.xy : top.zw) : (local.x < 0 ? bottom.zw : bottom.xy);
+    float2 away = abs(local) - half_size + curve;
+    float distance;
+    if (away.x > 0 && away.y > 0 && curve.x > 0 && curve.y > 0) {
+        float along = length(away / curve);
+        distance = along * (along - 1) / length(away / (curve * curve));
+    } else {
+        float2 out_by = abs(local) - half_size;
+        distance = max(out_by.x, out_by.y);
+    }
+    return saturate(0.5 - distance * sharp);
+}
+
+// How much of this pixel the round clips it's in leave showing.
+float round_clips_cover(Pixel input) {
+    if (round_how[0].x == 0) {
+        return 1;
+    }
+    float cover = 1;
+    [unroll] for (int at = 0; at < 2; at++) {
+        if (round_how[at].x != 0) {
+            bool on_screen = round_how[at].y > 0;
+            float inside = round_clip_cover(on_screen ? input.at.zw : input.at.xy, round_edges[at], round_top[at],
+                round_bottom[at], on_screen ? 1 : sharpness);
+            cover *= round_how[at].x > 0 ? inside : 1 - inside;
+        }
+    }
+    return cover;
+}
+
 float4 color_of(Pixel input) {
     if (input.inset.y > 0) {
         return inset_shadow(input);
@@ -229,7 +278,7 @@ Drawn drawn(float4 color) {
 }
 
 Drawn image_ps(Pixel input) {
-    return drawn(image_color(input));
+    return drawn(image_color(input) * round_clips_cover(input));
 }
 
 Drawn ps(Pixel input) {
@@ -242,10 +291,11 @@ Drawn ps(Pixel input) {
             float3 rgb = input.color.a > 0 ? input.color.rgb / input.color.a : input.color.rgb;
             cover = float3(browser_part(cover.r, rgb.r), browser_part(cover.g, rgb.g), browser_part(cover.b, rgb.b));
         }
+        cover *= round_clips_cover(input);
         Drawn out_value;
         out_value.color = float4(input.color.rgb * cover, input.color.a * max(cover.r, max(cover.g, cover.b)));
         out_value.cover = float4(cover * input.color.a, out_value.color.a);
         return out_value;
     }
-    return drawn(color_of(input));
+    return drawn(color_of(input) * round_clips_cover(input));
 }

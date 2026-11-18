@@ -4,6 +4,7 @@
 use rsui_core::{Element, Node};
 
 use crate::measure::Measure;
+use crate::share::Mix;
 use crate::style::{
     Align, Direction, Justify, Length, NAMES, Placement, Style, TablePart, is_contents, is_inert,
     is_paragraph, read_align, read_length, shows_own_text, sized_by_parent_height,
@@ -122,6 +123,15 @@ struct Item {
     wanted: Option<(f32, f32)>,
     /// Which of the parent's children this is.
     index: usize,
+}
+
+impl Item {
+    /// How much of what there's too little room for it gives up, against the others: its `flex-shrink` times how big it starts
+    /// inside its padding and border, as CSS has it (Flexbox 1 §9.7), so that what's mostly padding gives up little of it.
+    fn shrink_factor(&self, row: bool) -> f32 {
+        let (across, down) = padding_totals(&self.style);
+        self.style.shrink * (self.base - if row { across } else { down }).max(0.0)
+    }
 }
 
 pub(crate) fn compute<M: Measure>(
@@ -830,6 +840,9 @@ impl<M: Measure> Pass<'_, M> {
             return self.solve_ordered(current, node, style, key, mode);
         }
         self.solved += 1;
+        // The answer is kept as the answer to what it was asked, `question`, though it's worked out in the room it has.
+        let question = key;
+        let key = within_own_max(key, style);
         // What a margin or padding that's a percentage is a share of, for what's in this: how wide it is inside its padding.
         let base = if key.width.value >= 0.0 && key.width.value.is_finite() {
             (key.width.value - style.padding_left - style.padding_right).max(0.0)
@@ -903,10 +916,10 @@ impl<M: Measure> Pass<'_, M> {
                 if current.has(HAS_MEASURE) {
                     self.remember_displaced(current);
                 }
-                current.store_measure(key, size);
+                current.store_measure(question, size);
             }
             Mode::Layout => {
-                current.store_layout(key, size);
+                current.store_layout(question, size);
                 current.update_contains_absolute();
                 current.update_clipped_paint(node);
             }
@@ -920,10 +933,8 @@ impl<M: Measure> Pass<'_, M> {
     /// Room is taken as its lines take it, as only its box changes.
     #[inline(never)]
     fn fit_inline_areas(&mut self, current: &mut LayoutBox, node: &Element) {
-        static INLINE_AREA: std::sync::LazyLock<rsui_core::Symbol> =
-            std::sync::LazyLock::new(|| rsui_core::Symbol::new("inline_area"));
         for (child_box, child) in current.children.iter_mut().zip(&node.children) {
-            if matches!(child.props.get_symbol(*INLINE_AREA), Some(rsui_core::PropValue::Bool(true)))
+            if is_inline_area(child)
                 && (!child.children.is_empty() || child.role == rsui_core::Role::Text)
                 && let Some((top, cut)) = self.measure.inline_area(child)
             {
@@ -938,9 +949,7 @@ impl<M: Measure> Pass<'_, M> {
     /// is where its text puts it, which does the same.
     #[inline(never)]
     fn keep_inside_where_it_was(&mut self, current: &mut LayoutBox, node: &Element) {
-        static INLINE_AREA: std::sync::LazyLock<rsui_core::Symbol> =
-            std::sync::LazyLock::new(|| rsui_core::Symbol::new("inline_area"));
-        if !matches!(node.props.get_symbol(*INLINE_AREA), Some(rsui_core::PropValue::Bool(true))) {
+        if !is_inline_area(node) {
             return;
         }
         if let Some((top, _)) = self.measure.inline_area(node) {
@@ -1236,10 +1245,60 @@ impl<M: Measure> Pass<'_, M> {
             // No more than it says it is, if it says, as CSS's specified size suggestion has it. What only starts from a
             // basis, as `flex: 1` does, is no smaller than what's in it, however little it starts from.
             let said = !matches!(lengths(&item.style, row).0, Length::Auto);
-            let cap = if item.style.basis.is_some() && !said { f32::INFINITY } else { item.base };
-            item.min_main = item.min_main.max(content.min(cap));
+            let cap = if item.style.has_basis() && !said { f32::INFINITY } else { item.base };
+            // Nor more than its most, which its base can be past (see `base_past_max`).
+            item.min_main = item.min_main.max(content.min(cap).min(item.max_main));
             item.main = item.main.max(item.min_main);
         }
+    }
+
+    /// What a flex item that's as big as what's in it starts from along a flex box (CSS's flex base size), given `answer`, which
+    /// is how big it said it is: that's how big what's in it is, which can be past the most it can be, as only how big it can
+    /// end up is held to that. Shrinking takes from each as much more as it starts from, so a box of chips with `max-width:
+    /// 300px` that's 398 wide by what's in it gives up as much as 398 does beside text, not as 300 does. Only what's at its most
+    /// is asked again, without it. What has a shape, as a picture does, keeps to what it said, as its size is worked out from
+    /// that shape (see `solve_shaped`).
+    fn base_past_max(
+        &mut self,
+        child_box: &mut LayoutBox,
+        child: &Element,
+        item: &Item,
+        question: Key,
+        answer: Size,
+        row: bool,
+    ) -> f32 {
+        let along = if row { answer.width } else { answer.height };
+        if along < item.max_main - 0.01 || !item.max_main.is_finite() || item.style.aspect.is_some() || item.style.fit_width {
+            return along;
+        }
+        self.solve_past_max(child_box, child, &item.style, question, answer, row)
+    }
+
+    /// How big what's in something is along `row` or down, when it's asked `question`, without the most it can be that way:
+    /// see [`base_past_max`](Self::base_past_max). What it's kept as the answer to that question stays `answer`, which is what
+    /// it is with its most.
+    #[cold]
+    #[inline(never)]
+    fn solve_past_max(
+        &mut self,
+        child_box: &mut LayoutBox,
+        child: &Element,
+        style: &Style,
+        question: Key,
+        answer: Size,
+        row: bool,
+    ) -> f32 {
+        let mut unlimited = *style;
+        if row {
+            unlimited.max_width = f32::INFINITY;
+        } else {
+            unlimited.max_height = f32::INFINITY;
+        }
+        let size = self.solve_anew(child_box, child, &unlimited, question, Mode::Measure);
+        child_box.store_measure(question, answer);
+        // That isn't kept as an answer to anything, so when what's in it changes, what it's in has to ask again.
+        child_box.flags |= FORGOT_A_QUESTION;
+        if row { size.width } else { size.height }
     }
 
     /// How long a picture from a file is along a flex box, if it's as big as `cross` says the other way: as long as that makes it,
@@ -1260,6 +1319,31 @@ impl<M: Measure> Pass<'_, M> {
         } else {
             cross.value * natural.height / natural.width
         })
+    }
+
+    /// What's in a box of its own, as text in a `<p>` is, given room that's `room` wide that it needn't fill: as CSS's
+    /// `fit-content`, `min(max-content, room)`, has it, it's as wide as it is on one line where that fits, and as wide as the room
+    /// where it wraps, not as its widest line, as a centred `<p>` with `max-width: 300px` that wraps is 300 wide. Asking about it on
+    /// one line first costs nothing more where it fits, which is most of the time.
+    #[inline(never)]
+    fn fit_content(&mut self, node: &Element, room: f32) -> Size {
+        let one_line = self.measure.measure(node, f32::INFINITY);
+        if one_line.width <= room + 0.01 {
+            return one_line;
+        }
+        let wrapped = self.measure.measure(node, room);
+        Size::new(wrapped.width.max(room), wrapped.height)
+    }
+
+    /// Whether what a leaf shows is as wide as [`fit_content`](Self::fit_content) says, given room that isn't its own size: text
+    /// is, as a box of its own, but not text that's only part of a line (`inline_area`, as a `<span>` in a block is), which is as
+    /// wide as its lines are, as an inline box is, nor a picture or a field, which are as big as they are.
+    fn fits_content(node: &Element, key: Key) -> bool {
+        !key.width.exact
+            && key.width.value >= 0.0
+            && key.width.value.is_finite()
+            && !matches!(node.role, rsui_core::Role::Image | rsui_core::Role::TextInput)
+            && !is_inline_area(node)
     }
 
     #[inline(never)]
@@ -1289,7 +1373,11 @@ impl<M: Measure> Pass<'_, M> {
             }
         } else {
             let max_width = (key.width.value - pad_x).max(0.0);
-            self.measure.measure(node, max_width)
+            if Self::fits_content(node, key) {
+                self.fit_content(node, max_width)
+            } else {
+                self.measure.measure(node, max_width)
+            }
         };
         // Words that don't fit in the room they're given, as a word that can't be broken or text that doesn't wrap, are as wide as
         // they are, past it: CSS's `fit-content` is never narrower than what's in it can be (a toggle's "Medium" label under its
@@ -1744,8 +1832,9 @@ impl<M: Measure> Pass<'_, M> {
                 } else {
                     (answer.height, answer.width)
                 };
+                let base = self.base_past_max(child_box, child, &items[item_at], question, answer, row);
                 let item = &mut items[item_at];
-                item.base = main;
+                item.base = base;
                 item.main = main.clamp_to(item.min_main, item.max_main);
                 item.wanted = Some((main, cross));
             }
@@ -1813,13 +1902,13 @@ impl<M: Measure> Pass<'_, M> {
                     && items.iter().any(|item| {
                         item.style.keeps_to_content(row)
                             && item.style.grow > 0.0
-                            && item.style.basis.is_some()
+                            && item.style.has_basis()
                             && matches!(lengths(&item.style, row).0, Length::Auto)
                     })))
         {
             self.keep_to_content(current, node, &mut items, row);
         }
-        share_space(&mut items, room_left);
+        share_space(&mut items, room_left, row);
 
         // Now that children know their size one way, ask about the other.
         let mut widest_cross = 0f32;
@@ -1870,7 +1959,10 @@ impl<M: Measure> Pass<'_, M> {
         // Place everything.
         let inner_cross = (own_cross - pad_cross).max(0.0);
         let total_main: f32 = items.iter().map(|item| item.main).sum::<f32>() + gaps + all_margins;
-        let free = (inner_main - total_main).max(0.0);
+        // What's left over, which is less than none when what's in it is too long: then what's said to go at the end or in the
+        // middle runs over the start, as CSS has it unless it says `safe`.
+        let left_over = inner_main - total_main;
+        let free = left_over.max(0.0);
         let count = items.len();
         // Margins said to be `auto` along take what's left over, shared between them, as CSS has them, before anything else does.
         let (autos, auto_share) = if free > 0.0 {
@@ -1879,7 +1971,7 @@ impl<M: Measure> Pass<'_, M> {
             (Vec::new(), 0.0)
         };
         let (start_offset, more) = if autos.is_empty() {
-            spread_of(style.justify).offsets(free, count)
+            spread_of(style.justify).offsets(left_over, count)
         } else {
             (0.0, 0.0)
         };
@@ -2088,8 +2180,9 @@ impl<M: Measure> Pass<'_, M> {
                 } else {
                     (answer.height, answer.width)
                 };
+                let base = self.base_past_max(child_box, child, &items[at], question, answer, row);
                 let item = &mut items[at];
-                item.base = along;
+                item.base = base;
                 item.main = along.clamp_to(item.min_main, item.max_main);
                 item.wanted = Some((along, across));
             }
@@ -2105,7 +2198,7 @@ impl<M: Measure> Pass<'_, M> {
         // `min-width: auto`), however little it starts from, as `flex: 1` starts from nothing: buttons that each grow from
         // nothing still go on as many lines as their words need.
         if items.iter().any(|item| {
-            item.style.keeps_to_content(row) && item.style.basis.is_some()
+            item.style.keeps_to_content(row) && item.style.has_basis()
         }) {
             self.keep_to_content(current, node, &mut items, row);
         }
@@ -2132,22 +2225,20 @@ impl<M: Measure> Pass<'_, M> {
         let mut line_sizes = Vec::with_capacity(lines.len());
         let mut baselines = Vec::new();
         let mut line_ascents = Vec::new();
-        // As wide as its widest line, when how wide it is depends on what's in it, which what grows on a line grows to fill.
-        let fitted = lines
-            .iter()
-            .map(|line| {
-                items[line.clone()]
-                    .iter()
-                    .map(|item| item.main)
-                    .sum::<f32>()
-                    + style.gap * line.len().saturating_sub(1) as f32
-                    + main_margins[line.clone()]
-                        .iter()
-                        .map(|all| all.0 + all.1)
-                        .sum::<f32>()
-            })
-            .fold(0f32, f32::max)
-            .min(inner_limit);
+        // As wide as its widest line, when how wide it is depends on what's in it, which what grows on a line grows to fill. A row
+        // that doesn't fit on one line in the room it has fills that room, as CSS's `fit-content`, `min(max-content, room)`, has it:
+        // a box of chips that wraps in 300 is 300 wide, with its lines in it as it says, not as wide as its widest line.
+        let extent = |line: &std::ops::Range<usize>| {
+            items[line.clone()].iter().map(|item| item.main).sum::<f32>()
+                + style.gap * line.len().saturating_sub(1) as f32
+                + main_margins[line.clone()].iter().map(|all| all.0 + all.1).sum::<f32>()
+        };
+        let widest_line = lines.iter().map(extent).fold(0f32, f32::max);
+        let fills = row
+            && main_key.value >= 0.0
+            && inner_limit.is_finite()
+            && (lines.len() > 1 || widest_line > inner_limit + 0.01);
+        let fitted = if fills { inner_limit } else { widest_line.min(inner_limit) };
         for line in &lines {
             let margins_along: f32 = main_margins[line.clone()]
                 .iter()
@@ -2174,9 +2265,12 @@ impl<M: Measure> Pass<'_, M> {
                 self.keep_to_content(current, node, &mut items[line.clone()], true);
             }
             if main_key.exact || too_big {
-                share_space(&mut items[line.clone()], available);
+                share_space(&mut items[line.clone()], available, row);
+                if too_big && row {
+                    self.fit_wrapped_inline(current, node, &mut items[line.clone()]);
+                }
             } else if grows {
-                share_space(&mut items[line.clone()], fitted - gaps - margins_along);
+                share_space(&mut items[line.clone()], fitted - gaps - margins_along, row);
             }
             widest = widest.max(
                 items[line.clone()]
@@ -2248,7 +2342,7 @@ impl<M: Measure> Pass<'_, M> {
         let own_main = if main_key.exact {
             main_key.value
         } else {
-            (widest + pad_main)
+            (if fills { widest.max(inner_limit) } else { widest } + pad_main)
                 .within(main_key.value)
                 .clamp_to(min_main, max_main)
         };
@@ -2301,7 +2395,7 @@ impl<M: Measure> Pass<'_, M> {
                 + style.gap * line.len().saturating_sub(1) as f32
                 + margins_along;
             let (start_offset, extra) =
-                spread_of(style.justify).offsets((inner_main - total).max(0.0), line.len());
+                spread_of(style.justify).offsets(inner_main - total, line.len());
             let mut position = pad_main_start + start_offset;
             for at in line.clone() {
                 let (index, item_style, main) = (items[at].index, items[at].style, items[at].main);
@@ -2390,6 +2484,31 @@ impl<M: Measure> Pass<'_, M> {
         self.place_passed_absolutes(current, node, size);
         current.update_contains_overlay();
         size
+    }
+
+    /// What's only part of a line (`inline_area`, as a `<span>` of text in a block is) that was too long for its line, and so got
+    /// smaller, is as wide as its lines are once it wraps in what it got, as an inline box is as wide as its pieces on each line,
+    /// not as all the room: a lone `<span>` that wraps in a centred block 200 wide is as wide as its widest line, in the middle.
+    #[cold]
+    #[inline(never)]
+    fn fit_wrapped_inline(&mut self, current: &mut LayoutBox, node: &Element, items: &mut [Item]) {
+        for item in items.iter_mut() {
+            let child = &node.children[item.index];
+            if !is_inline_area(child) || item.wanted.is_none_or(|(along, _)| item.main >= along - 0.01) {
+                continue;
+            }
+            let answer = self.solve_styled(
+                &mut current.children[item.index],
+                child,
+                &item.style,
+                make_key(true, Axis::at_most(item.main), item.cross_axis),
+                Mode::Measure,
+            );
+            if answer.width < item.main {
+                item.main = answer.width;
+                item.wanted = Some((answer.width, answer.height));
+            }
+        }
     }
 
     /// Puts one child with a margin in its place, and says where the next one goes. It's apart from [`Self::solve_flex`] so that
@@ -3238,25 +3357,25 @@ fn start_item(
         return ItemStart::Overlay;
     }
     // A share of what it's in, across, is how wide it can be, now that that's known.
-    if let Some((percent, more)) = style.max_width_percent {
+    if let Some(share) = style.max_width_percent {
         let across = if room.row {
             room.definite_main
         } else {
             room.definite_cross.or(Some(room.cross_limit))
         };
         if let Some(across) = across.filter(|across| across.is_finite()) {
-            style.max_width = style.max_width.min(across * percent / 100.0 + more);
+            style.max_width = style.max_width.min(share.at(across));
         }
     }
     // And how narrow it can't be, as `min-width: 100%` says.
-    if let Some((percent, more)) = style.min_width_percent {
+    if let Some(share) = style.min_width_percent {
         let across = if room.row {
             room.definite_main
         } else {
             room.definite_cross.or(Some(room.cross_limit))
         };
         if let Some(across) = across.filter(|across| across.is_finite()) {
-            style.min_width = style.min_width.max(across * percent / 100.0 + more);
+            style.min_width = style.min_width.max(share.at(across));
         }
     }
     child_box.flags &= !IS_OVERLAY;
@@ -3298,10 +3417,9 @@ fn start_item(
     };
     // A share of what it's in is that much of how long it is along, and as big as what's in it while that isn't known, as CSS
     // has it.
-    let basis = if style.basis_share {
-        room.definite_main.zip(style.basis).map(|(main, share)| (main * share + style.basis_more).max(0.0))
-    } else {
-        style.basis
+    let basis = match style.basis_share {
+        Some(share) => room.definite_main.map(|main| share.at(main).max(0.0)),
+        None => style.basis,
     };
     // What it starts from is never less than its padding and border, as nothing is, so what starts from nothing, as `flex: 1`
     // does, starts from those, as CSS has it.
@@ -3335,10 +3453,10 @@ fn start_item(
     }
 }
 
-/// Shares `space` between items that can grow or shrink, keeping to their limits. An
+/// Shares `space` between items that can grow or shrink, keeping to their limits, along a row if `row`. An
 /// item that hits a limit stops there, and the rest share what that leaves.
 #[inline(never)]
-fn share_space(items: &mut [Item], space: f32) {
+fn share_space(items: &mut [Item], space: f32, row: bool) {
     let total: f32 = items.iter().map(|item| item.main).sum();
     let growing = space > total;
     // Every item can only stop once, so this can't loop forever.
@@ -3353,7 +3471,7 @@ fn share_space(items: &mut [Item], space: f32) {
                 factors += if growing {
                     item.style.grow
                 } else {
-                    item.style.shrink * item.base
+                    item.shrink_factor(row)
                 };
             }
         }
@@ -3371,7 +3489,7 @@ fn share_space(items: &mut [Item], space: f32) {
             let factor = if growing {
                 item.style.grow
             } else {
-                item.style.shrink * item.base
+                item.shrink_factor(row)
             };
             let wanted = item.base + left * factor / factors;
             let limited = wanted.clamp_to(item.min_main, item.max_main);
@@ -3496,6 +3614,11 @@ fn note_stacking(current: &mut LayoutBox, node: &Element) {
     }
 }
 
+/// Whether this is only part of a line, whose box is only as tall as its fonts make it, as a CSS inline box is (`inline_area`).
+fn is_inline_area(node: &Element) -> bool {
+    matches!(node.props.get_symbol(NAMES.inline_area), Some(rsui_core::PropValue::Bool(true)))
+}
+
 /// Whether all that's in a block is pictures that sit on a line of text, as `on_line` says they do, which leaves room below them for
 /// what goes under a line, as a page has it.
 fn on_a_line(node: &Element) -> bool {
@@ -3606,6 +3729,22 @@ fn apply_translate(child_box: &mut LayoutBox, child: &Element, parent: (f32, f32
     child_box.y += y;
 }
 
+/// The room something has, asked about `key`: no wider than it can be, as `max_width` says (unless `min_width` says more, which
+/// wins), so what's in it is laid out in that, as CSS has it. Text in a flex item with `max-width: 120px` that's asked how wide it
+/// is with room to spare wraps at 120, and is as tall as that makes it, not as tall as it is on one line. What's told how wide to
+/// be is that wide already.
+#[inline(always)]
+fn within_own_max(key: Key, style: &Style) -> Key {
+    let most = style.max_width.max(style.min_width);
+    if key.width.exact || key.width.value <= most {
+        return key;
+    }
+    Key {
+        width: Axis::at_most(most),
+        height: key.height,
+    }
+}
+
 fn padding_totals(style: &Style) -> (f32, f32) {
     (
         style.padding_left + style.padding_right,
@@ -3655,6 +3794,8 @@ fn resolve_cross(length: Length, inner_cross: f32, asked: Axis) -> Option<f32> {
     match length {
         Length::Percent(_) if !asked.exact => None,
         Length::Calc(percent, _) if percent != 0.0 && !asked.exact => None,
+        Length::Clamp(clamp) if clamp.has_share() && !asked.exact => None,
+        Length::Mix(along, ends) if Mix::of(along, ends).has_share() && !asked.exact => None,
         _ => resolve_length(length, Some(inner_cross)),
     }
 }
@@ -3667,6 +3808,8 @@ fn resolve_length(length: Length, parent: Option<f32>) -> Option<f32> {
         Length::Px(value) => Some(value),
         Length::Percent(percent) => parent.map(|parent| parent * percent / 100.0),
         Length::Calc(percent, pixels) => parent.map(|parent| parent * percent / 100.0 + pixels),
+        Length::Clamp(clamp) => parent.map(|parent| clamp.at(parent)),
+        Length::Mix(along, ends) => parent.map(|parent| Mix::of(along, ends).at(parent)),
     }
 }
 

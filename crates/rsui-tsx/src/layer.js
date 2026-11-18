@@ -25,7 +25,17 @@ globalThis.__Reordered = Object.freeze({ reordered: true });
 // Table's cells have it (see `Vm::props_equivalent`).
 const NOT_KEPT = Symbol('rsui.notKept');
 
+// `<webview>`, a web page from elsewhere, is drawn by `rsui/webview`, which is only loaded by an app that has one.
+let webviewElement = null;
+function webview() {
+    webviewElement ??= require('rsui/webview').WebView;
+    return webviewElement;
+}
+
 globalThis.__jsx = function (type, props, kids, mayHaveKey) {
+    if (type === 'webview') {
+        type = webview();
+    }
     const key = mayHaveKey === true ? props.key : undefined;
     if (typeof type === 'function' && type !== Fragment) {
         if (kids !== undefined && kids !== null && kids.length > 0) {
@@ -47,6 +57,9 @@ globalThis.__jsx = function (type, props, kids, mayHaveKey) {
 // (see `JsProps` in bridge.rs). Elements made anywhere else, as in `node_modules`, are as `__jsx` has them.
 // It's called by a name of its own here, as the compiler takes `__jsxMemo` in a file that isn't the app's, as this one, to be `__jsx`.
 function jsxMemo(type, props, kids, mayHaveKey) {
+    if (type === 'webview') {
+        type = webview();
+    }
     // A tag says so too, for what a page makes of it (see `webDescription`).
     if (typeof type === 'string') {
         return { type, key: mayHaveKey === true ? props.key : undefined, props, kids, memo: true };
@@ -1907,7 +1920,8 @@ function addLayers(kids, around, layers) {
     // What CSS says about this part, by its id, its classes, its attributes and its own `style`, goes over what it says itself, as
     // it does on a page: Mantine's ring is `<circle class="m_b1ca1fbf">`, whose stroke is only said in its stylesheet.
     // And what it says with `var()`, as shadcn's chart's `fill="var(--color-desktop)"` does, which is worked out there too.
-    const part = around.parts === undefined || (props.id === undefined && !saysVariable(props) && (tag === null || (props.className === undefined && props.style === undefined)))
+    // So is what its attributes say as SVG writes them, as a page's `stroke-width="2"` does.
+    const part = around.parts === undefined || (props.id === undefined && !saysVariable(props) && (tag === null || (props.className === undefined && props.style === undefined && !saysDashed(props))))
         ? NO_PROPS : around.parts(props.id, tag, props);
     if (part.__shapeMoves !== undefined) {
         around.moves?.push(part.__shapeMoves);
@@ -1973,13 +1987,23 @@ function addLayers(kids, around, layers) {
     const offset = parseFloat(own.strokeDashoffset ?? 0);
     // How far a mitred corner reaches before it's bevelled, in widths of the line, which is 4 unless it says.
     const limit = parseFloat(own.strokeMiterlimit ?? 4);
-    const line = [fill, colorText(own.stroke), own.strokeWidth ?? 1, own.strokeLinecap ?? 'butt', d, own.transform ?? '', dashText(own.strokeDasharray), Number.isFinite(offset) ? offset : 0, own.strokeLinejoin ?? 'miter', Number.isFinite(limit) && limit >= 1 ? limit : 4, own.fillRule === 'evenodd' ? 'evenodd' : 'nonzero'];
+    const line = [fill, colorText(own.stroke), strokeWidthOf(own.strokeWidth), own.strokeLinecap ?? 'butt', d, own.transform ?? '', dashText(own.strokeDasharray), Number.isFinite(offset) ? offset : 0, own.strokeLinejoin ?? 'miter', Number.isFinite(limit) && limit >= 1 ? limit : 4, own.fillRule === 'evenodd' ? 'evenodd' : 'nonzero'];
     layers.push(line.join('\t').replace(/\n/g, ' '));
 }
 
 /// Whether a shape's presentation attributes say something with `var()`, which only CSS can work out.
 function saysVariable(props) {
     return (typeof props.fill === 'string' && props.fill.includes('var(')) || (typeof props.stroke === 'string' && props.stroke.includes('var('));
+}
+
+/// Whether a shape has a prop with a `-` in its name, as a page's `stroke-width="2"` is.
+function saysDashed(props) {
+    for (const name in props) {
+        if (name.includes('-')) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// The font something in an `<svg>` is in: what's around it, then its attributes, then what CSS says about it.
@@ -2085,7 +2109,7 @@ function addText(props, own, layers) {
             const fill = piece.fill === undefined ? 'currentColor' : colorText(piece.fill);
             const moved = `translate(${piece.x + shift} ${piece.y})`;
             const transform = piece.transform === undefined || piece.transform === '' ? moved : piece.transform + ' ' + moved;
-            const line = [fill, colorText(piece.stroke), piece.strokeWidth ?? 1, 'butt', piece.d, transform, '', 0, 'miter'];
+            const line = [fill, colorText(piece.stroke), strokeWidthOf(piece.strokeWidth), 'butt', piece.d, transform, '', 0, 'miter'];
             layers.push(line.join('\t').replace(/\n/g, ' '));
         }
     }
@@ -2097,6 +2121,12 @@ const SVG_GROUPS = new Set(['a', 'switch']);
 const SVG_DEFINITIONS = new Set(['defs', 'clipPath', 'mask', 'pattern', 'symbol', 'marker', 'linearGradient', 'radialGradient', 'stop', 'filter',
     'title', 'desc', 'metadata', 'style']);
 const svgSaid = new Set();
+
+/// How wide a line is, from a number or SVG's text for one, as `2.2` or `"4px"`, in the shape's own units. It's 1 unless it says.
+function strokeWidthOf(width) {
+    const number = typeof width === 'number' ? width : parseFloat(width);
+    return Number.isFinite(number) && number >= 0 ? number : 1;
+}
 
 /// A shape: `<Svg viewBox="0 0 24 24"><Path d="M2 2H22V22Z" /></Svg>`. `fill`, `stroke`, `strokeWidth` and `strokeLinecap` go
 /// on what's inside or on this, for all of it. `currentColor`, which is what fills if nothing says, is this one's `color`.

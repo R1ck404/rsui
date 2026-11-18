@@ -13,6 +13,7 @@ members = [
     "crates/rsui-runtime",
     "crates/rsui-text",
     "crates/rsui-tsx",
+    "crates/rsui-webview",
 ]
 
 [workspace.package]

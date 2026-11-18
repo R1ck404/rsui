@@ -242,6 +242,7 @@ impl Painter {
                 &mut self.pilot.history.transforms,
             );
             std::mem::swap(&mut self.scene.filters, &mut self.pilot.history.filters);
+            std::mem::swap(&mut self.scene.round_clips, &mut self.pilot.history.round_clips);
         }
     }
 
@@ -258,7 +259,9 @@ impl Painter {
         self.pilot.revision = 0;
         self.pilot.contributors.clear();
         self.pilot.plan_ready = false;
-        self.pilot.valid &= self.scene.transforms.is_empty() && self.scene.filters.is_empty();
+        self.pilot.valid &= self.scene.transforms.is_empty()
+            && self.scene.filters.is_empty()
+            && self.scene.round_clips.is_empty();
     }
 
     fn build_owned_plan(&mut self) {

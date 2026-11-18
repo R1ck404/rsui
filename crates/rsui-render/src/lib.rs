@@ -42,7 +42,7 @@ pub use images::{ImageUpload, Images, image_size, register_image, set_files_from
 pub use paint::{Color, Paint, has_hover, has_pressed};
 pub use scene::{
     Batch, ContentBox, Editing, EditingLines, Filter, Interaction, Layer, Overlay, OverlayBox, OverlayText,
-    Painter, PixelRect, Quad, SCROLL_BAR_REACH, Scene, byte_from_mask, byte_in_mask, content_box,
+    Painter, PixelRect, Quad, RoundClip, SCROLL_BAR_REACH, Scene, byte_from_mask, byte_in_mask, content_box,
     input_indent, input_value, password_mask, scroll_for_thumb, scroll_thumb, text_line_count,
 };
 pub use shape::{LineCap, natural_shape_size, shape_layer};

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use rsui_js::{Args, Atom, HostFunction, Root, Value, Vm};
 
-use crate::css::{number_text, parse_float};
+use crate::css::{Size, Sizing, is_bounded, length, number_text, parse_float, with_current_color};
 
 type Run<T> = Result<T, Value>;
 
@@ -80,6 +80,11 @@ names! {
     margin_right = "marginRight",
     margin_left_share = "marginLeftShare",
     margin_right_share = "marginRightShare",
+    padding_top_share = "paddingTopShare",
+    padding_right_share = "paddingRightShare",
+    padding_bottom_share = "paddingBottomShare",
+    padding_left_share = "paddingLeftShare",
+    padding_outside = "paddingOutside",
     shrink = "shrink",
     tabular_nums = "tabularNums",
     text_wrap = "textWrap",
@@ -541,6 +546,12 @@ pub(crate) fn inline_box(tag: &str) -> bool {
     )
 }
 
+/// A form's control, which a browser makes as wide as it is by itself even when it's a block, rather than as wide as what it's in:
+/// an `<input>` with `display: block` keeps its own width, as a button with it keeps to what's in it.
+fn sized_by_itself(tag: &str) -> bool {
+    matches!(tag, "button" | "input" | "select" | "textarea")
+}
+
 /// What `align-content` comes to as `align`, for something that goes along a row.
 fn align_word(word: &str) -> Option<&'static str> {
     Some(match word {
@@ -614,8 +625,8 @@ impl Cx<'_, '_> {
         }
     }
 
-    /// `withCurrentColor`: the color of the text for each color that says it's that.
-    fn with_current_color(&self, look: &mut Look, current: Value) {
+    /// `withCurrentColor`: the color of the text for each color that says it's that, or is worked out from it.
+    fn with_current_color(&mut self, look: &mut Look, current: Value) {
         let n = self.n;
         for key in [
             n.background,
@@ -631,12 +642,17 @@ impl Cx<'_, '_> {
             n.hover,
             n.pressed,
         ] {
-            if look.is(self.vm, key, "currentcolor") {
-                if current.is_undefined() {
-                    look.delete(key);
-                } else {
-                    look.set(key, current);
-                }
+            let paint = if look.is(self.vm, key, "currentcolor") {
+                current
+            } else if let Some(mixed) = mixed_with_current(self.vm, look.get(key), current) {
+                mixed
+            } else {
+                continue;
+            };
+            if paint.is_undefined() {
+                look.delete(key);
+            } else {
+                look.set(key, paint);
             }
         }
     }
@@ -702,7 +718,8 @@ impl Cx<'_, '_> {
         }
     }
 
-    /// `fitInFlow`: what goes on a line is as wide as it is, in a block.
+    /// `fitInFlow`: what goes on a line is as wide as it is, in a block, and so is a form's control that's a block itself, at the
+    /// block's start, as a block isn't placed by the text it's in.
     /// Gives back whether it's inline, as what says so is taken off `look` here.
     fn fit_in_flow(&self, look: &mut Look, tag: &str, flow: &str, around: Value) -> bool {
         let n = self.n;
@@ -716,12 +733,14 @@ impl Cx<'_, '_> {
             truthy(self.vm, said)
         };
         look.delete(n.inline);
-        if inline && flow == "block" && look.is_undefined(n.width) && look.is_undefined(n.display) {
+        if (inline || sized_by_itself(tag)) && flow == "block" && look.is_undefined(n.width) && look.is_undefined(n.display) {
             look.set(n.fit_width, Value::TRUE);
             // Which side `right` and `left` are depends on which way the text goes: a block where it goes from right to left
             // is laid out from the left and turned around, so its start is at the right.
             let backwards = look.is(self.vm, n.text_direction, "rtl");
-            let side = if is_text(self.vm, around, "center") {
+            let side = if !inline {
+                self.w.start
+            } else if is_text(self.vm, around, "center") {
                 self.w.center
             } else if is_text(self.vm, around, "end")
                 || is_text(self.vm, around, if backwards { "left" } else { "right" })
@@ -807,6 +826,16 @@ impl Cx<'_, '_> {
             return Ok(size);
         }
         let text = text_of(self.vm, size).unwrap_or_default().into_owned();
+        if is_bounded(&text) && more.is_number() {
+            // Kept between a least and a most, each of which has the pixels more, as a `calc()` of it works them out.
+            let more = number_text(self.vm, more.as_number());
+            let sizing = &mut Sizing { font_size: 16.0, rem: 16.0, vm: self.vm };
+            return Ok(match length(&format!("calc({text} + {more}px)"), sizing) {
+                Size::Text(sum) => self.vm.new_string(&sum),
+                Size::Pixels(sum) => Value::number(sum),
+                Size::None => size,
+            });
+        }
         if let Some((share, pixels)) = share_and_pixels(&text) {
             let pixels = Value::number(number_text_value(pixels));
             let sum = add(self.vm, pixels, more)?;
@@ -918,6 +947,12 @@ impl Cx<'_, '_> {
             ] {
                 let size = self.with_more(look.get(key), more)?;
                 look.set(key, size);
+            }
+            // Padding that's a share of what it's in is only known once that is, so it's what lays it out that makes it bigger
+            // by that much (`padding_outside` in rsui-layout).
+            let shares = [n.padding_top_share, n.padding_right_share, n.padding_bottom_share, n.padding_left_share];
+            if shares.into_iter().any(|key| !look.is_undefined(key)) {
+                look.set(n.padding_outside, Value::TRUE);
             }
         }
         look.delete(n.box_sizing);
@@ -1329,6 +1364,14 @@ impl Cx<'_, '_> {
             // (`DEFAULT_SIZE` in rsui-text), which is what it's drawn at: `0.8em` is a share of that.
             self.resolve_relative(look, above_size.unwrap_or(NATIVE_TEXT_SIZE));
         }
+        // A color of its text that's worked out from the one it's in, as `currentcolor` in `color` itself is what's inherited.
+        if let Some(mixed) = mixed_with_current(self.vm, look.get(n.color), above.get(n.color)) {
+            if mixed.is_undefined() {
+                look.delete(n.color);
+            } else {
+                look.set(n.color, mixed);
+            }
+        }
         let props = self.font_props();
         if has_above {
             for name in props {
@@ -1590,6 +1633,14 @@ fn only_monospace(vm: &Vm, family: Value) -> bool {
     };
     let family: String = family.chars().filter(|c| *c != '"' && *c != '\'').collect();
     crate::css::trim(&family).to_lowercase() == "monospace"
+}
+
+/// What a color that [waits on the color of the text](crate::css::waits_on_current_color) comes to with that color, `current`, or
+/// `undefined` while that isn't known. Anything else, which isn't one of those, is `None`.
+fn mixed_with_current(vm: &mut Vm, paint: Value, current: Value) -> Option<Value> {
+    let paint = text_of(vm, paint).filter(|paint| *paint != "currentcolor" && paint.contains("currentcolor"))?.into_owned();
+    let mixed = text_of(vm, current).and_then(|current| with_current_color(&paint, &current)).map(Cow::into_owned);
+    Some(mixed.map_or(Value::UNDEFINED, |mixed| vm.new_string(&mixed)))
 }
 
 /// `/^(-?[0-9.]+)% \+ (-?[0-9.]+)px$/`, as its two numbers' text.
@@ -3319,7 +3370,7 @@ for (const text of short > 1 ? corpus.slice(4, 6) : corpus) {
 // Made up, from the props this reads and what they can be, the same every time.
 const KEYS = ['display', 'direction', 'align', 'flexWrap', 'lineStrut', 'justify', 'textAlign', '__whiteSpace', '__hidden', '__scroll', '__case', '__block', '__flex',
     '__inline', 'position', 'onLine', 'width', 'height', 'minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'fitWidth', 'alignSelf', '__lineAlign', '__lineBox',
-    'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+    'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'paddingTopShare', 'paddingLeftShare', 'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
     'marginTop', 'marginBottom', 'shrink', 'minAuto', '__autoTop', '__autoRight', '__autoBottom', '__autoLeft', '__fillWidth', 'background', 'borderColor',
     'borderTopColor', 'shadowColor', 'fill', 'stroke', 'hover', 'pressed', '__transition', '__transitionParts', '__animation', '__animationParts', '__fontScale',
     'fontSize', '__flow', '__alignContent', '__sticky', 'top', 'bottom', 'left', 'right', '__visibility', 'opacity', '__nativeBorder', '__ownBorder', '__boxSizing',

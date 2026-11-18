@@ -643,6 +643,98 @@ fn stroke_lines_joined(
     Stroker::default().stroke(&path, &style, &Matrix::IDENTITY, lines);
 }
 
+/// The widest a stroke is, in pixels, for it to be drawn as a browser draws a stroke no wider than a pixel: see [`hairline_lines`].
+const HAIRLINE: f32 = 1.0;
+
+/// The lines around a stroke no wider than [`HAIRLINE`], as Skia draws one, which is what a browser does: one pixel across, measured
+/// up and down along a piece of it that goes more across than down, and across along one that doesn't, so that a slanted or curved
+/// one covers less than its width would. Its color is only as strong as it's wide, by [`hairline_color`]. Joins aren't drawn, and a
+/// cap other than butt carries each open end on by as much as that cap covers of a line a pixel wide.
+fn hairline_lines(runs: &[Run], cap: LineCap, lines: &mut Vec<[f32; 4]>) {
+    // A square cap is half the line's width, and a round one half a circle that wide, which is a pixel's worth of π / 8.
+    let past_end = match cap {
+        LineCap::Butt => 0.0,
+        LineCap::Square => 0.5,
+        LineCap::Round => std::f32::consts::PI / 8.0,
+    };
+    let mut points = Vec::new();
+    for run in runs {
+        let Some(&first) = run.points.first() else {
+            continue;
+        };
+        points.clear();
+        points.extend_from_slice(&run.points);
+        if run.closed && points.last() != Some(&first) {
+            points.push(first);
+        }
+        if past_end > 0.0 && !run.closed {
+            if points.len() == 1 {
+                points.push(first);
+            }
+            // Each end goes on the way the run goes there. One that goes nowhere is a dot, drawn across.
+            let last = points.len() - 1;
+            let start = way_out(points[0], points.iter().skip(1)).unwrap_or((-1.0, 0.0));
+            let end = way_out(points[last], points.iter().rev().skip(1)).unwrap_or((1.0, 0.0));
+            points[0] = (
+                points[0].0 + start.0 * past_end,
+                points[0].1 + start.1 * past_end,
+            );
+            points[last] = (
+                points[last].0 + end.0 * past_end,
+                points[last].1 + end.1 * past_end,
+            );
+        }
+        for pair in points.windows(2) {
+            let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
+            let (across, down) = (x1 - x0, y1 - y0);
+            if across == 0.0 && down == 0.0 {
+                continue;
+            }
+            let (half_x, half_y) = if across.abs() >= down.abs() {
+                (0.0, 0.5)
+            } else {
+                (0.5, 0.0)
+            };
+            let mut corners = [
+                (x0 - half_x, y0 - half_y),
+                (x1 - half_x, y1 - half_y),
+                (x1 + half_x, y1 + half_y),
+                (x0 + half_x, y0 + half_y),
+            ];
+            // All of them go round the same way, so that where they overlap, as a path that goes back over itself does, they're
+            // filled once rather than cancelling out.
+            if across * half_y - down * half_x < 0.0 {
+                corners.reverse();
+            }
+            for at in 0..4 {
+                let (from, to) = (corners[at], corners[(at + 1) % 4]);
+                lines.push([from.0, from.1, to.0, to.1]);
+            }
+        }
+    }
+}
+
+/// Which way, a pixel long, `end` is from the first of `others` that isn't where it is, if any is.
+fn way_out<'a>(
+    end: (f32, f32),
+    mut others: impl Iterator<Item = &'a (f32, f32)>,
+) -> Option<(f32, f32)> {
+    let other = others.find(|point| **point != end)?;
+    let (x, y) = (end.0 - other.0, end.1 - other.1);
+    let length = x.hypot(y);
+    Some((x / length, y / length))
+}
+
+/// A stroke's color for a stroke this wide, in pixels, drawn by [`hairline_lines`]: as much of it as the stroke is of a pixel, worked
+/// out as Skia does.
+fn hairline_color(color: Color, width: f32) -> Color {
+    let strength = (width * 256.0) as u32;
+    Color {
+        a: ((u32::from(color.a) * strength) >> 8) as u8,
+        ..color
+    }
+}
+
 /// Lines cut down to what's inside a picture of this size, which is all that's going to be seen, whatever a path says. Past the
 /// left or right they still count, at that edge, as whatever's to the right of a line is inside it. Above or below,
 /// they don't reach anything. Lines too short or strange to add anything to it are left out, so that nothing further
@@ -841,17 +933,17 @@ pub(crate) fn draw_layers(
             let bitmap = rasterizer.fill_by_rule(&lines, LARGEST as usize + 1, even_odd);
             blend_coverage(&mut canvas, (pixels_wide, pixels_high), &bitmap, color);
         }
-        if let Some(color) = color_from(stroke) {
+        if let Some(mut color) = color_from(stroke) {
             lines.clear();
             let dashed = dashed(&runs, &dashes, dash_offset);
-            stroke_lines_joined(
-                dashed.as_deref().unwrap_or(&runs),
-                stroke_width * place.scale,
-                cap,
-                join,
-                miter_limit,
-                &mut lines,
-            );
+            let runs = dashed.as_deref().unwrap_or(&runs);
+            let thick = stroke_width * place.scale;
+            if thick > 0.0 && thick <= HAIRLINE {
+                hairline_lines(runs, cap, &mut lines);
+                color = hairline_color(color, thick);
+            } else {
+                stroke_lines_joined(runs, thick, cap, join, miter_limit, &mut lines);
+            }
             inside_picture(&mut lines, width, height);
             // A stroke's outline goes over itself at every bend and wherever the path crosses itself, and what it covers is
             // all of that once, as the nonzero rule has it.

@@ -364,6 +364,20 @@ impl Reads {
     pub(crate) fn shares_captures(&self, block: usize) -> bool {
         !self.groups.is_empty() && self.groups.contains_key(&block)
     }
+
+    /// Forgets the closures that shared captured variables by handing on that the collector has just freed, which `freed`
+    /// says of a place in the list of objects. Nothing else holds them, so a number of one left here could be another
+    /// object's once its place is used again, or be on a page given back (see `giveback.rs`), which can't be read. What's
+    /// left with fewer than two shares nothing any more.
+    pub(crate) fn forget_freed_closures(&mut self, freed: impl Fn(u32) -> bool) {
+        if self.groups.is_empty() {
+            return;
+        }
+        self.groups.retain(|_, members| {
+            members.retain(|member| !freed(*member));
+            members.len() > 1
+        });
+    }
 }
 
 impl Vm {
@@ -632,11 +646,13 @@ impl Vm {
     /// Whether what `record` read at `path`, and only gave on to elements as a prop, is the same as `now` for what it was given
     /// to: each of the components it went to, linked to it (see [`link_child`](Self::link_child)), read the same of it, and
     /// together they're everywhere it was given. Each is noted in `deferred`, to be given `now` once everything's the same.
+    #[allow(clippy::too_many_arguments)]
     fn given_hold(
         &mut self,
         record: &Record,
         path: u32,
         now: Value,
+        anew: bool,
         opaque: Value,
         handed: &mut Vec<(Value, Value)>,
         deferred: &mut Vec<(u32, Vec<(Value, Value)>)>,
@@ -664,7 +680,7 @@ impl Vm {
             let whole = found.entries.iter().any(|entry| entry.path == 0) || found.comparisons.iter().any(|(at, ..)| *at == 0);
             let holds = found.usable()
                 && !whole
-                && self.record_holds(&found, found.props, opaque, handed, &over, deferred);
+                && self.record_holds(&found, found.props, anew, opaque, handed, &over, deferred);
             linked += over.len() as u32;
             self.reads.records[child as usize] = Some(found);
             if !holds {
@@ -718,13 +734,15 @@ impl Vm {
     }
 
     /// [`reads_same`](Self::reads_same) but for looking again at what read the functions handed on, which are put in
-    /// `handed`.
+    /// `handed`. Given the props it already has, as it is when it's looked at again, it's only asked whether what was handed
+    /// on changed what it read.
     fn check_record(&mut self, id: u32, new: Value, opaque: Value, handed: &mut Vec<(Value, Value)>) -> bool {
         let Some(record) = self.reads.records.get_mut(id as usize).and_then(Option::take) else {
             return false;
         };
         let mut deferred = Vec::new();
-        let same = record.usable() && self.record_holds(&record, new, opaque, handed, &[], &mut deferred);
+        let anew = new != record.props;
+        let same = record.usable() && self.record_holds(&record, new, anew, opaque, handed, &[], &mut deferred);
         let mut record = record;
         if same {
             self.reads.records[id as usize] = Some(record);
@@ -748,11 +766,15 @@ impl Vm {
 
     /// Whether everything `record` read is the same in `new`, with each prop in `over` as it says instead, which is what was
     /// given in its place. What's only been given on to the components below, as a prop, is the same as long as what those
-    /// read of it is, which, if so, is to be given to them in `deferred`.
+    /// read of it is, which, if so, is to be given to them in `deferred`. Unless it's given `anew`, the same object it read
+    /// is the same even where it's cautious (see `cautious` in [`Vm::props_equivalent`]): it's only being asked whether
+    /// what's been handed on reads something else, and what's read through a function that's handed on is noted through it.
+    #[allow(clippy::too_many_arguments)]
     fn record_holds(
         &mut self,
         record: &Record,
         new: Value,
+        anew: bool,
         opaque: Value,
         handed: &mut Vec<(Value, Value)>,
         over: &[(Value, Value)],
@@ -778,7 +800,7 @@ impl Vm {
             let same = if entry.itself {
                 old == now || self.same_value(old, now)
             } else {
-                let cautious = entry.careful && record.cautious && !self.under_capture(record, entry.path);
+                let cautious = anew && entry.careful && record.cautious && !self.under_capture(record, entry.path);
                 let mark = looks.handed.len();
                 let equal = self.equivalent(old, now, crate::embed::EQUIVALENT_DEPTH, &mut looks, cautious);
                 if !equal {
@@ -786,7 +808,7 @@ impl Vm {
                 }
                 equal || self.hands_on_value(record, entry.path, old, now, &mut looks)
             };
-            if !same && !(entry.only_given && self.given_hold(record, entry.path, now, opaque, handed, deferred)) {
+            if !same && !(entry.only_given && self.given_hold(record, entry.path, now, anew, opaque, handed, deferred)) {
                 return false;
             }
         }
@@ -863,17 +885,18 @@ impl Vm {
     /// old function while what it's in holds the new one it was handed, or keeps an older one still, as a page element
     /// does, and once one of those is the one handed on again, the others have to follow. If one of them is running, as it
     /// can be while something renders because of what it did, its block stays where it is, and gets the new ones put in it
-    /// instead.
-    pub(crate) fn join_handed(&mut self, old: Value, new: Value) {
+    /// instead. Whether `old` now sees anything other than it did is given back: not if the two already held the same block,
+    /// as two kept apart, by an element that kept the old one, do once they've been joined, or if neither captured anything.
+    pub(crate) fn join_handed(&mut self, old: Value, new: Value) -> bool {
         let block_of = |vm: &Vm, value: Value| match &vm.objects[value.index()].kind {
             Kind::Function { upvalues, .. } => Some(upvalues.block()),
             _ => None,
         };
         let (Some(old_block), Some(new_block)) = (block_of(self, old), block_of(self, new)) else {
-            return;
+            return false;
         };
         if old_block == new_block || old_block == 0 || new_block == 0 {
-            return;
+            return false;
         }
         let members = self.holding(old_block, old);
         let running = self
@@ -883,7 +906,7 @@ impl Vm {
         if running {
             let captures: Vec<Value> = match &self.objects[new.index()].kind {
                 Kind::Function { upvalues, .. } => upvalues.to_vec(),
-                _ => return,
+                _ => return false,
             };
             for &member in &members {
                 // Through `objects[..]`, which is the write barrier, for each that holds the block.
@@ -895,12 +918,12 @@ impl Vm {
                     }
                 }
             }
-            return;
+            return true;
         }
         for &member in &members {
             let shared = match &self.objects[new.index()].kind {
                 Kind::Function { upvalues, .. } => upvalues.share(),
-                _ => return,
+                _ => return false,
             };
             if let Kind::Function { upvalues, .. } = &mut self.objects[member as usize].kind {
                 *upvalues = shared;
@@ -913,6 +936,7 @@ impl Vm {
                 group.push(member);
             }
         }
+        true
     }
 
     /// The closures that hold the block of captured variables at `block`: `one`, and those it's shared with that still do.

@@ -166,6 +166,45 @@ fn shrinking_takes_more_from_larger_elements() {
 }
 
 #[test]
+fn shrinking_takes_from_what_is_inside_the_padding() {
+    // Each 300 wide, but the first is 200 of padding: what's too much, 200, is taken in proportion to 100 and 300 inside them,
+    // as CSS has it, so the padding doesn't make it give up more.
+    let root = window(Style::row())
+        .child(group(Style::new().width(300.0).padding_each(0.0, 0.0, 0.0, 200.0).shrink(1.0)))
+        .child(group(Style::new().width(300.0).shrink(1.0)));
+    assert_eq!(
+        rects(root, &[&[0], &[1]]),
+        [rect(0.0, 0.0, 250.0, 300.0), rect(250.0, 0.0, 150.0, 300.0)]
+    );
+}
+
+#[test]
+fn padding_that_is_a_share_is_outside_a_size_said_inside_it() {
+    // In 400 wide, as `width: 50px; padding-left: 5%` with `box-sizing: content-box` is: 50 and 20 of padding. Padding that's a
+    // share of the width is outside a height too: 20 tall and 20 and 10 of padding is 50.
+    let content_box = |style: Style| group(style).prop("padding_outside", true);
+    let root = window(Style::column().width(400.0))
+        .child(content_box(Style::new().width(50.0).height(20.0)).prop("padding_left_share", "5%"))
+        .child(content_box(Style::new().width(50.0).height(20.0)).prop("padding_top_share", "5%").prop("padding_bottom_share", "2.5%"))
+        .child(content_box(Style::new().width_percent(50.0).height(20.0)).prop("padding_left_share", "5%").prop("padding_right_share", "5%"))
+        .child(content_box(Style::new().height(20.0)).prop("width", "min(100px, 10%)").prop("padding_left_share", "5%"))
+        // A size that's the whole thing has its padding inside it.
+        .child(group(Style::new().width(100.0).height(20.0)).prop("padding_left_share", "10%"));
+    assert_eq!(
+        rects(root, &[&[0], &[1], &[2], &[3], &[4]]).iter().map(|one| (one.width, one.height)).collect::<Vec<_>>(),
+        [(70.0, 20.0), (50.0, 50.0), (240.0, 20.0), (60.0, 20.0), (100.0, 20.0)]
+    );
+}
+
+#[test]
+fn a_width_part_way_between_two_is_worked_out_from_what_each_comes_to() {
+    // A quarter of the way from `min(300px, 50%)` to `clamp(400px, 60%, 800px)`, which in 400 wide are 200 and 400.
+    let root = window(Style::column().width(400.0))
+        .child(group(Style::new().height(20.0)).prop("width", "mix(0.25, min(300px, 50%), clamp(400px, 60%, 800px))"));
+    assert_eq!(rects(root, &[&[0]])[0].width, 250.0);
+}
+
+#[test]
 fn changing_a_childs_style_can_change_its_parents_decisions() {
     let tree = |first: Style| {
         window(Style::row())
@@ -288,6 +327,22 @@ fn justify_places_children_along_the_direction() {
 }
 
 #[test]
+fn what_is_too_long_for_its_row_runs_over_the_start_when_it_is_said_to_go_at_the_end() {
+    // As CSS has it without `safe`: a sidebar closing up from the page's side, with what's in it kept to that side, slides out
+    // under the window's edge.
+    let root = |justify| {
+        window(Style::row().justify(justify))
+            .child(group(Style::new().width(300.0)))
+            .child(group(Style::new().width(300.0)))
+    };
+    let x_of_first = |justify| rects(root(justify), &[&[0]])[0].x;
+    assert_eq!(x_of_first(Justify::End), -200.0);
+    assert_eq!(x_of_first(Justify::Center), -100.0);
+    assert_eq!(x_of_first(Justify::Start), 0.0);
+    assert_eq!(x_of_first(Justify::SpaceBetween), 0.0);
+}
+
+#[test]
 fn space_between_with_one_child_stays_at_the_start() {
     let root =
         window(Style::row().justify(Justify::SpaceBetween)).child(group(Style::new().width(100.0)));
@@ -314,6 +369,105 @@ fn text_is_measured_and_wraps_to_fit() {
             rect(0.0, 16.0, 100.0, 48.0),
         ]
     );
+}
+
+/// Text in a box of its own that wraps in room it needn't fill is as wide as that room, not as its widest line, as CSS's
+/// `fit-content` has it, and text that fits is as wide as it is. Text that's only part of a line (`inline_area`) is as wide as its
+/// lines, as an inline box is.
+#[test]
+fn text_that_wraps_where_it_needn_t_fill_its_room_is_as_wide_as_the_room() {
+    // 8 pixels per character: 30 characters wrap at 100 into lines of 12, which are 96 wide.
+    let thirty = "012345678901234567890123456789";
+    let root = window(Style::column().align(Align::Center))
+        .child(label(thirty).props(Style::new().max_width(100.0)))
+        .child(label("short"))
+        .child(with(label(thirty).props(Style::new().max_width(100.0)), &[("inline_area", rsui_core::PropValue::Bool(true))]));
+    assert_eq!(
+        rects(root, &[&[0], &[1], &[2]]),
+        [rect(150.0, 0.0, 100.0, 48.0), rect(180.0, 48.0, 40.0, 16.0), rect(152.0, 64.0, 96.0, 48.0)]
+    );
+}
+
+/// A flex item starts from how big what's in it is, past its `max-width`, and gives up as much as that when the row shrinks, as
+/// CSS's flex base size has it: a box of wrapping chips that's 180 wide by what's in it, at most 100, beside text that's 240.
+#[test]
+fn a_flex_item_shrinks_from_how_big_it_is_past_its_most() {
+    let thirty = "012345678901234567890123456789";
+    let chips = (0..3).fold(
+        group(Style::row().max_width(100.0).shrink(1.0)).prop("flex_wrap", true),
+        |chips, _| chips.child(group(Style::new().width(60.0).height(10.0))),
+    );
+    let row = group(Style::row().width(200.0)).child(label(thirty).props(Style::new().shrink(1.0))).child(chips);
+    let placed = rects(window(Style::new()).child(row), &[&[0, 0], &[0, 1]]);
+    // 420 between them in 200: the text gives up 240/420 of the 220 over, and the chips 180/420, as 85.7 is under their 100.
+    assert!((placed[0].width - 114.29).abs() < 0.01 && (placed[1].width - 85.71).abs() < 0.01, "{placed:?}");
+}
+
+/// How big a flex item at its `max-width` is past it isn't an answer it keeps, so when what's in it changes and it's as big as it
+/// was, the row it's in still shares its room again: text 88 wide by itself, at most 40, that becomes 40 wide gives up as much as
+/// 40 does, beside a box that's 60, in a row 60 by 20, as laying it all out from nothing does.
+#[test]
+fn a_flex_item_past_its_most_that_changes_shares_the_row_again() {
+    let tree = |name: &str| {
+        let row = group(Style::row().width(60.0).height(20.0))
+            .child(label(name).props(Style::new().max_width(40.0).shrink(1.0)))
+            .child(group(Style::new().width(60.0).shrink(1.0)));
+        window(Style::new().align(Align::Start)).child(row).into_node()
+    };
+    let (old, new) = (tree("ab cd ef gh"), tree("ab cd"));
+    let mut layout = laid_out(&old);
+    layout.apply(&diff(&old, &new));
+    layout.compute(&new, WINDOW, &mut FixedMetrics::default());
+    let fresh = laid_out(&new);
+    for path in [&[0, 0][..], &[0, 1]] {
+        assert_eq!(layout.rect(path), fresh.rect(path), "{path:?}");
+    }
+    // 100 between them in 60: the text gives up 40/100 of the 40 over.
+    assert_eq!(fresh.rect(&[0, 0]).map(|placed| placed.width), Some(24.0));
+}
+
+/// What's asked how big it is with more room than its `max-width` lets it have is laid out in that much, as CSS has it: text in a
+/// flex item at most 100 wide wraps at 100, and is as tall as that makes it, whether it's the item itself or in a box that is, and
+/// so is the row they're in. Laid out again in a window of another size, with what they said before kept, they're the same.
+#[test]
+fn what_s_in_a_flex_item_is_laid_out_at_its_most() {
+    // 8 pixels per character: 30 characters wrap at 100 into lines of 12, three of them.
+    let thirty = "012345678901234567890123456789";
+    let row = group(Style::row().width(300.0).align(Align::Start))
+        .child(label(thirty).props(Style::new().max_width(100.0)))
+        .child(group(Style::new().max_width(100.0)).child(label(thirty)));
+    let root = window(Style::new().align(Align::Start)).child(row).into_node();
+    let expected = [rect(0.0, 0.0, 300.0, 48.0), rect(0.0, 0.0, 100.0, 48.0), rect(100.0, 0.0, 100.0, 48.0)];
+    let placed = |layout: &Layout| [&[0][..], &[0, 0], &[0, 1]].map(|path| layout.rect(path).expect("the node was laid out"));
+    let mut layout = laid_out(&root);
+    assert_eq!(placed(&layout), expected);
+    layout.compute(&root, Size::new(500.0, 300.0), &mut FixedMetrics::default());
+    assert_eq!(placed(&layout), expected);
+}
+
+/// A row that wraps, with room it needn't fill, fills it where what's in it doesn't fit on one line, as CSS's `fit-content`,
+/// `min(max-content, room)`, has it, rather than being as wide as its widest line; one that fits on a line is as wide as that.
+#[test]
+fn a_row_that_wraps_fills_the_room_it_wraps_in() {
+    let chips = |count| {
+        (0..count).fold(group(Style::row().max_width(100.0)).prop("flex_wrap", true), |chips, _| {
+            chips.child(group(Style::new().width(60.0).height(10.0)))
+        })
+    };
+    let root = window(Style::column().align(Align::Center)).child(chips(3)).child(chips(1));
+    assert_eq!(rects(root, &[&[0], &[1]]), [rect(150.0, 0.0, 100.0, 30.0), rect(170.0, 30.0, 60.0, 10.0)]);
+}
+
+/// Text that's only part of a line (`inline_area`), alone on a line it's too long for, is as wide as its lines once it wraps
+/// there, as an inline box is as wide as its pieces, and is placed on its line as that wide: in the middle of 100, 96 wide.
+#[test]
+fn a_lone_inline_box_that_wraps_is_as_wide_as_its_lines() {
+    let thirty = "012345678901234567890123456789";
+    let line = group(Style::row().width(100.0).justify(Justify::Center))
+        .prop("flex_wrap", true)
+        .child(with(label(thirty).props(Style::new().shrink(1.0)), &[("inline_area", rsui_core::PropValue::Bool(true))]));
+    let root = window(Style::new().align(Align::Start)).child(line);
+    assert_eq!(rects(root, &[&[0, 0]]), [rect(2.0, 0.0, 96.0, 48.0)]);
 }
 
 #[test]

@@ -1615,6 +1615,9 @@ impl Vm {
             });
         objects.truncate(keep);
         trim_marks(&mut object_marks, keep);
+        // What handing on has share captured variables forgets what's gone, before its place is another's or given back.
+        let free = &self.free_objects;
+        self.reads.forget_freed_closures(|member| member as usize >= keep || free.is_free(member as usize));
         if !full {
             trim_marks(&mut surviving, keep);
             for (mark, survived) in object_marks.iter_mut().zip(&surviving) {

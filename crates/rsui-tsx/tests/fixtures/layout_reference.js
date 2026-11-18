@@ -9,6 +9,7 @@
 const layoutReference = (() => {
     const INLINE_TEXT_TAGS = new Set(['span', 'a', 'b', 'i', 'em', 'strong', 'small', 'code', 'u', 's', 'sub', 'sup', 'mark', 'abbr', 'cite', 'kbd', 'time', 'label', 'samp', 'var', 'dfn', 'ins', 'del', 'data', 'output', 'bdi', 'bdo']);
     const INLINE_BOXES = new Set(['button', 'input', 'select', 'textarea', 'img', 'svg', 'video', 'canvas', 'iframe', 'progress', 'meter']);
+    const SIZED_BY_ITSELF = new Set(['button', 'input', 'select', 'textarea']);
     const COLOR_KEYS = ['background', 'borderColor', 'borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor', 'shadowColor', 'outlineColor', 'fill', 'stroke', 'hover', 'pressed'];
     const fontFiles = new Map();
 
@@ -185,6 +186,10 @@ const layoutReference = (() => {
             for (const [key, more] of [['width', across], ['minWidth', across], ['maxWidth', across], ['height', down], ['minHeight', down], ['maxHeight', down]]) {
                 look[key] = withMore(look[key], more);
             }
+            // Padding that's a share of what it's in is only known once that is, so it's what lays it out that adds it.
+            if ([look.paddingTopShare, look.paddingRightShare, look.paddingBottomShare, look.paddingLeftShare].some((share) => share !== undefined)) {
+                look.paddingOutside = true;
+            }
         }
         delete look.__boxSizing;
         if (look.__fillWidth === true) {
@@ -355,12 +360,13 @@ const layoutReference = (() => {
         // What goes on a line is as wide as it is, as a span with a border or a background shows.
         const inline = look.__inline ?? (INLINE_BOXES.has(tag) || (INLINE_TEXT_TAGS.has(tag) && look.__block !== true && look.position !== 'absolute'));
         delete look.__inline;
-        if (inline && flow === 'block' && look.width === undefined && look.display === undefined) {
+        // A form's control is as wide as it is by itself even as a block, at its start, as a block isn't placed by the text it's in.
+        if ((inline || SIZED_BY_ITSELF.has(tag)) && flow === 'block' && look.width === undefined && look.display === undefined) {
             look.fitWidth = true;
             // Where it is on its line, which is as the text of what it's in is aligned, `around`.
             // A block where text goes from right to left is laid out from the left and turned around: its start is at the right.
             const backwards = look.textDirection === 'rtl';
-            look.alignSelf ??= around === 'center' ? 'center' : around === 'end' || around === (backwards ? 'left' : 'right') ? 'end' : 'start';
+            look.alignSelf ??= !inline ? 'start' : around === 'center' ? 'center' : around === 'end' || around === (backwards ? 'left' : 'right') ? 'end' : 'start';
         }
         return inline;
     }

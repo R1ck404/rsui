@@ -280,8 +280,9 @@ pub(crate) fn gather(
             } else if let Some(text) = vm.string_text(value) {
                 if let Some(Ok(number)) = text.strip_suffix('%').map(str::parse::<f64>) {
                     out.entries.push((percent, PropValue::Float(number)));
-                } else if text.contains("% +") {
-                    // A share of what it's in and some pixels more, as CSS's `calc()` comes to, which the layout reads as it is.
+                } else if text.contains("% +") || crate::css::is_bounded(&text) {
+                    // A share of what it's in and some pixels more, as CSS's `calc()` comes to, or those kept between a least and a
+                    // most, as its `min()`, `max()` and `clamp()` do, which the layout reads as it is.
                     out.entries.push((pixels, PropValue::from(text.as_ref())));
                 }
             }

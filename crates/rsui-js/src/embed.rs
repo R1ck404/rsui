@@ -528,13 +528,11 @@ impl Vm {
     /// Makes each old handler noted in `looks` do what the new one does: see
     /// [`props_equivalent_handing_on`](Self::props_equivalent_handing_on).
     /// Each old one comes to hold the new one's captured variables, with whatever held the same ones as it (see
-    /// `Vm::join_handed`), so that whatever's handed on to any of them later reaches all of them. What it hands on is given
-    /// back.
+    /// `Vm::join_handed`), so that whatever's handed on to any of them later reaches all of them. What it hands on that now
+    /// sees something else is given back, as only what read one of those can read something else.
     pub(crate) fn hand_on(&mut self, looks: &mut Looks) -> Vec<(Value, Value)> {
-        let handed = std::mem::take(&mut looks.handed);
-        for &(old, new) in &handed {
-            self.join_handed(old, new);
-        }
+        let mut handed = std::mem::take(&mut looks.handed);
+        handed.retain(|&(old, new)| self.join_handed(old, new));
         handed
     }
 

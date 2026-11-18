@@ -28,7 +28,7 @@ use windows::core::{HRESULT, Interface, s, w};
 
 use crate::images::ImageUpload;
 use crate::paint::Color;
-use crate::scene::{Batch, Filter, Layer, PixelRect, Quad, Scene};
+use crate::scene::{Batch, Filter, Layer, PixelRect, Quad, RoundClip, Scene};
 use crate::transform::Matrix;
 
 /// What showing a frame says when it can't be seen, `DXGI_STATUS_OCCLUDED`, which is a success: nothing waited for the screen.
@@ -140,8 +140,9 @@ struct AtlasTexture {
     view: ID3D11ShaderResourceView,
 }
 
-/// How many bytes are told to the shaders for each draw: the viewport, the atlas's size and how sharp edges should be, and then a transform.
-const FRAME_CONSTANTS_SIZE: u32 = 128;
+/// How many bytes are told to the shaders for each draw: the viewport, the atlas's size and how sharp edges should be, a
+/// transform, a filter, and the round clips of [`round_clips_of`].
+const FRAME_CONSTANTS_SIZE: u32 = 256;
 
 /// Draws scenes to a window, or to memory for tests and screenshots.
 pub struct Renderer {
@@ -214,6 +215,7 @@ pub struct Renderer {
     image_pipeline: Option<(ID3D11PixelShader, ID3D11SamplerState)>,
     last_transforms: Vec<Matrix>,
     last_filters: Vec<Filter>,
+    last_round_clips: Vec<RoundClip>,
     /// Images on the GPU, each only there as long as this holds it.
     images: HashMap<u32, ID3D11ShaderResourceView>,
     /// What the last frame faded as a whole, which a change to draws everything again.
@@ -305,6 +307,57 @@ pub(crate) fn placed_area(quad: &Quad, matrix: Matrix) -> PixelRect {
     }
 }
 
+/// The round clips a batch is cut off by, as the shaders take them, filled from the first: the one it's in, then the one that's
+/// in. A third around those is rare, and only the rectangle around it cuts off what's drawn. Each says whether it's measured on
+/// the screen, as one made outside what turns or resizes the batch is. One made inside another transform than the batch's is
+/// left out too, as only the rectangle around it can be cut to.
+type RoundSlots = [Option<(RoundClip, bool)>; 2];
+
+/// No round clips at all.
+const NO_ROUND_CLIPS: RoundSlots = [None, None];
+
+/// The round clips `batch` is cut off by: see [`RoundSlots`].
+fn round_clips_of(batch: &Batch, clips: &[RoundClip]) -> RoundSlots {
+    let get = |at: u16| usize::from(at).checked_sub(1).and_then(|at| clips.get(at)).copied();
+    let inner = get(batch.round);
+    let outer = inner.and_then(|inner| get(inner.outer));
+    let mut slots = NO_ROUND_CLIPS;
+    let mut free = slots.iter_mut();
+    for clip in [inner, outer].into_iter().flatten() {
+        let on_screen = match clip.transform {
+            at if at == batch.transform => false,
+            0 => true,
+            _ => continue,
+        };
+        if let Some(slot) = free.next() {
+            *slot = Some((clip, on_screen));
+        }
+    }
+    slots
+}
+
+/// Puts round clips where the shaders read them: each one's edges, its top corners, its bottom corners (bottom right first, as
+/// they go round), then whether it keeps what's drawn inside (1) or outside (-1) or isn't there (0), and whether it's measured
+/// on the screen.
+fn write_round_slots(values: &mut [f32], rounds: RoundSlots) {
+    for (at, round) in rounds.into_iter().enumerate() {
+        let Some((clip, on_screen)) = round else {
+            continue;
+        };
+        let [top_left, top_right, bottom_right, bottom_left] = clip.corners;
+        let parts = [
+            (0, clip.edges),
+            (2, [top_left[0], top_left[1], top_right[0], top_right[1]]),
+            (4, [bottom_right[0], bottom_right[1], bottom_left[0], bottom_left[1]]),
+            (6, [if clip.outside { -1.0 } else { 1.0 }, if on_screen { 1.0 } else { 0.0 }, 0.0, 0.0]),
+        ];
+        for (register, part) in parts {
+            let start = (register + at) * 4;
+            values[start..start + 4].copy_from_slice(&part);
+        }
+    }
+}
+
 /// [`changed_area`] for frames that have something turned or resized in them, whose quads are where their batch's transform
 /// puts them rather than where they say, and for frames whose filters (fading is one) changed, which only change the colors of
 /// their own batch's quads. When the batches are the same runs with the same clips, transforms and filters, what's changed is
@@ -334,6 +387,7 @@ fn changed_area_placed(
     let mut area = NO_AREA;
     for (a, b) in old_batches.iter().zip(new_batches) {
         if a.clip != b.clip
+            || a.round != b.round
             || a.first != b.first
             || a.count != b.count
             || a.transform != b.transform
@@ -380,7 +434,7 @@ fn changed_area<'a>(
     let mut area = NO_AREA;
     for (a, b) in old_batches.iter().zip(new_batches) {
         // Something clipped differently can look different without its quad changing.
-        if a.clip != b.clip {
+        if a.clip != b.clip || a.round != b.round {
             return whole;
         }
         // Another picture in the same place is different without its quad changing, but only there.
@@ -939,6 +993,7 @@ impl Renderer {
             image_pipeline: None,
             last_transforms: Vec::new(),
             last_filters: Vec::new(),
+            last_round_clips: Vec::new(),
             last_layers: Vec::new(),
             layer_target: None,
             layer_sampler: None,
@@ -1219,6 +1274,8 @@ impl Renderer {
             || text_changed
             || images_changed
             || transformed
+            // What's cut off at round corners that moved can look different without its quads or batches changing.
+            || scene.round_clips != self.last_round_clips
             || (!partial_layers && scene.layers != self.last_layers)
         {
             whole
@@ -1295,6 +1352,7 @@ impl Renderer {
                             && last.image == batch.image
                             && last.transform == batch.transform
                             && last.filter == batch.filter
+                            && last.round == batch.round
                     }) {
                         last.count += 1;
                     } else {
@@ -1337,6 +1395,7 @@ impl Renderer {
                             image: batch.image,
                             transform: batch.transform,
                             filter: batch.filter,
+                            round: batch.round,
                         });
                     }
                 }
@@ -1412,6 +1471,7 @@ impl Renderer {
             let mut drawing_image = false;
             let mut transform = 0;
             let mut filter = 0;
+            let mut round = 0;
             if !scene.transforms.is_empty() {
                 // Reading glyphs smoothly takes this, and it's only set for images otherwise.
                 if let Some((_, sampler)) = &self.image_pipeline {
@@ -1427,7 +1487,7 @@ impl Renderer {
                 if let Some(at) = in_layer.filter(|&at| layers[at].end <= index) {
                     in_layer = None;
                     self.put_down_layer(&layers[at], scene.quads.len() + at, &view, scene.atlas_size, region)?;
-                    (transform, filter, drawing_image) = (u16::MAX, u16::MAX, true);
+                    (transform, filter, round, drawing_image) = (u16::MAX, u16::MAX, u16::MAX, true);
                 }
                 if in_layer.is_none() && layers.get(next_layer).is_some_and(|layer| layer.first == index) {
                     self.start_layer(&layers[next_layer]);
@@ -1438,9 +1498,10 @@ impl Renderer {
                 if is_empty(clip) {
                     continue;
                 }
-                if batch.transform != transform || batch.filter != filter {
+                if batch.transform != transform || batch.filter != filter || batch.round != round {
                     transform = batch.transform;
                     filter = batch.filter;
+                    round = batch.round;
                     self.write_constants(
                         transform
                             .checked_sub(1)
@@ -1449,6 +1510,7 @@ impl Renderer {
                         filter
                             .checked_sub(1)
                             .and_then(|at| scene.filters.get(usize::from(at))),
+                        round_clips_of(batch, &scene.round_clips),
                         scene.atlas_size,
                     )?;
                 }
@@ -1552,6 +1614,7 @@ impl Renderer {
             self.last_batches = Vec::new();
             self.last_transforms = Vec::new();
             self.last_filters = Vec::new();
+            self.last_round_clips = Vec::new();
         }
         let stamp = (painter.pilot.epoch, painter.pilot.revision);
         let same_owner = self
@@ -1643,6 +1706,7 @@ impl Renderer {
         std::mem::swap(&mut self.last_batches, &mut scene.batches);
         std::mem::swap(&mut self.last_transforms, &mut scene.transforms);
         std::mem::swap(&mut self.last_filters, &mut scene.filters);
+        std::mem::swap(&mut self.last_round_clips, &mut scene.round_clips);
         std::mem::swap(&mut self.last_layers, &mut scene.layers);
     }
 
@@ -1842,6 +1906,7 @@ impl Renderer {
         self.last_batches = Vec::new();
         self.last_transforms = Vec::new();
         self.last_filters = Vec::new();
+        self.last_round_clips = Vec::new();
         self.partial_quads = Vec::new();
         self.partial_batches = Vec::new();
         let target = self.images.len().saturating_mul(2).max(16);
@@ -2130,7 +2195,7 @@ impl Renderer {
                 Width: self.size.0 as f32, Height: self.size.1 as f32,
                 MinDepth: 0.0, MaxDepth: 1.0,
             }]));
-            self.write_constants(None, None, atlas_size)?;
+            self.write_constants(None, None, NO_ROUND_CLIPS, atlas_size)?;
             context.PSSetShader(shader, None);
             context.PSSetSamplers(0, Some(&[Some(sampler.clone())]));
             context.PSSetShaderResources(1, Some(&[Some(picture.clone())]));
@@ -2339,14 +2404,16 @@ impl Renderer {
     ///
     /// Only uses `self`'s own objects, and is unsafe only because the calls it makes are.
     unsafe fn write_frame_constants(&self) -> Result<(), RenderError> {
-        self.write_constants(None, None, 0)
+        self.write_constants(None, None, NO_ROUND_CLIPS, 0)
     }
 
-    /// Says how what's about to be drawn is turned or resized, if it is, and what its colors go through, if anything.
+    /// Says how what's about to be drawn is turned or resized, if it is, what its colors go through, if anything, and which
+    /// round corners it's cut off at.
     fn write_constants(
         &self,
         matrix: Option<Matrix>,
         filter: Option<&Filter>,
+        rounds: RoundSlots,
         atlas_size: u32,
     ) -> Result<(), RenderError> {
         let rows = filter.map_or(
@@ -2358,7 +2425,8 @@ impl Renderer {
             let [a, b, c, d, ..] = matrix;
             (a * d - b * c).abs().sqrt()
         });
-        let values: [f32; 32] = [
+        let mut values = [0f32; 64];
+        values[..32].copy_from_slice(&[
             self.size.0 as f32,
             self.size.1 as f32,
             atlas_size as f32,
@@ -2391,7 +2459,8 @@ impl Renderer {
             filter.map_or(1.0, |filter| filter.opacity),
             0.0,
             0.0,
-        ];
+        ]);
+        write_round_slots(&mut values[32..], rounds);
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: the buffer is as big as what's written.
         unsafe {
@@ -2713,6 +2782,7 @@ mod tests {
             image,
             transform: 0,
             filter: 0,
+            round: 0,
         }
     }
 
@@ -3182,7 +3252,7 @@ mod tests {
                     work.constant_upload,
                     Payload {
                         count: 1,
-                        bytes: 128
+                        bytes: u64::from(FRAME_CONSTANTS_SIZE)
                     }
                 );
                 assert_eq!(work.draw_calls, 1);

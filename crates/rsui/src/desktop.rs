@@ -29,7 +29,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW,
+    NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW, SetCurrentProcessExplicitAppUserModelID,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, s, w};
@@ -1247,6 +1247,23 @@ pub fn pointer_on_screen() -> (i32, i32) {
     (at.x, at.y)
 }
 
+// The app
+
+/// Says which app this program is, as Windows knows apps by (its AppUserModelID): what its windows are grouped as on the
+/// taskbar, and what Task Manager puts the processes it starts under, as a web view's browser processes. Without it, a program
+/// is known by its file, so every app run by the same program is one app, and a web view's processes are its browser's. It's
+/// for before the first window's made; `id` is made of what an id can have, letters, digits, `.` and `-`, and kept to its most.
+pub fn set_app_id(id: &str) -> Result<(), String> {
+    let id = app_id(id);
+    // SAFETY: a call with a string that lives for it.
+    unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(id.as_str())) }.map_err(|error| error.message())
+}
+
+/// `name` as an app id can have it: anything else becomes `-`, and it's 128 long at most.
+fn app_id(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).take(128).collect()
+}
+
 // Power
 
 /// Stops the machine going to sleep and the screen going off, for as long as this is on, which is only from this thread.
@@ -1356,6 +1373,13 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn an_app_id_is_what_windows_lets_one_have() {
+        assert_eq!(app_id("rsui.browser-app"), "rsui.browser-app");
+        assert_eq!(app_id("rsui.My App/2"), "rsui.My-App-2");
+        assert_eq!(app_id(&"x".repeat(200)).len(), 128);
+    }
 
     fn item(label: &str) -> MenuItem {
         MenuItem {

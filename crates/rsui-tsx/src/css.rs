@@ -221,41 +221,9 @@ pub(crate) fn length(text: &str, sizing: &mut Sizing<'_>) -> Size {
     if value.starts_with("calc(") {
         return calculated(inside_parens(value, 4).0, sizing);
     }
-    let clamp = value.starts_with("clamp(");
-    if value.starts_with("min(") || value.starts_with("max(") || clamp {
-        let inside = inside_parens(value, if clamp { 5 } else { 3 }).0;
-        let parts: Vec<Size> = commas(inside)
-            .into_iter()
-            .map(|part| length(part, sizing))
-            .collect();
-        // In pixels, it's worked out now. With a share of what it's in among them, that's what it comes to, as it's usually what's meant
-        // and the others only keep it in bounds.
-        if parts.iter().all(|part| matches!(part, Size::Pixels(_))) {
-            let numbers: Vec<f64> = parts
-                .iter()
-                .map(|part| match part {
-                    Size::Pixels(number) => *number,
-                    _ => f64::NAN,
-                })
-                .collect();
-            let at = |index: usize| numbers.get(index).copied().unwrap_or(f64::NAN);
-            if clamp {
-                return Size::Pixels(js_max(at(0), js_min(at(1), at(2))));
-            }
-            let (start, pick): (f64, fn(f64, f64) -> f64) = if value.starts_with("min(") {
-                (f64::INFINITY, js_min)
-            } else {
-                (f64::NEG_INFINITY, js_max)
-            };
-            return Size::Pixels(numbers.into_iter().fold(start, pick));
-        }
-        if clamp {
-            return parts.into_iter().nth(1).unwrap_or(Size::None);
-        }
-        let text = parts.iter().find(|part| matches!(part, Size::Text(_)));
-        return text
-            .cloned()
-            .unwrap_or_else(|| parts.into_iter().next().unwrap_or(Size::None));
+    // These are worked out as `calc()` is, as what's in them can be anything it can.
+    if ["min(", "max(", "clamp("].iter().any(|name| value.starts_with(name)) {
+        return calculated(value, sizing);
     }
     let bytes = value.as_bytes();
     let start = usize::from(bytes.first() == Some(&b'-'));
@@ -293,14 +261,25 @@ pub(crate) fn length(text: &str, sizing: &mut Sizing<'_>) -> Size {
     }
 }
 
-/// The pieces of a `calc()`, as `/[()*/]|[+-](?=\s)|-?[0-9]*\.?[0-9]+[a-z%]*|NaN/g` finds them.
+/// What can be inside a `calc()` and works out to what it can: `calc()` again, and `min()`, `max()` and `clamp()`.
+const CALC_FUNCTIONS: [&str; 4] = ["calc", "min", "max", "clamp"];
+
+/// The pieces of a `calc()`, as `/[()*/]|[+-](?=\s)|-?[0-9]*\.?[0-9]+[a-z%]*|NaN/g` finds them, with each of `CALC_FUNCTIONS` and the
+/// bracket after it, as `min(`, as one, and the commas between what's in a `min()`, `max()` or `clamp()`.
 fn calc_tokens(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
+    // For each bracket that's open, whether what's in it is a list, as a `min()`'s is.
+    let mut lists = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         let c = bytes[at];
-        if matches!(c, b'(' | b')' | b'*' | b'/') {
+        if matches!(c, b'(' | b')' | b'*' | b'/') || (c == b',' && lists.last() == Some(&true)) {
+            if c == b'(' {
+                lists.push(false);
+            } else if c == b')' {
+                lists.pop();
+            }
             tokens.push(&text[at..at + 1]);
             at += 1;
             continue;
@@ -329,6 +308,15 @@ fn calc_tokens(text: &str) -> Vec<&str> {
                 at = word_end;
                 continue;
             }
+            if at == word_from
+                && bytes.get(word_end) == Some(&b'(')
+                && CALC_FUNCTIONS.iter().any(|one| word.eq_ignore_ascii_case(one))
+            {
+                lists.push(!word.eq_ignore_ascii_case("calc"));
+                tokens.push(&text[at..=word_end]);
+                at = word_end + 1;
+                continue;
+            }
         }
         // Not anything, so on to the next character.
         at += text[at..].chars().next().map_or(1, char::len_utf8);
@@ -346,6 +334,16 @@ struct Amount {
 }
 
 impl Amount {
+    /// Only pixels, this many.
+    const fn pixels(px: f64) -> Self {
+        Self {
+            number: 0.0,
+            px,
+            percent: 0.0,
+            plain: false,
+        }
+    }
+
     fn times(self, by: f64) -> Self {
         // What there's none of stays none, even times `infinity`, so `calc(infinity * 1px)` is that many pixels and no share.
         let times = |part: f64| if part == 0.0 { 0.0 } else { part * by };
@@ -360,15 +358,165 @@ impl Amount {
     /// A plain number with a length is taken as that many pixels, which is more than CSS lets through.
     fn as_px(self) -> Self {
         if self.plain {
-            Self {
-                number: 0.0,
-                px: self.number,
-                percent: 0.0,
-                plain: false,
-            }
+            Self::pixels(self.number)
         } else {
             self
         }
+    }
+
+    /// Both added up: a plain number if both are, and otherwise pixels and a share.
+    fn plus(self, other: Self) -> Self {
+        if self.plain && other.plain {
+            Self {
+                number: self.number + other.number,
+                ..self
+            }
+        } else {
+            let (one, other) = (self.as_px(), other.as_px());
+            Self {
+                px: one.px + other.px,
+                percent: one.percent + other.percent,
+                ..one
+            }
+        }
+    }
+
+    /// Whether this is as far as a length goes, which is what a `min()` of two has for a least, and a `max()` of two for a most.
+    fn endless(self) -> bool {
+        self.px.is_infinite()
+    }
+
+    /// Whether which of this and `other` is bigger is the same however big what they're in is, as it is when they're the same
+    /// share of it.
+    fn comparable(self, other: Self) -> bool {
+        self.as_px().percent == other.as_px().percent
+    }
+
+    /// Of this and another that's [`comparable`](Self::comparable), the one `pick` picks, as `js_min` picks the smaller.
+    fn picked(self, other: Self, pick: fn(f64, f64) -> f64) -> Self {
+        if self.plain && other.plain {
+            Self {
+                number: pick(self.number, other.number),
+                ..self
+            }
+        } else {
+            let (one, other) = (self.as_px(), other.as_px());
+            Self {
+                px: pick(one.px, other.px),
+                ..one
+            }
+        }
+    }
+}
+
+/// What a `min()` of two has for a least, and a `max()` of two for a most: none at all.
+const NO_LEAST: Amount = Amount::pixels(f64::NEG_INFINITY);
+const NO_MOST: Amount = Amount::pixels(f64::INFINITY);
+
+/// What a part of a `calc()` comes to: an amount, or one kept between a least and a most, as `clamp()` keeps it, which is what
+/// `min()`, `max()` and `clamp()` of different shares of what they're in come to, as which is smallest is only known once how big
+/// that is is. A `min()` of two has [`NO_LEAST`], and a `max()` of two [`NO_MOST`]. What can't be said as one of these, as a
+/// `min()` of three different shares, isn't anything.
+#[derive(Clone, Copy)]
+enum Term {
+    Amount(Amount),
+    Clamp(Amount, Amount, Amount),
+}
+
+impl Term {
+    /// `clamp(least, value, most)`, said as simply as it can be: worked out where none of it is a share of anything, with what's
+    /// the same share as what's next to it put together, and as the least where that's always more than the most.
+    fn clamp(least: Amount, value: Amount, most: Amount) -> Self {
+        let worked_out = |least: Amount, value: Amount, most: Amount| Self::Amount(value.picked(most, js_min).picked(least, js_max));
+        if least.plain && value.plain && most.plain {
+            return worked_out(least, value, most);
+        }
+        let (mut least, mut value, mut most) = (least.as_px(), value.as_px(), most.as_px());
+        if value.comparable(most) {
+            value = value.picked(most, js_min);
+            most = NO_MOST;
+        }
+        if most.endless() && least.comparable(value) {
+            value = value.picked(least, js_max);
+            least = NO_LEAST;
+        }
+        let fixed = |one: Amount| one.percent == 0.0;
+        if (least.endless() && most.endless()) || (fixed(least) && fixed(value) && fixed(most)) {
+            return worked_out(least, value, most);
+        }
+        if !least.endless() && !most.endless() && least.comparable(most) && least.px >= most.px {
+            return Self::Amount(least);
+        }
+        Self::Clamp(least, value, most)
+    }
+
+    /// The same, the other way around: `-clamp(l, v, m)` is `clamp(-m, -v, -l)` where the least is never more than the most,
+    /// which is so of what [`clamp`](Self::clamp) makes unless they're different shares.
+    fn negated(self) -> Option<Self> {
+        match self {
+            Self::Amount(amount) => Some(Self::Amount(amount.times(-1.0))),
+            Self::Clamp(least, value, most) if least.endless() || most.endless() || least.comparable(most) => {
+                Some(Self::clamp(most.times(-1.0), value.times(-1.0), least.times(-1.0)))
+            }
+            Self::Clamp(..) => None,
+        }
+    }
+
+    /// Times a plain number.
+    fn times(self, by: f64) -> Option<Self> {
+        match self {
+            Self::Amount(amount) => Some(Self::Amount(amount.times(by))),
+            Self::Clamp(_, value, _) if by == 0.0 => Some(Self::Amount(value.times(by))),
+            Self::Clamp(least, value, most) if by > 0.0 => Some(Self::clamp(least.times(by), value.times(by), most.times(by))),
+            Self::Clamp(..) if by < 0.0 => self.negated()?.times(-by),
+            Self::Clamp(..) => None,
+        }
+    }
+
+    /// Both added up. An amount is added to all of what's kept between a least and a most, and two of those can't be added.
+    fn plus(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Amount(one), Self::Amount(other)) => Some(Self::Amount(one.plus(other))),
+            (Self::Clamp(least, value, most), Self::Amount(more)) | (Self::Amount(more), Self::Clamp(least, value, most)) => {
+                let more = more.as_px();
+                let moved = |bound: Amount| if bound.endless() { bound } else { bound.plus(more) };
+                Some(Self::clamp(moved(least), value.plus(more), moved(most)))
+            }
+            (Self::Clamp(..), Self::Clamp(..)) => None,
+        }
+    }
+
+    /// The smaller of the two, as `min()` has it, where that can be said as one.
+    fn least_of(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Amount(one), Self::Amount(other)) if one.plain && other.plain => Some(Self::Amount(one.picked(other, js_min))),
+            (Self::Amount(one), Self::Amount(other)) => Some(Self::clamp(NO_LEAST, one, other)),
+            (Self::Clamp(least, value, most), Self::Amount(more)) | (Self::Amount(more), Self::Clamp(least, value, most)) => {
+                let more = more.as_px();
+                // What's always less than the least is what it comes to. What's never less is a most, which takes the place of the
+                // one it's the same share as, as `min(clamp(l, v, m), x)` is `clamp(l, v, min(m, x))`.
+                let above_least = least.endless() || (least.comparable(more) && least.px <= more.px);
+                if !above_least && least.comparable(more) {
+                    Some(Self::Amount(more))
+                } else if !above_least {
+                    None
+                } else if more.comparable(value) {
+                    Some(Self::clamp(least, value.picked(more, js_min), most))
+                } else if most.endless() {
+                    Some(Self::clamp(least, value, more))
+                } else if more.comparable(most) {
+                    Some(Self::clamp(least, value, most.picked(more, js_min)))
+                } else {
+                    None
+                }
+            }
+            (Self::Clamp(..), Self::Clamp(..)) => None,
+        }
+    }
+
+    /// The bigger of the two, as `max()` has it, which is the smaller of the two the other way around.
+    fn most_of(self, other: Self) -> Option<Self> {
+        self.negated()?.least_of(other.negated()?)?.negated()
     }
 }
 
@@ -383,14 +531,17 @@ impl<'t> Calc<'t, '_, '_> {
         self.tokens.get(self.at).copied()
     }
 
-    fn atom(&mut self) -> Option<Amount> {
+    fn atom(&mut self) -> Option<Term> {
         let token = self.token();
         self.at += 1;
         let token = token?;
-        if token == "(" {
+        if token == "(" || token.eq_ignore_ascii_case("calc(") {
             let inner = self.sum();
             self.at += 1;
             return inner;
+        }
+        if let Some(name) = token.strip_suffix('(') {
+            return self.function(name);
         }
         // CSS's constants (CSS Values 4, 10.7.1), as Tailwind 4's `rounded-full` is `calc(infinity * 1px)`.
         let (sign, word) = match token.strip_prefix('-') {
@@ -406,91 +557,73 @@ impl<'t> Calc<'t, '_, '_> {
             "e" => Some(std::f64::consts::E),
             _ => None,
         };
+        let plain = |number| Amount {
+            number,
+            px: 0.0,
+            percent: 0.0,
+            plain: true,
+        };
         if let Some(number) = constant.map(|number| sign * number) {
-            return Some(Amount {
-                number,
-                px: 0.0,
-                percent: 0.0,
-                plain: true,
-            });
+            return Some(Term::Amount(plain(number)));
         }
         let digits = token.strip_prefix('-').unwrap_or(token);
         if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
-            return Some(Amount {
-                number: parse_float(token),
-                px: 0.0,
-                percent: 0.0,
-                plain: true,
-            });
+            return Some(Term::Amount(plain(parse_float(token))));
         }
         match length(token, self.sizing) {
             Size::None => None,
-            Size::Pixels(px) => Some(Amount {
-                number: 0.0,
-                px,
-                percent: 0.0,
-                plain: false,
-            }),
-            Size::Text(text) => Some(Amount {
-                number: 0.0,
-                px: 0.0,
+            Size::Pixels(px) => Some(Term::Amount(Amount::pixels(px))),
+            Size::Text(text) => Some(Term::Amount(Amount {
                 percent: parse_float(&text),
-                plain: false,
-            }),
+                ..Amount::pixels(0.0)
+            })),
         }
     }
 
-    fn product(&mut self) -> Option<Amount> {
+    /// `min()`, `max()` or `clamp()`, by `name`, once its `(` has been read: what's in it, to its `)`.
+    fn function(&mut self, name: &str) -> Option<Term> {
+        let mut parts = vec![self.sum()];
+        while self.token() == Some(",") {
+            self.at += 1;
+            parts.push(self.sum());
+        }
+        self.at += 1;
+        let parts: Vec<Term> = parts.into_iter().collect::<Option<_>>()?;
+        match (name.to_ascii_lowercase().as_str(), parts.as_slice()) {
+            ("min", [first, rest @ ..]) => rest.iter().try_fold(*first, |least, one| least.least_of(*one)),
+            ("max", [first, rest @ ..]) => rest.iter().try_fold(*first, |most, one| most.most_of(*one)),
+            ("clamp", [Term::Amount(least), Term::Amount(value), Term::Amount(most)]) => Some(Term::clamp(*least, *value, *most)),
+            ("clamp", [least, value, most]) => least.most_of(value.least_of(*most)?),
+            _ => None,
+        }
+    }
+
+    fn product(&mut self) -> Option<Term> {
         let mut left = self.atom();
         while let Some(op @ ("*" | "/")) = self.token() {
             let divide = op == "/";
             self.at += 1;
             let right = self.atom();
             left = match (left, right) {
-                (Some(left), Some(right))
-                    if (left.plain || right.plain) && (!divide || right.plain) =>
-                {
-                    Some(if divide {
-                        left.times(1.0 / right.number)
-                    } else if left.plain {
-                        right.times(left.number)
-                    } else {
-                        left.times(right.number)
-                    })
-                }
+                (Some(left), Some(Term::Amount(right))) if divide && right.plain => left.times(1.0 / right.number),
+                (Some(Term::Amount(left)), Some(right)) if !divide && left.plain => right.times(left.number),
+                (Some(left), Some(Term::Amount(right))) if !divide && right.plain => left.times(right.number),
                 _ => None,
             };
         }
         left
     }
 
-    fn sum(&mut self) -> Option<Amount> {
+    fn sum(&mut self) -> Option<Term> {
         let mut left = self.product();
         while let Some(op @ ("+" | "-")) = self.token() {
             let minus = op == "-";
             self.at += 1;
             let right = self.product();
-            let (Some(one), Some(right)) = (left, right) else {
-                left = None;
-                continue;
+            left = match (left, right) {
+                (Some(one), Some(right)) => if minus { right.negated() } else { Some(right) }.and_then(|right| one.plus(right)),
+                _ => None,
             };
-            let other = if minus { right.times(-1.0) } else { right };
-            left = Some(if one.plain && other.plain {
-                Amount {
-                    number: one.number + other.number,
-                    px: 0.0,
-                    percent: 0.0,
-                    plain: true,
-                }
-            } else {
-                let (one, other) = (one.as_px(), other.as_px());
-                Amount {
-                    number: 0.0,
-                    px: one.px + other.px,
-                    percent: one.percent + other.percent,
-                    plain: false,
-                }
-            });
         }
         left
     }
@@ -506,8 +639,10 @@ fn calculated(text: &str, sizing: &mut Sizing<'_>) -> Size {
         at: 0,
         sizing,
     };
-    let Some(result) = calc.sum() else {
-        return Size::None;
+    let result = match calc.sum() {
+        None => return Size::None,
+        Some(Term::Amount(result)) => result,
+        Some(Term::Clamp(least, value, most)) => return bounded(calc.sizing.vm, [least, value, most]),
     };
     if result.plain {
         return if result.number.is_nan() {
@@ -519,24 +654,43 @@ fn calculated(text: &str, sizing: &mut Sizing<'_>) -> Size {
     if result.px.is_nan() || result.percent.is_nan() {
         return Size::None;
     }
-    // What's infinite is as far as a length goes, as a browser keeps it (Chromium's `LayoutUnit` reaches 33554431px, and its
-    // `getComputedStyle()` says `3.35544e+07px` for `calc(infinity * 1px)`), so that what's worked out from it, as corners made to
-    // fit their box, stays a number.
-    let result = Amount {
-        px: result.px.clamp(-MAX_LENGTH, MAX_LENGTH),
-        percent: result.percent.clamp(-MAX_LENGTH, MAX_LENGTH),
-        ..result
-    };
     if result.percent == 0.0 {
-        return Size::Pixels(result.px);
+        return Size::Pixels(result.px.clamp(-MAX_LENGTH, MAX_LENGTH));
     }
-    let vm = &mut *calc.sizing.vm;
-    // Both, which what lays it out reads as it's written here.
-    Size::Text(if result.px == 0.0 {
-        number_text(vm, result.percent) + "%"
+    Size::Text(share_text(calc.sizing.vm, result))
+}
+
+/// A share of what it's in and pixels, as what lays it out reads it: `50%`, `50% + -5px`, or `5px` with no share. What's infinite
+/// is as far as a length goes, as a browser keeps it (Chromium's `LayoutUnit` reaches 33554431px, and its `getComputedStyle()` says
+/// `3.35544e+07px` for `calc(infinity * 1px)`), so that what's worked out from it, as corners made to fit their box, stays a number.
+fn share_text(vm: &mut Vm, amount: Amount) -> String {
+    let (px, percent) = (amount.px.clamp(-MAX_LENGTH, MAX_LENGTH), amount.percent.clamp(-MAX_LENGTH, MAX_LENGTH));
+    if percent == 0.0 {
+        number_text(vm, px) + "px"
+    } else if px == 0.0 {
+        number_text(vm, percent) + "%"
     } else {
-        number_text(vm, result.percent) + "% + " + &number_text(vm, result.px) + "px"
+        number_text(vm, percent) + "% + " + &number_text(vm, px) + "px"
+    }
+}
+
+/// What's kept between a least and a most, as what lays it out reads it (rsui-layout's `Clamp`): `min()` where there's no least,
+/// `max()` where there's no most, and `clamp()` where there's both, as `min(640px, 100% + -48px)`.
+fn bounded(vm: &mut Vm, [least, value, most]: [Amount; 3]) -> Size {
+    if [least, value, most].iter().any(|part| part.px.is_nan() || part.percent.is_nan()) {
+        return Size::None;
+    }
+    let value = share_text(vm, value);
+    Size::Text(match (least.endless(), most.endless()) {
+        (true, _) => format!("min({value}, {})", share_text(vm, most)),
+        (false, true) => format!("max({}, {value})", share_text(vm, least)),
+        (false, false) => format!("clamp({}, {value}, {})", share_text(vm, least), share_text(vm, most)),
     })
+}
+
+/// Whether a size is one [`bounded`] writes.
+pub(crate) fn is_bounded(size: &str) -> bool {
+    ["min(", "max(", "clamp("].iter().any(|name| size.starts_with(name))
 }
 
 // Colors
@@ -781,6 +935,18 @@ fn color_mix(inside: &str) -> Option<Rgba> {
         [weigh(0), weigh(1), weigh(2)]
     };
     Some([mixed[0], mixed[1], mixed[2], alpha * scale])
+}
+
+/// Whether this is a color worked out from the color of the text it's with, as `color-mix(in oklab, currentcolor 50%, transparent)`
+/// is, which is kept as it's written until that's known, and then is [`with_current_color`].
+pub(crate) fn waits_on_current_color(text: &str) -> bool {
+    let text = trim(text).to_lowercase();
+    text != "currentcolor" && text.contains("currentcolor") && with_current_color(&text, "#000000").is_some()
+}
+
+/// What a color that [waits on the color of the text](waits_on_current_color) comes to, with that color, `current`, in it.
+pub(crate) fn with_current_color(text: &str, current: &str) -> Option<Cow<'static, str>> {
+    color(&trim(text).to_lowercase().replace("currentcolor", current))
 }
 
 /// A color as rsui takes it, as `#rrggbb` or `#rrggbbaa`, or as it was written if it's in hex, or nothing if it isn't one.
@@ -1251,6 +1417,10 @@ mod tests {
                     if (!/^\s*(color-mix|oklch|oklab|hwb)\(/i.test(value)) {
                         check('color', value, color(value), natives.cssColor(value));
                     }
+                    // Nor `min()`, `max()` and `clamp()` of shares, or in a `calc()`, which the tests below check instead.
+                    if (/(min|max|clamp)\(/i.test(value)) {
+                        continue;
+                    }
                     for (const [size, rem] of [[16, 16], [10, 10], [undefined, 16]]) {
                         remSize = rem;
                         check('length ' + size + '/' + rem, value, length(value, size), natives.cssLength(value, size, rem));
@@ -1274,6 +1444,55 @@ mod tests {
             "{failures}"
         );
         println!("{failures}");
+    }
+
+    /// What a size comes to, with text 10 pixels high and a rem of 16.
+    fn size_of(text: &str) -> Size {
+        let mut engine = rsui_js::Engine::new();
+        length(
+            text,
+            &mut Sizing {
+                font_size: 10.0,
+                rem: 16.0,
+                vm: engine.vm(),
+            },
+        )
+    }
+
+    fn text(text: &str) -> Size {
+        Size::Text(text.to_owned())
+    }
+
+    #[test]
+    fn min_max_and_clamp_of_shares_are_kept_for_what_lays_them_out() {
+        assert_eq!(size_of("min(640px, calc(100% - 48px))"), text("min(640px, 100% + -48px)"));
+        assert_eq!(size_of("max(100px, 20%)"), text("max(20%, 100px)"));
+        assert_eq!(size_of("clamp(50px, 50%, 300px)"), text("clamp(50px, 50%, 300px)"));
+        assert_eq!(size_of("clamp(1rem, 2.5% + 1em, 3rem)"), text("clamp(16px, 2.5% + 10px, 48px)"));
+        // What's the same share comes together, so that a `min()` of three is still two.
+        assert_eq!(size_of("min(640px, 100% - 48px, 40rem, 10em)"), text("min(100px, 100% + -48px)"));
+        assert_eq!(size_of("max(min(10%, 50px), 20px)"), text("clamp(20px, 10%, 50px)"));
+        // In a `calc()`, added to and times a number, and the other way around taken from something.
+        assert_eq!(size_of("calc(min(50%, 300px) + 2px)"), text("min(50% + 2px, 302px)"));
+        assert_eq!(size_of("calc(2 * min(50%, 300px))"), text("min(100%, 600px)"));
+        assert_eq!(size_of("calc(100% - max(16px, 10%))"), text("min(100% + -16px, 90%)"));
+        assert_eq!(size_of("calc((100% - min(1200px, 100%)) / 2)"), text("max(0px, 50% + -600px)"));
+        // Two that can't be said as one aren't anything.
+        assert_eq!(size_of("min(10%, 20% + 1px, 30% + 2px)"), Size::None);
+        assert_eq!(size_of("calc(min(10%, 5px) + max(20%, 1px))"), Size::None);
+        assert_eq!(size_of("clamp(1px, 2px)"), Size::None);
+    }
+
+    #[test]
+    fn min_max_and_clamp_of_pixels_are_worked_out() {
+        assert_eq!(size_of("min(10px, 2em, 3rem)"), Size::Pixels(10.0));
+        assert_eq!(size_of("max(10px, 2em, 3rem)"), Size::Pixels(48.0));
+        assert_eq!(size_of("clamp(1rem, 50px, 2rem)"), Size::Pixels(32.0));
+        // The least wins where it's more than the most, as CSS has it.
+        assert_eq!(size_of("clamp(30px, 10px, 20px)"), Size::Pixels(30.0));
+        assert_eq!(size_of("calc(min(2, 3) * 4px)"), Size::Pixels(8.0));
+        assert_eq!(size_of("min(100%, infinity * 1px)"), text("100%"));
+        assert_eq!(size_of("calc(1px + min(10%, 10%))"), text("10% + 1px"));
     }
 
     #[test]

@@ -39,7 +39,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
     GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardState, MAPVK_VK_TO_CHAR, MapVirtualKeyW, ReleaseCapture, SetCapture,
     TME_LEAVE, TRACKMOUSEEVENT, ToUnicode, TrackMouseEvent, VIRTUAL_KEY, VK_ADD, VK_APPS, VK_BACK,
@@ -929,12 +929,34 @@ impl WindowState {
         #[cfg(feature = "idle-probe")]
         idle_probe::rendered(self, probe_start, result.is_ok());
         match result {
-            Ok(()) => true,
+            Ok(()) => {
+                self.place_embedded(window);
+                true
+            }
             Err(error) => {
                 self.handle_render_error(window, error);
                 false
             }
         }
+    }
+
+    /// Puts what's kept where elements are, as a web view is, where they've just been drawn. A window of its own can't be
+    /// drawn over, so what's in this one doesn't draw over what's inside it.
+    fn place_embedded(&mut self, window: HWND) {
+        if !crate::embed::any() {
+            return;
+        }
+        let places = self.app.embedded_places();
+        if !places.is_empty() {
+            // SAFETY: `window` is the window this is running in.
+            unsafe {
+                let style = GetWindowLongPtrW(window, GWL_STYLE);
+                if style & WS_CLIPCHILDREN.0 as isize == 0 {
+                    SetWindowLongPtrW(window, GWL_STYLE, style | WS_CLIPCHILDREN.0 as isize);
+                }
+            }
+        }
+        crate::embed::place_in(window.0 as isize, places);
     }
 
     fn handle_render_error(&mut self, window: HWND, error: RenderError) {
@@ -1329,6 +1351,17 @@ fn show_picture(window: HWND, pixels: &[u8], width: u32, height: u32) {
         );
         let _ = GdiFlush();
         ReleaseDC(Some(window), context);
+    }
+}
+
+/// Gives the keyboard back to the window when it's clicked, if a window inside it had it, as a web view or something docked
+/// does once it's been clicked. The system leaves it there otherwise.
+fn take_keyboard_back(window: HWND) {
+    // SAFETY: `window` is valid for a message sent to it, and it's this thread's.
+    unsafe {
+        if GetFocus() != window {
+            let _ = SetFocus(Some(window));
+        }
     }
 }
 
@@ -2080,6 +2113,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            take_keyboard_back(window);
             let (x, y) = pointer_position(lparam);
             let clicks = if message == WM_LBUTTONDBLCLK { 2 } else { 1 };
             with_state(window, |state| {
@@ -2339,6 +2373,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+            take_keyboard_back(window);
             let (x, y) = pointer_position(lparam);
             let button = other_button(message, wparam);
             with_state(window, |state| {
@@ -2366,6 +2401,9 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
         WM_MOVE => {
             with_state(window, |state| state.tell_screen_origin(window));
             tell_state_changed(window);
+            if crate::embed::any() {
+                crate::embed::window_moved(window.0 as isize);
+            }
             LRESULT(0)
         }
         WM_ACTIVATE | WM_SHOWWINDOW => {
@@ -2633,6 +2671,8 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             if listening {
                 crate::drop::stop_listening(window);
             }
+            // What was kept inside it has gone with it.
+            crate::embed::window_gone(window.0 as isize);
             window_destroyed(window);
             LRESULT(0)
         }

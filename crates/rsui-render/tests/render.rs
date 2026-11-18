@@ -157,6 +157,7 @@ mod partial {
                 image: 0,
                 transform: 0,
                 filter: 0,
+                round: 0,
             });
         }
         if quads.len() as u32 > half {
@@ -170,6 +171,7 @@ mod partial {
                 image: 0,
                 transform: 0,
                 filter: 0,
+                round: 0,
             });
         }
         Scene {
@@ -1300,6 +1302,7 @@ mod resource_damage {
                 image: if first == 1 && image { IMAGE } else { 0 },
                 transform: u16::from(first == 1 && transformed),
                 filter: 0,
+                round: 0,
             });
         }
         if transformed {
@@ -1371,6 +1374,7 @@ mod resource_damage {
                     image: 0,
                     transform,
                     filter,
+                    round: 0,
                 });
             }
             scene

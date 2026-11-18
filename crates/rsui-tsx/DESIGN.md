@@ -280,7 +280,13 @@ reads of its props, and when they're new and not the same, a component whose rea
   do the same are joined in the same way. That's what keeps a child that skipped, which holds the old function, following what
   it's in, which holds the new one, or, as a page element that kept its old children does, an older one still: whichever of
   them is handed on next, all of them are, and what read any of them is looked at again. Only one that's running keeps its
-  block, and gets the new captures put in it instead.
+  block, and gets the new captures put in it instead. Two that already hold the same block see nothing new for being handed on
+  again, as a page's button that kept its old handler is each time what drew it renders, so nothing's looked at again for them.
+  And looked at again with the props it has, a render only asks whether what was handed on reads something else: an object it
+  read a function from is the same as itself then, though it's only that when new props are compared (see `cautious`), or what
+  read `onClick={props.model.add}` would render again for nothing, and again each time it did. Which closures share a block is
+  kept by their numbers, which the collector doesn't trace, so it forgets each that's freed (`forget_freed_closures`), before its
+  place can be another's or its page given back.
   That's only for a function every call of which, as something rendered, had its reads noted, which is known as a read of a
   captured variable that wasn't marks the function as one that can't be handed on (`NOT_HANDED_ON`), as can one made by such a
   function; and one that no hook keeps as a dependency (`keepAsItself` in layer.js), as an effect that depends on it would run

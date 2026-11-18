@@ -553,11 +553,11 @@ impl<M: Measure> Pass<'_, M> {
             inside
         } else {
             let mut least_wide = style.min_width;
-            if let Some((percent, more)) = style.min_width_percent
+            if let Some(share) = style.min_width_percent
                 && key.width.value.is_finite()
                 && key.width.value >= 0.0
             {
-                least_wide = least_wide.max(key.width.value * percent / 100.0 + more);
+                least_wide = least_wide.max(share.at(key.width.value));
             }
             inside.max(least_wide - pad_x)
         };

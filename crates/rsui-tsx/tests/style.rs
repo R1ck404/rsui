@@ -361,22 +361,31 @@ fn an_li_that_isnt_a_list_item_has_no_marker() {
     assert!(badge.0 >= 16.0 + 8.0, "the badge has its padding: {laid_out}");
 }
 
-/// A select's text is as tall as its line height says, as a browser's is: Bootstrap's `.form-select` is a 24px line with 6px of
-/// padding and a 1px border either side, 38px in all, the same as its `.form-control` input.
+/// A select the page draws itself (`appearance: none`) has text as tall as its line height says, as a browser's has: Bootstrap's
+/// `.form-select` is a 24px line with 6px of padding and a 1px border either side, 38px in all, the same as its `.form-control`
+/// input. One the browser draws has its font's own line height, whatever the page says, as Chromium has it.
 #[test]
 fn a_select_is_as_tall_as_its_line_height_says() {
-    let css = ".s { display: block; width: 300px; padding: 6px 12px; font-size: 16px; line-height: 1.5; border: 1px solid #ccc; box-sizing: border-box; }\n";
+    let css = ".s { display: block; width: 300px; padding: 6px 12px; font-size: 16px; line-height: 1.5; border: 1px solid #ccc; box-sizing: border-box; }\n.own { appearance: none; }\n.normal { line-height: normal; }\n";
+    let option = r#"<dom.option>Starter</dom.option>"#;
     let laid_out = laid_out(
         "select-line-height",
         css,
-        r#"<dom.select className="s"><dom.option>Starter</dom.option></dom.select><dom.input className="s" defaultValue="same" />"#,
+        &format!(
+            r#"<dom.select className="s own">{option}</dom.select><dom.input className="s" defaultValue="same" /><dom.select className="s">{option}</dom.select><dom.select className="s normal">{option}</dom.select>"#
+        ),
     );
-    let height = |kind: &str| -> f32 {
-        let line = laid_out.lines().find(|one| one.trim_start().starts_with(kind)).unwrap_or_else(|| panic!("no {kind}: {laid_out}"));
-        line.split_whitespace().nth(1).unwrap().split(',').nth(3).unwrap().parse().unwrap()
+    let heights = |kind: &str| -> Vec<f32> {
+        laid_out
+            .lines()
+            .filter(|one| one.trim_start().starts_with(kind))
+            .map(|one| one.split_whitespace().nth(1).unwrap().split(',').nth(3).unwrap().parse().unwrap())
+            .collect()
     };
-    assert_eq!(height("button"), 38.0, "{laid_out}");
-    assert_eq!(height("text_input"), 38.0, "{laid_out}");
+    let [own, drawn, normal] = heights("button")[..] else { panic!("three selects: {laid_out}") };
+    assert_eq!(own, 38.0, "{laid_out}");
+    assert_eq!(heights("text_input"), [38.0], "{laid_out}");
+    assert!(drawn == normal && drawn < 38.0, "{laid_out}");
 }
 
 /// What a rule about more than one element says floats does, as Bootstrap's `.form-check .form-check-input { float: left;
@@ -419,6 +428,84 @@ fn sibling_rules_reach_buttons_and_inputs() {
     let input_y: f32 = input.split_whitespace().nth(1).unwrap().split(',').nth(1).unwrap().parse().unwrap();
     let button_h: f32 = button.split_whitespace().nth(1).unwrap().split(',').nth(3).unwrap().parse().unwrap();
     assert!(input_y >= button_y + button_h + 16.0 - 0.5, "the input is 16px below the button: {laid_out}");
+}
+
+/// A textarea is as wide as its `cols` of its font's characters, to the next whole pixel, and a scrollbar 15 wide unless it's
+/// hidden, inside its 2px of padding and its border, as Edge has them: 147 + 15 + 6 for 20 of 13.3333px monospace.
+#[test]
+fn a_textarea_is_as_wide_as_its_columns_and_a_scrollbar() {
+    let css = "body { margin: 0; }\ntextarea { display: block; }\n.hidden { overflow: hidden; }\n";
+    let laid_out = laid_out(
+        "textarea-widths",
+        css,
+        r#"<dom.div><dom.textarea /><dom.textarea cols={10} /><dom.textarea className="hidden" /></dom.div>"#,
+    );
+    let widths: Vec<f32> = laid_out
+        .lines()
+        .filter(|one| one.trim_start().starts_with("text_input"))
+        .map(|one| one.split_whitespace().nth(1).unwrap().split(',').nth(2).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(widths, [168.0, 95.0, 153.0], "{laid_out}");
+}
+
+/// What a browser draws inside a `<select>` takes room on top of the page's padding, which is none unless it says: 4 before its
+/// text and 16 after, for its arrow, as Chromium has it, which `appearance: none` takes away, with the arrow.
+#[test]
+fn a_select_has_room_for_its_arrow_beside_its_padding() {
+    let css = "body { margin: 0; }\nselect { display: block; }\n.none { appearance: none; }\n.bare { padding: 0; }\n.wide { padding: 0 10px; }\n";
+    let option = r#"<dom.option>One option</dom.option>"#;
+    let laid_out = laid_out(
+        "select-widths",
+        css,
+        &format!(
+            r#"<dom.div><dom.select>{option}</dom.select><dom.select className="none">{option}</dom.select><dom.select className="bare">{option}</dom.select><dom.select className="wide">{option}</dom.select></dom.div>"#
+        ),
+    );
+    let widths: Vec<f32> = laid_out
+        .lines()
+        .filter(|one| one.trim_start().starts_with("button"))
+        .map(|one| one.split_whitespace().nth(1).unwrap().split(',').nth(2).unwrap().parse().unwrap())
+        .collect();
+    let [own, none, bare, wide] = widths[..] else { panic!("four selects: {laid_out}") };
+    assert!((own - none - 20.0).abs() < 0.01, "{laid_out}");
+    assert!((bare - own).abs() < 0.01 && (wide - own - 20.0).abs() < 0.01, "{laid_out}");
+}
+
+/// A form's controls that are blocks keep their own width, as a browser has them, rather than stretching across what they're in:
+/// an `<input>` with `display: block` is as wide as one on a line, and a button is as wide as its text.
+#[test]
+fn form_controls_that_are_blocks_keep_their_own_width() {
+    let css = "body { margin: 0; }\ninput, button { display: block; }\n";
+    let laid_out = laid_out(
+        "block-controls",
+        css,
+        r#"<dom.div><dom.input defaultValue="typed" /><dom.button type="button">press</dom.button></dom.div>"#,
+    );
+    let width = |kind: &str| -> f32 {
+        let line = laid_out.lines().find(|one| one.trim_start().starts_with(kind)).unwrap_or_else(|| panic!("no {kind}: {laid_out}"));
+        line.split_whitespace().nth(1).unwrap().split(',').nth(2).unwrap().parse().unwrap()
+    };
+    assert!(width("text_input") < 300.0, "the input's own width, not the window's 500: {laid_out}");
+    assert!(width("button") < 100.0, "the button as wide as its text: {laid_out}");
+}
+
+/// What's right in the page that all goes along a line, as two inline-block `<div>`s do, is side by side on that line, as it would
+/// be in a block, rather than one under the other.
+#[test]
+fn inline_blocks_right_in_the_page_are_side_by_side() {
+    let css = "body { margin: 0; }\n.d { display: inline-block; width: 32px; height: 32px; margin: 12px; }\n";
+    let laid_out = laid_out("page-inline-blocks", css, r#"<dom.div className="d" /><dom.div className="d" />"#);
+    let places: Vec<(f32, f32)> = laid_out
+        .lines()
+        .filter(|one| one.contains(",32,32"))
+        .map(|one| {
+            let rect: Vec<f32> = one.split_whitespace().nth(1).unwrap().split(',').map(|n| n.parse().unwrap()).collect();
+            (rect[0], rect[1])
+        })
+        .collect();
+    assert_eq!(places.len(), 2, "{laid_out}");
+    assert_eq!(places[0].1, places[1].1, "on one line: {laid_out}");
+    assert_eq!(places[1].0 - places[0].0, 56.0, "the second after the first and both their margins: {laid_out}");
 }
 
 /// `rows="5"` on a textarea is as many rows as `rows={5}`, as on a page.
@@ -1686,4 +1773,190 @@ fn tabular_nums_has_every_digit_as_wide() {
     let (two, eight) = (width("2111"), width("2000"));
     assert!((two - eight).abs() < 0.05, "every digit as wide, in what's in it: {two} and {eight}: {laid_out}");
     assert!((width("3311") - width("3300")).abs() < 0.05, "{laid_out}");
+}
+
+/// `min()`, `max()` and `clamp()` of a share of what something's in are worked out against how big that is, wherever a length goes,
+/// as a browser has them: `min(320px, calc(100% - 48px))` is 320 pixels in something 400 wide, and 152 in something 200 wide.
+#[test]
+fn min_max_and_clamp_are_worked_out_against_what_they_are_in() {
+    let css = "body { margin: 0; }\n.wide, .narrow { position: relative; }\n.wide { width: 400px; }\n.narrow { width: 200px; }\n\
+        .row { display: flex; }\n.tall { height: 200px; }\n.short { height: 40px; }\n\
+        .a { width: min(320px, calc(100% - 48px)); }\n.b { width: max(60px, 20%); }\n.c { width: clamp(50px, 50%, 150px); }\n\
+        .d { max-width: min(50%, 150px); }\n.e { padding-left: max(10px, 5%); }\n\
+        .f { width: 50px; margin-left: clamp(5px, 5%, 15px); }\n.g { flex: 0 0 min(50%, 150px); }\n.h { height: min(50%, 30px); }\n\
+        .k { box-sizing: border-box; width: min(50%, 150px); padding: 0 10px; }\n\
+        .l { position: absolute; top: 0; left: max(10px, 10%); width: 10px; }\n";
+    let side = |side: &str, tall: &str| {
+        format!(
+            r#"<dom.div className="{side}">
+                <dom.div className="a">a {side}</dom.div><dom.div className="b">b {side}</dom.div><dom.div className="c">c {side}</dom.div>
+                <dom.div className="d">d {side}</dom.div><dom.div className="e"><dom.span>e {side}</dom.span></dom.div><dom.div className="f">f {side}</dom.div>
+                <dom.div className="row"><dom.div className="g">g {side}</dom.div></dom.div>
+                <dom.div className="{tall}"><dom.div className="h">h {side}</dom.div></dom.div>
+                <dom.div className="k">k {side}</dom.div><dom.div className="l">l {side}</dom.div>
+            </dom.div>"#
+        )
+    };
+    let laid_out = laid_out("min-max-clamp", css, &(side("wide", "tall") + &side("narrow", "short")));
+    for (side, [a, b, c, d, e, f, g, h, k, l]) in [
+        ("wide", [320.0, 80.0, 150.0, 150.0, 20.0, 15.0, 150.0, 30.0, 150.0, 40.0]),
+        ("narrow", [152.0, 60.0, 100.0, 100.0, 10.0, 10.0, 100.0, 20.0, 100.0, 20.0]),
+    ] {
+        let at = |name: &str| format!("{name} {side}");
+        let width = |name: &str| size(&laid_out, &at(name)).0;
+        // How far from the left of what it's in, where `a` starts.
+        let from_left = |name: &str| rect(&laid_out, &at(name))[0] - rect(&laid_out, &at("a"))[0];
+        assert_eq!(width("a"), a, "width: min() {side}: {laid_out}");
+        assert_eq!(width("b"), b, "width: max() {side}: {laid_out}");
+        assert_eq!(width("c"), c, "width: clamp() {side}: {laid_out}");
+        assert_eq!(width("d"), d, "max-width {side}: {laid_out}");
+        assert_eq!(from_left("e"), e, "padding {side}: {laid_out}");
+        assert_eq!(from_left("f"), f, "margin {side}: {laid_out}");
+        assert_eq!(width("g"), g, "flex-basis {side}: {laid_out}");
+        assert_eq!(size(&laid_out, &at("h")).1, h, "height {side}: {laid_out}");
+        assert_eq!(width("k"), k, "border-box {side}: {laid_out}");
+        assert_eq!(from_left("l"), l, "left {side}: {laid_out}");
+    }
+}
+
+/// `currentcolor` in a `color-mix()` is the color of the text, its own or what it inherits, as Tailwind 4's `::placeholder` has
+/// it, and in `color` itself, the color it inherits.
+#[test]
+fn color_mix_with_currentcolor_is_mixed_with_the_color_of_the_text() {
+    let css = ".own { color: #ee0000; background: color-mix(in oklab, currentcolor 50%, transparent); }\n.blue { color: #0000ff; }\n\
+        .mixed { background: color-mix(in srgb, currentcolor 50%, #ffffff); }\n\
+        .paler { color: color-mix(in srgb, currentcolor 50%, #ffffff); border: 1px solid color-mix(in srgb, currentcolor 50%, #000000); }\n\
+        input::placeholder { color: color-mix(in oklab, currentcolor 50%, transparent); }\n";
+    let jsx = r#"<dom.div className="own">own</dom.div>
+        <dom.div className="blue"><dom.div className="mixed">inherited</dom.div><dom.div className="paler">paler</dom.div></dom.div>
+        <dom.input placeholder="hint" />"#;
+    let app = format!(
+        "import {{ PageWindow, dom }} from 'rsui/web';\nimport './app.css';\nexport default function App() {{ return <PageWindow>{jsx}</PageWindow>; }}\n"
+    );
+    let mut hands = open("color-mix-current", &[("app.tsx", &app), ("app.css", css)]);
+    hands.settle();
+    let color = |text: &str, prop: &str| color_prop(hands.app.runtime().root(), text, prop);
+    assert_eq!(color("own", "background").as_deref(), Some("#ee000080"));
+    assert_eq!(color("inherited", "background").as_deref(), Some("#8080ffff"));
+    assert_eq!(color("paler", "text_color").as_deref(), Some("#8080ffff"));
+    // A border's `currentcolor` is the color of its own text, which is the paler one.
+    assert_eq!(color("paler", "border_color").as_deref(), Some("#404080ff"));
+    // A placeholder's is the color of the field's text, which is black, as it is around it.
+    assert_eq!(color("hint", "placeholder_color").as_deref(), Some("#00000080"));
+}
+
+/// A color prop of what says this text, as `#rrggbbaa`.
+fn color_prop(node: &rsui::core::Node, text: &str, prop: &str) -> Option<String> {
+    if node.name.as_str() == text {
+        return match node.props.get(prop) {
+            Some(rsui::core::PropValue::Int(color)) => Some(format!("#{:08x}", *color as u32)),
+            other => Some(format!("{other:?}")),
+        };
+    }
+    node.children.iter().find_map(|child| color_prop(child, text, prop))
+}
+
+/// A color mixed with the color of the text is mixed again when that changes, there or in what it's in.
+#[test]
+fn color_mix_with_currentcolor_follows_the_color_of_the_text() {
+    let app = r#"
+        import { PageWindow, dom } from 'rsui/web';
+        import * as React from 'react';
+        import './app.css';
+        export default function App() {
+            const [red, setRed] = React.useState(false);
+            return (
+                <PageWindow>
+                    <dom.div className={red ? 'red' : 'blue'} onClick={() => setRed(true)}>
+                        <dom.div className="mixed">swatch</dom.div>
+                    </dom.div>
+                </PageWindow>
+            );
+        }
+    "#;
+    let css = ".blue { color: #0000ff; }\n.red { color: #ff0000; }\n.mixed { background: color-mix(in srgb, currentcolor 50%, #ffffff); }\n";
+    let mut hands = open("color-mix-follows", &[("app.tsx", app), ("app.css", css)]);
+    hands.settle();
+    let laid_out = hands.app.rectangles();
+    assert!(line(&laid_out, "swatch").contains("background=#8080ffff"), "{laid_out}");
+    let [x, y, width, height] = rect(&laid_out, "swatch")[..] else { panic!("{laid_out}") };
+    hands.click_at(x + width / 2.0, y + height / 2.0);
+    hands.settle();
+    let laid_out = hands.app.rectangles();
+    assert!(line(&laid_out, "swatch").contains("background=#ff8080ff"), "{laid_out}");
+}
+
+/// A shorthand on an element's `style` says all of what it stands for, over what a class says of any of it, as on a page:
+/// `background: #f00` takes away a class's gradient, which `background-color` doesn't, and `border` or `border-color` gives
+/// every side its color, over a class's `border-left`. The same when React changes the `style` later.
+#[test]
+fn a_shorthand_in_a_style_goes_over_what_a_class_says_of_its_parts() {
+    let app = r#"
+        import { PageWindow, dom } from 'rsui/web';
+        import * as React from 'react';
+        import './app.css';
+        export default function App() {
+            const [later, setLater] = React.useState(false);
+            const red = { background: '#f00' };
+            return (
+                <PageWindow>
+                    <dom.div onClick={() => setLater(!later)}>
+                        <dom.div className="g" style={red}>one</dom.div>
+                        <dom.div className="g" style={{ backgroundColor: '#f00' }}>two</dom.div>
+                        <dom.div className="i" style={red}>three</dom.div>
+                        <dom.div className="s" style={{ border: '2px solid #f00' }}>four</dom.div>
+                        <dom.div className="s" style={{ borderColor: '#f00' }}>five</dom.div>
+                        <dom.div className="s">plain</dom.div>
+                        <dom.div className="g" style={later ? red : undefined}>six</dom.div>
+                        <dom.div className="g" style={later ? undefined : red}>seven</dom.div>
+                    </dom.div>
+                </PageWindow>
+            );
+        }
+    "#;
+    let css = ".g { background: linear-gradient(90deg, #00f, #0f0); }\n.i { background-image: linear-gradient(90deg, #00f, #0f0); }\n\
+               .s { border-left: 6px solid #00f; border-top-color: #00f; }\n";
+    let mut hands = open("shorthand-over-class", &[("app.tsx", app), ("app.css", css)]);
+    hands.settle();
+    let prop = |hands: &Hands, text: &str, prop: &str| color_prop(hands.app.runtime().root(), text, prop).unwrap_or_default();
+    let gradient = |hands: &Hands, text: &str| prop(hands, text, "background_gradient") != "None";
+    assert!(!gradient(&hands, "one") && prop(&hands, "one", "background") == "#ff0000ff", "background goes over a gradient");
+    assert!(gradient(&hands, "two"), "background-color leaves the gradient");
+    assert!(!gradient(&hands, "three"), "background goes over background-image");
+    assert_eq!(prop(&hands, "plain", "border_left_color"), "#0000ffff", "the class's own");
+    for text in ["four", "five"] {
+        for side in ["border_top_color", "border_left_color"] {
+            assert_ne!(prop(&hands, text, side), "#0000ffff", "every side of {text} is red");
+        }
+        assert_eq!(prop(&hands, text, "border_color"), "#ff0000ff", "{text}");
+    }
+    assert!(gradient(&hands, "six") && !gradient(&hands, "seven"));
+    let laid_out = hands.app.rectangles();
+    let [x, y, width, height] = rect(&laid_out, "one")[..] else { panic!("{laid_out}") };
+    hands.click_at(x + width / 2.0, y + height / 2.0);
+    hands.settle();
+    assert!(!gradient(&hands, "six") && gradient(&hands, "seven"), "a style put on later, and taken off");
+}
+
+/// Padding that's a share of what something's in is a share of how wide that is, and outside a width and height said with
+/// `box-sizing: content-box`, as `width: 50px; padding-left: 5%` is 70 wide in 400, in a block or along a flex box, where what's
+/// too much is taken from each in proportion to how wide it is inside its padding.
+#[test]
+fn padding_that_is_a_share_is_outside_a_content_box_size() {
+    let css = ".w, .f { width: 400px; }\n.f { display: flex; }\n.p { width: 50px; padding-left: 5%; }\n\
+               .t { width: 50px; height: 20px; padding-top: 5%; padding-bottom: 2.5%; }\n\
+               .bb { box-sizing: border-box; width: 100px; padding-left: 10%; }\n.mx { width: 50%; padding: 0 5%; }\n";
+    let laid_out = laid_out(
+        "share-padding",
+        css,
+        r#"<dom.div><dom.div className="w"><dom.div className="p">a</dom.div><dom.div className="t">b</dom.div><dom.div className="bb">c</dom.div><dom.div className="mx">d</dom.div></dom.div><dom.div className="f"><dom.div className="p">e</dom.div><dom.div className="bb">f</dom.div><dom.div className="mx">g</dom.div></dom.div></dom.div>"#,
+    );
+    assert_eq!(size(&laid_out, "a").0, 70.0, "{laid_out}");
+    assert_eq!(size(&laid_out, "b"), (50.0, 50.0), "{laid_out}");
+    assert_eq!(size(&laid_out, "c").0, 100.0, "{laid_out}");
+    assert_eq!(size(&laid_out, "d").0, 240.0, "{laid_out}");
+    // 410 in 400: 10 taken from 50, 60 and 200 inside their padding, as Edge has it.
+    for (text, wide) in [("e", 70.0 - 50.0 / 31.0), ("f", 100.0 - 60.0 / 31.0), ("g", 240.0 - 200.0 / 31.0)] {
+        assert!((size(&laid_out, text).0 - wide).abs() < 0.01, "{text}: {laid_out}");
+    }
 }

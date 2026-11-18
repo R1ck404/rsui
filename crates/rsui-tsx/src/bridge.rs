@@ -33,6 +33,8 @@ const CANVAS: &str = include_str!("canvas.js");
 const EDITING: &str = include_str!("editing.js");
 /// What events as the web has them need beyond what every click does, which is only loaded when that's first wanted.
 const EVENTS: &str = include_str!("events.js");
+/// Web pages from elsewhere, in WebView2, which is only loaded by an app that shows one.
+const WEBVIEW: &str = include_str!("webview.js");
 /// `rsui/desktop`, a part at a time, each loaded the first time it's used.
 const DESKTOP: &str = include_str!("desktop/index.js");
 const DESKTOP_CORE: &str = include_str!("desktop/core.js");
@@ -1045,6 +1047,14 @@ fn host_app_name(vm: &mut Vm, _: Args) -> Result<Value, Value> {
     Ok(vm.new_string(&name))
 }
 
+/// What the app whose main file is `main` goes by, before it's loaded.
+pub(crate) fn name_of_app(main: &Path) -> String {
+    let program = rsui_js::running_packed()
+        .then(|| std::env::current_exe().ok())
+        .flatten();
+    app_name(program.as_deref(), main)
+}
+
 pub(crate) fn program_name() -> String {
     let program = rsui_js::running_packed()
         .then(|| std::env::current_exe().ok())
@@ -1111,6 +1121,8 @@ pub(crate) fn next_dialog_answer() -> Option<String> {
 /// A packed program goes by its own name, wherever it's moved to. Its main file isn't a real place, so the folder that seems to be in
 /// says nothing about which program this is. Otherwise it's the folder that the main file's in, and the file.
 fn app_name(packed: Option<&Path>, main: &Path) -> String {
+    // A main file given from its own folder, as `rsui-tsx app.tsx` gives it, is still in that folder.
+    let main = &std::path::absolute(main).unwrap_or_else(|_| main.to_owned());
     let stem = |path: &Path| {
         path.file_stem()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1187,6 +1199,7 @@ pub(crate) const HOST_MODULES: &[(&str, &str)] = &[
     ("rsui/canvas", CANVAS),
     ("rsui/editing", EDITING),
     ("rsui/events", EVENTS),
+    ("rsui/webview", WEBVIEW),
     ("react", REACT),
     ("react-dom", REACT_DOM),
     ("react-dom/client", REACT_DOM),
@@ -1271,6 +1284,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
         .chain(crate::native_more::MORE_FUNCTIONS)
         .chain(crate::geometry::FUNCTIONS)
         .chain(crate::why::FUNCTIONS)
+        .chain(crate::webview::FUNCTIONS)
     {
         let function = vm.host_function(name, 0, function);
         let atom = vm.atom(name);
@@ -5036,7 +5050,10 @@ mod tests {
             app_name(None, Path::new("C:/code/notes/app.tsx")),
             "notes-app"
         );
-        assert_eq!(app_name(None, Path::new("app.tsx")), "app");
+        // A main file given from its own folder is still in that folder, so it's named after it, wherever it's run from.
+        let folder = std::env::current_dir().unwrap();
+        let folder = folder.file_name().unwrap().to_string_lossy();
+        assert_eq!(app_name(None, Path::new("app.tsx")), format!("{folder}-app"));
     }
 
     #[test]

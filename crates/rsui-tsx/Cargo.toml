@@ -33,6 +33,7 @@ system-alloc = []
 rsui = { path = "../rsui" }
 rsui-agent = { path = "../rsui-agent" }
 rsui-js = { path = "../rsui-js" }
+rsui-webview = { path = "../rsui-webview" }
 serde_json = "1"
 
 [dev-dependencies]

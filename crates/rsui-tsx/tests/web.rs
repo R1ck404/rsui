@@ -929,8 +929,9 @@ fn a_textarea_is_as_wide_as_a_browser_makes_it_and_sits_on_its_line() {
         .split(',')
         .map(|part| part.parse().unwrap())
         .collect();
-    // 20 characters of 13 pixel monospace and a scrollbar, inside 2 pixels of padding and a border of 1 on each side.
-    assert!((numbers[2] - 169.6).abs() < 0.5, "{laid_out}");
+    // 20 characters of 13 pixel monospace, to a whole pixel, and Edge's 15 pixel scrollbar, inside 2 pixels of padding and a
+    // border of 1 on each side: 168, as Edge has it.
+    assert!((numbers[2] - 168.0).abs() < 0.5, "{laid_out}");
     let after = laid_out
         .lines()
         .find(|line| line.contains("\"after\""))
@@ -2326,6 +2327,32 @@ fn a_pictures_size_in_em_is_as_big_as_its_text() {
     );
     let [_, _, width, height] = hands.rect_of("icon");
     assert_eq!((width, height), (20.0, 20.0), "{}", hands.app.outline());
+}
+
+#[test]
+fn a_pictures_attributes_written_as_svg_writes_them_say_what_their_props_do() {
+    // As a page's HTML has them, which React passes on as they are: `stroke-width` rather than `strokeWidth`. On the `<svg>`, for
+    // all of it, and on each part, where CSS goes over them.
+    let mut hands = open_page(
+        "svg-dashed",
+        ".thick { stroke-width: 3px; }",
+        r#"<dom.svg key="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5" stroke-linecap="round">
+            <dom.path d="M1 1h10" />
+            <dom.path stroke-width="1.5" stroke-linejoin="bevel" fill-rule="evenodd" d="M2 2h10" />
+            <dom.path className="thick" stroke-width="1" d="M3 3h10" />
+            <dom.path stroke-width="4px" d="M4 4h10" />
+        </dom.svg>"#,
+    );
+    hands.settle();
+    let tree = format!("{:?}", hands.app.runtime().root());
+    let layers: Vec<&str> = tree.split(r"\n").collect();
+    let layer = |d: &str| layers.iter().find(|layer| layer.contains(d)).copied().unwrap_or_else(|| panic!("no {d} in {tree}"));
+    assert!(layer("M1 1h10").contains(r"\t2.5\tround\t"), "{}", layer("M1 1h10"));
+    assert!(layer("M2 2h10").contains(r"\t1.5\tround\t"), "{}", layer("M2 2h10"));
+    assert!(layer("M2 2h10").contains(r"\tbevel\t") && layer("M2 2h10").contains("evenodd"), "{}", layer("M2 2h10"));
+    assert!(layer("M3 3h10").contains(r"\t3\tround\t"), "{}", layer("M3 3h10"));
+    // A width with its unit is that many of the picture's own units, as one without is.
+    assert!(layer("M4 4h10").contains(r"\t4\tround\t"), "{}", layer("M4 4h10"));
 }
 
 #[test]

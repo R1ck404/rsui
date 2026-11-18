@@ -55,6 +55,7 @@ pub(crate) fn let_go_of_everything() {
     if real() {
         system::let_go_of_everything();
     }
+    crate::webview::let_go_of_everything();
     with_pretend(|pretend| {
         let kept = pretend.start_at_login.take();
         *pretend = Pretend::default();

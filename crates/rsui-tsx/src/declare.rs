@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 use rsui_js::{Args, HostFunction, Value, Vm};
 
 use crate::css::{
-    Size, Sizing, color, commas, is_space, length, number_end, number_or, number_text, parse_float,
-    split_outside, text_of, trim, words,
+    Size, Sizing, color, commas, is_bounded, is_space, length, number_end, number_or, number_text,
+    parse_float, split_outside, text_of, trim, waits_on_current_color, words,
 };
 
 type Run<T> = Result<T, Value>;
@@ -47,6 +47,16 @@ fn text(word: &'static str) -> Val {
 
 fn owned(word: impl Into<String>) -> Val {
     Val::Text(Cow::Owned(word.into()))
+}
+
+/// A color as a prop: as rsui takes it, or as it's written where it's worked out from the color of the text, which it is once
+/// that's known, as `currentcolor` on its own is.
+fn paint_of(value: &str) -> Option<Val> {
+    match color(value) {
+        Some(paint) => Some(Val::Text(paint)),
+        None if waits_on_current_color(value) => Some(owned(trim(value).to_lowercase())),
+        None => None,
+    }
 }
 
 fn size_val(size: Size) -> Val {
@@ -423,6 +433,23 @@ fn tnum_setting(value: &str) -> Option<bool> {
 fn without_border_sides(props: &mut Props) {
     for side in 0..4 {
         props.set(side_key("width", side), Val::Undefined);
+    }
+}
+
+/// What a shorthand that says every side's color, as `border` and `border-color` do, puts back over what a rule before said of
+/// one side, as `border-top-color` does: each side has the color they all have. It's `undefined` rather than left out, so that
+/// it goes over what's said elsewhere too, as a `style` over a class.
+fn without_border_side_colors(props: &mut Props) {
+    for side in 0..4 {
+        props.set(side_key("color", side), Val::Undefined);
+    }
+}
+
+/// What the `background` shorthand puts back to how it is if nothing says, besides its color: its pictures and how they're
+/// placed and cut. Each is `undefined` rather than left out, for the same reason as in `without_border_side_colors`.
+fn without_background_layers(props: &mut Props) {
+    for key in ["backgroundImage", "backgroundGradient", "backgroundRepeat", "backgroundPosition", "backgroundSize", "backgroundClip"] {
+        props.set(key, Val::Undefined);
     }
 }
 
@@ -906,8 +933,8 @@ impl<'v> Declarer<'v> {
             props.set(key, Val::Undefined);
             return;
         }
-        match color(value) {
-            Some(paint) => props.set(key, Val::Text(paint)),
+        match paint_of(value) {
+            Some(paint) => props.set(key, paint),
             None => self.not_here(format!("{name} as {value}")),
         }
     }
@@ -959,7 +986,7 @@ impl<'v> Declarer<'v> {
         let mut paint = None;
         for part in words(value) {
             let size = self.length(part, 16.0);
-            let found = color(part);
+            let found = paint_of(part);
             if let Size::Pixels(number) = size {
                 width = number;
             } else if part == "none" || part == "hidden" || border_style(part) || part == "auto" {
@@ -979,16 +1006,14 @@ impl<'v> Declarer<'v> {
         // What CSS's `outline-width` is, whatever the style, which is what moves when it changes (see `cssOutlineWidth` in web.js).
         props.set("cssOutlineWidth", Val::Number(width));
         // A shorthand sets each of its longhands, to its initial value where it doesn't say: the color of the text, for the color.
-        match paint {
-            Some(paint) => props.set("outlineColor", Val::Text(paint)),
-            None => props.set("outlineColor", text("currentcolor")),
-        }
+        props.set("outlineColor", paint.unwrap_or(text("currentcolor")));
         set_outline_style(props, style);
     }
 
     fn set_border(&mut self, props: &mut Props, value: &str) {
         if value == "none" || value == "0" {
             without_border_sides(props);
+            without_border_side_colors(props);
             props.set("borderWidth", Val::Number(0.0));
             return;
         }
@@ -998,13 +1023,13 @@ impl<'v> Declarer<'v> {
         let mut found = false;
         for part in words(value) {
             let size = self.length(part, 16.0);
-            let paint = color(part);
+            let paint = paint_of(part);
             if let Size::Pixels(number) = size {
                 without_border_sides(props);
                 props.set("borderWidth", Val::Number(number));
                 found = true;
             } else if let Some(paint) = paint {
-                props.set("borderColor", Val::Text(paint));
+                props.set("borderColor", paint);
                 found = true;
             } else if part == "none" || part == "hidden" {
                 without_border_sides(props);
@@ -1018,6 +1043,9 @@ impl<'v> Declarer<'v> {
         if found && props.is_undefined("borderWidth") {
             // It's 3 as CSS has it if it's not said, which is more than anyone meant.
             props.set("borderWidth", Val::Number(1.0));
+        }
+        if found {
+            without_border_side_colors(props);
         }
     }
 
@@ -1237,9 +1265,9 @@ impl<'v> Declarer<'v> {
         if let Size::Pixels(number) = size {
             props.set("basis", Val::Number(number));
         } else if let Size::Text(share) = &size
-            && share.contains("% +")
+            && (share.contains("% +") || is_bounded(share))
         {
-            // A share and some pixels more, as `calc(25% - 4px)` is.
+            // A share and some pixels more, as `calc(25% - 4px)` is, or one kept between a least and a most, as `min(50%, 200px)` is.
             props.set("basis", owned(share.clone()));
         } else if let Size::Text(share) = &size
             && trim(share).ends_with('%')
@@ -1497,8 +1525,8 @@ impl<'v> Declarer<'v> {
                 rest = "";
             }
             if shorthand && at == layers.len() - 1 {
-                if let Some(paint) = words(rest).into_iter().find_map(color) {
-                    props.set("background", Val::Text(paint));
+                if let Some(paint) = words(rest).into_iter().find_map(paint_of) {
+                    props.set("background", paint);
                 }
             }
         }
@@ -1998,6 +2026,14 @@ impl<'v> Declarer<'v> {
                 }
             }
             "background" | "background-color" => {
+                if value.is_empty() {
+                    return Ok(());
+                }
+                // The shorthand says everything about the background, so that what it doesn't say is as it is if nothing says,
+                // over what was said before it, as a `style="background: red"` over a class's gradient.
+                if name == "background" {
+                    without_background_layers(props);
+                }
                 if matches!(value, "none" | "inherit" | "unset" | "initial") {
                     props.set("background", text("#00000000"));
                     return Ok(());
@@ -2006,18 +2042,13 @@ impl<'v> Declarer<'v> {
                     props.set("background", text("currentcolor"));
                     return Ok(());
                 }
-                if value.is_empty() {
-                    return Ok(());
-                }
                 if name == "background" {
-                    props.delete("backgroundImage");
-                    props.delete("backgroundGradient");
                     if self.set_background_layers(props, value, true)? {
                         return Ok(());
                     }
                 }
-                if let Some(paint) = color(value) {
-                    props.set("background", Val::Text(paint));
+                if let Some(paint) = paint_of(value) {
+                    props.set("background", paint);
                     return Ok(());
                 }
                 if let Some(gradient) = self.linear_gradient(value)? {
@@ -2035,8 +2066,8 @@ impl<'v> Declarer<'v> {
                 }
             }
             "background-image" => {
-                props.delete("backgroundImage");
-                props.delete("backgroundGradient");
+                props.set("backgroundImage", Val::Undefined);
+                props.set("backgroundGradient", Val::Undefined);
                 if !self.set_background_layers(props, value, false)? && value != "none" {
                     self.not_here(format!("{name} as {value}"));
                 }
@@ -2125,7 +2156,7 @@ impl<'v> Declarer<'v> {
                 if value == "text" {
                     props.set("backgroundClip", text("text"));
                 } else {
-                    props.delete("backgroundClip");
+                    props.set("backgroundClip", Val::Undefined);
                 }
             }
             "clip-path" => {
@@ -2286,6 +2317,7 @@ impl<'v> Declarer<'v> {
             "border-color" => {
                 let parts = words(value);
                 if parts.len() < 2 {
+                    without_border_side_colors(props);
                     self.set_color(props, name, value, "borderColor");
                     return Ok(());
                 }
@@ -3441,7 +3473,7 @@ button { box-sizing: border-box; font-family: Arial; font-size: 13.3333px; line-
 select { box-sizing: border-box; }
 input { -rsui-natural-width: 169px; }
 input, select { font-family: Arial; font-size: 13.3333px; color: black; padding: 2px 3px; border: 1px solid #767676; border-radius: 2px; background-color: white; }
-select { padding: 1px 6px 1px 4px; }
+select { padding: 0; }
 checkbox { margin: 3px 3px 3px 4px; }
 radio { margin: 3px 3px 0 5px; }
 summary { list-style-type: disclosure-closed; }

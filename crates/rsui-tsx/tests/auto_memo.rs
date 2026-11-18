@@ -495,6 +495,50 @@ fn a_handler_that_sees_new_state_is_handed_it_without_the_child_rendering() {
 }
 
 #[test]
+fn a_handler_read_from_an_object_given_whole_is_handed_on_without_rendering_again_and_again() {
+    // As the browser demo's `browser`, made by a hook, is given whole to what draws `onClick={browser.addSpace}`.
+    let mut ui = start(
+        r#"
+        import { useState } from 'rsui';
+        function useModel() {
+            const [n, setN] = useState(0);
+            return { n, add: () => setN((before) => before + 1) };
+        }
+        function Bar(props) {
+            return <button key="add" onClick={props.model.add}>add</button>;
+        }
+        function Middle(props) {
+            return (
+                <div>
+                    <p>{'n=' + props.model.n}</p>
+                    <Bar model={props.model} />
+                </div>
+            );
+        }
+        function Inner() {
+            const model = useModel();
+            return <Middle model={model} />;
+        }
+        export default function App() {
+            return (
+                <window>
+                    <Inner />
+                </window>
+            );
+        }
+        "#,
+    );
+    for n in 1..=3 {
+        // What has the model, and `Bar`, which read a function from it, so the new one is only the same as itself: each once.
+        // Looking again at `Bar` once its button was handed the new handler had it render until it was stopped.
+        let rendered = renders_for(&mut ui, "add");
+        assert!(rendered <= 4, "{rendered} rendered");
+        assert!(line_with(&ui, "n=").contains(&format!("n={n}")));
+    }
+    assert_eq!(ui.runtime().runaways(), 0);
+}
+
+#[test]
 fn handlers_that_see_an_object_of_handlers_that_sees_itself_are_the_same() {
     // As the file explorer's `act` is: each of what's in it can call the others through it.
     let mut ui = start(

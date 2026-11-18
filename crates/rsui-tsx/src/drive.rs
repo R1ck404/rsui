@@ -613,8 +613,14 @@ impl Desk {
             if let [only] = found.as_slice() {
                 return Ok(only.path.clone());
             }
+            // Of more than one, what a person could reach, as what reads the window out has it: not in something that's only
+            // there to be seen, as what's `visibility: hidden` or on its way out is (see `rsui::access`).
+            let reachable: Vec<_> = found.iter().filter(|one| reachable(root, &one.path)).collect();
+            if let [only] = reachable.as_slice() {
+                return Ok(only.path.clone());
+            }
             if let Some(action) = action {
-                let able: Vec<_> = found
+                let able: Vec<_> = reachable
                     .iter()
                     .filter(|one| one.node.actions.contains(action))
                     .collect();
@@ -1671,6 +1677,10 @@ impl Desk {
                 crate::native::second_instance(&words)?;
             }
             ("power", [what]) => crate::native::power(&what.text)?,
+            ("webview", words) if !words.is_empty() => {
+                let words: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
+                crate::webview::step(&words)?;
+            }
             ("dialog", [answer]) => {
                 let cancelled = !answer.quoted && answer.text == "cancel";
                 let answer = (!cancelled).then(|| answer.text.clone());
@@ -1989,6 +1999,22 @@ fn node_at<'a>(root: &'a Node, path: &[u32]) -> Option<&'a Node> {
         .try_fold(root, |node, &index| node.children.get(index as usize))
 }
 
+/// Whether what's at `path` can be reached by a person: neither it nor anything it's in is inert, which is what's only there to
+/// be seen, as what's on its way out, `visibility: hidden` and `pointer-events: none` are, and which isn't read out either.
+fn reachable(root: &Node, path: &[u32]) -> bool {
+    let mut node = root;
+    for &index in path {
+        let Some(child) = node.children.get(index as usize) else {
+            return false;
+        };
+        if is_on(child, "inert") {
+            return false;
+        }
+        node = child;
+    }
+    true
+}
+
 fn is_on(node: &Node, prop: &str) -> bool {
     node.props.get(prop) == Some(&PropValue::Bool(true))
 }
@@ -2155,7 +2181,7 @@ fn print_split() {
     println!("  split {}", parts.join(" "));
 }
 
-pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"PATH\", dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide. A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT";
+pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"PATH\", dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide. A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT. For what a web page in a <WebView> would do: webview load URL, webview inpage URL, webview fail URL [CODE], webview title TEXT, webview popup URL, webview key KEYS, webview fullscreen on|off, webview message JSON, webview close, webview crash, webview unavailable";
 
 /// A word of a step, with whether it was in quotes, which is what makes `"#1"` some text rather than a key.
 #[derive(Debug, Clone)]

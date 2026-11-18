@@ -711,7 +711,7 @@ pub(crate) const FUNCTIONS: [(&str, HostFunction); 41] = [
 // or a font, sound devices and media keys.
 
 /// Bytes as base64, as a `data:` URL has them.
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for three in bytes.chunks(3) {

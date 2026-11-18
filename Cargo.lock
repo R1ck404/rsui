@@ -706,8 +706,17 @@ dependencies = [
  "rsui-headless",
  "rsui-image",
  "rsui-js",
+ "rsui-webview",
  "serde_json",
  "windows",
+]
+
+[[package]]
+name = "rsui-webview"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

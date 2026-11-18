@@ -74,6 +74,7 @@ fn scene(shade: u8) -> Scene {
             image: 0,
             transform: 0,
             filter: 0,
+            round: 0,
         }],
         ..Default::default()
     }
@@ -349,7 +350,7 @@ fn glyph_growth_text_settings_and_constant_payloads() {
                     work.constant_upload,
                     Payload {
                         count: 1,
-                        bytes: 128
+                        bytes: 256
                     }
                 );
             }
@@ -540,7 +541,7 @@ fn grown_quad_buffer_and_per_batch_constants_count_actual_work() {
         work.constant_upload,
         Payload {
             count: 2,
-            bytes: 256
+            bytes: 512
         }
     );
     assert_eq!(

@@ -632,7 +632,7 @@ impl LayoutVisitor for Clips {
         }
     }
     fn exit(&mut self, _element: &Element) {}
-    fn clip_to(&mut self, rect: Rect) {
+    fn clip_to(&mut self, rect: Rect, _element: &Element) {
         self.stack.push(rect);
     }
     fn unclip(&mut self) {

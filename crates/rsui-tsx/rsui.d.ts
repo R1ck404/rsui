@@ -578,6 +578,90 @@ declare module 'rsui/web' {
     export function Option(props: any): any;
 }
 
+/**
+ * What `<webview>` says and is given: a web page from elsewhere, in the system's browser view (WebView2). It's a window of its
+ * own over the app's, cut to what shows of its element, its corners and to what's drawn on top of it, such as a menu. Under
+ * something see-through, as a dimmed backdrop, it shows a still picture of the page instead, which that's drawn over. Nothing of
+ * it is loaded until an app has one. With `--do` it's never started: a load comes back as one that worked, and the `webview`
+ * steps make the page do the rest.
+ */
+declare module 'rsui/webview' {
+    /** What a view says about itself, each time any of it changes. */
+    export interface WebViewState {
+        url: string;
+        title: string;
+        loading: boolean;
+        canGoBack: boolean;
+        canGoForward: boolean;
+        /** The page's icon, drawn 64 pixels square, as a PNG `data:` address, once it's found, or ''. */
+        icon: string;
+        /** Why the last page didn't load, with Chromium's error number and name, such as -105 and ERR_NAME_NOT_RESOLVED. */
+        error: { url: string; code: number; description: string } | null;
+        /** What to do about there being no WebView2 on this computer, if there's none. */
+        unavailable: string | null;
+        /** Whether something in the page, such as a video, is full screen. */
+        fullScreen: boolean;
+    }
+    /** A key the app keeps for itself while a page has the keyboard, by the name it was given in `keys`. */
+    export interface WebViewKey {
+        name: string;
+        code: number;
+        ctrl: boolean;
+        shift: boolean;
+        alt: boolean;
+    }
+    /** What's given back through a `<WebView>`'s `ref`. */
+    export interface WebViewHandle {
+        readonly state: WebViewState;
+        go(url: string): void;
+        back(): void;
+        forward(): void;
+        reload(): void;
+        stop(): void;
+        /** Gives the page the keyboard. */
+        focus(): void;
+        /** Gives the keyboard back to the app's window, if the page has it. */
+        blur(): void;
+        devTools(): void;
+        zoom(factor: number): void;
+        /** Sends the page a message, which it hears with `chrome.webview.addEventListener('message')`. */
+        post(value: unknown): void;
+        /** Runs a script in the page, and gives what it comes to. */
+        run(script: string): Promise<any>;
+        /** Forgets the cookies of the view's profile. */
+        clearCookies(): void;
+    }
+    export interface WebViewProps {
+        /** Where it goes. Changing it goes there; the page going somewhere by itself doesn't change it. */
+        src?: string;
+        /** Cookies and storage of their own, kept in the app's folder, for every view with this name. */
+        profile?: string;
+        /** Nothing it keeps lasts past it. */
+        private?: boolean;
+        userAgent?: string;
+        /** Keys the app keeps while a page has the keyboard, such as `'Ctrl+T'` or `'F6'`, which reach `onKey` instead of the page. */
+        keys?: string[];
+        zoom?: number;
+        /** In a page. */
+        className?: string;
+        style?: any;
+        ref?: { current: WebViewHandle | null } | ((view: WebViewHandle | null) => void);
+        /** What shows until the page starts arriving, and instead of it if it can't be shown. */
+        children?: any;
+        onState?: (state: WebViewState) => void;
+        /** The page asked for another window, as a link with `target=_blank` does. It never gets one by itself. */
+        onNewWindow?: (request: { url: string; user: boolean }) => void;
+        onKey?: (key: WebViewKey) => void;
+        onMessage?: (value: any) => void;
+        onFocus?: (focused: boolean) => void;
+        /** The page asked to be closed, with `window.close()`. */
+        onClose?: () => void;
+        onUnavailable?: (why: string) => void;
+    }
+    /** The version of WebView2 on this computer, or '' if there's none. */
+    export function runtime(): string;
+}
+
 // Sockets and threads.
 declare module 'net' {
     export class Socket {
@@ -1823,6 +1907,8 @@ declare const __Fragment: import('rsui').Component<{ children?: import('rsui').C
 
 /** What a page's element has that rsui's own of the same name doesn't, for `span`, `button` and `input` written for a page. */
 type PageExtras<T> = Omit<PageProps<T>, keyof import('rsui').ElementProps>;
+/** rsui's own props for a tag a page has too, as `<button>`: its `style` is rsui's, or the page's CSS in a page. */
+type SharedProps = Omit<import('rsui').ElementProps, 'style'> & { style?: import('rsui').Style | PageStyle };
 
 declare namespace JSX {
     type Props = import('rsui').ElementProps;
@@ -1867,10 +1953,10 @@ declare namespace JSX {
         column: Props;
         text: Props;
         /// Part of the text it's in, which can look different and wraps along with the rest.
-        span: Props & PageExtras<HTMLSpanElement>;
-        button: Props & PageExtras<HTMLButtonElement> & { type?: string };
+        span: SharedProps & PageExtras<HTMLSpanElement>;
+        button: SharedProps & PageExtras<HTMLButtonElement> & { type?: string };
         link: Props;
-        input: Props & { value?: string; placeholder?: string; placeholderColor?: string; rows?: number } & PageExtras<HTMLInputElement> & { type?: string; checked?: boolean; defaultValue?: string; defaultChecked?: boolean; onInput?: (event: PageChangeEvent<HTMLInputElement>) => void };
+        input: SharedProps & { value?: string; placeholder?: string; placeholderColor?: string; rows?: number } & PageExtras<HTMLInputElement> & { type?: string; checked?: boolean; defaultValue?: string; defaultChecked?: boolean; onInput?: (event: PageChangeEvent<HTMLInputElement>) => void };
         checkbox: Props & { checked?: boolean };
         item: Props;
         image: Props & { src: string; fit?: 'contain' | 'cover' | 'fill' };
@@ -1881,6 +1967,11 @@ declare namespace JSX {
         scroll: Props & { axis?: 'vertical' | 'horizontal' | 'both' };
         /** A long list, which only builds the rows in view. */
         list: ListProps;
+        /**
+         * A web page from elsewhere, in the system's browser view (WebView2), placed and sized like a `<group>`, or by the page's
+         * CSS like a `<div>` in a page. See `rsui/webview` for what it says and its handle.
+         */
+        webview: Omit<Props, 'ref' | 'children' | 'style' | 'className'> & import('rsui/webview').WebViewProps;
         // A page's own, which are drawn as its CSS says. `span`, `button` and `input` above are a page's too, when they're
         // in a file written for a page, or have a `className` or a `type`.
         div: PageProps<HTMLDivElement>;

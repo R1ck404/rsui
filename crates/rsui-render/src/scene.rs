@@ -327,6 +327,25 @@ pub struct Batch {
     pub transform: u16,
     /// Which of the scene's filters their colors go through, counting from 1, or 0 for none, which is nearly always.
     pub filter: u16,
+    /// Which of the scene's round clips cuts them off, counting from 1, or 0 for none, which is nearly always.
+    pub round: u16,
+}
+
+/// Round corners what's drawn is cut off at, as CSS's `overflow: hidden` with `border-radius` has it, or a box with round
+/// corners what's drawn is kept out of, as a shadow is kept out from under what it's behind. A batch says which it's drawn with,
+/// and each says the one it's in, so that what's in two is cut off by both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundClip {
+    /// Its left, top, right and bottom edges, in physical pixels, as they are before the transform it was made in.
+    pub edges: [f32; 4],
+    /// How far across and down each corner's curve goes, in physical pixels, from the top left going round.
+    pub corners: [[f32; 2]; 4],
+    /// Whether what's drawn shows only outside it, rather than only inside.
+    pub outside: bool,
+    /// Which of the scene's transforms it was made in, counting from 1, or 0 for none.
+    pub transform: u16,
+    /// The one it's in, counting from 1, or 0 for none.
+    pub outer: u16,
 }
 
 /// What CSS's `filter` does to colors: red, green and blue each from those, as what each is multiplied by and what's added, and
@@ -538,6 +557,8 @@ pub struct Scene {
     pub transforms: Vec<Matrix>,
     /// What colors go through, as CSS's `filter` says. A batch says which it's using.
     pub filters: Vec<Filter>,
+    /// Round corners what's drawn is cut off at. A batch says which it's using.
+    pub round_clips: Vec<RoundClip>,
     /// The color of the window itself, if it says it has one that can't be seen through. What it hasn't covered has to be that,
     /// as there's nothing behind a window to show: that's the corners, if it has a radius.
     pub window_color: Option<Color>,
@@ -568,6 +589,13 @@ impl Scene {
         self.batches.iter().any(|batch| {
             let clip = batch.clip;
             if px < clip.left || px >= clip.right || py < clip.top || py >= clip.bottom {
+                return false;
+            }
+            // A shadow isn't under what it's around.
+            let round = usize::from(batch.round).checked_sub(1).and_then(|at| self.round_clips.get(at));
+            if let Some(&RoundClip { edges: [left, top, right, bottom], outside: true, .. }) = round
+                && x >= left && x < right && y >= top && y < bottom
+            {
                 return false;
             }
             let first = batch.first as usize;
@@ -946,6 +974,7 @@ struct CaretScene {
     batches: Vec<Batch>,
     transforms: Vec<Matrix>,
     filters: Vec<Filter>,
+    round_clips: Vec<RoundClip>,
     /// The caret's place among the quads, and the place among the batches of the one it's in.
     at: usize,
     batch_at: usize,
@@ -1003,6 +1032,7 @@ impl Painter {
             trim_slack(&mut self.pilot.history.batches);
             trim_slack(&mut self.pilot.history.transforms);
             trim_slack(&mut self.pilot.history.filters);
+            trim_slack(&mut self.pilot.history.round_clips);
         }
         self.text_runs.trim_spares();
         self.paragraph = ParagraphMemo::default();
@@ -1016,6 +1046,7 @@ impl Painter {
         trim_slack(&mut scene.batches);
         trim_slack(&mut scene.transforms);
         trim_slack(&mut scene.filters);
+        trim_slack(&mut scene.round_clips);
         trim_slack(&mut scene.uploads);
         trim_slack(&mut scene.image_uploads);
         trim_slack(&mut scene.dropped_images);
@@ -1024,6 +1055,7 @@ impl Painter {
             trim_slack(&mut kept.batches);
             trim_slack(&mut kept.transforms);
             trim_slack(&mut kept.filters);
+            trim_slack(&mut kept.round_clips);
         }
         // Only scratch: every layout overwrites these before reading them.
         self.glyphs.glyphs.clear();
@@ -1134,6 +1166,7 @@ impl Painter {
         scene.batches.clone_from(&kept.batches);
         scene.transforms.clone_from(&kept.transforms);
         scene.filters.clone_from(&kept.filters);
+        scene.round_clips.clone_from(&kept.round_clips);
         if !show {
             // The batches after the caret's start one earlier, and its own has one fewer. One that had only the caret
             // isn't there, as there'd be nothing in it.
@@ -1261,7 +1294,7 @@ impl Painter {
             drawn(&self.scene),
             // As text, so that a NaN in one is the same as in the other.
             format!("{:?}", self.scene.transforms),
-            format!("{:?}", self.scene.filters),
+            format!("{:?} {:?}", self.scene.filters, self.scene.round_clips),
         );
         self.keep_next = keep;
         let enters_all = self.work.node_enters;
@@ -1270,7 +1303,7 @@ impl Painter {
             drawn(&self.scene),
             // As text, so that a NaN in one is the same as in the other.
             format!("{:?}", self.scene.transforms),
-            format!("{:?}", self.scene.filters),
+            format!("{:?} {:?}", self.scene.filters, self.scene.round_clips),
         );
         let checks = CHECKS.fetch_add(1, Relaxed) + 1;
         if everything != culled {
@@ -1290,7 +1323,7 @@ impl Painter {
                 eprintln!("  first different run {at}: {:?} to {:?} / {:?} to {:?}", a.1.get(at), a.2.get(at), b.1.get(at), b.2.get(at));
             }
             if everything.1 != culled.1 || everything.2 != culled.2 {
-                eprintln!("  transforms or filters differ: {:?} / {:?}; {:?} / {:?}", everything.1, culled.1, everything.2, culled.2);
+                eprintln!("  transforms or filters and round clips differ: {:?} / {:?}; {:?} / {:?}", everything.1, culled.1, everything.2, culled.2);
             }
         } else if checks.is_power_of_two() {
             eprintln!(
@@ -1356,6 +1389,7 @@ impl Painter {
             self.scene.batches.clear();
             self.scene.transforms.clear();
             self.scene.filters.clear();
+            self.scene.round_clips.clear();
             self.scene.layers.clear();
             self.turning.clear();
             self.clips.clear();
@@ -1381,6 +1415,7 @@ impl Painter {
                 turning: &mut self.turning,
                 transform: 0,
                 filters: &mut self.scene.filters,
+                round_clips: &mut self.scene.round_clips,
                 filtering: Vec::new(),
                 filter: 0,
                 matrix: IDENTITY,
@@ -1406,7 +1441,6 @@ impl Painter {
                 paragraph: &mut self.paragraph,
                 pictured_glyphs: false,
                 rounded: Vec::new(),
-                entered: std::ptr::null(),
             };
             layout.visit(root, &mut visitor);
             if let Some((text, x, y)) = interaction.tooltip {
@@ -1504,6 +1538,7 @@ impl Painter {
         kept.batches.clone_from(&scene.batches);
         kept.transforms.clone_from(&scene.transforms);
         kept.filters.clone_from(&scene.filters);
+        kept.round_clips.clone_from(&scene.round_clips);
         kept.at = at;
         kept.batch_at = batch_at;
     }
@@ -1526,6 +1561,7 @@ struct SceneBuilder<'a, const PRUNE: bool> {
     /// Which transform what's being drawn has, and what it is.
     transform: u16,
     filters: &'a mut Vec<Filter>,
+    round_clips: &'a mut Vec<RoundClip>,
     /// What has a filter, and which filter was in use before it.
     filtering: Vec<(usize, u16)>,
     /// Which filter what's being drawn goes through.
@@ -1557,11 +1593,9 @@ struct SceneBuilder<'a, const PRUNE: bool> {
     paragraph: &'a mut ParagraphMemo,
     /// Whether text being placed has used a glyph kept as a picture, whose quads can't be kept in `text_runs`.
     pictured_glyphs: bool,
-    /// What cuts off what's in it with round corners, as CSS's `overflow: hidden` with `border-radius` does: how many clips there
-    /// were with it, and where it is and how round, in pixels.
-    rounded: Vec<(usize, [f32; 4], f32)>,
-    /// The last thing entered, which what's cut off at its edges, which comes right after, is about.
-    entered: *const Element,
+    /// The round clips what's drawn now is in, innermost last: how many clips there were with each, and which it is, counting
+    /// from 1.
+    rounded: Vec<(usize, u16)>,
 }
 
 /// The nearest whole number. `round` is a call into a library unless the program's built for newer
@@ -1595,16 +1629,70 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         self.colors.last().map_or(DEFAULT_TEXT, |held| held.1)
     }
 
-    /// Where a box that's this far across and down shows, and how round it is, inside what cuts it off with round corners, if
-    /// that's what it's right in: see [`rounded_by`].
+    /// Which of the scene's round clips what's drawn now is cut off by, counting from 1, or 0 for none.
     #[inline(always)]
-    fn round_in_clip(&self, area: [f32; 4], radius: f32) -> ([f32; 4], f32) {
-        match self.rounded.last() {
-            Some(&(depth, clip, round)) if depth == self.clips.len() => {
-                rounded_by(area, radius, clip, round).unwrap_or((area, radius))
-            }
-            _ => (area, radius),
+    fn round(&self) -> u16 {
+        self.rounded.last().map_or(0, |one| one.1)
+    }
+
+    /// Cuts what's drawn after this off at a box's round corners, as well as wherever it's already cut off, or keeps it out of
+    /// the box if `outside`, until the clip that was pushed last is popped. `edges` are its left, top, right and bottom.
+    #[cold]
+    #[inline(never)]
+    fn push_round_clip(&mut self, edges: [f32; 4], corners: [[f32; 2]; 4], outside: bool) {
+        self.finish_batch();
+        let outer = self.round();
+        self.round_clips.push(RoundClip { edges, corners, outside, transform: self.transform, outer });
+        let at = self.round_clips.len().min(usize::from(u16::MAX)) as u16;
+        self.rounded.push((self.clips.len(), at));
+    }
+
+    /// Stops cutting off what's drawn at the clip that was pushed last, and at any round corners that went with it.
+    fn pop_clip(&mut self) {
+        self.finish_batch();
+        let depth = self.clips.len();
+        self.clips.pop();
+        while self.rounded.last().is_some_and(|one| one.0 >= depth) {
+            self.rounded.pop();
         }
+    }
+
+    /// How far across and down each of an element's round corners goes on a box this big, in physical pixels, from the top left
+    /// going round, or `None` if they're all square. It's the element whose look was read last.
+    fn corners(&self, element: &Element, area: [f32; 4]) -> Option<[[f32; 2]; 4]> {
+        let shape = if self.look.shaped { crate::gradient::BoxShape::of(element, area, self.scale) } else { None };
+        let corners = match shape {
+            Some(shape) => shape.corners(),
+            None => [[fitting_radius(self.look.corner_radius * self.scale, area); 2]; 4],
+        };
+        corners.iter().any(|corner| corner[0] > 0.0 && corner[1] > 0.0).then_some(corners)
+    }
+
+    /// Cuts what's in an element with round corners off at them, inside its border, as CSS's `overflow: hidden` has it: the
+    /// curve inside a border is the one outside it less the width of the border on each side of it. It's the element whose look
+    /// was read last, at `rect`.
+    #[cold]
+    #[inline(never)]
+    fn round_off(&mut self, element: &Element, rect: Rect) {
+        let left = snap(rect.x * self.scale);
+        let top = snap(rect.y * self.scale);
+        let right = snap((rect.x + rect.width) * self.scale);
+        let bottom = snap((rect.y + rect.height) * self.scale);
+        let Some(corners) = self.corners(element, [left, top, right - left, bottom - top]) else {
+            return;
+        };
+        let (top_width, right_width, bottom_width, left_width) = border_sides(element);
+        let [top_width, right_width, bottom_width, left_width] =
+            [top_width, right_width, bottom_width, left_width].map(|width| drawn_width(width, self.scale));
+        let less = |[across, down]: [f32; 2], side: f32, end: f32| [(across - side).max(0.0), (down - end).max(0.0)];
+        let corners = [
+            less(corners[0], left_width, top_width),
+            less(corners[1], right_width, top_width),
+            less(corners[2], right_width, bottom_width),
+            less(corners[3], left_width, bottom_width),
+        ];
+        let edges = [left + left_width, top + top_width, right - right_width, bottom - bottom_width];
+        self.push_round_clip(edges, corners, false);
     }
 
     #[inline(always)]
@@ -1638,6 +1726,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                 image: 0,
                 transform: self.transform,
                 filter: self.filter,
+                round: self.round(),
             });
             self.batch_start = self.quads.len();
         }
@@ -1756,7 +1845,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         let cut = rsui_layout::clips(element);
         if self.look.arranged {
             if cut {
-                self.clip_to(rect);
+                self.clip_to(rect, element);
             }
             self.paint_arranged_text(element, rect, style, content, color);
             if cut {
@@ -1765,7 +1854,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
             return;
         }
         if cut {
-            self.clip_to(rect);
+            self.clip_to(rect, element);
         }
         let clip = self.clip();
         let keeps_words = keeps_words(element);
@@ -2550,7 +2639,8 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                 self.quads
                     .push(outline_quad(quad.rect, shadow.color, shadow_radius, spread));
             } else {
-                self.paint_shadow_around(quad, edges);
+                let corners = self.corners(element, area).unwrap_or_default();
+                self.paint_shadow_around(quad, edges, corners);
             }
         }
         let pressed = look
@@ -2573,9 +2663,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
             Some(shape) => {
                 let border = if look.border_pattern == BorderPattern::Line {
                     let (top, right, bottom, left) = border_sides(element);
-                    let widths = [top, right, bottom, left].map(|width| {
-                        if width > 0.0 { (width * self.scale).round().max(1.0) } else { 0.0 }
-                    });
+                    let widths = [top, right, bottom, left].map(|width| drawn_width(width, self.scale));
                     let colors = ["border_top_color", "border_right_color", "border_bottom_color", "border_left_color"]
                         .map(|name| element.props.get(name).and_then(Color::from_prop).or(look.border_color));
                     (widths.iter().any(|width| *width > 0.0) && colors.iter().any(Option::is_some))
@@ -2590,7 +2678,6 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         };
         if let Some(background) = background.filter(|_| !drew_shape) {
             if background.a > 0 {
-                let (area, radius) = self.round_in_clip(area, radius);
                 self.quads.push(solid_quad(area, background, radius));
             }
         }
@@ -2679,49 +2766,15 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         }
     }
 
-    /// A shadow only around what it's behind, as CSS has it, for something that can be seen through: it's drawn once for each side,
-    /// kept to that side.
+    /// A shadow only around what it's behind, as CSS has it, for something that can be seen through: it's kept out of the box,
+    /// whose edges are `edges`, with its round corners.
     #[cold]
     #[inline(never)]
-    fn paint_shadow_around(&mut self, quad: Quad, [left, top, right, bottom]: [f32; 4]) {
+    fn paint_shadow_around(&mut self, quad: Quad, edges: [f32; 4], corners: [[f32; 2]; 4]) {
+        self.push_round_clip(edges, corners, true);
+        self.quads.push(quad);
         self.finish_batch();
-        let outer = self.clip();
-        let [x, y, width, height] = quad.rect;
-        let (far_left, far_top) = (x.floor() as i32, y.floor() as i32);
-        let (far_right, far_bottom) = ((x + width).ceil() as i32, (y + height).ceil() as i32);
-        let [left, top, right, bottom] = [left, top, right, bottom].map(|edge| edge.round() as i32);
-        let sides = [
-            PixelRect {
-                left: far_left,
-                top: far_top,
-                right: far_right,
-                bottom: top,
-            },
-            PixelRect {
-                left: far_left,
-                top: bottom,
-                right: far_right,
-                bottom: far_bottom,
-            },
-            PixelRect {
-                left: far_left,
-                top,
-                right: left,
-                bottom,
-            },
-            PixelRect {
-                left: right,
-                top,
-                right: far_right,
-                bottom,
-            },
-        ];
-        for side in sides {
-            self.clips.push(outer.intersect(side));
-            self.quads.push(quad);
-            self.finish_batch();
-            self.clips.pop();
-        }
+        self.rounded.pop();
     }
 
     /// Draws a box whose corners aren't all one circle, or that's cut to a shape, with its background and its border, as a picture
@@ -3683,6 +3736,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
             image: shown.id,
             transform: self.transform,
             filter: self.filter,
+            round: self.round(),
         });
         self.batch_start = self.quads.len();
     }
@@ -3750,11 +3804,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         };
         self.finish_batch();
         let to_part = |value: f32| (value * 65535.0).round().clamp(0.0, 65535.0) as u16;
-        // A picture that fills what cuts it off with round corners has them too, as an avatar's has.
-        let radius = match self.round_in_clip(place, look.corner_radius * self.scale) {
-            (shown, radius) if shown == place => radius,
-            _ => look.corner_radius * self.scale,
-        };
+        let radius = look.corner_radius * self.scale;
         self.quads.push(Quad {
             rect: place,
             glyph: [
@@ -3773,6 +3823,7 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
             image: shown.id,
             transform: self.transform,
             filter: self.filter,
+            round: self.round(),
         });
         self.batch_start = self.quads.len();
     }
@@ -4214,9 +4265,15 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
             image: made.id,
             transform: self.transform,
             filter: self.filter,
+            round: self.round(),
         });
         self.batch_start = self.quads.len();
     }
+}
+
+/// How wide a border this wide, as CSS says, is drawn, in physical pixels: on whole pixels, and never thinner than one.
+fn drawn_width(width: f32, scale: f32) -> f32 {
+    if width > 0.0 { (width * scale).round().max(1.0) } else { 0.0 }
 }
 
 #[inline(always)]
@@ -4252,22 +4309,6 @@ fn inset_rect(said: &str, rect: Rect) -> Option<Rect> {
         (rect.width - left - right).max(0.0),
         (rect.height - top - bottom).max(0.0),
     ))
-}
-
-/// Where something that fills what cuts it off with round corners shows, and how round it is there: as much of it as is inside,
-/// if that's the same distance in from every side, as inside a border is, with corners that are that much less round. Anything
-/// else is as it is, as only what fills it, as Mantine's avatar picture and skeleton circle do, is found here.
-fn rounded_by(area: [f32; 4], radius: f32, clip: [f32; 4], round: f32) -> Option<([f32; 4], f32)> {
-    let [x, y, w, h] = area;
-    let [cx, cy, cw, ch] = clip;
-    let (left, top) = (x.max(cx), y.max(cy));
-    let (right, bottom) = ((x + w).min(cx + cw), (y + h).min(cy + ch));
-    let ins = [left - cx, top - cy, cx + cw - right, cy + ch - bottom];
-    let most = ins.iter().copied().fold(0f32, f32::max);
-    if ins.iter().any(|one| (one - most).abs() > 0.5) || most >= round || right <= left || bottom <= top {
-        return None;
-    }
-    Some(([left, top, right - left, bottom - top], radius.max(round - most)))
 }
 
 /// A glyph from the atlas at this place, in this premultiplied color. One with a byte for each part of each pixel is a third as wide
@@ -4613,7 +4654,8 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
         !self.clip().overlaps(left, top, right, bottom)
     }
 
-    /// What's past the edges of something that scrolls mustn't show, which are inside its borders, as CSS has it.
+    /// What's past the edges of something that scrolls mustn't show, which are inside its borders, as CSS has it, and inside
+    /// its round corners, if it has them.
     fn enter_scrolled(&mut self, rect: Rect, element: &Element) {
         let (top, right, bottom, left) = border_sides(element);
         let inside = Rect::new(
@@ -4623,13 +4665,16 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
             (rect.height - top - bottom).max(0.0),
         );
         self.push_clip(inside);
+        if self.look.corner_radius > 0.0 || self.look.shaped {
+            self.round_off(element, rect);
+        }
     }
 
-    fn clip_to(&mut self, rect: Rect) {
+    fn clip_to(&mut self, rect: Rect, element: &Element) {
+        // On the way to something placed by itself, this element wasn't entered.
+        self.read_look(element);
         // What's cut to a rectangle in from its edges, as CSS's `clip-path: inset()` says, is cut off there.
-        let rect = if self.look.shaped && !self.entered.is_null() {
-            // SAFETY: what's cut off at its edges is the thing just entered, which is still being visited.
-            let element = unsafe { &*self.entered };
+        let cut = if self.look.shaped {
             match element.props.get("clip_path") {
                 Some(PropValue::Str(said)) => inset_rect(said.as_str(), rect).unwrap_or(rect),
                 _ => rect,
@@ -4637,37 +4682,22 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
         } else {
             rect
         };
-        self.push_clip(rect);
-        // What's cut off by something with round corners, as an avatar's picture is, is cut off at them too.
-        let depth = self.clips.len();
-        self.rounded.retain(|one| one.0 < depth);
-        if self.look.corner_radius > 0.0 {
-            let left = snap(rect.x * self.scale);
-            let top = snap(rect.y * self.scale);
-            let area = [
-                left,
-                top,
-                snap((rect.x + rect.width) * self.scale) - left,
-                snap((rect.y + rect.height) * self.scale) - top,
-            ];
-            let radius = fitting_radius(self.look.corner_radius * self.scale, area);
-            self.rounded.push((depth, area, radius));
+        self.push_clip(cut);
+        // What's in something with round corners, as an avatar's picture is, is cut off at them too.
+        if self.look.corner_radius > 0.0 || self.look.shaped {
+            self.round_off(element, rect);
         }
     }
 
     fn unclip(&mut self) {
-        self.finish_batch();
-        self.clips.pop();
-        let depth = self.clips.len();
-        self.rounded.retain(|one| one.0 <= depth);
+        self.pop_clip();
     }
 
     fn exit_scrolled(&mut self, rect: Rect, info: ScrollInfo, element: &Element) {
         if matches!(element.props.get("scrollbar_style"), Some(PropValue::Str(style)) if style.as_str() == "classic")
         {
             self.paint_classic_scrollbars(rect, info, element);
-            self.finish_batch();
-            self.clips.pop();
+            self.pop_clip();
             return;
         }
         // What it looks like can be said, as CSS's scrollbars do, with a size that's all of it and colors for its thumb and track.
@@ -4684,8 +4714,7 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
             ),
         };
         if thickness <= 0.0 {
-            self.finish_batch();
-            self.clips.pop();
+            self.pop_clip();
             return;
         }
         let radius = if said.is_some() { 0.0 } else { thickness / 2.0 };
@@ -4735,8 +4764,7 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
                 radius,
             ));
         }
-        self.finish_batch();
-        self.clips.pop();
+        self.pop_clip();
     }
 
     #[inline]
@@ -4753,7 +4781,6 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
         let right = snap((rect.x + rect.width) * self.scale);
         let bottom = snap((rect.y + rect.height) * self.scale);
         let mut seen = self.clip().overlaps(left, top, right, bottom);
-        self.entered = element;
         self.read_look(element);
         if let Some(color) = self.look.text_color {
             if !element.children.is_empty() {
@@ -4769,7 +4796,6 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
                 if background.a > 0 {
                     let area = [left, top, right - left, bottom - top];
                     let radius = fitting_radius(self.look.corner_radius * self.scale, area);
-                    let (area, radius) = self.round_in_clip(area, radius);
                     self.quads.push(solid_quad(area, background, radius));
                 }
             }
@@ -4843,8 +4869,6 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
         {
             self.work.ancestor_passes = self.work.ancestor_passes.saturating_add(1);
         }
-        // What's cut off here is only what scrolls, not what was last entered.
-        self.entered = std::ptr::null();
         if let Some(color) = passed_text_color(element) {
             self.colors
                 .push((std::ptr::from_ref(element) as usize, color));
@@ -5292,8 +5316,8 @@ fn a_scene_says_where_something_is_drawn() {
             quad([300.0, 200.0, 20.0, 20.0], [0; 4], 255),
         ],
         batches: vec![
-            Batch { first: 0, count: 3, clip: everywhere, image: 0, transform: 0, filter: 0 },
-            Batch { first: 3, count: 1, clip: everywhere, image: 7, transform: 0, filter: 0 },
+            Batch { first: 0, count: 3, clip: everywhere, image: 0, transform: 0, filter: 0 , round: 0},
+            Batch { first: 3, count: 1, clip: everywhere, image: 7, transform: 0, filter: 0 , round: 0},
             Batch {
                 first: 4,
                 count: 1,
@@ -5301,6 +5325,7 @@ fn a_scene_says_where_something_is_drawn() {
                 image: 0,
                 transform: 1,
                 filter: 0,
+                round: 0,
             },
         ],
         ..Scene::default()
@@ -5316,7 +5341,7 @@ fn a_scene_says_where_something_is_drawn() {
     assert!(!scene.draws_at(380.0, 280.0));
     let cut = Scene {
         quads: vec![quad([0.0, 0.0, 400.0, 300.0], [0; 4], 255)],
-        batches: vec![Batch { first: 0, count: 1, clip: PixelRect { left: 0, top: 0, right: 100, bottom: 100 }, image: 0, transform: 0, filter: 0 }],
+        batches: vec![Batch { first: 0, count: 1, clip: PixelRect { left: 0, top: 0, right: 100, bottom: 100 }, image: 0, transform: 0, filter: 0 , round: 0}],
         ..Scene::default()
     };
     assert!(cut.draws_at(50.0, 50.0));

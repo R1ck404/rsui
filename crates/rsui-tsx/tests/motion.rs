@@ -137,6 +137,55 @@ fn a_width_that_is_a_share_moves() {
 }
 
 #[test]
+fn a_width_kept_between_a_least_and_a_most_moves() {
+    // From `min(300px, 50%)` to `clamp(400px, 60%, 800px)` in 200 wide, which are 100 and 400 there (the least wins): it goes
+    // from what the one comes to to what the other does, as a browser has it, where it used to go there at once. Turned back
+    // part way, it goes back from where it is.
+    let file = write(
+        "clamp",
+        r#"
+        import './app.css';
+        import { useState } from 'react';
+        import { PageWindow } from 'rsui/web';
+        export default function App() {
+            const [wide, setWide] = useState(false);
+            return (
+                <PageWindow><div>
+                    <button key="go" onClick={() => setWide(!wide)}>go</button>
+                    <div key="track" className="track"><div key="box" className={wide ? 'box wide' : 'box'} /></div>
+                </div></PageWindow>
+            );
+        }
+        "#,
+        r#"
+        .track { width: 200px; height: 10px; }
+        .box { width: min(300px, 50%); height: 10px; background: red; transition: width 300ms linear; }
+        .box.wide { width: clamp(400px, 60%, 800px); }
+        "#,
+    );
+    let mut hands = moving(&file);
+    assert!((hands.rect_of("box")[2] - 100.0).abs() < 0.01, "{:?}", hands.rect_of("box"));
+    let there = widths_after_click(&mut hands, "go", 25, |_, _| {});
+    assert!(there.iter().any(|&w| w > 120.0 && w < 380.0), "it's partway at some point: {there:?}");
+    assert!(there.windows(2).all(|pair| pair[1] >= pair[0] - 0.01), "only ever wider: {there:?}");
+    assert!((there.last().unwrap() - 400.0).abs() < 0.01, "and it gets there: {there:?}");
+    // Part way there, then back.
+    let mut turned = None;
+    let both = widths_after_click(&mut hands, "go", 25, |hands, step| {
+        if step == 8 {
+            turned = Some(hands.rect_of("box")[2]);
+            hands.click("go");
+            hands.settle();
+        }
+    });
+    let turned = turned.unwrap();
+    assert!(turned > 120.0 && turned < 380.0, "it was part way back: {both:?}");
+    let after = both[7];
+    assert!((after - turned).abs() < 60.0, "it goes back from where it was: {turned} then {both:?}");
+    assert!((both.last().unwrap() - 400.0).abs() < 0.01, "and gets there again: {both:?}");
+}
+
+#[test]
 fn shares_of_a_flex_box_move() {
     // Panes split by `flex-grow` shares, in a row 300 wide: going from 1 to 5 against a neighbour of 1 takes this one from
     // 150 to 250, which it glides to with `transition: flex-grow`, as a browser has it.

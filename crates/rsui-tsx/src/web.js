@@ -2722,8 +2722,8 @@ function compile(block, fontSize = 16, sorted = true) {
     addBlock(out, block, [{ tag: null, id: null, classes: [], attrs: [], pseudo: [], part: null, link: null, self: true }], fontSize);
     // Only a background that changes under the pointer is something rsui does by itself, and fades, as browsers don't.
     out.rules = out.rules.filter((rule) => {
-        // What only undoes an `inherit` before it says nothing here.
-        const said = Object.keys(rule.props).filter((key) => !(key.startsWith('__inherit_') && rule.props[key] === undefined));
+        // What only undoes an `inherit`, or what the block doesn't say, as `background` undoes a picture behind it, says nothing here.
+        const said = Object.keys(rule.props).filter((key) => rule.props[key] !== undefined || (!key.startsWith('__inherit_') && out.own[key] !== undefined));
         const background = said.length === 1 && rule.props.background !== undefined;
         const plain = rule.part === null && rule.classes.length === 0 && rule.attrs.length === 0 && rule.id === null && rule.pseudo.length === 1;
         const state = plain ? rule.pseudo[0].name : null;
@@ -4475,6 +4475,12 @@ function rulesNow(compiled, own) {
 
 const TEXT_TAGS = new Set(['span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'label', 'small', 'strong', 'em', 'b', 'i', 'pre', 'code', 'legend', 'blockquote', 'sup', 'sub', 'u', 's', 'mark', 'abbr', 'cite', 'kbd', 'time', 'del', 'ins', 'samp', 'var', 'dfn', 'q', 'data', 'output', 'bdi', 'bdo']);
 const SVG_TAGS = { svg: rsui.Svg, path: rsui.Path, g: rsui.G, circle: rsui.Circle, rect: rsui.Rect, line: rsui.Line, polyline: rsui.Polyline, polygon: rsui.Polygon, ellipse: rsui.Ellipse };
+/// How a shape is drawn, as SVG's attributes write it, with a `-`, each with the prop that says the same: `stroke-width="2"` is
+/// `strokeWidth={2}`. React passes an attribute written that way on as it is, and a browser draws with it, as a page's own HTML does.
+const SVG_DASHED_LOOKS = new Map([['stroke-width', 'strokeWidth'], ['stroke-linecap', 'strokeLinecap'], ['stroke-linejoin', 'strokeLinejoin'],
+    ['stroke-miterlimit', 'strokeMiterlimit'], ['stroke-dasharray', 'strokeDasharray'], ['stroke-dashoffset', 'strokeDashoffset'],
+    ['fill-rule', 'fillRule'], ['text-anchor', 'textAnchor'], ['font-size', 'fontSize'], ['font-family', 'fontFamily'],
+    ['font-weight', 'fontWeight'], ['font-style', 'fontStyle']]);
 /// What a browser says each element looks like by itself, which a page's own CSS goes over, as it's worked out in `declare.rs`, which
 /// does it once for every page there is. What's been asked for is kept here, as the same thing each time.
 const browserLooks = new Map();
@@ -4881,7 +4887,8 @@ function hostProps(tag, given) {
                 }
                 break;
             default:
-                out[name] = value;
+                // An `<svg>` says how what's in it is drawn as SVG writes it too, as `stroke-width="2"`.
+                out[tag === 'svg' ? SVG_DASHED_LOOKS.get(name) ?? name : name] = value;
         }
     }
     return out;
@@ -5036,9 +5043,11 @@ function Select({ children, value: given, defaultValue, onChange: changed, disab
     withInherited(look, useContext(ParentLook));
     const shown = look.__appearance ?? appearance;
     delete look.__appearance;
+    // What a browser draws by itself, unless the CSS says it'll draw its own.
+    const drawn = shown !== 'none';
     // As wide as its widest option, as a browser's is: each is there, one line high and nothing tall, under the one that shows.
     // In its own font, which what's measured needs said, with what CSS leaves to what it's in (`font: inherit`, as Bootstrap's
-    // is) from there, and as tall as its line height says.
+    // is) from there, and as tall as its line height says where the page draws it.
     const fontAround = useContext(InheritedFont);
     const size = look.fontSize ?? fontAround?.fontSize;
     const lineHeight = look.lineHeight ?? (typeof look.__lineScale === 'number' && typeof size === 'number' ? look.__lineScale * size : fontAround?.lineHeight);
@@ -5048,14 +5057,19 @@ function Select({ children, value: given, defaultValue, onChange: changed, disab
         fontWeight: look.fontWeight ?? fontAround?.fontWeight,
         fontStyle: look.fontStyle ?? fontAround?.fontStyle,
     });
-    const lined = typeof lineHeight === 'number' ? { ...font, lineHeight } : font;
+    // What it draws itself has its font's own line height, whatever the CSS says, as Chromium has it.
+    const lined = typeof lineHeight === 'number' && !drawn ? { ...font, lineHeight } : font;
     // One in an optgroup is measured four spaces in, as Chromium indents it under the group's label.
     const grouped = fromComponents && fromPage !== null ? [] : gathered.grouped;
     const widths = options.map((option, at) => make('text', { key: 'width-' + at, ...font, noWrap: true, keepWords: true, height: 0, opacity: 0 }, (grouped[at] === true ? '    ' : '') + option));
     // What it draws by itself isn't the page's text: its options are (see `pageTree`).
-    const label = make('group', { key: '__drawnOnlyLabel', inert: true, grow: 1 }, make('text', { key: 'shown', ...lined, ellipsis: true }, options[index] ?? ''), ...widths);
-    // What a browser draws by itself, unless the CSS says it'll draw its own.
-    const arrow = shown === 'none' ? null : make('text', { key: '__drawnOnlyArrow', inert: true, fontSize: 10, opacity: 0.7 }, '▾');
+    // Room inside what it draws itself, on top of the page's padding, 1 above and below and 4 at its start, and its arrow in a box
+    // 15 wide, 1 after its text, as Chromium has them.
+    const start = look.textDirection === 'rtl' ? 'paddingRight' : 'paddingLeft';
+    const label = make('group', { key: '__drawnOnlyLabel', inert: true, grow: 1, ...(drawn ? { paddingY: 1, [start]: 4 } : null) }, make('text', { key: 'shown', ...lined, ellipsis: true }, options[index] ?? ''), ...widths);
+    const arrow = drawn
+        ? make('group', { key: '__drawnOnlyArrow', inert: true, width: 16, [start]: 1, justify: 'center', align: 'center' }, make('text', { key: 'arrow', fontSize: 10, opacity: 0.7 }, '▾'))
+        : null;
     // Chooses an option, as the person did: the page hears `input` and then `change` on the element, whose `value` is the new one
     // by then, and React's `onChange` hears the `change`. Choosing what's chosen already says nothing.
     const choose = (at) => {
@@ -5197,7 +5211,7 @@ function Select({ children, value: given, defaultValue, onChange: changed, disab
           )
         : null;
     // Enter and Space aren't clicks on it, as they are on a button: they're its own keys (see `onKeyPress`).
-    return make('button', { direction: 'row', align: 'center', gap: 4, cursor: 'default', ...look, disabled, onClick, onKeyPress, keyClicks: false }, label, arrow, menu, kept);
+    return make('button', { direction: 'row', align: 'center', cursor: 'default', ...look, disabled, onClick, onKeyPress, keyClicks: false }, label, arrow, menu, kept);
 }
 
 /// `<select>` as a page has it: an element of the page as any other is (see `Styled`), which keeps what's chosen in it when nothing
@@ -5312,19 +5326,6 @@ FlowContext.Provider.displayName = 'FlowContext';
 
 /// What sits on a line by itself in a page, as big as what's in it, rather than as wide as what it's in.
 const INLINE_BOXES = new Set(['button', 'input', 'select', 'textarea', 'img', 'svg', 'video', 'canvas', 'iframe', 'progress', 'meter']);
-
-/// Keeps something that sits on a line from being stretched across a block it's in, as a page has it. In a flex box or a grid, it's
-/// stretched as those do. `layout.rs` does the same for what `Styled` makes.
-function fitInFlow(look, tag, flow, around = undefined) {
-    // What goes on a line is as wide as it is, as a span with a border or a background shows.
-    const inline = look.__inline ?? (INLINE_BOXES.has(tag) || (INLINE_TEXT_TAGS.has(tag) && look.__block !== true && look.position !== 'absolute'));
-    delete look.__inline;
-    if (inline && flow === 'block' && look.width === undefined && look.display === undefined) {
-        look.fitWidth = true;
-        // Where it is on its line, which is as the text of what it's in is aligned, `around`.
-        look.alignSelf ??= around === 'center' ? 'center' : around === 'right' ? 'end' : 'start';
-    }
-}
 
 /// Each element in `children` with this context around it, one by one, so that they stay where they are among what's around them.
 /// One around all of them would hold them in a box of their own.
@@ -6778,7 +6779,8 @@ const TEXTAREA_GRIP = "data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/s
 
 /// A textarea's own look on top of what CSS says: the grip a browser draws in the corner of one that can be made bigger, unless
 /// `resize: none` says it can't or the page draws a picture there itself, and as wide as `cols` characters of its font (20
-/// unless it says) and a scrollbar when nothing says how wide. A character of a monospace font is 0.55 of its size across.
+/// unless it says), to the next whole pixel, and a scrollbar, which is 15 wide, unless it's hidden, when nothing says how wide, as
+/// Chromium has it. A character of a monospace font is 0.55 of its size across.
 function textareaLook(look, cols) {
     if (look.__resize !== 'none' && look.backgroundImage === undefined && look.backgroundGradient === undefined) {
         look.backgroundImage = TEXTAREA_GRIP;
@@ -6795,7 +6797,8 @@ function textareaLook(look, cols) {
         const around = look.__boxSizing === 'border-box'
             ? number(look.paddingLeft) + number(look.paddingRight) + 2 * number(look.borderWidth)
             : 0;
-        look.width = (Number(cols ?? 20) * 0.5498 * size) + 17 + around;
+        const scrollbar = look.__overflowY === 'hidden' || look.__overflowY === 'clip' ? 0 : 15;
+        look.width = Math.ceil(Number(cols ?? 20) * 0.5498 * size) + scrollbar + around;
     }
 }
 
@@ -6891,15 +6894,38 @@ natives.cssKinds(layout, [NestedRules.Provider, InheritedFont.Provider, FlowCont
 const FONT_PROPS = ['fontSize', 'fontWeight', 'fontFamily', 'fontStyle', 'textAlign', 'lineHeight', '__lineScale', 'color', '__listStyle', 'keepWords', '__whiteSpace', '__sizeSaid', 'letterSpacing', 'wordSpacing', 'textShadow', 'textIndent', 'textDirection', 'tabularNums', '__case', 'textWrap'];
 const COLOR_KEYS = ['background', 'borderColor', 'borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor', 'shadowColor', 'outlineColor', 'fill', 'stroke', 'hover', 'pressed'];
 
-/// Puts in the color of the text for each color that says it's that.
+/// Puts in the color of the text for each color that says it's that, or is worked out from it.
 function withCurrentColor(look, current) {
     for (const key of COLOR_KEYS) {
-        if (look[key] === 'currentcolor') {
-            if (current === undefined) {
-                delete look[key];
-            } else {
-                look[key] = current;
-            }
+        const said = look[key];
+        if (said !== 'currentcolor' && !waitsOnCurrentColor(said)) {
+            continue;
+        }
+        const paint = said === 'currentcolor' ? current : mixedWithCurrent(said, current);
+        if (paint === undefined) {
+            delete look[key];
+        } else {
+            look[key] = paint;
+        }
+    }
+    return look;
+}
+
+/// Whether a color is worked out from the color of the text it's with, as `color-mix(in oklab, currentcolor 50%, transparent)` is,
+/// which is kept as it's written until that's known: see `waits_on_current_color` in `css.rs`.
+const waitsOnCurrentColor = (paint) => typeof paint === 'string' && paint !== 'currentcolor' && paint.includes('currentcolor');
+
+/// What such a color comes to with the color of the text, `current`, in it, or `undefined` while that isn't known.
+const mixedWithCurrent = (paint, current) => (current === undefined ? undefined : color(paint.replaceAll('currentcolor', current)));
+
+/// Puts in the color of a part's text, as `::placeholder`'s, where it's worked out from `current`, the color of the text it's part of.
+function withTextColor(look, current) {
+    if (waitsOnCurrentColor(look.color)) {
+        const paint = mixedWithCurrent(look.color, current);
+        if (paint === undefined) {
+            delete look.color;
+        } else {
+            look.color = paint;
         }
     }
     return look;
@@ -9940,7 +9966,8 @@ function makeStyled(target, settings = {}) {
                 const current = look.color ?? fontAbove?.color;
                 for (const name of ['before', 'after']) {
                     if (parts[name] !== undefined) {
-                        parts[name] = withCurrentColor({ ...parts[name] }, parts[name].color ?? current);
+                        const part = withTextColor({ ...parts[name] }, current);
+                        parts[name] = withCurrentColor(part, part.color ?? current);
                     }
                 }
                 children = withParts(children, parts.before ?? null, parts.after ?? null, { nth, props });
@@ -10395,6 +10422,7 @@ function makeStyled(target, settings = {}) {
             }
             for (const name of ['before', 'after']) {
                 if (parts[name] !== undefined) {
+                    withTextColor(parts[name], current);
                     withCurrentColor(parts[name], parts[name].color ?? current);
                 }
             }
@@ -18585,8 +18613,15 @@ const SHAPE_LOOKS = ['fill', 'stroke', 'strokeWidth', 'strokeLinecap', 'strokeLi
 function shapePartsOf(owners, variables = null, names = null) {
     return (id, tag = null, given = {}) => {
         const look = {};
-        // What its presentation attributes say with `var()` is what CSS starts from, as SVG has it, for that to be worked out with
-        // the variables around it: shadcn's chart fills its bars with `fill="var(--color-desktop)"`.
+        // What its presentation attributes say as SVG writes them, as `stroke-width="2"`, is what CSS starts from, as SVG has it.
+        for (const name in given) {
+            const prop = SVG_DASHED_LOOKS.get(name);
+            if (prop !== undefined) {
+                look[prop] = given[name];
+            }
+        }
+        // So is what they say with `var()`, for that to be worked out with the variables around it: shadcn's chart fills its bars
+        // with `fill="var(--color-desktop)"`.
         for (const key of ['fill', 'stroke']) {
             if (typeof given[key] === 'string' && given[key].includes('var(')) {
                 look[key] = withVariables(given[key], 0, variables);
@@ -19446,7 +19481,7 @@ function makeHost(tag, props, children, scroll, parts = {}, known = undefined) {
             own.placeholder = '-- : --';
             own.placeholderColor = own.color;
         } else if (parts.placeholder?.color !== undefined) {
-            own.placeholderColor = parts.placeholder.color;
+            own.placeholderColor = withTextColor({ color: parts.placeholder.color }, own.color).color;
         }
         if (parts.placeholder?.fontStyle === 'italic' || parts.placeholder?.fontStyle === 'oblique') {
             own.placeholderItalic = true;
@@ -19603,6 +19638,10 @@ function tagElement(tag) {
     }
     if (tag === 'canvas') {
         return PageCanvas;
+    }
+    // A web page from elsewhere, which the page's CSS places like any element.
+    if (tag === 'webview') {
+        return require('rsui/webview').PageWebView;
     }
     if (tag === 'template') {
         return PageTemplate;
@@ -20628,10 +20667,13 @@ function PageWindow({ children, ...rest }) {
     if (children !== undefined && children !== null) {
         // What's right in the page goes on lines as what's in any block does (see `intoLines`), and spaces between blocks are
         // nothing, as on a page: a `{'\n'}` between two `<div>`s in it was a line of its own, 40px tall. In a flex box or a grid, a
-        // space by itself is nothing either.
+        // space by itself is nothing either. What's only text and elements whose kind is known, all going along a line, is on a line
+        // too, as two inline-block `<div>`s side by side are, which would otherwise be a column of their own, as `body` is (a block
+        // has itself as the line for that: see `along` in `Styled`). A component that hasn't been drawn yet isn't known to go
+        // along one, so it isn't put on a line it would start again in once it's found to.
         children = body.__flex === true || body.display === 'grid'
             ? Children.toArray(children).filter((child) => typeof child !== 'string' || child.trim() !== '')
-            : intoLines(children, false, font);
+            : intoLines(children, slotted(children).every((child) => typeof child === 'string' || typeof child === 'number' || knownFlow(heldInNth(child))), font);
     }
     let inner;
     if (body.__flex === true || body.display === 'grid') {

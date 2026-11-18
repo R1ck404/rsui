@@ -208,12 +208,14 @@ fn between(kind: Kind, from: &PropValue, to: &PropValue, along: f64) -> Option<P
             }
             // A length that's a share of what it's in, as a Switch's thumb's `calc(100% - 16.5px)`, moves as CSS has it: its
             // share and its pixels each go their own way, and it's written as layout reads it, `"P% + Xpx"`.
-            let ((share_a, pixels_a), (share_b, pixels_b)) = (length(from)?, length(to)?);
-            let (share, pixels) = (
-                share_a + (share_b - share_a) * along,
-                pixels_a + (pixels_b - pixels_a) * along,
-            );
-            Some(PropValue::from(format!("{share}% + {pixels}px").as_str()))
+            if let (Some((share_a, pixels_a)), Some((share_b, pixels_b))) = (length(from), length(to)) {
+                let (share, pixels) = (
+                    share_a + (share_b - share_a) * along,
+                    pixels_a + (pixels_b - pixels_a) * along,
+                );
+                return Some(PropValue::from(format!("{share}% + {pixels}px").as_str()));
+            }
+            mixed(from, to, along)
         }
         Kind::Color => {
             let (PropValue::Int(a), PropValue::Int(b)) = (from, to) else {
@@ -255,11 +257,16 @@ fn between(kind: Kind, from: &PropValue, to: &PropValue, along: f64) -> Option<P
             };
             // A list of transform functions that starts the same as a longer one has the rest as moving nothing, as CSS has
             // it: a Slider's thumb goes from `translate(-50%, -50%)` to `translate(-50%, -50%) scale(1.05)`.
-            text_between(&a, &b, along)
-                .or_else(|| {
+            let moved = |a: String, b: String| {
+                text_between(&a, &b, along).or_else(|| {
                     let (a, b) = padded(a, b);
                     text_between(&a, &b, along)
                 })
+            };
+            moved(a.clone(), b.clone())
+                // Functions written differently that are the same move as that, as CSS has them: `translateX(-208px)` from
+                // `translate(0, 0)`, and a share and pixels together, as a drawer's `translate(calc(-100% - 8px))`, from none.
+                .or_else(|| moved(as_primitives(&a)?, as_primitives(&b)?))
                 .map(|text| PropValue::from(text.as_str()))
         }
         Kind::Shadows => {
@@ -525,6 +532,169 @@ fn functions_of(text: &str) -> Option<Vec<&str>> {
     Some(out)
 }
 
+/// A transform's functions each written as the one CSS moves it as, with every argument said: `translate(x, y)` for each way of
+/// moving, each length in it as a share and pixels (`calc(-100% + -8px)`), `scale(x, y)` and `skew(x, y)`. `None` if it isn't
+/// only functions, or a length in it isn't only a share and pixels.
+fn as_primitives(text: &str) -> Option<String> {
+    let mut out = Vec::new();
+    for function in functions_of(text)? {
+        let open = function.find('(')?;
+        let name = function[..open].to_ascii_lowercase();
+        let parts = top_level_parts(&function[open + 1..function.len() - 1]);
+        let part = |index: usize| parts.get(index).copied();
+        let pair = |x: Option<&str>, y: Option<&str>, still: &str| (x.unwrap_or(still).to_owned(), y.unwrap_or(still).to_owned());
+        match (name.as_str(), parts.len()) {
+            ("translate", 1 | 2) | ("translatex" | "translatey", 1) => {
+                let (x, y) = match name.as_str() {
+                    "translatex" => pair(part(0), None, "0"),
+                    "translatey" => pair(None, part(0), "0"),
+                    _ => pair(part(0), part(1), "0"),
+                };
+                out.push(format!("translate({}, {})", share_and_pixels(&x)?, share_and_pixels(&y)?));
+            }
+            ("scale", 1 | 2) | ("scalex" | "scaley", 1) => {
+                let (x, y) = match name.as_str() {
+                    "scalex" => pair(part(0), None, "1"),
+                    "scaley" => pair(None, part(0), "1"),
+                    _ => pair(part(0), part(1).or(part(0)), "1"),
+                };
+                out.push(format!("scale({x}, {y})"));
+            }
+            ("skew", 1 | 2) | ("skewx" | "skewy", 1) => {
+                let (x, y) = match name.as_str() {
+                    "skewy" => pair(None, part(0), "0deg"),
+                    _ => pair(part(0), part(1), "0deg"),
+                };
+                out.push(format!("skew({x}, {y})"));
+            }
+            _ => out.push(function.to_owned()),
+        }
+    }
+    Some(out.join(" "))
+}
+
+/// What's between a function's brackets, split at the commas outside any brackets of its own.
+fn top_level_parts(inside: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (at, c) in inside.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(inside[start..at].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(inside[start..].trim());
+    parts.into_iter().filter(|part| !part.is_empty()).collect()
+}
+
+/// A length that's some share of what it's in and some pixels, as `calc(-100% - 8px)`, written as both, `calc(-100% + -8px)`,
+/// so that any two are written alike and can move from one to the other. `None` if it's anything else.
+fn share_and_pixels(text: &str) -> Option<String> {
+    let mut reading = Shares { text: text.as_bytes(), at: 0 };
+    let (share, pixels, _) = reading.sum()?;
+    reading.spaces();
+    if reading.at != reading.text.len() || !share.is_finite() || !pixels.is_finite() {
+        return None;
+    }
+    // Rounded to what can be seen, and with no `-0`.
+    let round = |value: f64| (value * 10_000.0).round() / 10_000.0 + 0.0;
+    Some(format!("calc({}% + {}px)", round(share), round(pixels)))
+}
+
+/// Reads a length of shares and pixels, with `calc()`, `+ - * /` and brackets, as `(share, pixels, plain)`, where `plain` is a
+/// number with no unit, which is what can multiply or divide, and which is pixels as a length (a 0 with no unit is none).
+struct Shares<'a> {
+    text: &'a [u8],
+    at: usize,
+}
+
+impl Shares<'_> {
+    fn spaces(&mut self) {
+        while self.text.get(self.at).is_some_and(u8::is_ascii_whitespace) {
+            self.at += 1;
+        }
+    }
+
+    fn sum(&mut self) -> Option<(f64, f64, bool)> {
+        let (mut share, mut pixels, mut plain) = self.product()?;
+        loop {
+            self.spaces();
+            let sign = match self.text.get(self.at) {
+                Some(b'+') => 1.0,
+                Some(b'-') => -1.0,
+                _ => return Some((share, pixels, plain)),
+            };
+            self.at += 1;
+            let (more_share, more_pixels, more_plain) = self.product()?;
+            share += sign * more_share;
+            pixels += sign * more_pixels;
+            plain = plain && more_plain;
+        }
+    }
+
+    fn product(&mut self) -> Option<(f64, f64, bool)> {
+        let mut found = self.single()?;
+        loop {
+            self.spaces();
+            let times = match self.text.get(self.at) {
+                Some(b'*') => true,
+                Some(b'/') => false,
+                _ => return Some(found),
+            };
+            self.at += 1;
+            let next = self.single()?;
+            let (length, by) = if times && found.2 {
+                (next, found.1)
+            } else if next.2 && (times || next.1 != 0.0) {
+                (found, if times { next.1 } else { 1.0 / next.1 })
+            } else {
+                return None;
+            };
+            found = (length.0 * by, length.1 * by, length.2);
+        }
+    }
+
+    fn single(&mut self) -> Option<(f64, f64, bool)> {
+        self.spaces();
+        let rest = &self.text[self.at..];
+        if rest.first() == Some(&b'(') || rest.starts_with(b"calc(") {
+            self.at += if rest[0] == b'(' { 1 } else { "calc(".len() };
+            let inside = self.sum()?;
+            self.spaces();
+            if self.text.get(self.at) != Some(&b')') {
+                return None;
+            }
+            self.at += 1;
+            return Some(inside);
+        }
+        let start = self.at;
+        if matches!(self.text.get(self.at), Some(b'-' | b'+')) {
+            self.at += 1;
+        }
+        while self.text.get(self.at).is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.') {
+            self.at += 1;
+        }
+        let number = std::str::from_utf8(&self.text[start..self.at]).ok()?.parse::<f64>().ok()?;
+        let rest = &self.text[self.at..];
+        if rest.first() == Some(&b'%') {
+            self.at += 1;
+            Some((number, 0.0, false))
+        } else if rest.starts_with(b"px") {
+            self.at += 2;
+            Some((0.0, number, false))
+        } else if rest.first().is_some_and(u8::is_ascii_alphabetic) {
+            None
+        } else {
+            Some((0.0, number, true))
+        }
+    }
+}
+
 /// `a` and `b` with the shorter of two lists of transform functions made as long as the other, with what it's missing moving
 /// nothing, if each function it has is the same as the other's in the same place. Otherwise they're as they were.
 fn padded(a: String, b: String) -> (String, String) {
@@ -546,6 +716,56 @@ fn padded(a: String, b: String) -> (String, String) {
     }
     let long = long.join(" ");
     if first.len() < second.len() { (grown, long) } else { (long, grown) }
+}
+
+/// Part of the way between two lengths, one of which is a `min()`, `max()` or `clamp()` of shares, as
+/// `width: clamp(50px, 50%, 300px)` is, or is part of the way between two already. What each comes to is only known once what it's
+/// in is, so it's written for layout to work out, as `"mix(0.25, 20px, clamp(50px, 50%, 300px))"` (`Mix` in rsui-layout), which
+/// is what a browser does: it mixes what each end comes to. Going back to either end of a mix it's part way along is the same mix
+/// going back, as `mix(t, mix(s, a, b), a)` is `mix(s - t * s, a, b)`; going on to something else, it goes from the end it's
+/// nearer.
+fn mixed(from: &PropValue, to: &PropValue, along: f64) -> Option<PropValue> {
+    let end = |value: &PropValue| -> Option<String> {
+        match value {
+            PropValue::Int(pixels) => Some(format!("{pixels}px")),
+            PropValue::Float(pixels) => Some(format!("{pixels}px")),
+            PropValue::Str(text) => {
+                let text = text.as_str().trim();
+                let kept = ["min(", "max(", "clamp(", "mix("].iter().any(|name| text.starts_with(name));
+                (kept || length(value).is_some()).then(|| text.to_owned())
+            }
+            PropValue::Bool(_) => None,
+        }
+    };
+    let (mut from, to) = (end(from)?, end(to)?);
+    if let Some((was, a, b)) = mix_parts(&from) {
+        if to == a {
+            return Some(PropValue::from(format!("mix({}, {a}, {b})", was - was * along).as_str()));
+        }
+        if to == b {
+            return Some(PropValue::from(format!("mix({}, {a}, {b})", was + (1.0 - was) * along).as_str()));
+        }
+        from = if was < 0.5 { a } else { b }.to_owned();
+    }
+    Some(PropValue::from(format!("mix({along}, {from}, {to})").as_str()))
+}
+
+/// How far along a `"mix(along, from, to)"` is and its ends, as `mixed` writes it.
+fn mix_parts(text: &str) -> Option<(f64, &str, &str)> {
+    let inside = text.strip_prefix("mix(")?.strip_suffix(')')?;
+    let (along, ends) = inside.split_once(',')?;
+    // The comma between the ends is the one outside every bracket.
+    let mut depth = 0;
+    let middle = ends.char_indices().find_map(|(at, c)| {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some(at),
+            _ => {}
+        }
+        None
+    })?;
+    Some((along.trim().parse().ok()?, ends[..middle].trim(), ends[middle + 1..].trim()))
 }
 
 /// A length as `(share, pixels)`, from a number of pixels, `"40%"`, `"12px"` or `"100% + -16.5px"`, as layout writes them.
@@ -1127,7 +1347,7 @@ fn looks_the_same(kind: Kind, name: Symbol, a: &PropValue, b: &PropValue) -> boo
         Kind::Number => match (number(a), number(b)) {
             (Some(a), Some(b)) => (a - b).abs() < close,
             // Lengths with a share in them are the same if they say the same: how big a share is takes knowing what it's of.
-            _ => matches!((length(a), length(b)), (Some((share_a, a)), Some((share_b, b)))
+            _ => a == b || matches!((length(a), length(b)), (Some((share_a, a)), Some((share_b, b)))
                 if (share_a - share_b).abs() < 0.001 && (a - b).abs() < close),
         },
         Kind::Color => a == b,
@@ -2178,6 +2398,32 @@ opacity n 0.2 0 ease");
     }
 
     #[test]
+    fn transforms_written_differently_move_as_the_same_functions() {
+        let at = |from: &str, to: &str, along: f64| between(Kind::Text, &PropValue::from(from), &PropValue::from(to), along);
+        let said = |text: &str| Some(PropValue::from(text));
+        // One way of moving to another, as CSS moves them, as `translate()`.
+        assert_eq!(at("translate(0, 0)", "translateX(-208px)", 0.25), said("translate(calc(0% + -52px), calc(0% + 0px))"));
+        assert_eq!(at("translateY(10px)", "translate(4px)", 0.5), said("translate(calc(0% + 2px), calc(0% + 5px))"));
+        // A share and pixels together, as a drawer that goes out of sight past its gap has it, to and from nothing.
+        assert_eq!(
+            at("translate(calc(calc(100% + 8px) * -1), 0)", "translate(0, 0)", 0.5),
+            said("translate(calc(-50% + -4px), calc(0% + 0px))")
+        );
+        assert_eq!(at("none", "translateX(calc(-100% - 8px))", 0.5), said("translateX(calc(-50% - 4px))"));
+        assert_eq!(at("translateX(calc(-100% - 8px))", "translate(0, 0)", 0.75), said("translate(calc(-25% + -2px), calc(0% + 0px))"));
+        // What's partway is written so that it goes on from there.
+        assert_eq!(
+            at("translate(calc(-50% + -4px), calc(0% + 0px))", "translateX(0)", 0.5),
+            said("translate(calc(-25% + -2px), calc(0% + 0px))")
+        );
+        assert_eq!(at("scale(2)", "scaleX(1)", 0.5), said("scale(1.5, 1.5)"));
+        // What's written alike is as it was.
+        assert_eq!(at("translateY(100%)", "translateY(0)", 0.25), said("translateY(75%)"));
+        // Lengths that aren't only shares and pixels still don't move.
+        assert_eq!(at("translateX(1em)", "translate(4px, 0)", 0.5), None);
+    }
+
+    #[test]
     fn numbers_in_text_move_and_the_rest_stays() {
         assert_eq!(
             text_between(
@@ -2236,6 +2482,29 @@ opacity n 0.2 0 ease");
         let left = Symbol::new("left");
         assert!(looks_the_same(Kind::Number, left, &to, &PropValue::from("100% + -16.52px")));
         assert!(!looks_the_same(Kind::Number, left, &to, &PropValue::from("99% + -16.5px")));
+    }
+
+    #[test]
+    fn a_length_kept_between_a_least_and_a_most_moves_as_what_it_comes_to() {
+        // From `min(300px, 50%)` to `clamp(400px, 60%, 800px)`, which layout works out in what it's in each time.
+        let (from, to) = (PropValue::from("min(300px, 50%)"), PropValue::from("clamp(400px, 60%, 800px)"));
+        let quarter = between(Kind::Number, &from, &to, 0.25);
+        assert_eq!(quarter, Some(PropValue::from("mix(0.25, min(300px, 50%), clamp(400px, 60%, 800px))")));
+        // To or from a plain length too.
+        assert_eq!(
+            between(Kind::Number, &PropValue::Float(20.0), &to, 0.5),
+            Some(PropValue::from("mix(0.5, 20px, clamp(400px, 60%, 800px))"))
+        );
+        // Turned back a quarter of the way there, it goes back along the same mix, and on to it again the same way.
+        let quarter = quarter.unwrap();
+        assert_eq!(between(Kind::Number, &quarter, &from, 0.5), Some(PropValue::from("mix(0.125, min(300px, 50%), clamp(400px, 60%, 800px))")));
+        assert_eq!(between(Kind::Number, &quarter, &to, 0.5), Some(PropValue::from("mix(0.625, min(300px, 50%), clamp(400px, 60%, 800px))")));
+        // Somewhere else goes from the end it's nearer.
+        assert_eq!(between(Kind::Number, &quarter, &PropValue::from("12px"), 0.5), Some(PropValue::from("mix(0.5, min(300px, 50%), 12px)")));
+        // What isn't a length still can't be partway to one.
+        assert_eq!(between(Kind::Number, &PropValue::from("auto"), &to, 0.5), None);
+        assert!(looks_the_same(Kind::Number, Symbol::new("width"), &to, &to.clone()));
+        assert!(!looks_the_same(Kind::Number, Symbol::new("width"), &to, &from));
     }
 
     #[test]

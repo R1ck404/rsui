@@ -207,9 +207,24 @@ function withoutBorderSides(props) {
     }
 }
 
+/// What a shorthand that says every side's color puts back over what was said of one side: each side has the color they all have.
+function withoutBorderSideColors(props) {
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+        props['border' + side + 'Color'] = undefined;
+    }
+}
+
+/// What the `background` shorthand puts back to how it is if nothing says, besides its color.
+function withoutBackgroundLayers(props) {
+    for (const key of ['backgroundImage', 'backgroundGradient', 'backgroundRepeat', 'backgroundPosition', 'backgroundSize', 'backgroundClip']) {
+        props[key] = undefined;
+    }
+}
+
 function setBorder(props, value) {
     if (value === 'none' || value === '0') {
         withoutBorderSides(props);
+        withoutBorderSideColors(props);
         props.borderWidth = 0;
         return;
     }
@@ -239,6 +254,9 @@ function setBorder(props, value) {
     if (found && props.borderWidth === undefined) {
         // It's 3 as CSS has it if it's not said, which is more than anyone meant.
         props.borderWidth = 1;
+    }
+    if (found) {
+        withoutBorderSideColors(props);
     }
 }
 
@@ -1157,6 +1175,12 @@ function declareOneSaid(props, name, value, fontSize, given) {
         }
         case 'background':
         case 'background-color': {
+            if (value === '') {
+                break;
+            }
+            if (name === 'background') {
+                withoutBackgroundLayers(props);
+            }
             if (value === 'none' || value === 'inherit' || value === 'unset' || value === 'initial') {
                 props.background = '#00000000';
                 break;
@@ -1165,12 +1189,7 @@ function declareOneSaid(props, name, value, fontSize, given) {
                 props.background = 'currentcolor';
                 break;
             }
-            if (value === '') {
-                break;
-            }
             if (name === 'background') {
-                delete props.backgroundImage;
-                delete props.backgroundGradient;
                 if (setBackgroundLayers(props, value, true)) {
                     break;
                 }
@@ -1194,8 +1213,8 @@ function declareOneSaid(props, name, value, fontSize, given) {
             break;
         }
         case 'background-image': {
-            delete props.backgroundImage;
-            delete props.backgroundGradient;
+            props.backgroundImage = undefined;
+            props.backgroundGradient = undefined;
             if (!setBackgroundLayers(props, value, false) && value !== 'none') {
                 notHere(name + ' as ' + value);
             }
@@ -1291,7 +1310,7 @@ function declareOneSaid(props, name, value, fontSize, given) {
             if (value === 'text') {
                 props.backgroundClip = 'text';
             } else {
-                delete props.backgroundClip;
+                props.backgroundClip = undefined;
             }
             break;
         case 'clip-path':
@@ -1429,6 +1448,7 @@ function declareOneSaid(props, name, value, fontSize, given) {
         case 'border-color': {
             const parts = words(value);
             if (parts.length < 2) {
+                withoutBorderSideColors(props);
                 setColor('borderColor');
                 break;
             }
@@ -2093,7 +2113,7 @@ button { box-sizing: border-box; font-family: Arial; font-size: 13.3333px; line-
 select { box-sizing: border-box; }
 input { -rsui-natural-width: 169px; }
 input, select { font-family: Arial; font-size: 13.3333px; color: black; padding: 2px 3px; border: 1px solid #767676; border-radius: 2px; background-color: white; }
-select { padding: 1px 6px 1px 4px; }
+select { padding: 0; }
 checkbox { margin: 3px 3px 3px 4px; }
 radio { margin: 3px 3px 0 5px; }
 summary { list-style-type: disclosure-closed; }

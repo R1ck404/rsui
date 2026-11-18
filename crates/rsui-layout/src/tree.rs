@@ -820,9 +820,10 @@ pub trait LayoutVisitor {
     fn passed(&mut self, _element: &Element) {}
     /// Right after [`enter`](Self::enter), for text made of parts, whose children aren't visited.
     fn paragraph(&mut self, _element: &Element, _rect: Rect) {}
-    /// On the way to something that's placed by itself, going through something that scrolls, which cuts off what's past its
-    /// edges, as [`enter_scrolled`](Self::enter_scrolled) does, without being drawn this time.
-    fn clip_to(&mut self, _rect: Rect) {}
+    /// What's in `element`, which is at `rect`, is cut off at its edges, as CSS's `overflow: hidden` has it: right after
+    /// [`enter`](Self::enter), or on the way to something that's placed by itself, going through something that scrolls or
+    /// cuts it off, without that being drawn this time.
+    fn clip_to(&mut self, _rect: Rect, _element: &Element) {}
     /// Coming back out of what [`clip_to`](Self::clip_to) was called for.
     fn unclip(&mut self) {}
     /// Opt-in paint-only pruning after an explicit clip has been pushed. Return
@@ -2012,7 +2013,7 @@ impl Layout {
             visitor.passing(node);
             let clips = current.has(SCROLLS) || cut.get(at).copied().unwrap_or(false);
             if clips {
-                visitor.clip_to(Rect::new(inner_x, inner_y, current.width, current.height));
+                visitor.clip_to(Rect::new(inner_x, inner_y, current.width, current.height), node);
             }
             around.push((node, clips));
             (x, y) = (inner_x, inner_y);
@@ -2062,7 +2063,7 @@ impl Layout {
         // What's in something that says it's cut off at its edges, as CSS's `overflow: hidden` is, doesn't show past them.
         let clips = !node.props.is_empty() && clips(node);
         if clips {
-            visitor.clip_to(rect);
+            visitor.clip_to(rect, node);
             if current.has(CLIPPED_PAINT_SAFE)
                 && !current.children.is_empty()
                 && visitor.clipped_children_are_invisible()

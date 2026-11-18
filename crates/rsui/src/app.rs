@@ -1644,6 +1644,7 @@ impl App {
         scene.batches.clear();
         scene.transforms.clear();
         scene.filters.clear();
+        scene.round_clips.clear();
     }
 
     #[cfg(feature = "render-diagnostics")]
@@ -5261,6 +5262,16 @@ impl App {
                 let _ = self.scroll_area_to(around, target, info.x, true);
             }
         }
+    }
+
+    /// Where each element with an `embed` number is, as of the last layout, for what [`crate::embed`] keeps there. It's
+    /// empty, and costs nothing, while nothing's kept anywhere.
+    pub fn embedded_places(&mut self) -> Vec<(u64, crate::embed::Place)> {
+        if !crate::embed::any() {
+            return Vec::new();
+        }
+        self.lay_out();
+        crate::embed::places(self.runtime.root(), &self.layout.borrow(), self.scale, self.size)
     }
 
     /// Reads the tree as text, as in [`rsui_headless::outline`].

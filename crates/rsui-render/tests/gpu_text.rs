@@ -55,6 +55,7 @@ fn scene(look: [f32; 2], subpixel: bool) -> Scene {
         image: 0,
         transform: 0,
         filter: 0,
+        round: 0,
     }];
     Scene {
         quads,

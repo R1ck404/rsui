@@ -3,6 +3,8 @@ use std::sync::LazyLock;
 
 use rsui_core::{PropValue, Props, Symbol};
 
+use crate::share::{Clamp, Ends, Kept, Line, Mix};
+
 thread_local! {
     /// How wide the box that what's being read is in is, inside its padding, while it lays out what's in it: what a margin or
     /// padding that's a percentage is a share of, as CSS has it (of the width, even for top and bottom). Not a number where
@@ -14,14 +16,14 @@ thread_local! {
     pub(crate) static VIEW_HEIGHT: Cell<f32> = const { Cell::new(f32::NAN) };
 }
 
-/// A share of what it's in and some pixels more, as a margin or padding that's a percentage says it, as `"25%"` or
-/// `"50% + -5px"`, in pixels, given how wide what it's in is.
+/// A share of what it's in and some pixels more, as a margin or padding that's a percentage says it, as `"25%"`,
+/// `"50% + -5px"` or `"max(16px, 10%)"`, in pixels, given how wide what it's in is. Where that isn't known, a share is nothing.
 fn share_in_pixels(said: &str) -> f32 {
-    let Some((share, more)) = share_and_more(said) else {
+    let Some(share) = Clamp::read(said) else {
         return 0.0;
     };
     let base = PERCENT_BASE.with(Cell::get);
-    if base.is_finite() { base * share / 100.0 + more } else { more }
+    share.at(if base.is_finite() { base } else { 0.0 })
 }
 
 /// Which way an element stacks its children.
@@ -74,6 +76,35 @@ pub enum Length {
     /// A percentage of the parent's size and some pixels more, as CSS's `calc(100% - 14px)` is. As a prop it's written
     /// `"100% + -14px"`. Like [`Percent`](Self::Percent), it needs the parent's size.
     Calc(f32, f32),
+    /// Those kept between a least and a most, as CSS's `min()`, `max()` and `clamp()` say, as `min(640px, calc(100% - 48px))`
+    /// is. As a prop it's written as [`Clamp`] writes it. Like [`Percent`](Self::Percent), it needs the parent's size. It's
+    /// kept once and pointed to (see [`Kept`]), so it's no bigger than the others.
+    Clamp(Kept<Clamp>),
+    /// Part of the way from one of those to another, as a transition between them is part way, worked out from what each comes
+    /// to. As a prop it's written as [`Mix`] writes it. Like [`Percent`](Self::Percent), it needs the parent's size if either
+    /// end does. It's how far along it is, and its ends, kept once (see [`Mix::kept`]).
+    Mix(f32, Kept<Ends>),
+}
+
+impl Length {
+    /// A length part of the way between two, keeping its ends once (see [`Mix::kept`]).
+    pub fn mix(mix: Mix) -> Self {
+        let (along, ends) = mix.kept();
+        Length::Mix(along, ends)
+    }
+
+    /// This and some pixels more, as a size inside padding that's only known once what it's in is, as CSS's
+    /// `box-sizing: content-box` has it, comes to with that padding. What fits what's in it stays that.
+    fn plus(self, more: f32) -> Self {
+        match self {
+            Length::Auto => Length::Auto,
+            Length::Px(pixels) => Length::Px(pixels + more),
+            Length::Percent(percent) => Length::Calc(percent, more),
+            Length::Calc(percent, pixels) => Length::Calc(percent, pixels + more),
+            Length::Clamp(clamp) => Length::Clamp(clamp.plus(more).kept()),
+            Length::Mix(along, ends) => Length::mix(Mix::of(along, ends).plus(more)),
+        }
+    }
 }
 
 /// How an element lays out. Convert it to [`Props`] for an element, usually with the
@@ -90,14 +121,12 @@ pub struct Style {
     pub(crate) max_width: f32,
     /// What `max_width` is as a share of what it's in, and some pixels more, which is worked out when that's known, as CSS's
     /// `max-width: 75%` says.
-    pub(crate) max_width_percent: Option<(f32, f32)>,
+    pub(crate) max_width_percent: Option<Kept<Clamp>>,
     /// The same for `min_width`, as CSS's `min-width: 100%` says.
-    pub(crate) min_width_percent: Option<(f32, f32)>,
-    /// Whether `basis` is a share of what it's in (1.0 for all of it) rather than pixels. Where how long that is isn't known yet,
-    /// it's as big as what's in it, as CSS has it.
-    pub(crate) basis_share: bool,
-    /// Pixels on top of a `basis` that's a share, as `flex-basis: calc(25% - 4px)` has.
-    pub(crate) basis_more: f32,
+    pub(crate) min_width_percent: Option<Kept<Clamp>>,
+    /// A basis that's a share of what it's in, rather than `basis`'s pixels, as `flex-basis: calc(25% - 4px)` says. Where how
+    /// long that is isn't known yet, it's as big as what's in it, as CSS has it.
+    pub(crate) basis_share: Option<Kept<Clamp>>,
     pub(crate) min_height: f32,
     pub(crate) max_height: f32,
     pub(crate) grow: f32,
@@ -209,6 +238,28 @@ impl Style {
         self.min_auto && self.shrink > 0.0 && !(if row { self.min_width_said } else { self.min_height_said })
     }
 
+    /// Bigger by padding that's outside what its sizes say, `across` wider and `down` taller, wherever they say something: a size
+    /// that fits what's in it, and a least or a most that isn't said, stay as they are.
+    fn grow_by(&mut self, across: f32, down: f32) {
+        self.width = self.width.plus(across);
+        self.height = self.height.plus(down);
+        if self.min_width > 0.0 {
+            self.min_width += across;
+        }
+        self.max_width += across;
+        self.min_width_percent = self.min_width_percent.map(|least| least.plus(across).kept());
+        self.max_width_percent = self.max_width_percent.map(|most| most.plus(across).kept());
+        if self.min_height > 0.0 {
+            self.min_height += down;
+        }
+        self.max_height += down;
+    }
+
+    /// Whether it says what it starts from as a flex item, in pixels or as a share.
+    pub(crate) const fn has_basis(&self) -> bool {
+        self.basis.is_some() || self.basis_share.is_some()
+    }
+
     pub const fn new() -> Self {
         Self {
             direction: Direction::Column,
@@ -218,8 +269,7 @@ impl Style {
             max_width: f32::INFINITY,
             max_width_percent: None,
             min_width_percent: None,
-            basis_share: false,
-            basis_more: 0.0,
+            basis_share: None,
             min_height: 0.0,
             max_height: f32::INFINITY,
             grow: 0.0,
@@ -479,6 +529,9 @@ pub(crate) struct Names {
     min_auto: Symbol,
     min_width_said: Symbol,
     min_height_said: Symbol,
+    /// Its padding that's a share of what it's in is outside its width and height, as CSS's `box-sizing: content-box` has it,
+    /// so that it's bigger by as much once that's known.
+    padding_outside: Symbol,
     collapse_margins: Symbol,
     keep_margins: Symbol,
     aspect: Symbol,
@@ -489,6 +542,7 @@ pub(crate) struct Names {
     fit_height: Symbol,
     pub(crate) on_line: Symbol,
     pub(crate) line_strut: Symbol,
+    pub(crate) inline_area: Symbol,
     pub(crate) z_index: Symbol,
     /// CSS's `order` on a flex or grid item: where it's laid out among the others, apart from where it's written.
     pub(crate) order: Symbol,
@@ -585,6 +639,7 @@ pub(crate) static NAMES: LazyLock<Names> = LazyLock::new(|| Names {
     min_auto: Symbol::new("min_auto"),
     min_width_said: Symbol::new("min_width_said"),
     min_height_said: Symbol::new("min_height_said"),
+    padding_outside: Symbol::new("padding_outside"),
     collapse_margins: Symbol::new("collapse_margins"),
     keep_margins: Symbol::new("keep_margins"),
     aspect: Symbol::new("aspect"),
@@ -595,6 +650,7 @@ pub(crate) static NAMES: LazyLock<Names> = LazyLock::new(|| Names {
     fit_height: Symbol::new("fit_height"),
     on_line: Symbol::new("on_line"),
     line_strut: Symbol::new("line_strut"),
+    inline_area: Symbol::new("inline_area"),
     z_index: Symbol::new("z_index"),
     order: Symbol::new("order"),
     scrollbar_room: Symbol::new("scrollbar_room"),
@@ -748,6 +804,7 @@ pub(crate) fn is_layout_prop(name: Symbol) -> bool {
         names.min_auto,
         names.min_width_said,
         names.min_height_said,
+        names.padding_outside,
         names.sticky_top,
         names.sticky_bottom,
         names.collapse_margins,
@@ -893,15 +950,18 @@ impl From<Style> for Props {
         let names = &*NAMES;
         let default = Style::new();
         let mut entries: Vec<(Symbol, PropValue)> = Vec::new();
-        // A size that's a percentage and pixels is written as text.
+        // A size that's a percentage and pixels, or those kept between a least and a most, is written as text.
         for (name, length) in [(names.width, style.width), (names.height, style.height)] {
-            if let Length::Calc(percent, pixels) = length {
-                entries.push((name, PropValue::from(format!("{percent}% + {pixels}px"))));
+            match length {
+                Length::Calc(percent, pixels) => entries.push((name, PropValue::from(format!("{percent}% + {pixels}px")))),
+                Length::Clamp(clamp) => entries.push((name, PropValue::from(clamp.to_string()))),
+                Length::Mix(along, ends) => entries.push((name, PropValue::from(Mix::of(along, ends).to_string()))),
+                _ => {}
             }
         }
-        // A basis that's a share is written as the percentage it was.
-        if let (Some(share), true) = (style.basis, style.basis_share) {
-            entries.push((names.basis, PropValue::from(format!("{}%", share * 100.0))));
+        // A basis that's a share is written as the share it was.
+        if let Some(share) = style.basis_share {
+            entries.push((names.basis, PropValue::from(share.to_string())));
         }
         let mut number = |name: Symbol, value: f32, default: f32| {
             if value != default {
@@ -912,13 +972,13 @@ impl From<Style> for Props {
             Length::Auto => {}
             Length::Px(value) => number(names.width, value, f32::NAN),
             Length::Percent(value) => number(names.width_percent, value, f32::NAN),
-            Length::Calc(..) => {}
+            Length::Calc(..) | Length::Clamp(_) | Length::Mix(..) => {}
         }
         match style.height {
             Length::Auto => {}
             Length::Px(value) => number(names.height, value, f32::NAN),
             Length::Percent(value) => number(names.height_percent, value, f32::NAN),
-            Length::Calc(..) => {}
+            Length::Calc(..) | Length::Clamp(_) | Length::Mix(..) => {}
         }
         number(names.min_width, style.min_width, default.min_width);
         number(names.max_width, style.max_width, default.max_width);
@@ -926,7 +986,7 @@ impl From<Style> for Props {
         number(names.max_height, style.max_height, default.max_height);
         number(names.grow, style.grow, default.grow);
         number(names.shrink, style.shrink, default.shrink);
-        if let Some(basis) = style.basis.filter(|_| !style.basis_share) {
+        if let Some(basis) = style.basis {
             number(names.basis, basis, f32::NAN);
         }
         number(names.gap, style.gap, default.gap);
@@ -1047,6 +1107,8 @@ impl Style {
             Some(Length::Px(pixels)) => Some(pixels),
             Some(Length::Percent(percent)) => Some(size * percent / 100.0),
             Some(Length::Calc(percent, pixels)) => Some(size * percent / 100.0 + pixels),
+            Some(Length::Clamp(clamp)) => Some(clamp.at(size)),
+            Some(Length::Mix(along, ends)) => Some(Mix::of(along, ends).at(size)),
             _ => None,
         };
         let mut x = along(names.translate_x, width).unwrap_or(0.0);
@@ -1074,6 +1136,7 @@ impl Style {
         let names = &*NAMES;
         let mut overlay_at = (0.0, 0.0);
         let mut padding_shares: [Option<f32>; 4] = [None; 4];
+        let mut padding_outside = false;
         for (name, value) in props.iter() {
             if name == names.width {
                 style.width = size_of(value, name);
@@ -1101,6 +1164,8 @@ impl Style {
                 style.min_width_said = matches!(value, PropValue::Bool(true));
             } else if name == names.min_height_said {
                 style.min_height_said = matches!(value, PropValue::Bool(true));
+            } else if name == names.padding_outside {
+                padding_outside = matches!(value, PropValue::Bool(true));
             } else if name == names.fit_width {
                 style.fit_width = matches!(value, PropValue::Bool(true));
             } else if name == names.max_width_fit {
@@ -1129,14 +1194,10 @@ impl Style {
                 ANY_STICKY.store(true, std::sync::atomic::Ordering::Relaxed);
             } else if name == names.basis {
                 match value {
-                    // A share of how long what it's in is along, as `flex-basis: 100%` says, kept as that share (1.0 for all of it)
-                    // until that's known: see `flex_items` in engine.rs. CSS's `flex: 1` is a share of 0%, which is nothing.
+                    // A share of how long what it's in is along, as `flex-basis: 100%` says, kept as that share until that's
+                    // known: see `start_item` in engine.rs. CSS's `flex: 1` is a share of 0%, which is nothing.
                     PropValue::Str(said) if said.as_str().contains('%') => {
-                        let (share, more) = share_and_more(said.as_str()).unwrap_or((0.0, 0.0));
-                        let share = share / 100.0;
-                        style.basis = Some(if share.is_finite() { share.max(0.0) } else { 0.0 });
-                        style.basis_share = true;
-                        style.basis_more = if more.is_finite() { more } else { 0.0 };
+                        style.basis_share = Some(Clamp::read(said.as_str()).unwrap_or(Clamp::line(Line::pixels(0.0))).kept());
                     }
                     PropValue::Str(_) => {}
                     _ => style.basis = Some(pixels(value, name)),
@@ -1152,7 +1213,7 @@ impl Style {
             } else if name == names.min_width {
                 match value {
                     PropValue::Str(said) if said.as_str().contains('%') => {
-                        style.min_width_percent = share_and_more(said.as_str());
+                        style.min_width_percent = Clamp::read(said.as_str()).map(Clamp::kept);
                     }
                     PropValue::Str(_) => {}
                     _ => style.min_width = pixels(value, name),
@@ -1160,7 +1221,7 @@ impl Style {
             } else if name == names.max_width {
                 match value {
                     PropValue::Str(said) if said.as_str().contains('%') => {
-                        style.max_width_percent = share_and_more(said.as_str());
+                        style.max_width_percent = Clamp::read(said.as_str()).map(Clamp::kept);
                     }
                     // Anything else that's text, as `none`, is no limit.
                     PropValue::Str(_) => {}
@@ -1266,6 +1327,9 @@ impl Style {
             style.padding_right += right;
             style.padding_bottom += bottom;
             style.padding_left += left;
+            if padding_outside {
+                style.grow_by(left + right, top + bottom);
+            }
         }
         // What's fixed is placed by them, rather than moved.
         if has_inset && !style.absolute && style.overlay != Some(Placement::Inset) {
@@ -1295,6 +1359,12 @@ pub(crate) fn read_length(value: &PropValue) -> Length {
         PropValue::Int(number) => Length::Px(*number as f32),
         PropValue::Str(text) => {
             let text = text.trim();
+            if text.starts_with("mix(") {
+                return Mix::read(text).map_or(Length::Auto, Length::mix);
+            }
+            if text.ends_with(')') {
+                return Clamp::read(text).map_or(Length::Auto, |clamp| Length::Clamp(clamp.kept()));
+            }
             if let Some((percent, pixels)) = text.split_once("% +") {
                 let pixels = pixels.trim();
                 return match (
@@ -1363,21 +1433,4 @@ fn bad_value<T>(name: Symbol, value: &str, fallback: T) -> T {
         name.as_str()
     );
     fallback
-}
-
-/// A share of what something's in, as `75%`, or `75% + 16px` for what its padding and border add to that: the percentage, and
-/// the pixels more.
-fn share_and_more(said: &str) -> Option<(f32, f32)> {
-    let (share, more) = said.split_once('%').unwrap_or((said, ""));
-    let more = more
-        .trim()
-        .trim_start_matches('+')
-        .trim()
-        .trim_end_matches("px")
-        .trim();
-    share
-        .trim()
-        .parse::<f32>()
-        .ok()
-        .map(|share| (share, more.parse::<f32>().unwrap_or(0.0)))
 }

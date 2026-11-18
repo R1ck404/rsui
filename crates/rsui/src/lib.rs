@@ -45,6 +45,7 @@ pub mod dialogs;
 mod dock;
 mod drop;
 pub mod edit;
+pub mod embed;
 pub mod geometry;
 mod input;
 mod input_log;

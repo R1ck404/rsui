@@ -188,6 +188,7 @@ fn oversized_quad_buffer_shrinks_and_same_id_upload_after_idle_is_visible() {
                 image: 7,
                 transform: 0,
                 filter: 0,
+                round: 0,
             }],
             image_uploads: upload
                 .map(|color| ImageUpload {

@@ -619,6 +619,11 @@ impl BoxShape {
         Some(Self { corners, clip })
     }
 
+    /// How far across and down each corner's curve goes, in physical pixels, from the top left going around.
+    pub(crate) fn corners(&self) -> [[f32; 2]; 4] {
+        self.corners
+    }
+
     pub(crate) fn hash_into(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         for corner in &self.corners {

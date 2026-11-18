@@ -47,11 +47,13 @@ mod engine;
 mod grid;
 mod hit_region;
 mod measure;
+mod share;
 mod style;
 mod tree;
 
 pub use measure::{FixedMetrics, Measure, TEXT_INPUT_WIDTH, input_width, shows_name};
 pub use hit_region::HitRegion;
+pub use share::{Clamp, Ends, Kept, Line, Mix};
 pub use style::{
     Align, Direction, Justify, Length, Placement, Style, is_inert, is_paragraph, shows_own_text,
     takes_pointer, with_margin,
