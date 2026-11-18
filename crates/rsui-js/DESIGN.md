@@ -78,6 +78,11 @@ Heavy loops won't match V8's JIT, and aren't meant to. That work belongs in Rust
   itself, reading each name's cell, so it behaves as the language's own kind of object does, and `require` of an ES
   module gives what Node gives. A file is an ES module if it's `.mjs`, if its package says `"type": "module"`, or if what's in it
   says so. CommonJS is run when its turn comes, and what's imported from it is what it had then, as in Node.
+- **What a render works out** is kept for the next one: a plain call in a component's or a hook's body gives what it gave
+  last time while it's given the same and nothing it was worked out from has changed, which is everything reached from the
+  function and its arguments, watched through the collector's write barrier, so any change to it, by anything, is seen. A
+  call that changes what it didn't make, calls something that isn't pure, or throws isn't kept (`keeping.rs`, and "What a
+  render works out" in rsui-tsx's DESIGN.md).
 - **`using` and `await using`** need no instructions of their own. A block with one in it is compiled as a `try` with a
   `finally`, from the first `using` on, and each declaration calls a native that puts what it's given on a list the block
   keeps in a register, which the `finally` has the same native dispose of, last first. For `await using`, it does that a

@@ -634,13 +634,13 @@ fn a_client_going_away_ends_it() {
 
 #[test]
 fn an_agent_can_ask_why_something_rendered_without_turning_anything_on() {
-    // `pick` rather than `onPick`, which, being a handler, would be handed what it sees rather than render the row.
+    // `pick` kept as an effect's dependency, which has a new one render the row, rather than be handed what it sees.
     let file = app(
         "why",
         r#"
-        import { useState } from 'rsui';
+        import { useEffect, useState } from 'rsui';
         function Row({ label, pick }: { label: string; pick: () => void }) {
-            return <button key={label} onClick={pick}>{label}</button>;
+            useEffect(() => {}, [pick]); return <button key={label} onClick={pick}>{label}</button>;
         }
         export default function App() {
             const [count, setCount] = useState(0);

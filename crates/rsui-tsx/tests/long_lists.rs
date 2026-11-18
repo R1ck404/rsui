@@ -398,3 +398,68 @@ fn rows_that_can_be_edited_are_drawn_whole() {
     let said = run(&file, "size 600 400\nwait 100");
     assert_eq!(drawn(&said), ROWS, "{said}");
 }
+
+/// The tree of the window as it's printed at the end, which is everything drawn, as it's drawn.
+fn tree(said: &str) -> &str {
+    &said[said.rfind("\nwindow ").unwrap_or(0)..]
+}
+
+/// Rows that are one of a few kinds, with what Tailwind 4 says of every element, which is about it alone, and a state of their own.
+const KINDS: &str = ".row { display: flex; align-items: center } .row:hover { background: #eee } \
+    *:where(:not(iframe)) { box-sizing: border-box; --tw-x: 0 } .name { color: #333 }";
+
+#[test]
+fn rows_of_a_long_list_start_from_another_of_their_kind() {
+    let file = app("kinds", KINDS);
+    let steps = format!("size 600 400\nwait 100\nhoverat 100 50\nwait 50\neval \"globalThis.__rsuiSharedLooksUsed\"\n{ASKED}");
+    let said = run(&file, &steps);
+    // Every row but the first of each kind, selected or not, starts from that one's look rather than working its own out.
+    let shared: usize = value(&said, "eval \"globalThis.__rsuiSharedLooksUsed").parse().unwrap();
+    assert!(shared >= ROWS - 10, "{shared} of {ROWS} rows shared a look\n{said}");
+    // And everything is drawn as it is with each working its own out, the hovered row too.
+    let alone = run_with(&file, &steps, &[("RSUI_SHARED_LOOKS", "0")]);
+    assert_eq!(value(&alone, "eval \"globalThis.__rsuiSharedLooksUsed"), "0", "{alone}");
+    assert_eq!(values(&said)[1..], values(&alone)[1..], "{said}\n{alone}");
+    assert_eq!(tree(&said), tree(&alone));
+}
+
+#[test]
+fn a_row_with_more_to_it_than_its_kind_has_its_own_look() {
+    // Rules about where a row is, about what it's given, and about what it's in, and a row with a `style` of its own, each make what a
+    // row comes to more than its kind, so each such row works it out itself, and comes out as it does with nothing shared.
+    for (name, css) in [
+        ("attribute", "[data-index=\"7\"] { background: #f00 }"),
+        ("position", ".row:nth-child(3n) { background: #0f0 }"),
+        ("inside", ".rows > .row { margin-left: 2px } .frame .selected { background: #00f }"),
+        ("inherit", ".row { padding-left: inherit } .rows { padding-left: 3px }"),
+    ] {
+        let file = app(name, &format!("{KINDS} {css}"));
+        let steps = format!("size 600 400\nwait 100\nclickat 100 10\npress end\npress home\neval \"globalThis.__rsuiSharedLooksUsed\"\n{ASKED}");
+        let said = run(&file, &steps);
+        let alone = run_with(&file, &steps, &[("RSUI_SHARED_LOOKS", "0")]);
+        assert_eq!(values(&said)[1..], values(&alone)[1..], "{name}\n{said}\n{alone}");
+        assert_eq!(tree(&said), tree(&alone), "{name}");
+    }
+}
+
+#[test]
+fn a_rows_element_does_what_a_page_element_does() {
+    let file = app("element", KINDS);
+    let row = "document.querySelector('[data-index=\\\"3\\\"]')";
+    let steps = format!(
+        "size 600 400\nwait 100\n\
+         eval \"Object.getOwnPropertyNames({row}).length < 16\"\n\
+         eval \"{row} instanceof HTMLDivElement && {row}.tagName === 'DIV' && {row}.localName === 'div'\"\n\
+         eval \"{row}.classList.contains('row') && {row}.dataset.index === '3' && {row}.textContent === 'Row 3'\"\n\
+         eval \"let heard = 0; {row}.addEventListener('click', () => heard++); {row}.click(); heard\"\n\
+         eval \"{row}.setAttribute('data-x', 'y'); {row}.getAttribute('data-x')\"\n\
+         eval \"{row}.style.color = 'rgb(255, 0, 0)'; {row}.style.color\"\n\
+         wait 50\n\
+         eval \"getComputedStyle({row}).color\"\n\
+         eval \"{row} === document.querySelector('[data-index=\\\"3\\\"]') && {row}.parentElement.id\""
+    );
+    let said = run(&file, &steps);
+    // Each element's handle has only what's its own, as its key, its classes and where it was found, and gets the rest from what every
+    // element with its tag shares, where each had all of what an element does of its own, 70 and more methods and accessors.
+    assert_eq!(values(&said), ["true", "true", "true", "1", "y", "rgb(255, 0, 0)", "rgb(255, 0, 0)", "rows"], "{said}");
+}

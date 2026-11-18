@@ -180,21 +180,10 @@ export const readDrives = (): Promise<Drive[]> => files.drives();
 /**
  * Puts entries in order. Each name is turned into a key once (lower case unless case matters, and with each run of digits
  * padded so that file2 comes before file10), and keys are compared as plain strings. That's about 30 times faster than
- * comparing names with `Intl.Collator` each time, which matters on a folder of 25,000 things.
+ * comparing names with `Intl.Collator` each time, which matters on a folder of 25,000 things. It changes nothing it's given,
+ * so the engine gives what it gave again while what it's given is the same, and it only runs when that changes.
  */
 const ZEROS = '0000000000000000';
-const keyCaches = new Map<string, Map<string, string>>();
-
-function keyCache(settings: Pick<Settings, 'naturalSort' | 'caseSensitiveSort'>): Map<string, string> {
-    const kind = `${settings.naturalSort}${settings.caseSensitiveSort}`;
-    let cache = keyCaches.get(kind);
-    if (!cache || cache.size > 300_000) {
-        keyCaches.clear();
-        cache = new Map();
-        keyCaches.set(kind, cache);
-    }
-    return cache;
-}
 
 export function sortEntries(
     entries: Entry[],
@@ -221,16 +210,9 @@ export function sortEntries(
             return by(a, b) * direction;
         });
     }
-    // Keys are kept by name, so sorting a folder again, or after it's read again, makes none it already has.
-    const cache = keyCache(settings);
     const nameKey = (name: string) => {
-        let key = cache.get(name);
-        if (key === undefined) {
-            const folded = settings.caseSensitiveSort ? name : name.toLowerCase();
-            key = settings.naturalSort ? folded.replace(/\d+/g, (digits) => (digits.length >= 16 ? digits : ZEROS.slice(digits.length) + digits)) : folded;
-            cache.set(name, key);
-        }
-        return key;
+        const folded = settings.caseSensitiveSort ? name : name.toLowerCase();
+        return settings.naturalSort ? folded.replace(/\d+/g, (digits) => (digits.length >= 16 ? digits : ZEROS.slice(digits.length) + digits)) : folded;
     };
     const keyed = entries.map((entry) => ({ entry, name: nameKey(entry.name), ext: entry.ext }));
     const byName = (a: { name: string }, b: { name: string }) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);

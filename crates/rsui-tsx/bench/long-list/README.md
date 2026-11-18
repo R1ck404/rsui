@@ -41,6 +41,59 @@ how much there is: what's left per row is its own element styled and made, and t
 renders. With `content-visibility: auto` said on each row, after: starting 5.0 s, Down 13 ms, Down, scrolling, 19 ms at 25,000.
 The native list costs what shows, whatever the count.
 
+## Sharing what's the same
+
+Measured on 2026-11-18 with what DESIGN.md says of page elements sharing what's the same: each element's handle with only what's its
+own, a long list's rows of a kind starting from one look, fonts shared, and parts and contexts left out where nothing uses them.
+Before is 285452a9, after is with it, run one after the other three times each at each count, with no window and nothing else
+running but one build, as `steps.txt` is but with 15 Downs: starting is how long the process took apart from the steps, which is
+mostly the first render, and memory is the process's peak private bytes. Each is the median of the three. Down at 25,000 is also
+the median of 51 presses that move within what shows, and Down, scrolling, of 120 that each scroll a row, from three runs of
+`steps-down.txt` each.
+
+| Rows | | Before | After |
+|---|---|---|---|
+| 1,000 | starting | 968 ms | 927 ms |
+| 1,000 | memory | 79 MB | 75 MB |
+| 1,000 | Down | 2.3 ms | 2.3 ms |
+| 5,000 | starting | 1,080 ms | 718 ms |
+| 5,000 | memory | 168 MB | 116 MB |
+| 5,000 | Down | 3.5 ms | 3.5 ms |
+| 25,000 | starting | 5,654 ms | 3,397 ms |
+| 25,000 | memory | 759 MB | 497 MB |
+| 25,000 | Down, of 15 | 15.7 ms | 16.5 ms |
+| 25,000 | Down, of 51 | 19.4 ms | 18.4 ms |
+| 25,000 | Down, scrolling | 27.2 ms | 25.5 ms |
+
+What each row still costs, at 25,000 (about 18 KB of the process, of which 8.5 KB is objects in JavaScript): the app's own `Row` and its JSX, which
+makes six elements, each `<span>`'s copied once more to be given a key by where it is (`joinedText`); the row's `Styled`
+component, with its hooks, effects, what it read of what's above it and what it is to the page (`live`, `me`); its look as
+what it's drawn with, about 40 props in JavaScript and again in Rust as the host element's (`Props::replace_from`, about 800 B a
+row); and the text it's named by. A component for each element is most of that, and what's left to take away next.
+
+## Page elements drawn in place
+
+Measured on 2026-11-18 with what DESIGN.md says of a page's plain elements drawn in place: each row's `<div>` and `<span>`s are
+host elements of the app's `Row`, with no component, hooks or effects of their own, and a row that skips what's in it keeps that as
+it was given. Before is bcaeea55, after is with it, run one after the other twice each with `steps.txt`, and Down at 25,000 from
+five runs of `steps-down.txt` each, on a machine other builds were using. Memory is private bytes.
+
+| Rows | | Before | After |
+|---|---|---|---|
+| 1,000 | starting | 774-908 ms | 680-1,015 ms |
+| 1,000 | memory to start | 63-66 MB | 51 MB |
+| 5,000 | starting | 793-834 ms | 657-658 ms |
+| 5,000 | memory to start | 95 MB | 73 MB |
+| 25,000 | starting | 3,545-4,062 ms | 2,883-2,896 ms |
+| 25,000 | memory to start | 418-423 MB | 305 MB |
+| 25,000 | memory after the steps | 568-579 MB | 490 MB |
+| 25,000 | Down, median of 21 a run | 13-24 ms | 10.5-20 ms |
+| 25,000 | Down, scrolling, median of 40 a run | 20-33 ms | 17-32 ms |
+
+What a row of 25,000 still takes, by the engine's count (`census` in a build with `alloc-owners`): the elements the app's JSX makes
+for it, the row's `live` with its look worked out (about 550 B, and the look itself about 460 B), what stands for its `<div>` among
+the components, and its own `Row`. Most of starting is still each row's look being worked out once and its `Row` rendering.
+
 ## Running it
 
 It needs Tailwind: `npm install` here, or a junction to another `node_modules` with `tailwindcss` 4 in it, as the file explorer's

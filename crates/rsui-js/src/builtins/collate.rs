@@ -773,7 +773,12 @@ pub(crate) fn make_compare(vm: &mut Vm, args: Args) -> Run<Value> {
     let given = vm.arg(&args, 1);
     let options = options_of(vm, locales, given)?;
     let name = vm.intern_str("");
-    Ok(vm.new_native(name, 2, compare_native, Value::int(options.to_bits()), false))
+    let compare = vm.new_native(name, 2, compare_native, Value::int(options.to_bits()), false);
+    // Comparing two strings depends on nothing else, so what's worked out with it can be kept (see `NativeData::pure`).
+    if let Kind::Native(native) = &mut vm.objects[compare.index()].kind {
+        native.pure = true;
+    }
+    Ok(compare)
 }
 
 /// What a native compare function's options are, for `resolvedOptions`: `[numeric, sensitivity, caseFirst,

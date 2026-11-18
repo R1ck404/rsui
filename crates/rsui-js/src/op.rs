@@ -868,6 +868,23 @@ pub(crate) enum Op {
     Step {
         line: u32,
     },
+    /// Notes what a component has just read of what it was given, while it's rendering, which does nothing otherwise but
+    /// step over the `count` instructions after it, NoteKey and NoteName, which say the rest. `kind` is one of the `NOTE_`
+    /// kinds, with `NOTE_SAME_ITSELF` and `NOTE_CALLED` added in. See `reads.rs`.
+    Note {
+        value: u16,
+        root: u16,
+        count: u8,
+        kind: u8,
+    },
+    /// After a Note: a key of what was read, in a register, or for `NOTE_CALLED`, first, what it's called on.
+    NoteKey {
+        reg: u16,
+    },
+    /// After a Note: a key of what was read that's a name.
+    NoteName {
+        atom: u32,
+    },
 
     /// Starts a generator or an async function, by handing back an object with this frame saved in it.
     InitialYield,
@@ -880,6 +897,58 @@ pub(crate) enum Op {
         src: u16,
     },
 }
+
+/// A [`Op::Note`] at the start of a component's function, with its props in register `value`, which says that this frame
+/// is the component's if it's the one being rendered and given those.
+pub(crate) const NOTE_ENTER: u8 = 0;
+/// A Note of what the component's own frame read of its props: `value` has what was read, and the keys after it say where
+/// it is, starting with the destructured name it was read as, if it was.
+pub(crate) const NOTE_OWN: u8 = 1;
+/// A Note of what a function read of what it captured, which is captured variable `root`: `value` has what was read.
+pub(crate) const NOTE_UP: u8 = 2;
+/// A Note, in the component's own frame, that register `value` has the cell its props, or the destructured name the keys
+/// after it say, are in, which a function inside it can see.
+pub(crate) const NOTE_CELL: u8 = 3;
+/// A Note of what a function that isn't a component read of parameter `root`, which is noted where what it was given was
+/// read (see `NOTE_PARAMS`): `value` has what was read, and the keys after it say where in it.
+pub(crate) const NOTE_PARAM: u8 = 4;
+/// A Note at the start of a function that isn't a component, whose parameters in the bits of `value` are read only as
+/// they're noted, and in the bits of `root` are read whole, as a function inside it sees them. What it's given that was a
+/// noted read, given to it as the call it's in said (`NOTE_CALLING`), has what's read of it noted there, rather than being
+/// read as itself, which is what it would have to be for anything else it's given to.
+pub(crate) const NOTE_PARAMS: u8 = 5;
+/// A Note just before a call, whose arguments start in register `value` and are `root` of them: what of them was noted
+/// (`NOTE_ARG`) is given to what's called now.
+pub(crate) const NOTE_CALLING: u8 = 6;
+/// A Note just after a call of what was read with `NOTE_CALLED`, whose result is in register `value`, and whose arguments
+/// start two after register `root`, as many of them as the register the key after it names: when what was called only
+/// looks something up, as a `Set`'s `has` does, what it gave is all that's noted of what it was called on.
+pub(crate) const NOTE_RESULT: u8 = 7;
+/// What says which of those a Note is.
+pub(crate) const NOTE_KINDS: u8 = 7;
+/// A Note just before a plain call in a component's or a hook's own body, as `sortEntries(listing, sort)`, whose result
+/// goes to register `value` and whose callee is in register `root`, with as many arguments as the register the key after
+/// it names: while something renders, what the call gave last time is given again if what it was worked out from is the
+/// same, and otherwise the call is made from here, so the instructions after it, the call and the `NOTE_KEPT` after that,
+/// are stepped over (see `keeping.rs`). It's `NOTE_ENTER`'s kind with a bit that one never has.
+pub(crate) const NOTE_KEEP: u8 = NOTE_ENTER | NOTE_COMPARED;
+/// A Note just after a call a `NOTE_KEEP` is before, which says how long the call took when it was made the usual way.
+pub(crate) const NOTE_KEPT: u8 = NOTE_ENTER | NOTE_ALIASED;
+/// Added to a Note's kind: what was read has to be the same value, not one that does the same, as it's compared with
+/// `===`, or given to a call or a hook's dependencies.
+pub(crate) const NOTE_SAME_ITSELF: u8 = 8;
+/// Added to a Note's kind: what was read is about to be called as a method of what it was read from, which the first key
+/// after it has, and which a function that isn't an arrow can see as `this`.
+pub(crate) const NOTE_CALLED: u8 = 16;
+/// Added to a Note's kind: the first key after it is the name the props were destructured as, which is where what's read
+/// is, but isn't read itself.
+pub(crate) const NOTE_ALIASED: u8 = 32;
+/// Added to a Note's kind: what was read is only compared with `===` or `!==` to what the key after it (after the name
+/// it was destructured as, if it was) has, which is all that's noted of it.
+pub(crate) const NOTE_COMPARED: u8 = 64;
+/// Added to a Note's kind: what was read is given to a call, as its argument in register `value`, which is read as itself
+/// unless what's called notes what it reads of it (see `NOTE_PARAMS`).
+pub(crate) const NOTE_ARG: u8 = 128;
 
 pub(crate) const TYPE_NUMBER: u16 = 0;
 pub(crate) const TYPE_STRING: u16 = 1;

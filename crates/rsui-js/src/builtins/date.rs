@@ -721,6 +721,10 @@ fn this_time(vm: &mut Vm, this: Value) -> Run<f64> {
 }
 
 fn date_constructor(vm: &mut Vm, args: Args) -> Run<Value> {
+    // What's made from the time now isn't pure (see `NativeData::pure`); a date of a time that's given is.
+    if (!args.new_target.is_object() || args.count == 0) && vm.keeping.working != 0 {
+        vm.keeping.spoiled = true;
+    }
     if !args.new_target.is_object() {
         let now = Vm::now_ms();
         let text = date_string(now);

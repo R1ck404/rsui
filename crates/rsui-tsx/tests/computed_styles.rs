@@ -46,7 +46,7 @@ fn fresh_wrappers_local_setters_and_custom_rects_are_isolated() {
                     check(getComputedStyle(box).visibility==='visible','initial custom parent');
                     fakeParent=document.getElementById('hidden-parent');
                     check(getComputedStyle(box).visibility==='hidden','custom parent getter cannot be cached');
-                    Object.defineProperty(box,'parentElement',parent);
+                    if (parent) Object.defineProperty(box,'parentElement',parent); else delete box.parentElement;
                     box.style.setProperty('position','fixed');
                     check(getComputedStyle(box).position==='fixed','CSSOM visible before render');
                     setSaid('isolated passed');

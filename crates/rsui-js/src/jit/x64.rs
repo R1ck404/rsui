@@ -77,6 +77,7 @@ pub(crate) struct Layout {
     frames_committed: i32,
     stack_len: i32,
     debt: i32,
+    tracking: i32,
     threshold: i32,
     epoch: i32,
     global: i32,
@@ -172,6 +173,7 @@ impl Layout {
             frames_committed: o(offset_of!(Vm, frames) + Arena::<Frame>::COMMITTED_OFFSET),
             stack_len: o(offset_of!(Vm, stack) + Arena::<Value>::LEN_OFFSET),
             debt: o(offset_of!(Vm, debt)),
+            tracking: o(offset_of!(Vm, tracking)),
             threshold: o(offset_of!(Vm, threshold)),
             epoch: o(offset_of!(Vm, epoch)),
             global: o(offset_of!(Vm, global)),
@@ -2872,6 +2874,31 @@ impl<'a> Gen<'a> {
                 self.a.load(R8, self.reg(value));
                 self.call_helper(helpers::array_push as *const () as usize);
             }
+            // Nothing unless something's rendering, when what was read is noted the generic way.
+            // A call that's been given what it gave last time, or made by the Note, is jumped over with the Note after it
+            // (see `keeping.rs`).
+            Op::Note { kind, count, .. } if kind == crate::op::NOTE_KEEP && i + 3 + (count as usize) < self.labels.len() => {
+                let note = self.a.label();
+                let done = self.a.label();
+                let past = self.labels[i + 3 + count as usize];
+                self.a.test_m8(m(VM, self.l.tracking), 1);
+                self.a.jcc(NE, note);
+                self.a.bind(done);
+                let was = self.a.is_cold();
+                self.a.set_cold(true);
+                self.a.bind(note);
+                self.generic_jump(i, past, done);
+                self.a.set_cold(was);
+            }
+            Op::Note { .. } => {
+                let note = self.a.label();
+                let done = self.a.label();
+                self.a.test_m8(m(VM, self.l.tracking), 1);
+                self.a.jcc(NE, note);
+                self.a.bind(done);
+                self.cold_generic(i, note, done);
+            }
+            Op::NoteKey { .. } | Op::NoteName { .. } => {}
             Op::Closure { dst, proto } => {
                 self.a.mov_rr(RCX, VM);
                 self.a.mov_imm64(RDX, u64::from(proto));
@@ -4792,6 +4819,9 @@ impl<'a> Gen<'a> {
                 | Op::SetProp { .. }
                 | Op::SetPropPoly { .. }
                 | Op::CallMath { .. }
+                | Op::Note { .. }
+                | Op::NoteKey { .. }
+                | Op::NoteName { .. }
                 | Op::Return { .. }
                 | Op::ReturnUndefined
         )

@@ -97,8 +97,9 @@ pub(crate) struct Uncompiled {
     /// In `kept`, which lasts as long as this does. Nothing borrowed from here outlives the compiling of it.
     function: &'static Function<'static>,
     kept: std::rc::Rc<KeptAst>,
-    /// The name and kind of each of its captures, in their order.
-    outside: Box<[(&'static str, VarKind)]>,
+    /// The name and kind of each of its captures, in their order, and whether each is from the top of a module or a
+    /// script.
+    outside: Box<[(&'static str, VarKind, bool)]>,
     /// The private names of the classes around it.
     private_scopes: Box<[Vec<(&'static str, Atom)>]>,
     /// Whether it's strict because of where it is.
@@ -203,7 +204,9 @@ struct FnState<'a> {
     /// The registers below this are `this`, the parameters and the function's own variables, which a call makes
     /// undefined. Everything above is written before it's read.
     clear: u32,
-    upvalues: Vec<(&'a str, Capture, VarKind)>,
+    /// What it captures: each name, how, its kind, and whether it's from the top of a module or a script, whose variables
+    /// what's read as a component renders doesn't note.
+    upvalues: Vec<(&'a str, Capture, VarKind, bool)>,
     control: Vec<Control<'a>>,
     chains: Vec<Vec<usize>>,
     next_target: u32,
@@ -227,6 +230,59 @@ struct FnState<'a> {
     /// for which stretch of its code.
     steps: bool,
     debug_vars: Vec<crate::op::DebugVar>,
+    /// Whether what it reads of what it captures, and what it's given if it's a component, is noted while something's
+    /// rendering (see `reads.rs`): for an app's own code.
+    noting: bool,
+    /// Whether it's the top of a module or a script.
+    is_top: bool,
+    /// Whether it's named as a component is, with a capital, and given its props as its first parameter.
+    component: bool,
+    /// Whether it's a component or a hook (`useSomething`) of the app's own, whose plain calls can give what they gave
+    /// at the last render (see `NOTE_KEEP` and `keeping.rs`).
+    keeps: bool,
+    /// The registers of a component's props and of the names destructured from them, which are what a Note says is read,
+    /// with the name each was destructured as.
+    roots: Vec<(u16, Option<&'a str>)>,
+    /// The registers of the parameters of a function that isn't a component whose reads are noted where what it was given
+    /// was (see `NOTE_PARAMS`), which are only ever read here.
+    param_roots: Vec<u16>,
+    /// Whether the next Note is of something given to a call, as an argument (see `NOTE_ARG`).
+    arg_next: bool,
+    /// How many Notes of what's given to the call whose arguments are being worked out there have been.
+    arg_notes: u32,
+    /// Whether the next object literal is the props of an element the app's JSX makes (see `NOTE_ARG`).
+    jsx_props_next: bool,
+    /// The prop the next Note's read is given as, to an element the app's JSX makes, as `look` in `<Icon look={look} />`.
+    prop_next: Option<Atom>,
+}
+
+/// What a read that's noted starts from.
+#[derive(Clone, Copy)]
+enum NoteBase<'a> {
+    /// A component's props, or a name destructured from them, in this register.
+    Own { reg: u16, key: Option<&'a str> },
+    /// This captured variable.
+    Up { index: u16 },
+    /// A parameter of a function that isn't a component, in this register: see `NOTE_PARAMS`.
+    Param { reg: u16 },
+}
+
+/// Reads that have been emitted, with the Note to emit after them: see `Compiler::noted_reads`.
+struct NotedReads {
+    value: u16,
+    root: u16,
+    kind: u8,
+    keys: Vec<Op>,
+    /// Where in `keys` what's compared with goes, after the name the props were destructured as.
+    first: usize,
+    mark: u32,
+}
+
+/// One step of a chain of reads.
+#[derive(Clone, Copy)]
+enum ChainStep<'a> {
+    Name(&'a str),
+    Index(&'a Expr<'a>),
 }
 
 pub(crate) struct Compiler<'a, 'v> {
@@ -253,7 +309,7 @@ pub(crate) struct Compiler<'a, 'v> {
     checked: bool,
     /// For a function that was waiting to be compiled: what it sees from outside, the proto it's to go in, and whether
     /// it's strict because of where it is.
-    outside: Vec<(&'a str, Capture, VarKind)>,
+    outside: Vec<(&'a str, Capture, VarKind, bool)>,
     into: Option<u32>,
     outer_strict: bool,
     /// What a module being compiled imports and exports, for what loads it. See [`crate::modules::ModuleInfo`].
@@ -262,6 +318,16 @@ pub(crate) struct Compiler<'a, 'v> {
     source: u32,
     /// Whether the file is one of the app's own, once that's been asked: see [`Compiler::jsx_factory`].
     app_file: Option<bool>,
+    /// Whether the next read that's noted has to be the same value as itself, not one that does the same: see
+    /// `NOTE_SAME_ITSELF`.
+    itself_next: bool,
+    /// Whether the elements of the next array literal are read as themselves, as a hook's dependencies are.
+    itself_items: bool,
+}
+
+/// Whether a name is a hook's, as React has them: `use`, and a capital or nothing after it.
+fn is_hook_name(name: &str) -> bool {
+    name.strip_prefix("use").is_some_and(|rest| rest.chars().next().is_none_or(|first| first.is_ascii_uppercase()))
 }
 
 /// What a module's `export default` of something that isn't a declaration is kept in. No name that can be written is this.
@@ -935,6 +1001,8 @@ impl<'a, 'v> Compiler<'a, 'v> {
             module: None,
             source: crate::source_text::NO_SOURCE,
             app_file: None,
+            itself_next: false,
+            itself_items: false,
         }
     }
 
@@ -953,6 +1021,53 @@ impl<'a, 'v> Compiler<'a, 'v> {
     }
 
     /// Whether what's compiled is in one of the app's own files: a real path, outside `node_modules`.
+    /// Whether a function is a component whose reads of its props are noted (see `reads.rs`): one named with a capital, as
+    /// React has a component, that isn't a method, a class, async or a generator, given its props first as a name or an object
+    /// pattern with no default, and that doesn't see its arguments any other way.
+    fn is_component(&mut self, function: &'a Function<'a>, hint: Option<Atom>) -> bool {
+        let named = match function.name {
+            Some(name) => name.chars().next().is_some_and(|first| first.is_ascii_uppercase()),
+            None => hint.is_some_and(|hint| {
+                self.vm.atom_text(hint).chars().next().is_some_and(|first| first.is_ascii_uppercase())
+            }),
+        };
+        let Some(first) = function.params.first() else {
+            return false;
+        };
+        let plain = match &first.target {
+            Pattern::Ident(name, _) => {
+                let names = [*name];
+                let mut rebinds = Rebinds::new(&names);
+                rebinds.statements(function.body);
+                !rebinds.hit[0]
+            }
+            Pattern::Object { .. } => true,
+            _ => false,
+        };
+        named
+            && plain
+            && first.default.is_none()
+            && matches!(function.kind, FunctionKind::Normal | FunctionKind::Arrow)
+            && !function.is_async
+            && !function.is_generator
+            && !function.uses_arguments
+            && !function.inner_names.contains("arguments")
+            && self.with_depth == 0
+    }
+
+    /// Whether a function is a hook, as React names one, `use` and a capital, that gives its answer as it's called.
+    fn is_hook(&mut self, function: &'a Function<'a>, hint: Option<Atom>) -> bool {
+        let named = match function.name {
+            Some(name) => is_hook_name(name),
+            None => hint.is_some_and(|hint| is_hook_name(&self.vm.atom_text(hint))),
+        };
+        named
+            && matches!(function.kind, FunctionKind::Normal | FunctionKind::Arrow)
+            && !function.is_async
+            && !function.is_generator
+            && self.with_depth == 0
+    }
+
     fn app_file(&mut self) -> bool {
         *self.app_file.get_or_insert_with(|| {
             let path = std::path::PathBuf::from(self.vm.atom_text(self.file));
@@ -1240,7 +1355,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
 
     fn upvalue(&mut self, depth: usize, name: &'a str) -> Compiled<Option<(u16, VarKind, bool)>> {
         // What the outermost function sees from outside is all there already, if it was waiting to be compiled.
-        for (index, (found, capture, kind)) in self.fns[depth].upvalues.iter().enumerate() {
+        for (index, (found, capture, kind, _)) in self.fns[depth].upvalues.iter().enumerate() {
             if *found == name {
                 return Ok(Some((index as u16, *kind, capture.by_value)));
             }
@@ -1248,8 +1363,8 @@ impl<'a, 'v> Compiler<'a, 'v> {
         if depth == 0 {
             return Ok(None);
         }
-        let (capture, kind) = match Self::local_capture(&self.fns[depth - 1], name) {
-            Some(Ok(found)) => found,
+        let (capture, kind, top) = match Self::local_capture(&self.fns[depth - 1], name) {
+            Some(Ok((capture, kind))) => (capture, kind, self.fns[depth - 1].is_top),
             Some(Err(())) => {
                 return self.error(format!("{name} should have been seen as captured"), 0);
             }
@@ -1261,12 +1376,13 @@ impl<'a, 'v> Compiler<'a, 'v> {
                         index,
                     },
                     kind,
+                    self.fns[depth - 1].upvalues[index as usize].3,
                 ),
                 None => return Ok(None),
             },
         };
         let list = &mut self.fns[depth].upvalues;
-        list.push((name, capture, kind));
+        list.push((name, capture, kind, top));
         Ok(Some(((list.len() - 1) as u16, kind, capture.by_value)))
     }
 
@@ -1357,7 +1473,8 @@ impl<'a, 'v> Compiler<'a, 'v> {
     fn read_var(&mut self, name: &'a str, dst: u16) -> Compiled<()> {
         let chain = self.with_chain(name);
         if chain.is_empty() {
-            return self.read_plain(name, dst);
+            self.read_plain(name, dst)?;
+            return self.note_bare(name, dst);
         }
         let mark = self.mark();
         let object = self.alloc()?;
@@ -1535,7 +1652,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
                 reg,
                 started: true,
                 kind: VarKind::Var | VarKind::Let,
-            } => Some(reg),
+            } if !self.is_root(reg) => Some(reg),
             _ => None,
         })
     }
@@ -1546,11 +1663,304 @@ impl<'a, 'v> Compiler<'a, 'v> {
             return Ok(None);
         }
         Ok(match self.resolve(name)? {
+            // A component's props, or what's destructured from them, are read through `read_var`, which notes the read.
             Place::Register {
                 reg, started: true, ..
-            } => Some(reg),
+            } if !self.is_root(reg) => Some(reg),
             _ => None,
         })
+    }
+
+    /// Whether a register is a component's props, or a name destructured from them, whose reads are noted.
+    fn is_root(&self, reg: u16) -> bool {
+        self.fns
+            .last()
+            .is_some_and(|state| state.roots.iter().any(|(root, _)| *root == reg) || state.param_roots.contains(&reg))
+    }
+
+    /// Where a read of `name` that's noted starts from, if it's one: a component's props or what's destructured from them,
+    /// or a variable captured from a function around this one, in an app's own code.
+    fn note_base(&mut self, name: &'a str) -> Compiled<Option<NoteBase<'a>>> {
+        if !self.f().noting || !self.with_chain(name).is_empty() {
+            return Ok(None);
+        }
+        Ok(match self.resolve(name)? {
+            Place::Register { reg, .. } if self.f().param_roots.contains(&reg) => Some(NoteBase::Param { reg }),
+            Place::Register { reg, .. } | Place::Cell { reg, .. } => self
+                .f()
+                .roots
+                .iter()
+                .find(|(root, _)| *root == reg)
+                .map(|&(reg, key)| NoteBase::Own { reg, key }),
+            Place::Up { index, .. } | Place::UpValue { index, .. }
+                if !self.f().upvalues[index as usize].3 =>
+            {
+                Some(NoteBase::Up { index })
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether an expression is a read that's noted, or a chain of property reads starting with one.
+    fn may_note(&mut self, expression: &'a Expr<'a>) -> Compiled<bool> {
+        if !self.f().noting {
+            return Ok(false);
+        }
+        let mut at = expression;
+        loop {
+            match at {
+                Expr::Member {
+                    object,
+                    optional: false,
+                    ..
+                }
+                | Expr::Index {
+                    object,
+                    optional: false,
+                    ..
+                } => at = object,
+                Expr::Ident(name, _) => return Ok(self.note_base(name)?.is_some()),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// Emits a Note of `kind`, with the keys after it.
+    fn emit_note(&mut self, value: u16, root: u16, mut kind: u8, keys: &[Op]) {
+        let mut prop = None;
+        if std::mem::take(&mut self.itself_next) {
+            kind |= NOTE_SAME_ITSELF;
+            if std::mem::take(&mut self.f().arg_next) {
+                kind |= NOTE_ARG;
+                self.f().arg_notes += 1;
+            }
+        } else if let Some(name) = self.f().prop_next.take() {
+            kind |= NOTE_ARG;
+            prop = Some(Op::NoteName { atom: name.0 });
+        }
+        self.emit(Op::Note {
+            value,
+            root,
+            count: (keys.len() + usize::from(prop.is_some())) as u8,
+            kind,
+        });
+        for key in keys {
+            self.emit(*key);
+        }
+        if let Some(prop) = prop {
+            self.emit(prop);
+        }
+    }
+
+    /// Notes that `name`, just read into `dst`, was read whole, if it's what's noted.
+    fn note_bare(&mut self, name: &'a str, dst: u16) -> Compiled<()> {
+        if dst == DISCARD {
+            return Ok(());
+        }
+        match self.note_base(name)? {
+            Some(NoteBase::Own { reg, key: Some(key) }) => {
+                let atom = self.intern(key);
+                self.emit_note(dst, reg, NOTE_OWN | NOTE_ALIASED, &[Op::NoteName { atom: atom.0 }]);
+            }
+            Some(NoteBase::Own { reg, key: None }) => self.emit_note(dst, reg, NOTE_OWN, &[]),
+            Some(NoteBase::Up { index }) => self.emit_note(dst, index, NOTE_UP, &[]),
+            Some(NoteBase::Param { reg }) => self.emit_note(dst, reg, NOTE_PARAM, &[]),
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Compiles a chain of property reads that starts with what's noted, as `props.session.views[key]`, noting it whole,
+    /// with what it gave in `dst`. With `this`, it's what's about to be called, and what it's read from goes there. Gives
+    /// back whether it was such a chain: nothing's been emitted if it wasn't.
+    fn noted_chain(&mut self, expression: &'a Expr<'a>, dst: u16, this: Option<u16>) -> Compiled<bool> {
+        if !matches!(expression, Expr::Member { .. } | Expr::Index { .. }) {
+            return Ok(false);
+        }
+        match self.noted_reads(expression, dst, this)? {
+            Some(reads) => {
+                self.finish_note(reads, None);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Emits the reads of what's noted, a name or a chain of property reads starting with one, into `dst`, and gives the
+    /// Note to emit after them (see [`finish_note`](Self::finish_note)), or nothing if it isn't noted, with nothing
+    /// emitted. With `this`, it's what's about to be called, and what it's read from goes there.
+    fn noted_reads(&mut self, expression: &'a Expr<'a>, dst: u16, this: Option<u16>) -> Compiled<Option<NotedReads>> {
+        if dst == DISCARD || !self.f().noting {
+            return Ok(None);
+        }
+        let mut steps = Vec::new();
+        let mut at = expression;
+        let name = loop {
+            match at {
+                Expr::Member {
+                    object,
+                    name,
+                    optional: false,
+                } => {
+                    steps.push(ChainStep::Name(name));
+                    at = object;
+                }
+                Expr::Index {
+                    object,
+                    index,
+                    optional: false,
+                } => {
+                    steps.push(ChainStep::Index(index));
+                    at = object;
+                }
+                Expr::Ident(name, _) => break *name,
+                _ => return Ok(None),
+            }
+        };
+        if steps.len() > 30 || (this.is_some() && steps.is_empty()) {
+            return Ok(None);
+        }
+        let Some(base) = self.note_base(name)? else {
+            return Ok(None);
+        };
+        steps.reverse();
+        let itself = std::mem::take(&mut self.itself_next);
+        let mark = self.mark();
+        let mut keys = Vec::with_capacity(steps.len() + 2);
+        let (root, mut kind) = match base {
+            NoteBase::Own { reg, key: Some(key) } => {
+                let atom = self.intern(key);
+                keys.push(Op::NoteName { atom: atom.0 });
+                (reg, NOTE_OWN | NOTE_ALIASED)
+            }
+            NoteBase::Own { reg, key: None } => (reg, NOTE_OWN),
+            NoteBase::Up { index } => (index, NOTE_UP),
+            NoteBase::Param { reg } => (reg, NOTE_PARAM),
+        };
+        let mut prop = None;
+        if itself {
+            kind |= NOTE_SAME_ITSELF;
+            if std::mem::take(&mut self.f().arg_next) {
+                kind |= NOTE_ARG;
+                self.f().arg_notes += 1;
+            }
+        } else if let Some(name) = self.f().prop_next.take() {
+            kind |= NOTE_ARG;
+            prop = Some(name);
+        }
+        let first = keys.len();
+        if let Some(this) = this {
+            kind |= NOTE_CALLED;
+            keys.push(Op::NoteKey { reg: this });
+        }
+        let count = steps.len();
+        if count == 0 {
+            self.read_plain(name, dst)?;
+        } else {
+            let mut object = match this {
+                Some(this) if count == 1 => this,
+                _ => self.alloc()?,
+            };
+            self.read_plain(name, object)?;
+            for (at, step) in steps.iter().enumerate() {
+                let target = if at == count - 1 {
+                    dst
+                } else if at == count - 2
+                    && let Some(this) = this
+                {
+                    this
+                } else {
+                    self.alloc()?
+                };
+                match *step {
+                    ChainStep::Name(key) => {
+                        self.get_named(target, object, key)?;
+                        let atom = self.intern(key);
+                        keys.push(Op::NoteName { atom: atom.0 });
+                    }
+                    ChainStep::Index(index) => {
+                        let key = self.alloc()?;
+                        self.expr(index, key)?;
+                        self.emit(Op::GetElem {
+                            dst: target,
+                            object,
+                            key,
+                        });
+                        keys.push(Op::NoteKey { reg: key });
+                    }
+                }
+                object = target;
+            }
+        }
+        if let Some(name) = prop {
+            keys.push(Op::NoteName { atom: name.0 });
+        }
+        Ok(Some(NotedReads {
+            value: dst,
+            root,
+            kind,
+            keys,
+            first,
+            mark,
+        }))
+    }
+
+    /// Emits the Note for reads [`noted_reads`](Self::noted_reads) emitted, which, with `compared`, says what was read
+    /// was only compared with `===` or `!==` to what that register has.
+    fn finish_note(&mut self, mut reads: NotedReads, compared: Option<u16>) {
+        if let Some(other) = compared {
+            reads.kind |= NOTE_COMPARED;
+            reads.kind &= !NOTE_SAME_ITSELF;
+            reads.keys.insert(reads.first, Op::NoteKey { reg: other });
+        }
+        self.emit(Op::Note {
+            value: reads.value,
+            root: reads.root,
+            count: reads.keys.len() as u8,
+            kind: reads.kind,
+        });
+        for key in &reads.keys {
+            self.emit(*key);
+        }
+        self.release(reads.mark);
+    }
+
+    /// Works out a value that's read as itself, as what's compared with `===` or given to a call is.
+    fn expr_itself(&mut self, expression: &'a Expr<'a>, dst: u16) -> Compiled<()> {
+        if self.may_note(expression)? {
+            self.itself_next = true;
+            let done = self.expr_fresh(expression, dst);
+            self.itself_next = false;
+            return done;
+        }
+        self.expr_fresh(expression, dst)
+    }
+
+    /// The operands of `===` and the rest: what's noted is read as itself. Compared with `===` or `!==`, what's noted on
+    /// one side only says whether it's the same as what the other side has, as in `active={id === focus}`, which is the
+    /// same for each pane but the two the focus moves between, however it moved. Only one side is noted that way, as
+    /// two would each take the other to be what it was.
+    fn equality_operands(&mut self, strict: bool, a: &'a Expr<'a>, b: &'a Expr<'a>) -> Compiled<(u16, u16)> {
+        let (left_noted, right_noted) = (self.may_note(a)?, self.may_note(b)?);
+        if !(left_noted || right_noted) {
+            return self.binary_operands(a, b);
+        }
+        let left = self.alloc()?;
+        let right = self.alloc()?;
+        if !strict {
+            self.expr_itself(a, left)?;
+            self.expr_itself(b, right)?;
+        } else if right_noted {
+            self.expr_itself(a, left)?;
+            let reads = self.noted_reads(b, right, None)?.expect("may_note said so");
+            self.finish_note(reads, Some(left));
+        } else {
+            // What's on the left is noted once what it's compared with is known.
+            let reads = self.noted_reads(a, left, None)?.expect("may_note said so");
+            self.expr_fresh(b, right)?;
+            self.finish_note(reads, Some(right));
+        }
+        Ok((left, right))
     }
 
     fn read_this(&mut self, dst: u16) -> Compiled<()> {
@@ -1629,6 +2039,10 @@ impl<'a, 'v> Compiler<'a, 'v> {
         } else {
             Vec::new()
         };
+        let is_top = is_module || (self.fns.is_empty() && self.into.is_none());
+        let noting = !is_top && crate::reads::reads_enabled() && self.app_file();
+        let component = noting && self.is_component(function, hint);
+        let keeps = component || (noting && self.is_hook(function, hint));
         self.fns.push(FnState {
             kind: function.kind,
             inner: function.inner_names,
@@ -1656,6 +2070,16 @@ impl<'a, 'v> Compiler<'a, 'v> {
             disposals: Vec::new(),
             steps: false,
             debug_vars: Vec::new(),
+            noting,
+            is_top,
+            component,
+            keeps,
+            roots: Vec::new(),
+            param_roots: Vec::new(),
+            arg_next: false,
+            arg_notes: 0,
+            jsx_props_next: false,
+            prop_next: None,
         });
         self.mark_line(function.line);
         if function.is_async && !function.is_generator {
@@ -1700,7 +2124,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
         let spans = (state.code.len() as u32, state.caches.len() as u32);
         let mut captures = Vec::with_capacity(state.upvalues.len());
         let mut capture_names = Vec::with_capacity(state.upvalues.len());
-        for (name, capture, _) in &state.upvalues {
+        for (name, capture, _, _) in &state.upvalues {
             captures.push(*capture);
             capture_names.push(self.vm.intern_str(name));
         }
@@ -1828,7 +2252,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
         let mut outside = Vec::new();
         for &name in function.outer_names {
             let found = match Self::local_capture(&self.fns[depth], name) {
-                Some(Ok(found)) => Some(found),
+                Some(Ok((capture, kind))) => Some((capture, kind, self.fns[depth].is_top)),
                 // Only what's captured can be seen from inside, so the function has something of its own by that name.
                 Some(Err(())) => None,
                 None => self.upvalue(depth, name)?.map(|(index, kind, by_value)| {
@@ -1839,13 +2263,14 @@ impl<'a, 'v> Compiler<'a, 'v> {
                             index,
                         },
                         kind,
+                        self.fns[depth].upvalues[index as usize].3,
                     )
                 }),
             };
-            if let Some((capture, kind)) = found {
+            if let Some((capture, kind, top)) = found {
                 captures.push(capture);
                 capture_names.push(self.vm.intern_str(name));
-                outside.push((name, kind));
+                outside.push((name, kind, top));
             }
         }
         let (name, length, flags) = self.header(function, hint);
@@ -1855,9 +2280,9 @@ impl<'a, 'v> Compiler<'a, 'v> {
         // the source and the memory in that don't move.
         #[allow(unsafe_code)]
         let (function, outside, private_scopes) = unsafe {
-            let outside: Vec<(&'static str, VarKind)> = outside
+            let outside: Vec<(&'static str, VarKind, bool)> = outside
                 .into_iter()
-                .map(|(name, kind)| (&*std::ptr::from_ref::<str>(name), kind))
+                .map(|(name, kind, top)| (&*std::ptr::from_ref::<str>(name), kind, top))
                 .collect();
             let private_scopes: Vec<Vec<(&'static str, Atom)>> = self
                 .private_scopes
@@ -1916,7 +2341,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
             .outside
             .iter()
             .zip(proto.captures.iter())
-            .map(|(&(name, kind), &capture)| (name, capture, kind))
+            .map(|(&(name, kind, top), &capture)| (name, capture, kind, top))
             .collect();
         self.into = Some(id);
         self.outer_strict = waiting.outer_strict;
@@ -1937,7 +2362,59 @@ impl<'a, 'v> Compiler<'a, 'v> {
         Ok(())
     }
 
+    /// For a function of the app's that isn't a component, which of its parameters have what's read of them noted where what
+    /// it was given was read, when that was noted, and which are read whole there, as a function inside sees them: see
+    /// `NOTE_PARAMS`. Only a plain name that nothing gives another value, of a plain function that isn't async or a generator
+    /// and doesn't look at its `arguments`, and only the first 16.
+    fn note_params(&mut self, function: &'a Function<'a>, is_module: bool) -> Compiled<()> {
+        if !self.f().noting
+            || self.f().component
+            || is_module
+            || !matches!(function.kind, FunctionKind::Normal | FunctionKind::Arrow | FunctionKind::Method)
+            || function.is_async
+            || function.is_generator
+            || function.uses_arguments
+            || function.inner_names.contains("arguments")
+            || self.with_depth > 0
+        {
+            return Ok(());
+        }
+        let names: Vec<&'a str> = function
+            .params
+            .iter()
+            .take(16)
+            .map(|param| match (&param.target, &param.default) {
+                (Pattern::Ident(name, _), None) => *name,
+                _ => "",
+            })
+            .collect();
+        let mut rebinds = Rebinds::new(&names);
+        rebinds.statements(function.body);
+        let (mut noted, mut whole) = (0u16, 0u16);
+        for (at, name) in names.iter().enumerate() {
+            // Said twice, the last is the one that's read.
+            if name.is_empty() || rebinds.hit[at] || names[at + 1..].contains(name) {
+                continue;
+            }
+            let reg = 1 + at as u16;
+            if function.inner_names.contains(name) {
+                whole |= 1 << at;
+            } else if matches!(Self::find_local(self.f(), name), Some(Place::Register { reg: found, .. }) if found == reg) {
+                noted |= 1 << at;
+                self.f().param_roots.push(reg);
+            }
+        }
+        if noted != 0 || whole != 0 {
+            self.emit_note(noted, whole, NOTE_PARAMS, &[]);
+        }
+        Ok(())
+    }
+
     fn function_body(&mut self, function: &'a Function<'a>, is_module: bool) -> Compiled<()> {
+        // A component says its frame is the one being rendered, before its props are put in a cell.
+        if self.f().component {
+            self.emit_note(1, 0, NOTE_ENTER, &[]);
+        }
         if const_value_captures_enabled() {
             let mut dynamic = Rebinds::new(&[]);
             dynamic.statements(function.body);
@@ -2055,19 +2532,25 @@ impl<'a, 'v> Compiler<'a, 'v> {
                         .filter(|param| matches!(param.target, Pattern::Ident(other, _) if other == name))
                         .count()
                 };
+                // A component's props are in a cell when something sees them, which is how what reads them is told.
+                let props = match function.params.first().map(|param| &param.target) {
+                    Some(Pattern::Ident(name, _)) if self.f().component => Some(*name),
+                    _ => None,
+                };
                 let by_value: Vec<&'a str> = captured
                     .iter()
                     .zip(&rebinds.hit)
-                    .filter(|&(name, hit)| !hit && said(name) == 1)
+                    .filter(|&(name, hit)| !hit && said(name) == 1 && Some(*name) != props)
                     .map(|(name, _)| *name)
                     .collect();
                 self.f().by_value = by_value;
             }
         }
         // Parameters are named first, so that their defaults can see the ones before them.
-        for param in function.params.iter() {
+        for (number, param) in function.params.iter().enumerate() {
             let reg = next_param;
             next_param += 1;
+            let props = number == 0 && self.f().component;
             if let Some(default) = &param.default {
                 let skip = self.emit(Op::JumpIfNotUndefined {
                     condition: reg,
@@ -2090,17 +2573,38 @@ impl<'a, 'v> Compiler<'a, 'v> {
                         kind: VarKind::Let,
                         started: true,
                     });
+                    if props {
+                        self.f().roots.push((reg, None));
+                        if cell {
+                            self.emit_note(reg, 0, NOTE_CELL, &[]);
+                        }
+                    }
                 }
                 pattern => {
                     let mut names = Vec::new();
                     pattern_names(pattern, &mut names);
-                    for name in names {
+                    for name in &names {
                         self.declare(name, VarKind::Let, false)?;
                     }
-                    self.bind(pattern, reg, true)?;
+                    match pattern {
+                        Pattern::Object { items, rest } if props => {
+                            // What's given another value somewhere isn't the props' any more.
+                            let mut rebinds = Rebinds::new(&names);
+                            rebinds.statements(function.body);
+                            let given: Vec<&'a str> = names
+                                .iter()
+                                .zip(&rebinds.hit)
+                                .filter(|(_, hit)| **hit)
+                                .map(|(name, _)| *name)
+                                .collect();
+                            self.bind_props(pattern, items, rest.is_some(), reg, &given)?;
+                        }
+                        _ => self.bind(pattern, reg, true)?,
+                    }
                 }
             }
         }
+        self.note_params(function, is_module)?;
         if let Some(rest) = &function.rest {
             let mark_names = {
                 let mut names = Vec::new();
@@ -2943,6 +3447,12 @@ impl<'a, 'v> Compiler<'a, 'v> {
                         self.emit(Op::LoadUndefined { dst: temp });
                         self.init_var(name, temp)?;
                     }
+                }
+                (pattern @ Pattern::Object { items, rest }, Some(Expr::Ident(from, _)))
+                    if kind == VarKind::Const && self.props_named(from)?.is_some() =>
+                {
+                    let source = self.props_named(from)?.expect("just found");
+                    self.bind_props(pattern, items, rest.is_some(), source, &[])?;
                 }
                 (pattern, Some(value)) => {
                     let source = self.expr_reg(value)?;
@@ -3840,6 +4350,82 @@ impl<'a, 'v> Compiler<'a, 'v> {
     }
 
     /// Puts the value that's in `source` where a pattern says. `declaring` means it's the variables' first value.
+    /// Whether a component is being compiled, at the top of its body, and `name` is its props, which are in a register: if so,
+    /// that register, with the props in it (read out of their cell if they're in one).
+    fn props_named(&mut self, name: &'a str) -> Compiled<Option<u16>> {
+        if !self.f().component || self.f().blocks.len() != 2 || !self.with_chain(name).is_empty() {
+            return Ok(None);
+        }
+        Ok(match Self::find_local(self.f(), name) {
+            Some(Place::Register { reg, started: true, .. }) if self.f().roots.contains(&(reg, None)) => Some(reg),
+            Some(Place::Cell { reg, .. }) if self.f().roots.contains(&(reg, None)) => {
+                let value = self.alloc()?;
+                self.emit(Op::GetCell { dst: value, cell: reg });
+                Some(value)
+            }
+            _ => None,
+        })
+    }
+
+    /// Destructures a component's props, in `source`: each plain name, as `session` in `{ session }`, is the props'
+    /// `session` whenever it's read, which is what's noted (see `reads.rs`), unless it's one in `given`, which something
+    /// gives another value. What has a default, or is destructured further, is read whole here, and a rest reads all of them.
+    fn bind_props(
+        &mut self,
+        pattern: &'a Pattern<'a>,
+        items: &'a [(PropertyKey<'a>, PatternItem<'a>)],
+        has_rest: bool,
+        source: u16,
+        given: &[&'a str],
+    ) -> Compiled<()> {
+        if has_rest {
+            // What's left is all of them, as far as this can tell.
+            let whole = self.alloc()?;
+            self.emit(Op::Move { dst: whole, src: source });
+            self.emit_note(whole, source, NOTE_OWN, &[]);
+            return self.bind(pattern, source, true);
+        }
+        self.emit(Op::CheckObjectCoercible { src: source });
+        for (key, item) in items {
+            let inner = self.mark();
+            let value = self.alloc()?;
+            match (key, &item.target, &item.default) {
+                (PropertyKey::Name(key), Pattern::Ident(name, _), None) if !given.contains(name) => {
+                    self.get_named(value, source, key)?;
+                    self.init_var(name, value)?;
+                    let atom = self.intern(key);
+                    match Self::find_local(self.f(), name) {
+                        Some(Place::Cell { reg, .. }) => {
+                            self.f().roots.push((reg, Some(*key)));
+                            self.emit_note(reg, 0, NOTE_CELL | NOTE_ALIASED, &[Op::NoteName { atom: atom.0 }]);
+                        }
+                        Some(Place::Register { reg, .. }) => self.f().roots.push((reg, Some(*key))),
+                        _ => {}
+                    }
+                }
+                (PropertyKey::Name(key), ..) => {
+                    self.get_named(value, source, key)?;
+                    let atom = self.intern(key);
+                    self.emit_note(value, source, NOTE_OWN, &[Op::NoteName { atom: atom.0 }]);
+                    self.bind_item(item, value, true)?;
+                }
+                _ => {
+                    let key_reg = self.alloc()?;
+                    self.property_key(key, key_reg)?;
+                    self.emit(Op::GetElem {
+                        dst: value,
+                        object: source,
+                        key: key_reg,
+                    });
+                    self.emit_note(value, source, NOTE_OWN, &[Op::NoteKey { reg: key_reg }]);
+                    self.bind_item(item, value, true)?;
+                }
+            }
+            self.release(inner);
+        }
+        Ok(())
+    }
+
     fn bind(&mut self, pattern: &'a Pattern<'a>, source: u16, declaring: bool) -> Compiled<()> {
         self.check_depth()?;
         match pattern {
@@ -4105,7 +4691,11 @@ impl<'a, 'v> Compiler<'a, 'v> {
                 };
                 if let Some(make) = make {
                     let mark = self.mark();
-                    let (a, b) = self.binary_operands(a, b)?;
+                    let (a, b) = if matches!(op, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::StrictEq | BinaryOp::StrictNe) {
+                        self.equality_operands(matches!(op, BinaryOp::StrictEq | BinaryOp::StrictNe), a, b)?
+                    } else {
+                        self.binary_operands(a, b)?
+                    };
                     out.push(self.emit(make(a, b)));
                     self.release(mark);
                     return Ok(());
@@ -4618,6 +5208,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
                 }
                 self.release(mark);
             }
+            Expr::Member { .. } | Expr::Index { .. } if self.noted_chain(expression, dst, None)? => {}
             Expr::Member {
                 object,
                 name,
@@ -4874,6 +5465,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
         elements: &'a [Option<Element<'a>>],
         array: u16,
     ) -> Compiled<()> {
+        let itself = std::mem::take(&mut self.itself_items);
         self.emit(Op::NewArray {
             dst: array,
             capacity: elements.len() as u32,
@@ -4883,6 +5475,11 @@ impl<'a, 'v> Compiler<'a, 'v> {
             match element {
                 None => {
                     self.emit(Op::ArrayHole { array });
+                }
+                Some(Element::Plain(value)) if itself && self.may_note(value)? => {
+                    let temp = self.alloc()?;
+                    self.expr_itself(value, temp)?;
+                    self.emit(Op::ArrayPush { array, value: temp });
                 }
                 Some(Element::Plain(value)) => {
                     let value = self.expr_reg(value)?;
@@ -4908,12 +5505,25 @@ impl<'a, 'v> Compiler<'a, 'v> {
     }
 
     fn object_literal_in(&mut self, properties: &'a [Property<'a>], object: u16) -> Compiled<()> {
+        let jsx = std::mem::take(&mut self.f().jsx_props_next);
         self.emit(Op::NewObject {
             dst: object,
             capacity: properties.len().min(1000) as u16,
         });
         for property in properties {
             let inner = self.mark();
+            // A prop of an element that's a noted read as it is says which prop it's given as.
+            let given = match property {
+                Property::Value(key @ (PropertyKey::Name(_) | PropertyKey::String(_)), value) if jsx => {
+                    let atom = self.key_hint(key).filter(|atom| !matches!(self.vm.atom_text(*atom).as_str(), "children" | "key" | "ref"));
+                    if atom.is_some() && self.may_note(value)? { atom } else { None }
+                }
+                Property::Short(name, _) if jsx && !matches!(*name, "children" | "key" | "ref") => {
+                    if self.note_base(name)?.is_some() { Some(self.intern(name)) } else { None }
+                }
+                _ => None,
+            };
+            self.f().prop_next = given;
             match property {
                 Property::Value(key, value) => {
                     let hint = self.key_hint(key);
@@ -5048,6 +5658,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
                     self.emit(Op::ObjectSpread { object, source });
                 }
             }
+            self.f().prop_next = None;
             self.release(inner);
         }
         Ok(())
@@ -5284,9 +5895,14 @@ impl<'a, 'v> Compiler<'a, 'v> {
             }
             _ => (a, b),
         };
+        let equality = matches!(op, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::StrictEq | BinaryOp::StrictNe);
         if self.right_side_is_constant(op, b) {
             let left = self.expr_reg(a)?;
             self.binary_with_left(op, left, b, dst)?;
+        } else if equality {
+            let strict = matches!(op, BinaryOp::StrictEq | BinaryOp::StrictNe);
+            let (a, b) = self.equality_operands(strict, a, b)?;
+            self.emit(Self::binary_op(op, dst, a, b));
         } else {
             let (a, b) = self.binary_operands(a, b)?;
             self.emit(Self::binary_op(op, dst, a, b));
@@ -5558,6 +6174,11 @@ impl<'a, 'v> Compiler<'a, 'v> {
 
     /// Works out what's being called, and what `this` will be.
     fn callee(&mut self, callee: &'a Expr<'a>, f: u16, this: u16) -> Compiled<()> {
+        if matches!(callee, Expr::Member { optional: false, .. } | Expr::Index { optional: false, .. })
+            && self.noted_chain(callee, f, Some(this))?
+        {
+            return Ok(());
+        }
         match callee {
             Expr::Member {
                 object,
@@ -5612,6 +6233,56 @@ impl<'a, 'v> Compiler<'a, 'v> {
         Ok(args.len() as u16)
     }
 
+    /// [`plain_args`](Self::plain_args) for a call: what's noted is read as itself, as a call can keep it or compare it, and
+    /// the arrays given to a hook (`useEffect` and the rest) are its dependencies, which are compared as themselves.
+    fn call_args(&mut self, callee: &'a Expr<'a>, args: &'a [Element<'a>]) -> Compiled<u16> {
+        if !self.f().noting {
+            return self.plain_args(args);
+        }
+        let named = match callee {
+            Expr::Ident(name, _) => Some(*name),
+            Expr::Member { name, .. } => Some(*name),
+            _ => None,
+        };
+        let hook = named.is_some_and(|name| name.starts_with("use"));
+        // What's given that's noted waits to be noted until it's known what it's given to: see `NOTE_ARG`.
+        let notes_before = std::mem::take(&mut self.f().arg_notes);
+        let mut first = None;
+        // Only a component's element: a tag's props are drawn, and nothing reads them to say what of them matters.
+        let jsx = matches!(callee, Expr::Ident("__jsxMemo" | "__jsxPageMemo", _))
+            && !matches!(args.first(), Some(Element::Plain(Expr::String(_))));
+        for (at, arg) in args.iter().enumerate() {
+            let Element::Plain(value) = arg else {
+                return self.error("a spread came where it shouldn't", 0);
+            };
+            let reg = self.alloc()?;
+            first.get_or_insert(reg);
+            if hook && matches!(value, Expr::Array(_)) {
+                self.itself_items = true;
+                self.expr_fresh(value, reg)?;
+                self.itself_items = false;
+            } else if jsx && at == 1 && matches!(value, Expr::Object(_)) {
+                // An element's props: what's given as one is read as what it's given to reads it, where that's noted.
+                self.f().jsx_props_next = true;
+                let done = self.expr_itself(value, reg);
+                self.f().jsx_props_next = false;
+                done?;
+            } else {
+                let noted = self.may_note(value)?;
+                self.f().arg_next = noted;
+                let done = self.expr_itself(value, reg);
+                self.f().arg_next = false;
+                done?;
+            }
+        }
+        let noted = std::mem::replace(&mut self.f().arg_notes, notes_before);
+        if let (true, Some(first)) = (noted > 0, first) {
+            // Last before the call, which is what's given to it.
+            self.emit_note(first, args.len() as u16, NOTE_CALLING, &[]);
+        }
+        Ok(args.len() as u16)
+    }
+
     fn args_array(&mut self, args: &'a [Element<'a>]) -> Compiled<u16> {
         let array = self.alloc()?;
         self.emit(Op::NewArray {
@@ -5660,9 +6331,32 @@ impl<'a, 'v> Compiler<'a, 'v> {
             if optional {
                 self.chain_jump(f);
             }
-            let argc = self.plain_args(args)?;
+            let argc = self.call_args(callee, args)?;
             self.mark_line(line);
+            // In a component's or hook's own body, a call of a function by name whose answer is used can give what it gave
+            // at the last render (see `keeping.rs`). A hook is called every time, as React counts them.
+            let keep = !optional
+                && dst != DISCARD
+                && self.f().keeps
+                && matches!(callee, Expr::Ident(name, _) if !is_hook_name(name) && !name.starts_with("__"));
+            if keep {
+                self.emit(Op::Note {
+                    value: dst,
+                    root: f,
+                    count: 1,
+                    kind: NOTE_KEEP,
+                });
+                self.emit(Op::NoteKey { reg: argc });
+            }
             self.emit(Op::CallPlain { dst, f, argc });
+            if keep {
+                self.emit(Op::Note {
+                    value: dst,
+                    root: f,
+                    count: 0,
+                    kind: NOTE_KEPT,
+                });
+            }
             self.release(mark);
             return Ok(());
         }
@@ -5674,6 +6368,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
         } = callee
             && args.is_empty()
             && !optional
+            && !self.may_note(object)?
         {
             let atom = self.atom_of_key(name);
             if atom != text::LENGTH {
@@ -5685,6 +6380,11 @@ impl<'a, 'v> Compiler<'a, 'v> {
                 return Ok(());
             }
         }
+        // What a lookup of what's noted gives is noted after it: see `NOTE_RESULT`.
+        let result_noted = !has_spread
+            && dst != DISCARD
+            && matches!(callee, Expr::Member { optional: false, .. } | Expr::Index { optional: false, .. })
+            && self.may_note(callee)?;
         self.callee(callee, f, this)?;
         if optional {
             self.chain_jump(f);
@@ -5694,7 +6394,7 @@ impl<'a, 'v> Compiler<'a, 'v> {
             self.mark_line(line);
             self.emit(Op::CallSpread { dst, f, array });
         } else {
-            let argc = self.plain_args(args)?;
+            let argc = self.call_args(callee, args)?;
             self.mark_line(line);
             // Whatever `Math` is when it runs, as CallMath looks at what it calls.
             let which = match callee {
@@ -5709,6 +6409,16 @@ impl<'a, 'v> Compiler<'a, 'v> {
                 Some(which) => Op::CallMath { dst, f, which },
                 None => Op::Call { dst, f, argc },
             });
+            if result_noted && which.is_none() {
+                self.emit(Op::Note {
+                    value: dst,
+                    root: f,
+                    count: 1,
+                    kind: NOTE_RESULT,
+                });
+                // How many arguments there were, as a key's register.
+                self.emit(Op::NoteKey { reg: argc });
+            }
         }
         self.release(mark);
         Ok(())

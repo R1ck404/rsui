@@ -5329,10 +5329,29 @@ function fitInFlow(look, tag, flow, around = undefined) {
 /// Each element in `children` with this context around it, one by one, so that they stay where they are among what's around them.
 /// One around all of them would hold them in a box of their own.
 function eachWithin(context, value, children) {
-    return slotted(children).map((child) =>
-        isValidElement(child) ? make(context.Provider, { key: child.key ?? undefined, value }, child) : child,
-    );
+    return slotted(children).map((child) => (isValidElement(child) ? wrappedIn(context, value, child) : child));
 }
+
+/// `child` with `context` around it, saying `value`. What's around a page's element to tell it something, as where it is among the
+/// rest, or that it's on a line, is made again whenever what it's in is drawn, and is compared with what was there before as the
+/// page's own elements are (see `JsProps` in bridge.rs), so that it doesn't render again when it says the same about what does the
+/// same, and nor does what's in it. That's only while the page's CSS is what it was, as for a page's element, which this is marked
+/// with: what's in it can be one.
+function wrappedIn(context, value, child, key = child.key ?? undefined) {
+    const made = make(context.Provider, { key, value }, child);
+    if (context.Provider.__rsuiEquivalent === true) {
+        made.memo = version + 2;
+    }
+    return made;
+}
+
+/// What tells what's in a page's element something, which `wrappedIn` puts around each of them, and which is compared as a page's
+/// element is.
+function comparedAsPage(context) {
+    context.Provider.__rsuiShallow = true;
+    context.Provider.__rsuiEquivalent = true;
+}
+comparedAsPage(FlowContext);
 
 /// What a part of a table says about how it's laid out, which is done in Rust: see `table.rs` in rsui-layout. Each column is as
 /// wide as what's widest in it in any row, wherever the rows come from, and each row is as tall as what's tallest in it.
@@ -5622,16 +5641,13 @@ function useDomRef(ref, always = false, live = null, tag = 'div', had = undefine
         const handle = handleOf(kept, tag, true);
         // What a ref holds says where it is as it was last laid out, which is kept for it from now on.
         handle.__placedByKey = true;
-        const forget = () => {
-            if (handles.get(key) === handle) {
-                handles.delete(key);
-            }
-        };
         // As React 19 has it: a function's given the element, and what it gives back, if that's a function, is what's called
         // when it goes or the ref changes. Otherwise it's given null then, as an object's `current` is set to.
         const detach = attachRef(ref, handle);
         return () => {
-            forget();
+            if (handles.get(key) === handle) {
+                handles.delete(key);
+            }
             detach?.();
         };
     }, ref === null || ref === undefined ? NO_REF : [ref]);
@@ -6862,6 +6878,7 @@ let pageOwnersKept = null;
 /// Where something is among what's around it, for what's about that, as `:last-of-type` is.
 const NthContext = createContext(null);
 NthContext.Provider.displayName = 'NthContext';
+comparedAsPage(NthContext);
 
 // What text gets from what it's in, which CSS does and props don't, apart from its color.
 
@@ -6920,6 +6937,31 @@ function fontFrom(look, above) {
         }
     }
     return out;
+}
+
+/// What text in an element is written in, as `fontFrom` has it from its look, the same object for every element that comes to the same,
+/// where that's only plain values, as most are: a long list's rows each had one of their own.
+const sharedFonts = new Map();
+function fontOf(look, ellipsisLine) {
+    let key = ellipsisLine ? 'e' : '';
+    for (const name of FONT_PROPS) {
+        const value = look[name];
+        if (value !== undefined && value !== null && (typeof value === 'object' || typeof value === 'function')) {
+            const made = fontFrom(look, null);
+            return ellipsisLine ? { ...made, __ellipsisLine: true } : made;
+        }
+        key += value === undefined ? '\u0001' : '\u0001' + typeof value + ':' + String(value);
+    }
+    let font = sharedFonts.get(key);
+    if (font === undefined) {
+        const made = fontFrom(look, null);
+        font = ellipsisLine ? { ...made, __ellipsisLine: true } : made;
+        if (sharedFonts.size > 4000) {
+            sharedFonts.clear();
+        }
+        sharedFonts.set(key, font);
+    }
+    return font;
 }
 
 /// What's in something, with what it's written in given to what can't get it any other way: text that's right there, and elements.
@@ -6986,8 +7028,37 @@ function mergeParts(parts, more) {
         return;
     }
     for (const name of Object.keys(more)) {
-        parts[name] = { ...parts[name], ...more[name] };
+        const was = parts[name];
+        if (was === undefined && parts === sharingParts) {
+            // The same object as what it comes from, until something's put over it: see `sharingParts`.
+            parts[name] = more[name];
+            sharedPartNames.push(name);
+        } else {
+            parts[name] = { ...was, ...more[name] };
+        }
     }
+}
+
+/// The parts of the element being worked out now, whose `::before` and `::after` are what the rules' kept results are, rather than a
+/// copy of them, until something's said over them, as a part that comes from one rule alone is put in as it is: what Tailwind says
+/// about every element's `::before` and `::after` was otherwise copied for each of them, to be thrown away as they have no
+/// `content`. What's kept is copied once the cascade's done (see `ownParts`), as what comes after changes parts in place.
+let sharingParts = null;
+/// Which of those parts are the same object as what they came from.
+const sharedPartNames = [];
+
+/// Has each part of `parts` that's still what it came from be a copy of its own, apart from a `::before` or `::after` with no
+/// `content`, which isn't drawn, and goes before anything's done with it.
+function ownParts(parts) {
+    sharingParts = null;
+    for (const name of sharedPartNames) {
+        const part = parts[name];
+        if (part === undefined || ((name === 'before' || name === 'after') && part.__content === undefined && part['__var content'] == null)) {
+            continue;
+        }
+        parts[name] = { ...part };
+    }
+    sharedPartNames.length = 0;
 }
 
 /// What's said about how something is, as it's kept for it, rather than given to it.
@@ -7048,6 +7119,7 @@ function fromAbove(owners, own, look, parts, classes = false, between = null) {
             if (index.watched.size > 0) {
                 keys ??= keysOf(own);
                 for (const [rule, at] of candidates(index.watched, keys)) {
+                    cascadeLookedAround = true;
                     const bits = watchedStep(rule, at, own);
                     watched |= bits;
                     needs |= bits;
@@ -7055,6 +7127,9 @@ function fromAbove(owners, own, look, parts, classes = false, between = null) {
             }
             needs |= indexedRulesOn(index, rules, owner, own, look, parts, classes, between);
             continue;
+        }
+        if (rules.length > 0) {
+            cascadeLookedAround = true;
         }
         if (rules.length <= FEW_RULES) {
             for (const rule of rules) {
@@ -7109,17 +7184,39 @@ function selfReads(rule) {
     }
     let reads = null;
     const last = rule.steps[rule.steps.length - 1];
-    if (rule.steps.length === 2 && (last.link ?? 'descendant') === 'descendant' && last.pseudo.every((one) => SELF_PSEUDO[one.name] !== undefined)) {
+    if (rule.steps.length === 2 && (last.link ?? 'descendant') === 'descendant') {
         reads = [];
-        for (const one of last.pseudo) {
-            reads.push(...SELF_PSEUDO[one.name]);
-        }
-        for (const attr of last.attrs) {
-            reads.push(attr.name === 'class' ? 'className' : attr.name === 'for' ? 'htmlFor' : attr.name);
+        if (!compoundSelfReads(last, reads, 0)) {
+            reads = null;
         }
     }
     rule.selfReads = reads;
     return reads;
+}
+
+/// What one step of a selector reads of what an element's given, into `reads`, if it's only about the element itself, as `.x`,
+/// `div:hover` and `[data-x]` are, and Tailwind 4's `:where(:not(iframe))` too, as what `:where()`, `:is()` and `:not()` have in
+/// them is about the element itself when each of those is one step that is. Says whether it is.
+function compoundSelfReads(step, reads, depth) {
+    for (const one of step.pseudo) {
+        const asked = SELF_PSEUDO[one.name];
+        if (asked !== undefined) {
+            reads.push(...asked);
+            continue;
+        }
+        if (depth > 4 || one.list === null || one.list === undefined || !(one.name === 'where' || one.name === 'is' || one.name === 'not' || one.name === 'matches')) {
+            return false;
+        }
+        for (const steps of one.list) {
+            if (steps === null || steps.length !== 1 || steps[0].part !== null || steps[0].unknown === true || !compoundSelfReads(steps[0], reads, depth + 1)) {
+                return false;
+            }
+        }
+    }
+    for (const attr of step.attrs) {
+        reads.push(attr.name === 'class' ? 'className' : attr.name === 'for' ? 'htmlFor' : attr.name);
+    }
+    return true;
 }
 
 /// What the page's rules that could be about something with these classes, of this kind and with this id, are, in the order the
@@ -7318,6 +7415,10 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
                 (byAttribute ??= []).push(...found);
             }
         }
+    }
+    if (byAttribute !== null || plan.others || plan.reads.length > 0) {
+        // What it comes to depends on more than its tag, classes, id and state: see `sharedLook`.
+        cascadeLookedAround = true;
     }
     const self = plan.items.length === 0 ? null : selfResults(plan, owner, own);
     let needs = self?.needs ?? 0;
@@ -8746,6 +8847,494 @@ function withListMarker(children, said, index, font) {
     return [drawn, ...content];
 }
 
+// A long list's rows are mostly the same as each other, as a browser finds its elements are, which share one computed style where
+// they have the same tag, classes and state, and the same parent's, and nothing says anything of where they are. So a row's look,
+// as the page's rules, what it inherits and its variables make it, is worked out once for each kind of row in a list, and the rest
+// of that kind start from it: the same look and parts, copied, and the same variables passed down. What each row is given of its
+// own, its handlers, its key on the page and what's in it, is still its own. A row is only one of a kind when what it's like is all
+// there is to it: a page's plain element, with no `style`, nothing set on it from code, and no rule about it that looks at more
+// than it, as one about what it's in, what's beside it, where it is, or what it's given (`cascadeLookedAround`), and nothing that
+// asks about `:has()` or `inherit` on the page. It's on unless `RSUI_SHARED_LOOKS=0`, or the page says
+// `globalThis.__rsuiSharedLooks = false`, as a test comparing the two does.
+
+/// Whether working out the look of the element being drawn looked at more than the element itself: see above.
+let cascadeLookedAround = false;
+const SHARED_LOOKS_FROM_ENV = (() => {
+    try {
+        return globalThis.process?.env?.RSUI_SHARED_LOOKS !== '0';
+    } catch {
+        return true;
+    }
+})();
+/// How many rows have started from another's look, for tests.
+let sharedLooksUsed = 0;
+Object.defineProperty(globalThis, '__rsuiSharedLooksUsed', { get: () => sharedLooksUsed, configurable: true });
+
+/// What tells kinds of row apart, from what they're given, or null if a row given this isn't one of a kind: only its tag, state,
+/// whether it's empty, and what it's given that's plain, apart from what it's given as `data-` and `aria-` attributes, which only
+/// rules about attributes read, and a row with those isn't one of a kind (see `indexedRulesOn`).
+function sharedLookKey(tag, state, empty, given) {
+    let key = tag + '\u0001' + state + (empty ? '\u0001e' : '\u0001');
+    for (const name in given) {
+        const value = given[name];
+        // A ref and where it is among what's around it (which nothing reads while nothing says anything of that: see
+        // `sharedLooksOn`) don't change how it looks.
+        if (name === 'children' || name === 'key' || name === 'ref' || name === '__nth' || name === '__disclosure' || value === undefined || (name === 'style' && value === null)) {
+            continue;
+        }
+        if (typeof value === 'function') {
+            continue;
+        }
+        if (name === 'style' || name === 'as' || name.startsWith('__')) {
+            return null;
+        }
+        if (value !== null && typeof value === 'object') {
+            return null;
+        }
+        key += '\u0001' + name;
+        if (!(name.startsWith('data-') || name.startsWith('aria-'))) {
+            key += '=' + typeof value + ':' + String(value);
+        }
+    }
+    return key;
+}
+
+/// What a row's look depends on beyond what it's given, which is the same for every row of a list, and every kind of row is worked
+/// out again once any of it changes.
+function sharedLookAround(compiled, owners, theme, fontAbove, variablesAbove, parentLook, flow, form) {
+    return [compiled, owners, theme, fontAbove, variablesAbove, parentLook, flow, form, pageOwners()?.[0]?.rules, version, flowVersion, declared, hasEpoch, remSize, declaring.em];
+}
+
+/// The kinds of row of a long list, by `sharedLookKey`, while what's around them is still `around`.
+function sharedLooksOf(run, around) {
+    let kept = run.looks;
+    if (kept === undefined || kept.around.length !== around.length || kept.around.some((one, at) => one !== around[at])) {
+        kept = run.looks = { around, kinds: new Map() };
+    }
+    return kept.kinds;
+}
+
+/// Whether what's on the page now lets a row's look be another's: see above.
+const sharedLooksOn = () => SHARED_LOOKS_FROM_ENV && globalThis.__rsuiSharedLooks !== false && hasWatched.size === 0 && !inheritAsked && !structural && restyleFresh === null
+    && !RESTYLE_ENV.check && !RESTYLE_ENV.log;
+
+// A page's plain elements drawn in place. Most of a page is `<div>`s and `<span>`s that are only what CSS makes of them, each of
+// which was a component of its own, with its hooks, effects and what Rust keeps for a component, for what does no more than a
+// browser's element does. So each of those the app's JSX makes is drawn as a host element of the component whose output it's in,
+// by Rust as it builds that output (`placed_in_output` in bridge.rs): what it comes to is worked out by the same `Styled` as before,
+// and given back as it was each time that output's built again, until something it depends on changes, as a browser only styles an
+// element again once what its style depends on has. That's what it's given, unless it does the same as before as a component's props
+// would (`samePageProps`), its own state (hovered, pressed and the rest), what it reads of what's above it, and the page's CSS. What
+// it keeps between drawings is its `live`, the one object every element of the page has, and what stands for it among the components
+// (`newFrame` in layer.js), for what it reads of what's above it and passes down to what's in it. What it does once it's on the page,
+// and its ref, is done as the commit it's drawn in starts, and undone once it's not drawn again (`placedCommit`). When something it
+// depends on changes, its owner builds what it gave back again without calling it, which works out again only what's changed of it.
+// It's on unless `RSUI_PLACED=0`, or the page says `globalThis.__rsuiPlaced = false`, as a test comparing the two does.
+
+const PLACED_FROM_ENV = (() => {
+    try {
+        return globalThis.process?.env?.RSUI_PLACED !== '0';
+    } catch {
+        return true;
+    }
+})();
+const placedOn = () => PLACED_FROM_ENV && globalThis.__rsuiPlaced !== false;
+/// The tags drawn in place: what's only what CSS makes of it, and what's in it. What does more of its own, as a field, a link, a
+/// button, a form, a picture or a table, is a component as before.
+const PLACED_TAGS = new Set(['div', 'span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'strong', 'em', 'b', 'i', 'u', 's',
+    'small', 'code', 'mark', 'sub', 'sup', 'section', 'article', 'aside', 'header', 'footer', 'main', 'nav', 'blockquote', 'pre', 'figure',
+    'figcaption', 'dl', 'dt', 'dd', 'time', 'abbr', 'kbd', 'samp', 'var', 'q', 'cite', 'del', 'ins', 'bdi', 'hgroup', 'search', 'address']);
+/// The element being drawn in place, while its `Styled` works out what it comes to.
+let placedNow = null;
+/// What a `Styled` hasn't worked out yet.
+const UNWORKED = Symbol('unworked');
+/// What's been drawn in place for the first time, which is put on the page in the commit that's coming, what's gone, and what's to be
+/// given to a ref or taken from one.
+let placedMounting = [];
+let placedLeaving = [];
+let placedRefs = [];
+
+/// The element drawn in place at `place` in what `owner` gives back, if there's one.
+function placedAt(owner, place) {
+    const records = owner.placed?.records;
+    if (records === undefined) {
+        return undefined;
+    }
+    return records instanceof Map ? records.get(place) : records.placedPlace === place ? records : undefined;
+}
+
+/// Keeps an element drawn in place with its owner, by its place, as one or, once there's more than one, a map of them.
+function keepPlaced(owner, record) {
+    const kept = (owner.placed ??= { records: undefined, walks: 0, walking: false });
+    const records = kept.records;
+    if (records === undefined) {
+        kept.records = record;
+    } else if (records instanceof Map) {
+        records.set(record.placedPlace, record);
+    } else {
+        kept.records = new Map([[records.placedPlace, records], [record.placedPlace, record]]);
+    }
+}
+
+/// What a page's plain element made by the app's JSX comes to, drawn in place in what `owner` gives back, under the element drawn in
+/// place that `parent` stands for, if it's in one: see above. Undefined is for it to be a component.
+function placeElement(description, owner, parent, place) {
+    const type = description.type;
+    const given = description.props ?? NO_LOOK;
+    // What code made is drawn by a component of its own for each node already (`OwnElement` in dom.js), which finds out what each
+    // kind comes to from the first of it (see `drawNative`), so it's drawn by that as before.
+    if (!placedOn() || given.as !== undefined || given.__handle !== undefined || given.__nativeProbe !== undefined) {
+        return undefined;
+    }
+    const around = parent ?? owner;
+    let record = placedAt(owner, place);
+    if (record !== undefined && (record.placedType !== type || record.frame.parent !== around)) {
+        // Something else in its place is another element, as a component of another kind would be.
+        placedGoes(owner, record);
+        record = undefined;
+    }
+    if (record === undefined) {
+        record = new PlacedLive(type, place);
+        record.frame = rsui.__newFrame(around, owner, type, record);
+        keepPlaced(owner, record);
+        placedMounting.push(record);
+    }
+    const kept = owner.placed;
+    kept.walking = true;
+    record.seenWalk = kept.walks;
+    const was = record.description;
+    if (record.out !== undefined && !record.placedDirty && !rsui.__framePending(record.frame) && record.seen === version
+        && record.flowSeen === flowVersion && record.everything === rsui.__everything()
+        && (was === description || rsuiHostMethods.samePageProps(was.props ?? NO_LOOK, given, was.memo, description.memo))) {
+        // What it's given does the same as before, as a component given it wouldn't render again: what it came to is what it comes to.
+        return record.out;
+    }
+    record.description = description;
+    // What it was given is what stands for it, as a component's props are, which is how it's told from what's beside it once code
+    // moves it (see `slotOf`).
+    record.frame.props = given;
+    record.placedDirty = false;
+    record.everything = rsui.__everything();
+    const before = placedNow;
+    placedNow = record;
+    let out;
+    try {
+        out = rsui.__renderPlaced(record.frame, type, given);
+    } finally {
+        placedNow = before;
+    }
+    if (isValidElement(out)) {
+        // Told apart from what's around it by its key, as the component it'd be is, and with what stands for it, for what's in it.
+        // What `Styled` gave back is made anew each time, and is only this one's.
+        if ((out.key === undefined || out.key === null) && typeof out.type === 'string' && out.type !== 'scroll') {
+            out.key = description.key ?? undefined;
+        }
+        out.__placed = record.frame;
+    }
+    record.out = out ?? null;
+    return record.out;
+}
+
+/// The `live` of an element drawn in place: what a `Styled` keeps of an element between drawings, with what its hooks would keep,
+/// and what sets its state and draws it again, which are its own methods rather than functions made for each element, as there can
+/// be thousands. It's the handlers Rust's told about its state with too (see `StateHandlers`), each made the first time it's asked
+/// for.
+class PlacedLive {
+    constructor(type, place) {
+        this.current = null;
+        this.placedType = type;
+        this.placedPlace = place;
+        this.frame = null;
+        this.description = undefined;
+        this.out = undefined;
+        this.seenWalk = -1;
+        this.placedDirty = false;
+        this.placedState = 0;
+        this.everything = -1;
+        this.mounted = false;
+        this.left = false;
+        this.refWanted = null;
+        this.refHeld = null;
+        this.refDetach = undefined;
+        this.refHandle = undefined;
+        this.innerDeps = undefined;
+        this.inner = undefined;
+        this.nthRef = undefined;
+        this.handlers = this;
+        this.made = null;
+    }
+
+    /// Its state, set as `useState`'s setter would.
+    setPlaced(next) {
+        const value = typeof next === 'function' ? next(this.placedState) : next;
+        if (!Object.is(value, this.placedState)) {
+            this.placedState = value;
+            this.placedDirty = true;
+            placedChanged(this.frame);
+        }
+    }
+
+    /// Draws it again, once for however many times it's asked before it is, as `Styled`'s own `redraw` does.
+    redraw() {
+        if (this.redrawing !== true) {
+            this.redrawing = true;
+            this.setPlaced(this.placedState ^ REDRAWN);
+        }
+    }
+
+    of(bit, at) {
+        const made = (this.made ??= [undefined, undefined, undefined, undefined, undefined]);
+        return (made[at] ??= (on) => this.setPlaced(on ? this.placedState | bit : this.placedState & ~bit));
+    }
+
+    get hover() {
+        return this.of(HOVER, 0);
+    }
+
+    get press() {
+        return this.of(PRESS, 1);
+    }
+
+    get focus() {
+        return this.of(FOCUS, 2);
+    }
+
+    get within() {
+        return this.of(WITHIN, 3);
+    }
+
+    get ring() {
+        return this.of(RING, 4);
+    }
+}
+
+/// What a `Styled` drawn in place has as its state, in place of `useState`. What would set it is the element's own `setPlaced`,
+/// which is what its `redraw` and its handlers call (see `PlacedLive`), so there's no setter made for it here.
+function placedState(record) {
+    return [record.placedState, null];
+}
+
+/// What a `Styled` drawn in place keeps worked out while what it's worked out from is the same, in place of `useMemo`.
+function placedMemo(record, make, deps) {
+    const was = record.innerDeps;
+    if (was === undefined || was.length !== deps.length || deps.some((one, at) => !Object.is(one, was[at]))) {
+        record.inner = make();
+        record.innerDeps = deps;
+    }
+    return record.inner;
+}
+
+/// What `useDomRef` gives an element drawn in place: its key on the page, with its ref given its element as the commit it's drawn in
+/// starts.
+function placedDomRef(record, ref, had) {
+    const key = (record.pageKey ??= had ?? '__dom' + nextDomKey++);
+    const wanted = ref === undefined ? null : ref;
+    if (record.refWanted !== wanted) {
+        record.refWanted = wanted;
+        placedRefs.push(record);
+    }
+    return key;
+}
+
+/// Has what an element drawn in place reads changing draw it again: its owner builds what it gave back again, which works it out
+/// again, unless that's under way now and hasn't reached it yet.
+function placedChanged(frame) {
+    const record = frame.__pageLive;
+    const owner = frame.placedIn;
+    const kept = owner.placed;
+    if (kept !== undefined && kept.walking && record.seenWalk !== kept.walks) {
+        return;
+    }
+    rsui.__markStateSet(owner);
+}
+rsui.__placedChanged = placedChanged;
+
+/// Says that what `owner` gave back has been built, and lets go of what was drawn in place in it last time that wasn't this time,
+/// giving back whether anything's drawn in place in it now.
+function placedWalked(owner) {
+    const kept = owner.placed;
+    if (kept === undefined) {
+        return false;
+    }
+    const walk = kept.walks;
+    kept.walks = walk + 1;
+    kept.walking = false;
+    const records = kept.records;
+    if (records instanceof Map) {
+        for (const [place, record] of records) {
+            if (record.seenWalk !== walk) {
+                records.delete(place);
+                placedLeaving.push(record);
+            }
+        }
+        if (records.size === 0) {
+            kept.records = undefined;
+        } else if (records.size === 1) {
+            kept.records = records.values().next().value;
+        }
+    } else if (records !== undefined && records.seenWalk !== walk) {
+        kept.records = undefined;
+        placedLeaving.push(records);
+    }
+    return kept.records !== undefined;
+}
+
+/// Lets go of one element drawn in place in what `owner` gives back, as something else has taken its place.
+function placedGoes(owner, record) {
+    const records = owner.placed.records;
+    if (records instanceof Map) {
+        records.delete(record.placedPlace);
+    } else if (records === record) {
+        owner.placed.records = undefined;
+    }
+    placedLeaving.push(record);
+}
+
+/// Lets go of everything drawn in place in what `owner` gave back, as it's gone.
+function placedOwnerGone(owner) {
+    const records = owner.placed?.records;
+    owner.placed = undefined;
+    if (records === undefined) {
+        return;
+    }
+    for (const record of records instanceof Map ? [...records.values()] : [records]) {
+        placedLeft(record);
+    }
+}
+
+/// What an element drawn in place does once it isn't drawn: what it did once it was on the page is undone, and its ref let go of.
+function placedLeft(record) {
+    if (record.left) {
+        return;
+    }
+    record.left = true;
+    if (record.mounted) {
+        record.mounted = false;
+        liveGone(record);
+    }
+    placedLetGo(record);
+    record.refHeld = null;
+    rsui.__forgetFrame(record.frame);
+}
+
+/// Takes an element drawn in place from the ref it was given, as `useDomRef` does when it goes.
+function placedLetGo(record) {
+    const detach = record.refDetach;
+    const handle = record.refHandle;
+    record.refDetach = undefined;
+    record.refHandle = undefined;
+    if (handle !== undefined && handles.get(record.pageKey) === handle) {
+        handles.delete(record.pageKey);
+    }
+    detach?.();
+}
+
+/// What's done as a commit starts, before any layout effect, for what's drawn in place: what's gone is let go of, what's new is put on
+/// the page, and refs are given their elements, as React gives a host element's.
+function placedCommit() {
+    if (placedLeaving.length === 0 && placedMounting.length === 0 && placedRefs.length === 0) {
+        return;
+    }
+    const leaving = placedLeaving;
+    const mounting = placedMounting;
+    const refs = placedRefs;
+    placedLeaving = [];
+    placedMounting = [];
+    placedRefs = [];
+    for (const record of leaving) {
+        placedLeft(record);
+    }
+    for (const record of mounting) {
+        if (!record.left && !record.mounted) {
+            record.mounted = true;
+            // What it does once it's gone is `liveGone`, which `placedLeft` calls itself.
+            liveMounted(record);
+        }
+    }
+    for (const record of refs) {
+        if (record.left || record.refHeld === record.refWanted) {
+            continue;
+        }
+        placedLetGo(record);
+        record.refHeld = record.refWanted;
+        const ref = record.refWanted;
+        if (ref === null) {
+            continue;
+        }
+        // As `useDomRef` gives it: what code holds says where it is as it was last laid out.
+        keepLaidOut();
+        const key = record.pageKey;
+        record.domKey = key;
+        const handle = handleOf(record, record.tag ?? 'div', true);
+        handle.__placedByKey = true;
+        record.refHandle = handle;
+        record.refDetach = attachRef(ref, handle);
+    }
+}
+
+rsui.__placeElement = placeElement;
+rsui.__placedWalked = placedWalked;
+rsui.__placedCommit = placedCommit;
+rsui.__placedOwnerGone = placedOwnerGone;
+
+/// What a page's element does once it's on the page, as React has put it in, giving back what it does once it's taken out, as a
+/// function of its own, so that what each element keeps until it's taken out is only a small function that knows which it is.
+function liveMounted(live) {
+    listeners.add(live);
+    if (movedDrawn) {
+        drawnCameOrWent(live);
+    }
+    if (live.domKey !== undefined) {
+        // It's on the page from now, before Rust has it, as what React's put in is: see `inPageNow`.
+        mountedNotDrawn.add(live.domKey);
+    }
+    // It could have changed between drawing it and getting here.
+    if (live.seen !== version || live.flowSeen !== flowVersion) {
+        live.redraw();
+    }
+    return () => liveGone(live);
+}
+
+/// What a page's element does once React has taken it out.
+function liveGone(live) {
+    listeners.delete(live);
+    if (movedDrawn) {
+        drawnCameOrWent(live);
+    }
+    mountedNotDrawn.delete(live.domKey);
+    if (focusedElement !== null) {
+        focusTakenOut(live);
+    }
+    forgetNotShown(live);
+    forgetSvgParts(live.domKey);
+    if (skippingLives.get(live.domKey) === live) {
+        skippingLives.delete(live.domKey);
+    }
+    if (live.skippedKids !== undefined) {
+        forgetSkippedParts(live);
+    }
+    const forgotHas = hasWatched.delete(live);
+    if (forgotHas) hasRecipesChanged();
+    if (forgotHas | containerWatched.delete(live)) {
+        lookForResizes();
+    }
+    // What's gone isn't an element of the page any more, even where something's still in the tree under its key, as
+    // what a component that now renders nothing leaves is.
+    if (live.domKey !== undefined && live.weak !== undefined && pageLives.get(live.domKey) === live.weak) {
+        pageLives.delete(live.domKey);
+        pageNow = null;
+        if (focusedElement !== null && focusedElement.__domKey === live.domKey) {
+            // What has the keyboard being taken out loses it there and then, as Chromium says with `blur` and
+            // `focusout` (to nothing), and `document.activeElement` is `body` until something else is given it, as a
+            // menu's item is when the menu closes, before Radix gives its trigger the keyboard back.
+            moveFocus(null, false);
+        }
+        if (live.handle != null) {
+            hoverGone(live.handle);
+        }
+    }
+}
+
 /// What a selector for a styled component is, for what's been told about it in plain text.
 function makeStyled(target, settings = {}) {
     const attrs = settings.attrs ?? [];
@@ -8767,62 +9356,16 @@ function makeStyled(target, settings = {}) {
             // What it is on the page, kept from one drawing to the next, which what's set on it with `setAttribute()` and the like is
             // kept on, and which is what draws it again when CSS changes, as it's in `listeners` (see `restyled`) while it's there. That
             // takes nothing more than what it has already, where `usePage` would keep a state, two refs and an effect of its own.
-            const live = useRef(null);
+            // Drawn in place, it has no hooks of its own: what they'd keep is kept on its `live`, and what it does once it's on the
+            // page is done as the commit it's drawn in starts (see `placeElement`).
+            const placed = placedNow;
+            const live = placed ?? useRef(null);
             // The page's variables it reads from here on, which it's drawn again for when one changes.
             variableReader = live;
             live.pageVarsRead = null;
-            useLayoutEffect(() => {
-                listeners.add(live);
-                if (movedDrawn) {
-                    drawnCameOrWent(live);
-                }
-                if (live.domKey !== undefined) {
-                    // It's on the page from now, before Rust has it, as what React's put in is: see `inPageNow`.
-                    mountedNotDrawn.add(live.domKey);
-                }
-                // It could have changed between drawing it and getting here.
-                if (live.seen !== version || live.flowSeen !== flowVersion) {
-                    live.redraw();
-                }
-                return () => {
-                    listeners.delete(live);
-                    if (movedDrawn) {
-                        drawnCameOrWent(live);
-                    }
-                    mountedNotDrawn.delete(live.domKey);
-                    if (focusedElement !== null) {
-                        focusTakenOut(live);
-                    }
-                    forgetNotShown(live);
-                    forgetSvgParts(live.domKey);
-                    if (skippingLives.get(live.domKey) === live) {
-                        skippingLives.delete(live.domKey);
-                    }
-                    if (live.skippedKids !== undefined) {
-                        forgetSkippedParts(live);
-                    }
-                    const forgotHas = hasWatched.delete(live);
-                    if (forgotHas) hasRecipesChanged();
-                    if (forgotHas | containerWatched.delete(live)) {
-                        lookForResizes();
-                    }
-                    // What's gone isn't an element of the page any more, even where something's still in the tree under its key, as
-                    // what a component that now renders nothing leaves is.
-                    if (live.domKey !== undefined && live.weak !== undefined && pageLives.get(live.domKey) === live.weak) {
-                        pageLives.delete(live.domKey);
-                        pageNow = null;
-                        if (focusedElement !== null && focusedElement.__domKey === live.domKey) {
-                            // What has the keyboard being taken out loses it there and then, as Chromium says with `blur` and
-                            // `focusout` (to nothing), and `document.activeElement` is `body` until something else is given it, as a
-                            // menu's item is when the menu closes, before Radix gives its trigger the keyboard back.
-                            moveFocus(null, false);
-                        }
-                        if (live.handle != null) {
-                            hoverGone(live.handle);
-                        }
-                    }
-                };
-            }, []);
+            if (placed === null) {
+                useLayoutEffect(() => liveMounted(live), []);
+            }
             live.seen = seen;
             live.flowSeen = flowVersion;
             // Drawn again once for however many times it's asked before it is, as asking twice would flip it back.
@@ -8859,19 +9402,24 @@ function makeStyled(target, settings = {}) {
             const onLine = given_flow === 'line';
             const flow = onLine ? 'row' : given_flow;
             const nth = given_nth;
-            const [state, setState] = useState(0);
-            const handlers = useMemo(() => makeHandlers(setState), []);
+            const [state, setState] = placed === null ? useState(0) : placedState(placed);
+            // What sets its state from what Rust says, made once, as `setState` is the same for as long as it's there.
+            const handlers = (live.handlers ??= makeHandlers(setState));
             // Where each thing in this was last time, for it to be told the same as long as it's the same.
-            const nthKept = useRef(null);
+            const nthKept = placed === null ? useRef(null) : (placed.nthRef ??= { current: null });
             // What finds which of what's in it an element is, once code moves one of them: see `slotOf`.
             live.nthKept = nthKept;
             // It's about the component it's in, and this is what that component made.
             if (given_nth !== null && given_nth.owner !== Styled && typeof given_nth.owner === 'function' && given_nth.owner.__webTag === undefined) {
                 given_nth.learn?.(typeof (given.as ?? target) === 'string' ? given.as ?? target : Styled.__webTag ?? null, nthKept, given.className);
             }
-            let props = { ...given, theme: given.theme ?? theme };
-            delete props.__nth;
-            delete props.__disclosure;
+            // What it's given, as it is unless there's something to put in it or take out, as most elements have nothing of either.
+            let props = given.theme === undefined && theme === undefined && given.__nth === undefined && given.__disclosure === undefined ? given
+                : { ...given, theme: given.theme ?? theme };
+            if (props !== given) {
+                delete props.__nth;
+                delete props.__disclosure;
+            }
             for (const attr of attrs) {
                 props = { ...props, ...(typeof attr === 'function' ? attr(props) : attr) };
             }
@@ -8910,10 +9458,35 @@ function makeStyled(target, settings = {}) {
             };
             // What it is, for what's drawn again when CSS changes to be only what that's about: see `restyleTouches`.
             live.me = me;
+            // The kind of row of a long list it is, and what another of that kind came to, if one has: see `sharedLook`.
+            let shareKinds = null;
+            let shareKey = null;
+            if (runAbove !== null && isHost && attrs.length === 0 && live.attributes === undefined && given.__webMore === undefined && live.cssom == null
+                && PLAIN_TAGS.has(tag) && tag !== 'br' && sharedLooksOn()) {
+                shareKey = sharedLookKey(tag, state, me.empty, given);
+                if (shareKey !== null && me.classes.some((name) => madeClasses.has(name))) {
+                    shareKey = null;
+                }
+                if (shareKey !== null) {
+                    shareKinds = sharedLooksOf(runAbove, sharedLookAround(compiled, owners, theme, fontAbove, variablesAbove, parentLook, given_flow, form));
+                }
+            }
+            const shared = shareKey === null ? undefined : shareKinds.get(shareKey);
+            if (shared !== undefined) {
+                sharedLooksUsed += 1;
+            }
             let look = {};
-            const parts = {};
+            let parts = {};
             let needs = 0;
             let started = null;
+            let passedOn = null;
+            let cascaded = null;
+            let writtenLook = null;
+            let kept = null;
+            let parentReads;
+            let lookForInside = null;
+            if (shared === undefined) {
+            cascadeLookedAround = false;
             if (isHost) {
                 Object.assign(look, browserLook(tag, props.type, props.disabled === true, typeof props.href !== 'string'), dirLook(props.dir), tagLook('*'), tagLook(tag));
                 if (hasWatched.size !== 0) {
@@ -8931,7 +9504,7 @@ function makeStyled(target, settings = {}) {
             // What the page's rules say, its rules about one class among them, in the cascade's order. What a styled component says
             // itself, and what one has passed on as a class, is a rule about one class that comes after all of the page's, as its
             // `<style>` would, so it goes over what the page says about one class and under what says more.
-            const passedOn = !isHost ? null : () => {
+            passedOn = !isHost ? null : () => {
                 applyCompiled(compiled, me, look, parts);
                 for (const name of me.classes) {
                     const record = madeClasses.get(name);
@@ -8944,22 +9517,41 @@ function makeStyled(target, settings = {}) {
                     }
                 }
             };
-            needs |= fromAbove(owners, me, look, parts, isHost, passedOn);
+            sharingParts = parts;
+            sharedPartNames.length = 0;
+            try {
+                needs |= fromAbove(owners, me, look, parts, isHost, passedOn);
+            } finally {
+                sharingParts = null;
+            }
             // What the page's rules came to, for `freshLook` to compare with what they come to later.
-            const cascaded = started === null ? null : { ...look };
-            let writtenLook = null;
+            cascaded = started === null ? null : { ...look };
+            } else {
+                // Another row of its kind's look, as it was before what's written on it and what it inherits: see `sharedLook`.
+                // It's copied once everything that works it out has been, below.
+                look = shared.look;
+                for (const name of Object.keys(shared.parts)) {
+                    parts[name] = { ...shared.parts[name] };
+                }
+                needs = shared.needs;
+                watched = shared.watched;
+            }
             // Only the states that rules about what's inside it care about change what goes down to it, so hovering something that
             // only changes how it looks itself doesn't draw everything inside it again.
             const passedState = state & (watched | compiled.needs);
             // What's been set on it with `setAttribute()`, which rules about what's inside it can be about.
             const attributesSet = live.attributes === undefined ? '' : JSON.stringify(live.attributes);
+            if (shared === undefined) {
             if (given.__webMore !== undefined) {
                 pendingVariableFields.delete(look);
                 Object.assign(look, given.__webMore.look);
                 mergeParts(parts, given.__webMore.parts);
             }
+            ownParts(parts);
+            }
             // Only once it's been drawn, which it's been given something by then.
-            const kept = live.given === undefined ? null : live;
+            kept = live.given === undefined ? null : live;
+            if (shared === undefined) {
             if (isHost && kept?.cssom != null) {
                 // What React says that's new goes over what code set for it, as React writes it then.
                 const before = kept.styleProp ?? {};
@@ -8999,9 +9591,9 @@ function makeStyled(target, settings = {}) {
             // `inherit` on what isn't passed down by itself is what the parent says, and what this says goes down to what's in it.
             // What this read of what's around it, so that it isn't drawn again when only what it didn't read changes: see
             // `toldChanged` in layer.js.
-            const parentReads = [];
+            parentReads = [];
             withInherited(look, parentLook, parentReads);
-            const lookForInside = isHost && inheritAsked ? keptLookDown(live, { ...look }) : null;
+            lookForInside = isHost && inheritAsked ? keptLookDown(live, { ...look }) : null;
             if (isHost && tag === 'button') {
                 plainButton(look);
             }
@@ -9023,23 +9615,46 @@ function makeStyled(target, settings = {}) {
             if (isHost && tag === 'textarea') {
                 textareaLook(look, props.cols);
             }
+            } else {
+                live.styleProp = null;
+                live.inlineVars = null;
+                if (live.cssAnimationName !== undefined) {
+                    live.cssAnimationName = undefined;
+                }
+                parentReads = shared.parentReads;
+            }
             const nthKey = nth === null ? '' : nth.index + '/' + nth.count + '/' + nth.typeIndex + '/' + nth.typeCount + '/' + (nth.peerKey ?? '');
             const nested = rulesNow(compiled, me);
             // What's inside it is under it as it is now, whichever time it was drawn, and only what rules ask of what's
             // around them is a new chain for what's inside, as what's inside is drawn again for that.
-            if (live.chainEl === undefined) {
-                live.chainEl = {};
-                // What it is, as it is now, for `RSUI_RESTYLE_CHECK` to look from: see `freshChain`.
-                Object.defineProperty(live.chainEl, '__live', { value: live, enumerable: false });
-            }
-            const chainEl = live.chainEl;
-            Object.assign(chainEl, me);
-            const chainSaid = chainKey(me, compiled, nested);
             // What it says itself is made again each time CSS changes, which only what's inside hears about when it has rules for that.
             const ownRules = compiled.nested.length === 0 ? null : compiled;
-            // And what it says about `:has()` once it's drawn (see `hasDrawn`), as what's inside it can be about it, as
-            // `.x:has(> .on) .y` is.
-            const inner = useMemo(() => passedDown(owners, chainEl, nested), [owners, ownRules, chainSaid, passedState, nthKey, live.hasVersion]);
+            let chainSaid;
+            // What's passed down to what's in it. Drawn in place, that's only worked out once something's drawn in it, as nothing is in
+            // a long list's row far from being seen.
+            let inner = UNWORKED;
+            const innerNow = () => {
+                if (inner === UNWORKED) {
+                    if (live.chainEl === undefined) {
+                        live.chainEl = {};
+                        // What it is, as it is now, for `RSUI_RESTYLE_CHECK` to look from: see `freshChain`.
+                        Object.defineProperty(live.chainEl, '__live', { value: live, enumerable: false });
+                    }
+                    const chainEl = live.chainEl;
+                    Object.assign(chainEl, me);
+                    chainSaid = chainKey(me, compiled, nested);
+                    // And what it says about `:has()` once it's drawn (see `hasDrawn`), as what's inside it can be about it, as
+                    // `.x:has(> .on) .y` is.
+                    const innerDeps = [owners, ownRules, chainSaid, passedState, nthKey, live.hasVersion];
+                    inner = placed === null ? useMemo(() => passedDown(owners, chainEl, nested), innerDeps)
+                        : placedMemo(placed, () => passedDown(owners, chainEl, nested), innerDeps);
+                }
+                return inner;
+            };
+            if (placed === null || RESTYLE_ENV.log || RESTYLE_ENV.check) {
+                // A component's hooks are the same each time.
+                innerNow();
+            }
             if (RESTYLE_ENV.log) {
                 const deps = [owners, ownRules, chainSaid, passedState, nthKey, fontAbove, variablesAbove, parentLook, given_flow, theme, form];
                 if (live.depsWas !== undefined) {
@@ -9058,8 +9673,12 @@ function makeStyled(target, settings = {}) {
             // this says itself, as that component gets the rest from where it is.
             const own_look = isHost ? look : { ...look };
             // What uses the variables it has, and what it sets for what's inside it. Another component works out its own.
-            const varsNote = { names: [], own: null, live };
-            const variablesInside = isHost ? keptVariablesDown(live, withElementVariables(look, variablesAbove, false, varsNote)) : null;
+            let varsNote;
+            let variablesInside;
+            let ownColorSaid;
+            if (shared === undefined) {
+            varsNote = { names: [], own: null, live };
+            variablesInside = isHost ? keptVariablesDown(live, withElementVariables(look, variablesAbove, false, varsNote)) : null;
             live.varsRead = varsNote.names.length > 0 ? varsNote.names : null;
             if (isHost) {
                 // `::before` and `::after` use its variables too, as Radix's checkbox's `::before { width: var(--checkbox-size) }`
@@ -9117,7 +9736,7 @@ function makeStyled(target, settings = {}) {
 
             // How text is written in it, from what it says and what it's in, and what tells whether that's changed: see `layout.rs`.
             // The color CSS says for it itself, before what it inherits is in its look, which an `<svg>`'s `color` attribute is under.
-            const ownColorSaid = look.color;
+            ownColorSaid = look.color;
             look = natives.cssOwnFont(layout, look, fontAbove, tag, isHost, placing);
             if (look.__logical === true) {
                 // Which way the text goes is known now, which logical properties' sides depend on.
@@ -9135,30 +9754,64 @@ function makeStyled(target, settings = {}) {
                 || (!(look.__flex === true && look.direction !== 'column') && (look.direction === undefined || look.direction === 'column')))) {
                 look.crossReverse = true;
             }
+            if (shareKey !== null && !cascadeLookedAround && started === null && writtenLook === null && lookForInside === null && (needs & (RING | PEER | DEEP_PEER)) === 0
+                && sharedLooksOn()) {
+                // The first of its kind in this list, which the rest start from: see `sharedLook`.
+                const sharedParts = {};
+                for (const name of Object.keys(parts)) {
+                    sharedParts[name] = { ...parts[name] };
+                }
+                shareKinds.set(shareKey, {
+                    look: { ...look }, parts: sharedParts, needs, watched, parentReads, variablesInside, varNames: varsNote.names, varsOwn: varsNote.own,
+                    pageVarsRead: live.pageVarsRead, saidTranslate: live.saidTranslate, saidRotate: live.saidRotate, saidScale: live.saidScale,
+                    ownColorSaid, fontKey: placing.fontKey,
+                });
+            }
+            } else {
+                look = { ...shared.look };
+                varsNote = { names: shared.varNames, own: shared.varsOwn, live };
+                variablesInside = keptVariablesDown(live, shared.variablesInside);
+                live.varsRead = shared.varNames.length > 0 ? shared.varNames : null;
+                live.pageVarsRead = shared.pageVarsRead;
+                if (shared.saidTranslate) live.saidTranslate = true;
+                if (shared.saidRotate) live.saidRotate = true;
+                if (shared.saidScale) live.saidScale = true;
+                ownColorSaid = shared.ownColorSaid;
+                placing.fontKey = shared.fontKey;
+            }
             const fontKey = placing.fontKey;
             // A button's or a link's text that ends in `…` (`text-overflow: ellipsis`) is all of what's on its line, a `<span>` in it
             // too, which is told so with what it's written in: see `ellipsisLine` below.
             const ellipsisLine = look.ellipsis === true && (tag === 'button' || tag === 'a');
-            const font = useMemo(() => {
-                const made = fontFrom(look, null);
-                return ellipsisLine ? { ...made, __ellipsisLine: true } : made;
-            }, [fontKey, ellipsisLine]);
+            // The same as last time while what tells fonts apart is, as a memo would keep it: see `fontOf`.
+            if (live.fontKey !== fontKey || live.fontEllipsis !== ellipsisLine || live.font === undefined) {
+                live.font = fontOf(look, ellipsisLine);
+                live.fontKey = fontKey;
+                live.fontEllipsis = ellipsisLine;
+            }
+            const font = live.font;
             // What goes down to what's in it, from this component itself rather than from providers around what it makes, which
             // would be there only when it has something of its own to pass down, and make everything in it start again when that
-            // changes, as a sheet that gains a rule about attributes does. It's on every render, as `provideHere` needs.
+            // changes, as a sheet that gains a rule about attributes does. It's on every render, as `provideHere` needs, apart from
+            // while it skips what's in it (see `contentVisibility`), as nothing in it is drawn then to read any of it: a long list's
+            // rows far from being seen don't each keep all of it. It's said once what's in it is drawn, before that's drawn.
             const passDown = rsui.__provideHere;
-            passDown(InheritedFont, font);
-            passDown(NestedRules, inner);
-            passDown(InheritedVariables, isHost && holdsFixed(look) ? withFixedBox(variablesInside ?? variablesAbove) : variablesInside ?? variablesAbove);
-            passDown(ParentLook, lookForInside ?? parentLook);
-            if (isHost) {
-                // What's in it is a long list's rows when it's a long list that scrolls, and nothing deeper in is.
-                passDown(LongRun, longRunOf(live, look, given));
-            }
+            const variablesDown = isHost && holdsFixed(look) ? withFixedBox(variablesInside ?? variablesAbove) : variablesInside ?? variablesAbove;
+            // What's in it is a long list's rows when it's a long list that scrolls, and nothing deeper in is.
+            const runDown = isHost ? longRunOf(live, look, given) : undefined;
+            const passAllDown = () => {
+                passDown(InheritedFont, font);
+                passDown(NestedRules, innerNow());
+                passDown(InheritedVariables, variablesDown);
+                passDown(ParentLook, lookForInside ?? parentLook);
+                if (isHost) {
+                    passDown(LongRun, runDown);
+                }
+                // Where this is among what's around it is only about this, and not what's in it.
+                passDown(NthContext, null);
+            };
             rsui.__readsHere(InheritedVariables, varsNote);
             rsui.__readsHere(ParentLook, { props: parentReads, through: lookForInside === null, live });
-            // Where this is among what's around it is only about this, and not what's in it.
-            passDown(NthContext, null);
             // The same, as what's in it is put into lines, which is worked out once: nothing said about fonts changes in between.
             let ownFont;
             const lookFont = () => (ownFont === undefined ? (ownFont = fontFrom(look, null)) : ownFont);
@@ -9207,14 +9860,20 @@ function makeStyled(target, settings = {}) {
             const kidsIn = !isHost ? null : codeKids === null ? (givenKids === given.children ? givenKids : null)
                 : replaced || given.children === undefined || given.children === null ? codeKids : null;
             const keepable = isHost && Array.isArray(kidsIn) && kidsIn.length >= KEPT_FROM && keepsKids(tag, look, nested, parts, nthKept);
-            const keptSaid = keepable ? keptSignature(look, inner, kidsIn) : null;
-            const keptList = keepable ? keptKids(nthKept, kidsIn, keptSaid, tag, inner) : null;
+            const keptSaid = keepable ? keptSignature(look, innerNow(), kidsIn) : null;
+            const keptList = keepable ? keptKids(nthKept, kidsIn, keptSaid, tag, innerNow()) : null;
             const keptNow = keptList !== null;
             // How spaces in its text were taken, for what's drawn like it without a `Styled` of its own: see `drawNative`.
             const whiteSpaceSaid = look.__whiteSpace;
+            // A long list's row that skips what's in it (see `LongRun`) keeps that as it was given, as nothing of it is drawn: putting it
+            // through what's below would copy each of its elements to give it a key by where it is, for every such row.
+            const skipsGiven = isHost && !keptNow && runAbove !== null && codeKids === null && givenKids === given.children
+                && (live.portalKids === undefined || live.portalKids.size === 0) && skipsByItself(live, look, given, givenKids);
             let children;
             if (keptNow) {
                 children = keptList;
+            } else if (skipsGiven) {
+                children = givenKids;
             } else {
                 children = isHost ? spacesAsSaid(joinedText(givenKids), look.__whiteSpace) : givenKids;
                 if (replaced) {
@@ -9231,9 +9890,11 @@ function makeStyled(target, settings = {}) {
             // What CSS says to skip while it's far from being seen (`content-visibility`) has a box of the size it says in place of
             // what's in it until then, and what's in it from then on: see `contentVisibility`.
             // A long list's row that's far from being seen is skipped the same way where that changes nothing (see `LongRun`).
-            const skipping = isHost ? contentVisibility(look, live, children, runAbove !== null && skipsByItself(live, look, given, children)) : null;
+            const skipping = isHost ? contentVisibility(look, live, children, runAbove !== null && (skipsGiven || skipsByItself(live, look, given, children))) : null;
             if (skipping !== null) {
                 children = skipping;
+            } else {
+                passAllDown();
             }
             if (isHost && (look.__flex === true || look.display === 'grid') && !keepsSpaces(look.__whiteSpace)) {
                 // Text in a flex box or a grid is a box of its own, with no spaces at its ends, and only spaces is nothing.
@@ -9336,17 +9997,17 @@ function makeStyled(target, settings = {}) {
             if (keptNow) {
                 // What's in it is a list of blocks, which is none of this, as it wasn't last time: see `keptKids`.
             } else if (((TEXT_TAGS.has(tag) && !INLINE_TEXT_TAGS.has(tag)) || BLOCK_TAGS.has(tag)) && look.display === undefined && look.direction === undefined && look.__flex !== true
-                && children !== undefined && !anyFloats(children, inner) && (natives.cssChildren(layout, children, LINE_BOXES)
+                && children !== undefined && !anyFloats(children, innerNow()) && (natives.cssChildren(layout, children, LINE_BOXES)
                     // Text with a block in it, as Mantine's `<blockquote>` has its `<cite>`, which is a block by its class, is broken
                     // around it, as CSS has it, rather than running through it.
                     || (TEXT_TAGS.has(tag) && natives.cssChildren(layout, children, HOLDS_BLOCK))
-                    || (inner !== null && complexLineBoxes() && Children.toArray(children).some((child) => lineBoxFromAbove(child, inner))))) {
+                    || (innerNow() !== null && complexLineBoxes() && Children.toArray(children).some((child) => lineBoxFromAbove(child, inner))))) {
                 lined = true;
                 along = false;
                 children = intoLines(children, true, lookFont());
             } else if (BLOCK_TAGS.has(tag) && look.display === undefined && look.direction === undefined && children !== undefined) {
                 blockLines = true;
-                const floated = withFloats(children, lookFont(), inner);
+                const floated = withFloats(children, lookFont(), innerNow());
                 if (floated !== children) {
                     // What floats has its own row beside what's after it, so the block isn't a line of its own any more.
                     along = false;
@@ -9487,7 +10148,9 @@ function makeStyled(target, settings = {}) {
                 live.handle = given.__handle;
             }
             // Every element of the page has a key of its own, by which what a selector asks about it is found: see `pageTree`.
-            const domKey = useDomRef(isHost ? props.ref : null, isHost, live, tag, given.__handle?.__own === true ? given.__handle.__domKey : undefined);
+            const domKey = placed === null
+                ? useDomRef(isHost ? props.ref : null, isHost, live, tag, given.__handle?.__own === true ? given.__handle.__domKey : undefined)
+                : placedDomRef(placed, props.ref, given.__handle?.__own === true ? given.__handle.__domKey : undefined);
             live.domKey = domKey;
             // Where it's drawn from, for what it's in before it's drawn (see `parentElement`).
             live.instance = rsui.__instanceNow?.() ?? undefined;
@@ -9622,10 +10285,25 @@ function makeStyled(target, settings = {}) {
             // What CSS says about the shapes in it, by their ids, which goes over what they say themselves, as it does on a page.
             // The rules that reach what's inside it are this one's, as `[data-x] .curve` reaches a `<circle class="curve">` in it, and
             // so are the variables it sets.
-            const shapeParts = tag === 'svg' ? shapePartsOf(inner, variablesInside ?? variablesAbove) : undefined;
+            // The same function as last time while what it works from is the same, so that the picture, which is given it, isn't
+            // drawn again for being given a new one that would say the same.
+            let shapeParts;
             if (tag === 'svg') {
-                // What its shapes use isn't known here.
-                rsui.__readsHere(InheritedVariables, null);
+                const variablesHere = variablesInside ?? variablesAbove;
+                const keptParts = live.shapeParts;
+                if (keptParts !== undefined && keptParts.inner === innerNow() && keptParts.variables === variablesHere) {
+                    shapeParts = keptParts.parts;
+                } else {
+                    // The variables its shapes use, as they're drawn, which is after this.
+                    const names = [];
+                    shapeParts = shapePartsOf(inner, variablesHere, names);
+                    live.shapeParts = { inner, variables: variablesHere, parts: shapeParts, names };
+                }
+                // It's drawn again when a variable it or its shapes use changes, and not for one that nothing in it uses. Its shapes
+                // say which they use once they're drawn, which they are before anything changes.
+                const shapeNames = live.shapeParts.names;
+                const ownNames = varsNote.names;
+                rsui.__readsHere(InheritedVariables, { get names() { return shapeNames.length === 0 ? ownNames : [...ownNames, ...shapeNames]; }, own: varsNote.own, live });
             }
             if (tag === 'svg') {
                 // What CSS says about how it's drawn goes over what it says itself, as SVG's presentation attributes are only what
@@ -9712,7 +10390,9 @@ function makeStyled(target, settings = {}) {
             }
             // What's in it is told, from this rather than from providers around each of them, which would be there only while it's
             // different from what this was told, and make what's in it start again when that changes: see `provideHere`.
-            rsui.__provideHere(FlowContext, inside);
+            if (skipping === null) {
+                rsui.__provideHere(FlowContext, inside);
+            }
             for (const name of ['before', 'after']) {
                 if (parts[name] !== undefined) {
                     withCurrentColor(parts[name], parts[name].color ?? current);
@@ -9725,7 +10405,7 @@ function makeStyled(target, settings = {}) {
             live.look = out;
             if (tag === 'svg') {
                 // What's in the picture is elements of the page too, which code looks for, though they're drawn as one picture.
-                out.__elements = (found) => keepSvgElements(live, found);
+                out.__elements = live.keepsSvgElements ??= (found) => keepSvgElements(live, found);
             }
             if (inlineArea) {
                 // Its box is as tall as its font makes it, as CSS's inline box is, wherever its lines are: see `inline_area` in
@@ -9783,7 +10463,7 @@ function makeStyled(target, settings = {}) {
             if (live.nativeKids === true) {
                 // What's in it that's drawn without a `Styled` of its own reads what this passes down without watching it, and is drawn
                 // again from here when that changes: see `drawNative`.
-                tellNativeKids(live, [inner === PAGE_RULES ? pageOwners() : inner, font, variablesInside ?? variablesAbove, lookForInside ?? parentLook, inside, theme, version, declared, form, kindsForgotten]);
+                tellNativeKids(live, [innerNow() === PAGE_RULES ? pageOwners() : inner, font, variablesInside ?? variablesAbove, lookForInside ?? parentLook, inside, theme, version, declared, form, kindsForgotten]);
             }
             if (fontAbove === null && out.keepWords === undefined) {
                 // Words written with CSS aren't broken to fit, as a page's aren't, wherever they are: only what says to
@@ -9821,7 +10501,7 @@ function makeStyled(target, settings = {}) {
                     marker: markerSaid,
                     lineFont: lookFont(),
                     font,
-                    inner,
+                    inner: innerNow(),
                     down: [inner === PAGE_RULES ? pageOwners() : inner, font, variablesInside ?? variablesAbove, lookForInside ?? parentLook, inside, theme, version, declared, null, kindsForgotten],
                     value: props.value,
                 }) : null);
@@ -12294,56 +12974,96 @@ const NO_FOCUS = '__rsui_no_focus';
 /// Elements of a page by their `id`, while they're there, as far as they're known here.
 const idElements = new Map();
 
-/// The handle for an element of a page, made the first time it's wanted, and found by its key from then on.
-function handleOf(live, tag, keep = false) {
-    if (live.handle == null) {
-        const key = live.domKey;
-        const upper = String(tag ?? 'div').toUpperCase();
-        live.handle = {
-            ...fakeElement(),
-            tagName: upper,
-            nodeName: upper,
-            localName: String(tag ?? 'div'),
-            focus(options) {
-                if (canFocus(this)) {
-                    moveFocus(this, true, options);
-                }
-            },
-            blur() {
-                if (focusedElement === this) {
-                    moveFocus(null, false);
-                    // Rust's keyboard leaves it too, so keys go to the page rather than to it, as after a page's `blur()`.
-                    rsui.focus(NO_FOCUS);
-                }
-            },
-            select() {
-                selectField(this);
-            },
-            ...pointerCaptureMethods,
-            __domKey: key,
-        };
-        const handle = live.handle;
-        handle.addEventListener = (type, listener, options) => listenOnElement(handle, String(type), listener, options);
-        handle.removeEventListener = (type, listener, options) => unlistenOnElement(handle, String(type), listener, options);
-        handle.dispatchEvent = (event) => dispatchOn(handle, event);
-        handle.click = (from) => {
-            if (live.given?.disabled === true) {
+/// What every handle of an element of the page with this tag has, by its tag, rather than each having its own: what a page's element
+/// has (`fakeElement`), what it knows from where it is (`chainProps`), and what it does, each of them going by the handle it's asked of
+/// and what that's the handle of (`__live`). A handle itself only has its key, what it's of, and what it says about itself, as
+/// thousands of rows each with a ref otherwise took 6 KB each for their handles alone, most of it functions and accessors that were
+/// the same for all of them.
+const handleProtos = new Map();
+
+function handleProtoOf(tag) {
+    let proto = handleProtos.get(tag);
+    if (proto !== undefined) {
+        return proto;
+    }
+    proto = Object.create(prototypeFor(tag));
+    const upper = tag.toUpperCase();
+    // What's kept for each element itself, as code changes it, is made for each one: see `handleOf`.
+    const { style: _style, dataset: _dataset, classList: _classList, children: _children, ...shared } = Object.getOwnPropertyDescriptors(fakeElement());
+    Object.defineProperties(proto, shared);
+    Object.defineProperties(proto, Object.getOwnPropertyDescriptors({
+        tagName: upper,
+        nodeName: upper,
+        localName: tag,
+        focus(options) {
+            if (canFocus(this)) {
+                moveFocus(this, true, options);
+            }
+        },
+        blur() {
+            if (focusedElement === this) {
+                moveFocus(null, false);
+                // Rust's keyboard leaves it too, so keys go to the page rather than to it, as after a page's `blur()`.
+                rsui.focus(NO_FOCUS);
+            }
+        },
+        select() {
+            selectField(this);
+        },
+        ...pointerCaptureMethods,
+        addEventListener(type, listener, options) {
+            return listenOnElement(this, String(type), listener, options);
+        },
+        removeEventListener(type, listener, options) {
+            return unlistenOnElement(this, String(type), listener, options);
+        },
+        dispatchEvent(event) {
+            return dispatchOn(this, event);
+        },
+        click(from) {
+            if (this.__live?.given?.disabled === true) {
                 return;
             }
             const { MouseEvent } = domEvents();
-            dispatchOn(handle, new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: globalThis, ...clickFrom(from) }));
-        };
-        Object.setPrototypeOf(handle, prototypeFor(String(tag ?? 'div')));
-        Object.defineProperty(handle, '__live', { value: live, enumerable: false, configurable: true });
-        handle.setAttribute = (name, value) => setAttributeOn(live, String(name), String(value));
-        handle.removeAttribute = (name) => setAttributeOn(live, String(name), null);
-        handle.toggleAttribute = (name, force) => {
-            const on = force ?? handle.getAttribute(name) === null;
-            setAttributeOn(live, String(name), on ? '' : null);
+            dispatchOn(this, new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: globalThis, ...clickFrom(from) }));
+        },
+        setAttribute(name, value) {
+            setAttributeOn(this.__live, String(name), String(value));
+        },
+        removeAttribute(name) {
+            setAttributeOn(this.__live, String(name), null);
+        },
+        toggleAttribute(name, force) {
+            const on = force ?? this.getAttribute(name) === null;
+            setAttributeOn(this.__live, String(name), on ? '' : null);
             return on;
-        };
-        Object.defineProperties(live.handle, chainProps);
-        Object.defineProperty(handle, '__drawnChildren', { value: () => drawnChildren(handle), enumerable: false, configurable: true });
+        },
+        // Its `style`, made the first time code asks for it, as most elements are never asked.
+        get style() {
+            return styleOfLive(this.__live);
+        },
+        set style(text) {
+            styleOfLive(this.__live).cssText = text;
+        },
+    }));
+    Object.defineProperties(proto, chainProps);
+    Object.defineProperty(proto, '__drawnChildren', {
+        value() {
+            return drawnChildren(this);
+        },
+        enumerable: false,
+        configurable: true,
+    });
+    if (tag.toLowerCase() === 'form') {
+        Object.defineProperties(proto, formProps);
+    }
+    handleProtos.set(tag, proto);
+    return proto;
+}
+
+/// The `style` of the element `live` is, as code reads and writes it, which draws it again as it changes.
+function styleOfLive(live) {
+    if (live.styleDeclaration === undefined) {
         const style = styleFor({
             live,
             changed: () => {
@@ -12353,18 +13073,19 @@ function handleOf(live, tag, keep = false) {
                 live.redraw?.();
             },
         });
-        Object.defineProperty(handle, 'style', {
-            get: () => style,
-            set: (text) => {
-                style.cssText = text;
-            },
-            enumerable: true,
-            configurable: true,
-        });
         live.styleDeclaration = style;
-        if (String(tag).toLowerCase() === 'form') {
-            Object.defineProperties(handle, formProps);
-        }
+    }
+    return live.styleDeclaration;
+}
+
+/// The handle for an element of a page, made the first time it's wanted, and found by its key from then on.
+function handleOf(live, tag, keep = false) {
+    if (live.handle == null) {
+        const handle = Object.create(handleProtoOf(String(tag ?? 'div')));
+        handle.__domKey = live.domKey;
+        handle.dataset = {};
+        Object.defineProperty(handle, '__live', { value: live, enumerable: false, configurable: true });
+        live.handle = handle;
     }
     if (live.domKey !== undefined && keep) {
         handles.set(live.domKey, live.handle);
@@ -16411,10 +17132,13 @@ for (const name of Object.values(DRAG_HANDLERS)) {
 /// Whether a window's been told that something wants what's dragged in from other programs, which is only said once.
 let dropsWanted = false;
 
+/// The names of the handlers for dragging, looked for on each element with a handler.
+const DRAG_NAMES = Object.values(DRAG_HANDLERS);
+
 /// Handlers for dragging, on the way up, or on the way down if `capture`.
 function dragHandler(given, live, tag, capture) {
     const suffix = capture ? 'Capture' : '';
-    if (!Object.values(DRAG_HANDLERS).some((name) => typeof given[name + suffix] === 'function')) {
+    if (!DRAG_NAMES.some((name) => typeof given[name + suffix] === 'function')) {
         return undefined;
     }
     if (!dropsWanted && ['onDrop', 'onDragOver', 'onDragEnter'].some((name) => typeof given[name + suffix] === 'function')) {
@@ -17718,7 +18442,7 @@ function withNthAlong(children, kept = null) {
             }
             return told;
         }
-        return make(NthContext.Provider, { value, key: one.key ?? 'nth-' + index }, one);
+        return wrappedIn(NthContext, value, one, one.key ?? 'nth-' + index);
     });
     if (kept !== null) {
         kept.current = now;
@@ -17858,7 +18582,7 @@ const SHAPE_LOOKS = ['fill', 'stroke', 'strokeWidth', 'strokeLinecap', 'strokeLi
 
 /// What CSS says about each part of a shape, by its id, its tag, its classes and attributes and its own `style`, given the rules that
 /// come down to the shape and the variables set around it.
-function shapePartsOf(owners, variables = null) {
+function shapePartsOf(owners, variables = null, names = null) {
     return (id, tag = null, given = {}) => {
         const look = {};
         // What its presentation attributes say with `var()` is what CSS starts from, as SVG has it, for that to be worked out with
@@ -17873,7 +18597,7 @@ function shapePartsOf(owners, variables = null) {
         if (given.style !== null && typeof given.style === 'object') {
             assignLook(look, inlineLook(given.style, 16));
         }
-        withElementVariables(look, variables);
+        withElementVariables(look, variables, false, names === null ? undefined : { names, own: null });
         const moves = look.__transition !== undefined || look.__transitionParts !== undefined ? shapeMoves(look) : undefined;
         const { __hidden, __scroll, __case, __transition, __transitionParts, __animation, __animationParts, ...props } = look;
         if (moves !== undefined) {
@@ -18913,6 +19637,10 @@ function plainDomElement(tag) {
         // React Compiler kept isn't, handlers and children made again and all (see `JsProps` in bridge.rs). Not an `<option>`,
         // whose text is what's chosen, or a field, which is drawn by what's above.
         made.__rsuiEquivalent = !FIELD_TAGS.has(tag) && tag !== 'option';
+        // What's only what CSS makes of it is drawn in place, in the output it's in: see `placeElement`.
+        if (PLACED_TAGS.has(tag)) {
+            made.__rsuiPlaced = true;
+        }
         domElements.set(tag, made);
     }
     return made;
@@ -20212,7 +20940,8 @@ function computedAnimationName(live) {
     if (live === undefined) {
         return 'none';
     }
-    const style = live.styleDeclaration;
+    // What its `style` says, as an element's handle has one from the start, though it's only made once it's asked for.
+    const style = live.styleDeclaration ?? (live.handle != null ? styleOfLive(live) : undefined);
     if (style !== undefined) {
         const name = style.getPropertyValue('animation-name');
         if (name !== '') {

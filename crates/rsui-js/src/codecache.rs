@@ -100,7 +100,8 @@ pub(crate) fn numbered(op: &mut Op) -> Numbered<'_> {
         Op::DeclareGlobalVar { name, .. }
         | Op::DeclareGlobalFunction { name, .. }
         | Op::ThrowConstAssign { name, .. }
-        | Op::ThrowTdz { name, .. } => Numbered::Atom(name),
+        | Op::ThrowTdz { name, .. }
+        | Op::NoteName { atom: name } => Numbered::Atom(name),
         Op::Closure { proto, .. } => Numbered::Proto(proto),
         _ => Numbered::Nothing,
     }
@@ -1620,11 +1621,13 @@ mod tests {
         ("count", "u16"),
         ("capacity", "u16"),
         ("capacity", "u32"),
+        ("count", "u8"),
+        ("kind", "u8"),
     ];
 
     /// Fields whose name means a number for one engine in other kinds, and is plain only in these.
     const PLAIN_IN: &[(&str, &str, &[&str])] =
-        &[("index", "u16", &["GetUp", "GetUpValue", "SetUp"])];
+        &[("index", "u16", &["GetUp", "GetUpValue", "SetUp"]), ("root", "u16", &["Note"])];
 
     /// The fields that hold a number for one engine, which [`numbered`] has to give.
     const NUMBERED: &[(&str, &str)] = &[
@@ -1639,6 +1642,7 @@ mod tests {
         ("ThrowConstAssign", "name"),
         ("ThrowTdz", "name"),
         ("Closure", "proto"),
+        ("NoteName", "atom"),
     ];
 
     fn size(kind: &str) -> usize {

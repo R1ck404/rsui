@@ -7,7 +7,7 @@ pub(crate) mod collate;
 mod collate_han;
 #[rustfmt::skip]
 mod collate_tables;
-mod collections;
+pub(crate) mod collections;
 mod date;
 pub(crate) mod disposal;
 pub(crate) mod host;
@@ -193,6 +193,7 @@ impl Vm {
                     length: 0,
                     is_constructor: false,
                     forwards: 0,
+                    pure: true,
                 })),
                 0,
             )
@@ -219,6 +220,10 @@ impl Vm {
         self.absent = absent;
         self.roots.push(Value::object(absent));
 
+        // The language's own functions are pure, apart from those that say what time it is, what's random, what's been
+        // collected, or that run something later: see `NativeData::pure`. The host's aren't. `Date` says itself when it's
+        // asked for the time now.
+        self.making_pure = true;
         self.install_object();
         self.install_function();
         self.install_errors();
@@ -228,7 +233,9 @@ impl Vm {
         math::install(self);
         collections::install(self);
         json::install(self);
+        self.making_pure = false;
         promise::install(self);
+        self.making_pure = true;
         date::install(self);
         reflect::install(self);
         inspect::install(self);
@@ -237,8 +244,45 @@ impl Vm {
         typed::install(self);
         proxy::install(self);
         disposal::install(self);
+        self.making_pure = false;
+        for (on, name) in [("Math", "random"), ("Date", "now")] {
+            self.make_impure(Some(on), name);
+        }
+        for name in ["WeakRef", "FinalizationRegistry"] {
+            self.make_impure(None, name);
+        }
+        let weak_ref = self.get_global("WeakRef");
+        if let Ok(weak_ref) = weak_ref
+            && let Ok(prototype) = self.get_named(weak_ref, "prototype")
+            && let Ok(deref) = self.get_named(prototype, "deref")
+        {
+            self.make_native_impure(deref);
+        }
         host::install(self);
         self.install_modules();
+        self.note_built_ins();
+    }
+
+    /// Says the language's function `name`, of the global `on` or a global itself, isn't pure: see `NativeData::pure`.
+    fn make_impure(&mut self, on: Option<&str>, name: &str) {
+        let found = match on {
+            Some(on) => match self.get_global(on) {
+                Ok(global) => self.get_named(global, name),
+                Err(error) => Err(error),
+            },
+            None => self.get_global(name),
+        };
+        if let Ok(function) = found {
+            self.make_native_impure(function);
+        }
+    }
+
+    pub(crate) fn make_native_impure(&mut self, function: Value) {
+        if function.is_object()
+            && let Kind::Native(native) = &mut self.objects[function.index()].kind
+        {
+            native.pure = false;
+        }
     }
 
     fn install_regexp(&mut self) {

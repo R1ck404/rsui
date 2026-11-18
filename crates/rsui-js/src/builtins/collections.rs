@@ -694,7 +694,7 @@ const SET: i32 = 1;
 const WEAK_MAP: i32 = 2;
 const WEAK_SET: i32 = 3;
 
-fn map_get(vm: &mut Vm, args: Args) -> Run<Value> {
+pub(crate) fn map_get(vm: &mut Vm, args: Args) -> Run<Value> {
     check_kind(vm, &args)?;
     let key = vm.arg(&args, 0);
     let hash = vm.key_hash(key);
@@ -735,7 +735,7 @@ fn set_add(vm: &mut Vm, args: Args) -> Run<Value> {
     Ok(args.this)
 }
 
-fn collection_has(vm: &mut Vm, args: Args) -> Run<Value> {
+pub(crate) fn collection_has(vm: &mut Vm, args: Args) -> Run<Value> {
     check_kind(vm, &args)?;
     let key = vm.arg(&args, 0);
     Ok(Value::bool(vm.find_entry(args.this, key)?.is_some()))

@@ -28,6 +28,7 @@ mod iocp;
 mod jit;
 #[cfg(feature = "jsprof")]
 mod jsprof;
+mod keeping;
 mod lexer;
 mod modules;
 mod net;
@@ -36,6 +37,7 @@ mod op;
 mod packed;
 mod parser;
 mod props;
+mod reads;
 mod regex;
 mod source_overlay;
 mod source_text;
@@ -52,6 +54,8 @@ use std::path::Path;
 pub use census::{Census, CensusGroup};
 pub use codecache::CompiledCode;
 pub use embed::{DataProperty, DataSurfaceError, HostFunction, Root};
+pub use keeping::KeptCounts;
+pub use reads::NO_READS;
 pub use gc::footprint::{Footprint, ListFootprint};
 pub use inspect::{
     DebugFiles, FrameView, Origin, Pause, PauseHandle, PauseHandler, PauseReason, Resume,
@@ -600,6 +604,10 @@ pub struct JitCode {
 
 #[cfg(test)]
 mod equivalent_tests;
+#[cfg(test)]
+mod keeping_tests;
+#[cfg(test)]
+mod reads_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

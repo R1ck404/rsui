@@ -216,6 +216,122 @@ pub(crate) struct Objects {
     list: Arena<Object>,
     /// The old objects that have been changed since the last collection, which have `OLD` cleared.
     remembered: Vec<u32>,
+    /// The objects a result kept for a render was worked out from, or is: see [`Watch`].
+    pub(crate) watch: Watch,
+}
+
+/// The objects that what's kept for the next render was worked out from, and what it is, so that a change to any of them
+/// is known (see `keeping.rs`), at no cost to anything that changes something else.
+///
+/// A change to an object goes through the write barrier when the object has `OLD`, which an old object has until it's
+/// changed. A young one that's watched is given `OLD` too, as if it were old, and is called faked: changing it then goes
+/// the slow way once, which sees it's watched. A faked object is never remembered, as it's young, and the collector never
+/// sees one: they're put back as they were before each collection ([`Watch::unfake`]), and given `OLD` again after it
+/// ([`Watch::refake`]). An old object that a collection remembered again, as it holds something young, has `OLD` cleared,
+/// and is faked in the same way: changing it doesn't remember it again, as it's remembered already.
+///
+/// A change to a watched object stops it being watched and counts one more change. That's all it does: what's kept is
+/// only given again while there's been no change since it was kept.
+#[derive(Default)]
+pub(crate) struct Watch {
+    /// Whether anything is watched, so the slow way of a change only looks further when something is.
+    pub(crate) any: bool,
+    watched: Vec<u64>,
+    faked: Vec<u64>,
+    /// How many changes there have been to what was watched.
+    pub(crate) changes: u32,
+    /// How many objects are watched.
+    pub(crate) count: usize,
+    /// The last watched object to change, for saying why what was kept was forgotten.
+    pub(crate) last_changed: usize,
+}
+
+impl Watch {
+    pub(crate) fn is_watched(&self, handle: usize) -> bool {
+        is_marked(&self.watched, handle)
+    }
+
+    /// Watches `object`, at `handle`, if it isn't already.
+    pub(crate) fn watch(&mut self, object: &mut Object, handle: usize) {
+        extend_marks(&mut self.watched, handle + 1);
+        if set_mark(&mut self.watched, handle) {
+            return;
+        }
+        self.any = true;
+        self.count += 1;
+        if object.flags & OLD == 0 {
+            extend_marks(&mut self.faked, handle + 1);
+            set_mark(&mut self.faked, handle);
+            object.flags |= OLD;
+        }
+    }
+
+    /// `object`, at `handle`, which is watched, is about to be changed: it's no longer watched, and if it was faked, it has
+    /// `OLD` taken off again, and gives true, as it doesn't need remembering.
+    #[cold]
+    fn changing(&mut self, object: &mut Object, handle: usize) -> bool {
+        self.watched[handle / 64] &= !(1u64 << (handle % 64));
+        self.count -= 1;
+        self.changes = self.changes.wrapping_add(1);
+        self.last_changed = handle;
+        if is_marked(&self.faked, handle) {
+            self.faked[handle / 64] &= !(1u64 << (handle % 64));
+            object.flags &= !OLD;
+            return true;
+        }
+        false
+    }
+
+    /// Takes `OLD` off every faked object, so the collector sees each as it is, which comes before every collection.
+    fn unfake(&mut self, objects: &mut [Object]) {
+        for (word_at, word) in self.faked.iter_mut().enumerate() {
+            let mut bits = std::mem::take(word);
+            while bits != 0 {
+                let handle = word_at * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(object) = objects.get_mut(handle) {
+                    object.flags &= !OLD;
+                }
+            }
+        }
+    }
+
+    /// After a collection: what was watched and has been freed isn't any more, and what's watched without `OLD` is given it,
+    /// as a young object kept, or an old one remembered again, has it cleared.
+    fn refake(&mut self, objects: &mut [Object]) {
+        if !self.any {
+            return;
+        }
+        extend_marks(&mut self.faked, self.watched.len() * 64);
+        for word_at in 0..self.watched.len() {
+            let mut bits = self.watched[word_at];
+            while bits != 0 {
+                let handle = word_at * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                match objects.get_mut(handle) {
+                    Some(object) if !matches!(object.kind, Kind::Free) => {
+                        if object.flags & OLD == 0 {
+                            object.flags |= OLD;
+                            set_mark(&mut self.faked, handle);
+                        }
+                    }
+                    _ => {
+                        self.watched[word_at] &= !(1u64 << (handle % 64));
+                        self.count -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stops watching everything, with each faked object put back as it was.
+    pub(crate) fn clear(&mut self, objects: &mut [Object]) {
+        self.unfake(objects);
+        self.watched.clear();
+        self.faked.clear();
+        self.count = 0;
+        self.any = false;
+    }
 }
 
 impl Objects {
@@ -223,7 +339,32 @@ impl Objects {
         Self {
             list,
             remembered: Vec::new(),
+            watch: Watch::default(),
         }
+    }
+
+    /// Stops watching everything: see [`Watch::clear`].
+    pub(crate) fn stop_watching(&mut self) {
+        self.watch.clear(&mut self.list);
+    }
+
+    /// Adds `flags` to the object at `handle` without going through the write barrier: a flag that says something of the
+    /// object, as `NOT_HANDED_ON` does, isn't a change to what it holds, which the collector and what's watched look at.
+    pub(crate) fn add_flags(&mut self, handle: usize, flags: u8) {
+        self.list[handle].flags |= flags;
+    }
+
+    /// The object at `handle`, to change only what the engine keeps in it for itself and the program can't see, as where
+    /// calls of a closure start: that doesn't go through the write barrier, so nothing can be stored in it that refers to
+    /// anything, and it isn't taken for a change by what's watched.
+    pub(crate) fn for_the_engine(&mut self, handle: usize) -> &mut Object {
+        &mut self.list[handle]
+    }
+
+    /// Watches the object at `handle`: see [`Watch`].
+    pub(crate) fn watch(&mut self, handle: usize) {
+        let object = &mut self.list[handle];
+        self.watch.watch(object, handle);
     }
 
     #[inline(always)]
@@ -241,9 +382,19 @@ impl Objects {
     #[inline(always)]
     pub(crate) fn write_barrier(&mut self, object: &mut Object, handle: usize) {
         if object.flags & OLD != 0 {
-            remember(&mut self.remembered, object, handle);
+            changing(&mut self.remembered, &mut self.watch, object, handle);
         }
     }
+}
+
+/// An object with `OLD` that's about to be changed: it's remembered, unless it's watched and was only faked (see [`Watch`]).
+#[cold]
+#[inline(never)]
+fn changing(remembered: &mut Vec<u32>, watch: &mut Watch, object: &mut Object, handle: usize) {
+    if watch.any && watch.is_watched(handle) && watch.changing(object, handle) {
+        return;
+    }
+    remember(remembered, object, handle);
 }
 
 #[cold]
@@ -277,7 +428,7 @@ impl IndexMut<usize> for Objects {
     fn index_mut(&mut self, index: usize) -> &mut Object {
         let object = &mut self.list[index];
         if object.flags & OLD != 0 {
-            remember(&mut self.remembered, object, index);
+            changing(&mut self.remembered, &mut self.watch, object, index);
         }
         object
     }
@@ -1188,6 +1339,8 @@ impl Vm {
         self.nursery.truncate(self.run_mark);
         // Calls don't clear the registers they leave behind, so nothing above the top may name something freed.
         self.wipe_above_top();
+        // What's watched and young is seen as it is: see `Watch`.
+        self.objects.watch.unfake(&mut self.objects.list);
         if full {
             clear_marks(&mut self.object_marks, self.objects.len());
             clear_marks(&mut self.strings.marks, self.strings.items.len());
@@ -1356,6 +1509,7 @@ impl Vm {
                 }
             }
             marker.values(&self.kept);
+            self.each_read_value(|value| marker.value(value));
             for registry in &self.cleanups {
                 marker.value(*registry);
             }
@@ -1658,6 +1812,7 @@ impl Vm {
             self.verify_atoms("after a collection");
             self.verify_code("after a collection");
         }
+        self.objects.watch.refake(&mut self.objects.list);
 
         if let Some(started) = started {
             eprintln!(

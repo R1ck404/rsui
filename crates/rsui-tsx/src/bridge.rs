@@ -66,6 +66,12 @@ struct Internals {
     pass_click: Root,
     /// What a page's element written in JSX comes to, from `rsui/web`.
     web_description: Root,
+    /// What a page's plain element is drawn as in place, in the output it's in, and what's let go of that wasn't drawn again: see
+    /// `placeElement` and `placedWalked` in web.js.
+    place_element: Root,
+    placed_walked: Root,
+    placed_name: Atom,
+    placeable_name: Atom,
     /// Makes what a handler's given about where the pointer was and what it happened to, as the web has it.
     new_event: Root,
     /// Tells what's listening on `document` and `window`.
@@ -114,6 +120,8 @@ struct JsInstance {
     slot: u32,
     /// Goes up whenever it has effects to run.
     effect_runs: Cell<u32>,
+    /// Whether it has page elements drawn in place in its output, which are let go of once they're not: see `placedWalked`.
+    placed: Cell<bool>,
 }
 
 /// What an app has logged, a line each.
@@ -213,6 +221,14 @@ struct Host {
     pass_wanted: Cell<bool>,
     /// What each component whose output has a long list in it was last given there, by its slot: see [`KeptKids`].
     kept_kids: RefCell<std::collections::HashMap<u32, KeptKids>>,
+    /// Whether a page's plain elements in what's being built are drawn in place, as host elements of the component whose output
+    /// they're in, rather than each as a component of its own: see `placeElement` in web.js. It's on while a component's own
+    /// output is built, and off in what's built by itself later, as what scrolls and a long list's kept rows are.
+    placing: Cell<bool>,
+    /// What stands for the element drawn in place that what's being built is in, for what's in it to be under: see `placeElement`.
+    placed_parent: RefCell<Option<Root>>,
+    /// Whether anything's been drawn in place in the output being built.
+    placed_any: Cell<bool>,
 }
 
 /// How long a list of children has to be for what's the same in it from one render to the next to be kept as it is.
@@ -598,6 +614,31 @@ fn report(message: String) {
 }
 
 // What JavaScript calls.
+
+/// Says a function's kept as a hook's dependency, so it isn't handed on: see `Vm::keep_as_itself`.
+fn host_keep_as_itself(vm: &mut Vm, args: Args) -> Result<Value, Value> {
+    let value = args.get(vm, 0);
+    vm.keep_as_itself(value);
+    Ok(Value::UNDEFINED)
+}
+
+/// Whether a page's element drawn in place is given what it was, as `JsProps::eq` has it for one that's a component: the same props,
+/// or, where both were made by the app's own JSX under the same version of the page's CSS (`memo`), what does the same as before,
+/// with each handler made again from the same code handed on, and otherwise props that are each the same.
+fn host_same_page_props(vm: &mut Vm, args: Args) -> Result<Value, Value> {
+    let (old, new) = (args.get(vm, 0), args.get(vm, 1));
+    let (old_memo, new_memo) = (memo_mark(args.get(vm, 2)), memo_mark(args.get(vm, 3)));
+    if old == new {
+        return Ok(Value::TRUE);
+    }
+    if old_memo > KEPT && old_memo == new_memo {
+        let not_kept = with_internals(|internals| internals.not_kept.get());
+        let same = vm.page_props_equivalent_handing_on(old, new, not_kept);
+        render_unheld_readers(vm);
+        return Ok(Value::bool(same));
+    }
+    Ok(Value::bool(vm.shallow_equal(old, new)))
+}
 
 fn host_dirty(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     let slot = args.get(vm, 0).as_number() as u32;
@@ -1183,7 +1224,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
     let failed = |engine: &mut Engine, error: Value| engine.error_message(error).message;
     let vm = engine.vm();
     let natives = vm.new_object();
-    let functions: [(&str, rsui_js::HostFunction); 36] = [
+    let functions: [(&str, rsui_js::HostFunction); 38] = [
         ("wantDrops", host_want_drops),
         ("stopEvent", host_stop_event),
         ("passEvent", host_pass_event),
@@ -1211,6 +1252,8 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
         ("paste", host_paste),
         ("dialog", host_dialog),
         ("dirty", host_dirty),
+        ("keepAsItself", host_keep_as_itself),
+        ("samePageProps", host_same_page_props),
         ("effects", host_effects),
         ("frame", host_frame),
         ("wantLaidOut", host_want_laid_out),
@@ -1286,6 +1329,10 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
             new_click_event: read(vm, from, "newClickEvent")?,
             pass_click: read(vm, from, "passClick")?,
             web_description: read(vm, from, "webDescription")?,
+            place_element: read(vm, from, "placeElement")?,
+            placed_walked: read(vm, from, "placedWalked")?,
+            placed_name: vm.atom("__placed"),
+            placeable_name: vm.atom("__rsuiPlaced"),
             new_event: read(vm, from, "newEvent")?,
             document_event: read(vm, from, "documentEvent")?,
             rsui_events: read(vm, from, "rsuiEvents")?,
@@ -1980,7 +2027,9 @@ fn apply_changes(updates: &mut Updates<'_>) {
 /// What makes a JavaScript component.
 struct JsProps {
     function: Root,
-    props: Root,
+    /// What it's given, which is the new props once it's skipped rendering for them because what it read of them is the
+    /// same (see `eq`), so that what it renders next reads them.
+    props: RefCell<Root>,
     /// What kind of component this is. When it changes, what's there is unmounted and this starts again.
     kind: u64,
     /// Whether the parent gave it a key, which then goes on its element.
@@ -1989,6 +2038,56 @@ struct JsProps {
     /// for a component, and for a page's element the version of the page's CSS it was made under, plus 2 (see `__pageMark` in
     /// web.js), or 0. See `eq`.
     memo: u32,
+    /// What it read of its props as it last rendered with these (`Vm::start_reads`), or `NO_READS`.
+    reads: Cell<u32>,
+}
+
+thread_local! {
+    /// What renders read that's been let go of, for the engine to forget when it's next to hand.
+    static DROPPED_READS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+impl JsProps {
+    fn new(function: Root, props: Root, kind: u64, keyed: bool, memo: u32) -> JsProps {
+        JsProps {
+            function,
+            props: RefCell::new(props),
+            kind,
+            keyed,
+            memo,
+            reads: Cell::new(rsui_js::NO_READS),
+        }
+    }
+
+    /// What it's given.
+    fn props(&self) -> Value {
+        self.props.borrow().get()
+    }
+}
+
+impl Drop for JsProps {
+    fn drop(&mut self) {
+        let reads = self.reads.get();
+        if reads != rsui_js::NO_READS {
+            DROPPED_READS.with(|dropped| dropped.borrow_mut().push(reads));
+        }
+    }
+}
+
+/// Has the engine forget what was read by renders whose props have been let go of.
+fn forget_dropped_reads(vm: &mut Vm) {
+    let dropped = DROPPED_READS.with(|dropped| std::mem::take(&mut *dropped.borrow_mut()));
+    for reads in dropped {
+        vm.drop_reads(reads);
+    }
+}
+
+/// Has what read a function that's been handed on, and now reads something else, render again.
+fn render_unheld_readers(vm: &mut Vm) {
+    let unheld = vm.take_unheld_readers();
+    if !unheld.is_empty() {
+        HOST.with(|host| host.dirty.borrow_mut().extend(unheld));
+    }
 }
 
 /// What `JsProps::memo` is for a component the app's own JSX made.
@@ -2033,8 +2132,15 @@ impl PartialEq for JsProps {
         if function != other.function.get() {
             return false;
         }
-        let (old, new) = (self.props.get(), other.props.get());
+        let (old, new) = (self.props(), other.props());
         if old == new {
+            if self.memo == KEPT {
+                // Kept from rendering inside what's rendering, it's still given what that gave it.
+                with_vm(|vm| {
+                    let parent = vm.current_reads();
+                    vm.link_child(parent, self.reads.get(), old);
+                });
+            }
             return true;
         }
         let not_kept = with_internals(|internals| internals.not_kept.get());
@@ -2048,10 +2154,26 @@ impl PartialEq for JsProps {
                 vm.get_property(function, name).is_ok_and(|said| said == Value::TRUE)
             };
             if page && self.memo > KEPT && self.memo == other.memo {
-                return vm.page_props_equivalent_handing_on(old, new, not_kept);
+                let same = vm.page_props_equivalent_handing_on(old, new, not_kept);
+                render_unheld_readers(vm);
+                return same;
             }
             if self.memo == KEPT && other.memo == KEPT && vm.made_by_app(function) && !vm.says_no_memo(function) {
-                return vm.props_equivalent_handing_on(old, new, !said_memo, not_kept);
+                let parent = vm.current_reads();
+                if vm.props_equivalent_handing_on(old, new, !said_memo, not_kept) {
+                    vm.link_child(parent, self.reads.get(), old);
+                    render_unheld_readers(vm);
+                    return true;
+                }
+                // What it read of them as it rendered is the same, whatever else in them isn't: it renders with them next.
+                let reads = self.reads.get();
+                if reads != rsui_js::NO_READS && vm.reads_same(reads, new, not_kept) {
+                    *self.props.borrow_mut() = vm.root(new);
+                    vm.link_child(parent, reads, new);
+                    render_unheld_readers(vm);
+                    return true;
+                }
+                return false;
             }
             vm.shallow_equal(old, new) && (said_memo || vm.holds_no_objects(new))
         })
@@ -2077,7 +2199,13 @@ fn new_instance() -> JsInstance {
             (instances.len() - 1) as u32
         })
     });
-    let parent = HOST.with(|host| host.owner.borrow().clone());
+    // What's in a page element drawn in place is under that, for what it reads of what's above it: see `placeElement`.
+    let parent = HOST.with(|host| {
+        host.placed_parent
+            .borrow()
+            .clone()
+            .or_else(|| host.owner.borrow().clone())
+    });
     let make = with_internals(|internals| internals.new_instance.clone());
     let object = with_vm_letting_go(|vm| {
         let parent = parent.map_or(Value::NULL, |parent| parent.get());
@@ -2098,6 +2226,7 @@ fn new_instance() -> JsInstance {
         object,
         slot,
         effect_runs: Cell::new(0),
+        placed: Cell::new(false),
     }
 }
 
@@ -2183,13 +2312,26 @@ fn js_component(cx: &mut Cx<'_>, props: &JsProps) -> Node {
     }
     let render = with_internals(|internals| internals.render.clone());
     let (output, mark) = with_vm(|vm| {
+        forget_dropped_reads(vm);
         let mark = vm.new_values_mark();
+        // What it reads of its props is noted as it renders, and as what it makes renders, as long as that's what the app's
+        // own JSX made and the app wrote it (see `eq`). Anything else still notes what it calls of the app's, which then
+        // can't be handed on.
+        let function = props.function.get();
+        let noted = props.memo == KEPT && vm.made_by_app(function) && !vm.says_no_memo(function);
+        let cautious = noted && {
+            let name = vm.atom("__rsuiShallow");
+            !vm.get_property(function, name).is_ok_and(|said| said == Value::TRUE)
+        };
+        let reads = vm.start_reads(slot, function, props.props(), noted, cautious);
+        let old = props.reads.replace(reads);
+        if old != rsui_js::NO_READS {
+            // Rendering again by itself, it's still given what it was by what it's in.
+            vm.move_link(old, reads);
+            vm.drop_reads(old);
+        }
         let output = vm
-            .call_function(
-                render.get(),
-                Value::UNDEFINED,
-                &[object.get(), props.function.get(), props.props.get()],
-            )
+            .call_function(render.get(), Value::UNDEFINED, &[object.get(), function, props.props()])
             .map_err(|error| vm.error_text(error));
         (output, mark)
     });
@@ -2207,8 +2349,38 @@ fn js_component(cx: &mut Cx<'_>, props: &JsProps) -> Node {
                 apply_dirty!(cx);
             }
             let parent = HOST.with(|host| host.owner.replace(Some(object.clone())));
+            let around = HOST.with(|host| {
+                (
+                    host.placing.replace(true),
+                    host.placed_parent.replace(None),
+                    host.placed_any.replace(false),
+                )
+            });
             let node = build_output(cx, output, props.keyed, Some(slot));
-            HOST.with(|host| *host.owner.borrow_mut() = parent);
+            let placed_now = HOST.with(|host| {
+                let placed = host.placed_any.get();
+                host.placing.set(around.0);
+                *host.placed_parent.borrow_mut() = around.1;
+                host.placed_any.set(around.2);
+                *host.owner.borrow_mut() = parent;
+                placed
+            });
+            // What was drawn in place in its output and isn't now is let go of.
+            if placed_now || cx.with(instance, |instance| instance.placed.get()) {
+                let walked = with_internals(|internals| internals.placed_walked.clone());
+                let still = with_vm_letting_go(|vm| {
+                    vm.call_function(walked.get(), Value::UNDEFINED, &[object.get()])
+                        .map(|still| still == Value::TRUE)
+                        .unwrap_or_else(|error| {
+                            eprintln!("{}", vm.error_text(error));
+                            false
+                        })
+                });
+                cx.with(instance, |instance| instance.placed.set(still));
+                // What's new, gone or given a ref there is seen to as the commit starts, which there has to be one of, even when
+                // no component in this round has effects of its own.
+                HOST.with(|host| host.commit_waiting.set(true));
+            }
             node
         }
         Err(message) => {
@@ -2216,6 +2388,12 @@ fn js_component(cx: &mut Cx<'_>, props: &JsProps) -> Node {
             error_element(&message).into_node()
         }
     };
+    with_vm(|vm| {
+        vm.end_reads();
+        // What it was given by what's rendering around it, which is what that gave it as it is.
+        let parent = vm.current_reads();
+        vm.link_child(parent, props.reads.get(), props.props());
+    });
     with_vm(|vm| vm.release_new_values(mark));
     if with_vm(|vm| vm.has_jobs()) {
         HOST.with(|host| host.jobs_waiting.set(true));
@@ -2294,7 +2472,7 @@ fn explain_render(cx: &mut Cx<'_>, object: &Root, slot: u32, props: &JsProps) {
                     why.extend(crate::why::props_why(
                         vm,
                         last.get(),
-                        props.props.get(),
+                        props.props(),
                         &parent_name,
                         around,
                     ));
@@ -2306,7 +2484,7 @@ fn explain_render(cx: &mut Cx<'_>, object: &Root, slot: u32, props: &JsProps) {
             }
             _ => {}
         }
-        (name, why, vm.root(props.props.get()))
+        (name, why, vm.root(props.props()))
     });
     HOST.with(|host| {
         host.traced
@@ -2419,6 +2597,13 @@ enum Described {
         memo: u32,
     },
     Fragment(Vec<Kid>),
+    /// A page's plain element drawn in place (see `placeElement` in web.js): what it comes to, to be built as it is, and what stands
+    /// for it, which what's in it is under.
+    Placed {
+        made: Value,
+        kind: Value,
+        frame: Option<Root>,
+    },
     Host {
         role: Role,
         is_row: bool,
@@ -2771,6 +2956,9 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
         } else {
             at.scope.at(at.index)
         };
+        if let Some(placed) = placed_in_output(vm, description, kind, at.place(key.as_ref()))? {
+            return Ok(placed);
+        }
         let memo = memo_mark(vm.get_property(description, memo_name)?);
         return Ok(Described::Component {
             kind: kind_of(vm, kind, function_name),
@@ -2890,6 +3078,38 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
         own_text,
         long: None,
     })
+}
+
+/// What a page's plain element comes to drawn in place, as a host element of the component whose output it's in, rather than as a
+/// component of its own, if it's one that's drawn that way: see `placeElement` in web.js. Where it is in that output tells it from
+/// the rest there, as a component's place does.
+fn placed_in_output(vm: &mut Vm, description: Value, kind: Value, place: Place) -> Result<Option<Described>, Value> {
+    let (placeable, placed_name, type_name) = with_internals(|internals| {
+        (internals.placeable_name, internals.placed_name, internals.type_name)
+    });
+    if !HOST.with(|host| host.placing.get()) || vm.get_property(kind, placeable)? != Value::TRUE {
+        return Ok(None);
+    }
+    let (owner, parent) = HOST.with(|host| (host.owner.borrow().clone(), host.placed_parent.borrow().clone()));
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let place_element = with_internals(|internals| internals.place_element.clone());
+    let parent = parent.map_or(Value::NULL, |parent| parent.get());
+    // Where it is, in as many bits as a number holds exactly.
+    let place = Value::number((place.0 & ((1u64 << 52) - 1)) as f64);
+    let made = vm.call_function(place_element.get(), Value::UNDEFINED, &[description, owner.get(), parent, place])?;
+    if made == Value::UNDEFINED {
+        return Ok(None);
+    }
+    HOST.with(|host| host.placed_any.set(true));
+    let (kind, frame) = if made.is_object() && vm.array_elements(made).is_none() {
+        let frame = vm.get_property(made, placed_name)?;
+        (vm.get_property(made, type_name)?, frame.is_object().then(|| vm.root(frame)))
+    } else {
+        (Value::UNDEFINED, None)
+    };
+    Ok(Some(Described::Placed { made, kind, frame }))
 }
 
 /// Text in pieces as one, without anything in between that it doesn't need. Most are one string, and short.
@@ -3109,10 +3329,33 @@ impl AutoKeys {
 /// What a component that renders nothing is in the tree. It has to be there for the component to stay mounted, and
 /// this takes up no room and nothing can reach it.
 fn nothing() -> Node {
+    nothing_element().into_node()
+}
+
+fn nothing_element() -> Element {
     Element::new(Role::Group)
         .prop("overlay", "fill")
         .prop("inert", true)
-        .into_node()
+}
+
+/// What's drawn in place that comes to more than one thing, as a fragment would be.
+fn build_output_list(
+    cx: &mut Cx<'_>,
+    made: Value,
+    at: Kid,
+    auto: &mut AutoKeys,
+    previous: Option<PreviousNode<'_>>,
+) -> Node {
+    let kids = with_vm(|vm| {
+        let mut kids = Vec::new();
+        children_in(vm, names(), made, at.place(None).inside(Place::FRAGMENT), &mut kids);
+        kids
+    });
+    let mut group = fragment_group();
+    for (index, kid) in kids.into_iter().enumerate() {
+        group = group.child(build_kid(cx, kid, auto, previous.and_then(|old| old.child(index))));
+    }
+    finish_node(group, previous)
 }
 
 /// A component's output as one node. It has to come to one element, so anything else goes in a group. `slot` is the component's,
@@ -3230,14 +3473,25 @@ fn build_node(
             memo,
         }) => {
             let keyed = key.is_some();
-            let props = JsProps {
-                function,
-                props,
-                kind,
-                keyed,
-                memo,
-            };
+            let props = JsProps::new(function, props, kind, keyed, memo);
             cx.child_at(key, place, js_component, props, same_kind)
+        }
+        Ok(Described::Placed { made, kind, frame }) => {
+            if made.is_nullish() || made.is_bool() {
+                return finish_node(nothing_element(), previous);
+            }
+            if !made.is_object() {
+                return build_kid(cx, Kid { value: made, kind, ..kid }, auto, previous);
+            }
+            // What's in it is under what stands for it, as what's in a component is under that component.
+            let parent = HOST.with(|host| host.placed_parent.replace(frame));
+            let node = if with_vm(|vm| vm.array_elements(made).is_some()) {
+                build_output_list(cx, made, kid, auto, previous)
+            } else {
+                build_node(cx, Kid { value: made, kind, ..kid }, keyed_root, root, auto, previous)
+            };
+            HOST.with(|host| *host.placed_parent.borrow_mut() = parent);
+            node
         }
         Ok(Described::Fragment(kids)) => {
             let mut group = fragment_group();
@@ -3252,12 +3506,12 @@ fn build_node(
             finish_node(group, previous)
         }
         Ok(Described::Scroll(description, place)) => {
-            let owner = HOST.with(|host| host.owner.borrow().clone());
+            let owner = deferred_owner();
             let props = Deferred { description, owner };
             cx.child_at(None, place, scroll_component, props, |_, _| true)
         }
         Ok(Described::List(description, place)) => {
-            let owner = HOST.with(|host| host.owner.borrow().clone());
+            let owner = deferred_owner();
             let props = Deferred { description, owner };
             cx.child_at(None, place, list_component, props, |_, _| true)
         }
@@ -3511,6 +3765,9 @@ fn build_long(
     let mut found: Option<std::collections::HashMap<u64, usize>> = None;
     let mut outputs = Vec::with_capacity(values.len());
     let mut kids = Vec::new();
+    // What's in a long list is kept as it is from one build to the next, which isn't the output it's in as that last built it, so
+    // nothing in it is drawn in place: each of its page elements is a component, kept or built again by itself.
+    let placing = HOST.with(|host| host.placing.replace(false));
     for (index, &value) in values.iter().enumerate() {
         if let Some(kept) = &kept {
             let near = (0..=NEAR_KEPT)
@@ -3573,6 +3830,7 @@ fn build_long(
         outputs.push(component.map(|keyed| (first, keyed)));
         count_built(1);
     }
+    HOST.with(|host| host.placing.set(placing));
     if let Some(kept_in) = kept_in {
         let list = with_vm(|vm| vm.root(list));
         kept_in.keep(KeptKids {
@@ -3722,6 +3980,17 @@ fn trace_handler(updates: &mut Updates<'_>, function: &Root) {
     }
 }
 
+/// What's above what scrolls or a long list, for what's new in it when it builds by itself: the page element drawn in place that
+/// it's in, if it's in one, which what's in it is under (see `placeElement` in web.js), or the component whose output it is.
+fn deferred_owner() -> Option<Root> {
+    HOST.with(|host| {
+        host.placed_parent
+            .borrow()
+            .clone()
+            .or_else(|| host.owner.borrow().clone())
+    })
+}
+
 /// A description of a scrolling area or a long list, which has state of its own in the runtime.
 struct Deferred {
     description: Root,
@@ -3736,9 +4005,15 @@ impl PartialEq for Deferred {
 }
 
 fn with_owner<R>(owner: &Option<Root>, action: impl FnOnce() -> R) -> R {
+    // What's built here by itself isn't the owner's output as it last built it, so nothing in it is drawn in place.
     let parent = HOST.with(|host| host.owner.replace(owner.clone()));
+    let placing = HOST.with(|host| (host.placing.replace(false), host.placed_parent.replace(None)));
     let result = action();
-    HOST.with(|host| *host.owner.borrow_mut() = parent);
+    HOST.with(|host| {
+        *host.owner.borrow_mut() = parent;
+        host.placing.set(placing.0);
+        *host.placed_parent.borrow_mut() = placing.1;
+    });
     result
 }
 
@@ -4152,28 +4427,106 @@ pub fn tables() -> Vec<(&'static str, usize)> {
 
 /// What makes one row of a long list.
 struct RowProps {
-    render: Root,
+    /// What draws it, which is the new one once it's skipped drawing for it because what the old one read is the same (see
+    /// `eq`), for what draws it next.
+    render: RefCell<Root>,
     index: usize,
     owner: Option<Root>,
+    /// What `render` read as it last drew this row (`Vm::start_function_reads`), or `NO_READS`.
+    reads: Cell<u32>,
+}
+
+impl Drop for RowProps {
+    fn drop(&mut self) {
+        let reads = self.reads.get();
+        if reads != rsui_js::NO_READS {
+            DROPPED_READS.with(|dropped| dropped.borrow_mut().push(reads));
+        }
+    }
+}
+
+/// A row's place among the components, which isn't one of the layer's, for being drawn again when what it read is handed on and
+/// now reads something else (see `Vm::take_unheld_readers`): a list's `renderRow`, made again with what each row reads the same,
+/// is the same function from then on, and a row that reads something else of it now is drawn again by itself.
+fn new_row_slot() -> JsInstance {
+    let slot = HOST.with(|host| {
+        host.free_slots.borrow_mut().pop().unwrap_or_else(|| {
+            let mut instances = host.instances.borrow_mut();
+            instances.push(None);
+            (instances.len() - 1) as u32
+        })
+    });
+    JsInstance {
+        object: with_vm(|vm| vm.root(Value::UNDEFINED)),
+        slot,
+        effect_runs: Cell::new(0),
+        placed: Cell::new(false),
+    }
 }
 
 impl PartialEq for RowProps {
+    /// Whether a row is drawn by what drew it before: the same function for the same row, or one made again, as a list's
+    /// `renderRow` is each time what holds it renders, that sees what the old one read of what it captured as it drew this row
+    /// the same (`Vm::reads_same`), as a component's props are compared. So moving the selection in a list draws only the rows
+    /// whose `selected.has(path)` comes out differently, and a row whose child component was given something new as a prop,
+    /// which it only gave on, isn't drawn again unless what that child read of it changed.
     fn eq(&self, other: &Self) -> bool {
-        self.index == other.index && self.render.get() == other.render.get()
+        if self.index != other.index {
+            return false;
+        }
+        let (old, new) = (self.render.borrow().get(), other.render.borrow().get());
+        if old == new {
+            return true;
+        }
+        let reads = self.reads.get();
+        if reads == rsui_js::NO_READS {
+            return false;
+        }
+        let not_kept = with_internals(|internals| internals.not_kept.get());
+        with_vm(|vm| {
+            if vm.reads_same(reads, new, not_kept) {
+                *self.render.borrow_mut() = vm.root(new);
+                render_unheld_readers(vm);
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 
 fn row_component(cx: &mut Cx<'_>, props: &RowProps) -> Node {
     cx.trace_name("a row of a list");
+    let instance = cx.state(new_row_slot);
+    let slot = cx.with(instance, |instance| instance.slot);
+    HOST.with(|host| {
+        host.instances.borrow_mut()[slot as usize] = Some(instance);
+        let mut owners = host.owners.borrow_mut();
+        if owners.len() <= slot as usize {
+            owners.resize(slot as usize + 1, 0);
+        }
+        owners[slot as usize] = cx.runtime_id();
+    });
+    cx.effect_with_cleanup((), move |_| {
+        move |_: &mut Updates<'_>| {
+            HOST.with(|host| {
+                host.instances.borrow_mut()[slot as usize] = None;
+                host.free_slots.borrow_mut().push(slot);
+            });
+        }
+    });
     with_owner(&props.owner, || {
+        let render = props.render.borrow().get();
         let (output, mark) = with_vm(|vm| {
+            forget_dropped_reads(vm);
             let mark = vm.new_values_mark();
+            let reads = vm.start_function_reads(slot, render);
+            let old = props.reads.replace(reads);
+            if old != rsui_js::NO_READS {
+                vm.drop_reads(old);
+            }
             let output = vm
-                .call_function(
-                    props.render.get(),
-                    Value::UNDEFINED,
-                    &[Value::int_or_double(props.index)],
-                )
+                .call_function(render, Value::UNDEFINED, &[Value::int_or_double(props.index)])
                 .map_err(|error| vm.error_text(error));
             (output, mark)
         });
@@ -4184,7 +4537,10 @@ fn row_component(cx: &mut Cx<'_>, props: &RowProps) -> Node {
                 error_element(&message).into_node()
             }
         };
-        with_vm(|vm| vm.release_new_values(mark));
+        with_vm(|vm| {
+            vm.end_reads();
+            vm.release_new_values(mark);
+        });
         node
     })
 }
@@ -4224,6 +4580,9 @@ fn list_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
             let reveal = (reveal.is_number() && reveal.as_number() >= 0.0)
                 .then(|| reveal.as_number() as usize);
             let render = vm.get_property(own, render_name)?;
+            // Each row compares what draws it with what drew it itself (see `RowProps`), rather than the old one being made to do
+            // what a new one does, which only the rows drawn inside what's rendering would hear about.
+            vm.keep_as_itself(render);
             let render = vm.root(render);
             let mut gathered = gather_props(vm, own)?;
             static UNWANTED: LazyLock<[Symbol; 5]> = LazyLock::new(|| {
@@ -4297,9 +4656,10 @@ fn list_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
                     index,
                     row_component,
                     RowProps {
-                        render: render.clone(),
+                        render: RefCell::new(render.clone()),
                         index,
                         owner: owner.clone(),
+                        reads: Cell::new(rsui_js::NO_READS),
                     },
                 )
             },
@@ -4476,13 +4836,7 @@ fn window_root(cx: &mut Cx<'_>, window: &WindowEntry) -> Node {
     });
     cx.child_of_kind(
         js_component,
-        JsProps {
-            function,
-            props: window.entry.clone(),
-            kind,
-            keyed: false,
-            memo: 0,
-        },
+        JsProps::new(function, window.entry.clone(), kind, false, 0),
         same_kind,
     )
 }
@@ -4521,13 +4875,7 @@ pub fn root(cx: &mut Cx<'_>, _: &Entry) -> Node {
     });
     let node = cx.child_of_kind(
         js_component,
-        JsProps {
-            function: app,
-            props,
-            kind,
-            keyed: false,
-            memo: 0,
-        },
+        JsProps::new(app, props, kind, false, 0),
         same_kind,
     );
     let error = HOST.with(|host| host.error.borrow().clone());

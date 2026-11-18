@@ -3,7 +3,7 @@
 // are all ordered this way. What's picked up has the pointer to itself until it's let go (`setPointerCapture`), so it hears where
 // the pointer goes over anything, and Escape, or the window losing the pointer to another, puts it back where it was.
 
-import { useMemo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 
 /** How far something's pulled before it's being dragged rather than clicked. */
 const DRAG_AFTER = 5;
@@ -63,11 +63,12 @@ export function useReorder(ids: string[], axis: Axis, onMove: (from: number, to:
     const held = useRef<Grip | null>(null);
     const dropped = useRef(false);
     const [lifted, setLifted] = useState<{ id: string; dx: number; dy: number; out: boolean } | null>(null);
-    const latest = useRef({ ids, onMove, outside });
-    latest.current = { ids, onMove, outside };
+    const latest = useRef({ ids, axis, onMove, outside });
+    latest.current = { ids, axis, onMove, outside };
     const refs = useRef(new Map<string, (element: any) => void>());
 
-    const made = useMemo(() => {
+    // Made once, as what's given to the elements, and reading what's latest when they're called.
+    const [made] = useState(() => {
         // Let go of, however that happened: `back` puts it where it was picked up, as Escape does.
         const end = (back: boolean) => {
             const grip = held.current;
@@ -156,6 +157,7 @@ export function useReorder(ids: string[], axis: Axis, onMove: (from: number, to:
                 }
                 grip.moved = true;
                 const now = latest.current;
+                const along = now.axis;
                 // Over somewhere outside the list, it follows the pointer from where it is and the others stay as they are.
                 grip.out = now.outside?.over(grip.at, x, y) === true;
                 if (!grip.out) {
@@ -167,7 +169,7 @@ export function useReorder(ids: string[], axis: Axis, onMove: (from: number, to:
                         }
                         const acrossX = x >= slot.x && x < slot.x + slot.w;
                         const acrossY = y >= slot.y && y < slot.y + slot.h;
-                        if (axis === 'both' ? acrossX && acrossY : axis === 'x' ? acrossX : acrossY) {
+                        if (along === 'both' ? acrossX && acrossY : along === 'x' ? acrossX : acrossY) {
                             to = at;
                         }
                     });
@@ -180,8 +182,8 @@ export function useReorder(ids: string[], axis: Axis, onMove: (from: number, to:
                 // moving on, it ends where the one it's taken the place of ended; moving back, it starts where that started.
                 const [home, here] = [grip.slots[grip.start], grip.slots[grip.at]];
                 const later = grip.at > grip.start;
-                const shiftX = axis === 'x' && later ? here.x + here.w - home.w - home.x : here.x - home.x;
-                const shiftY = axis === 'y' && later ? here.y + here.h - home.h - home.y : here.y - home.y;
+                const shiftX = along === 'x' && later ? here.x + here.w - home.w - home.x : here.x - home.x;
+                const shiftY = along === 'y' && later ? here.y + here.h - home.h - home.y : here.y - home.y;
                 setLifted({ id: grip.id, dx: dx - shiftX, dy: dy - shiftY, out: grip.out });
             },
             up: () => end(false),
@@ -191,7 +193,7 @@ export function useReorder(ids: string[], axis: Axis, onMove: (from: number, to:
                 return was;
             },
         };
-    }, [axis]);
+    });
     return {
         ...made,
         lifted: (id: string) => (lifted !== null && lifted.id === id ? { dx: lifted.dx, dy: lifted.dy, out: lifted.out } : null),

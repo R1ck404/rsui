@@ -1056,6 +1056,9 @@ fn function_call(vm: &mut Vm, args: Args) -> Run<Value> {
         && native.forwards == 0
     {
         let func = native.func;
+        if vm.keeping.working != 0 && !native.pure {
+            vm.keeping.spoiled = true;
+        }
         let inner = Args {
             this,
             start: args.start + 1,

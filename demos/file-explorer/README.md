@@ -120,8 +120,10 @@ What makes the difference:
   made of `<row>` and `<text>`. It's as big as layout makes it, and works out what fits from that; the grid is the same `<list>`
   with an `itemWidth`, which wraps its tiles itself and says how many fit across, for the arrow keys. Everything around it is Tailwind. With rows built from styled `<div>`s, jumping to the end of
   WinSxS took a 73 ms frame instead of 7 ms.
-- **Plain React.** There's no `memo`, `useCallback` or handler objects kept in refs: rsui skips components and page elements whose
-  props didn't change, and counts handlers made by the same code as the same, so moving the selection redraws two rows by itself.
+- **Plain React.** There's no `memo`, `useMemo`, `useCallback` or handler objects kept in refs: rsui skips components and page
+  elements whose props didn't change, and counts handlers made by the same code as the same, so moving the selection redraws two
+  rows by itself. The folder's order is a plain call in the pane (`shownItems` in `src/Pane.tsx`), which the engine gives again
+  while the listing, the search and the settings are the same, so moving the selection doesn't sort 25,000 entries again.
 - **Icons imported one by one.** `src/icons.ts` imports each Blode icon from its own file. Importing from the package root loads all
   6,116 icons, which added about 470 ms to every start.
 

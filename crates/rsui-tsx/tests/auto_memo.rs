@@ -520,8 +520,9 @@ fn handlers_that_see_an_object_of_handlers_that_sees_itself_are_the_same() {
         "#,
     );
     assert_eq!(renders_for(&mut ui, "other"), 1);
-    // The child renders once what its `step` sees has changed, which isn't a handler's name, so it's given the new one.
-    assert_eq!(renders_for(&mut ui, "child"), 2);
+    // What the child's `step` sees has changed, which isn't a handler's name, but nothing rendering called it, so it's handed
+    // on as a handler is, rather than the child rendering (see `reads.rs` in rsui-js).
+    assert_eq!(renders_for(&mut ui, "child"), 1);
     assert!(line_with(&ui, "count ").contains("count 1"));
     ui.click(&key("child")).unwrap();
     assert!(line_with(&ui, "count ").contains("count 2"));
@@ -622,7 +623,230 @@ fn a_handler_made_again_before_something_on_a_page_doesnt_move_it() {
     ui.click(&key("other")).unwrap();
     assert!(line_with(&ui, "text \"other").contains("other 2"));
     assert_eq!(line_with(&ui, "label renders"), label);
-    // Each time the app, the `<div>`, the button, which says something else, and three providers around them that aren't the
-    // app's: but not the label's `<span>`, which a new place would draw again.
-    assert_eq!(ui.runtime().renders() - before, 12);
+    // Each time the app, the button, which says something else, and two providers around them that aren't the app's, with the
+    // `<div>` drawn in place in the app's output (see `placeElement` in web.js): but not the label's `<span>`, which a new place
+    // would draw again, nor what tells the label where it is, which says the same about what does the same.
+    assert_eq!(ui.runtime().renders() - before, 8);
+}
+
+/// Panes each given the whole session, as the file explorer's were before it gave them only what they use: the session's
+/// `tabs` change whenever another pane gets the keyboard, and a pane only reads its own folder's view and what's pinned, in a
+/// menu it makes as it renders and calls later.
+const SESSION: &str = r#"
+    import { useEffect, useState } from 'rsui';
+    const renders = { a: 0, b: 0, c: 0 };
+    let effects = 0;
+    function Pane({ session, id }) {
+        renders[id]++;
+        const [said, setSaid] = useState('nothing');
+        const own = session.views[id];
+        const menu = () => setSaid('pinned ' + session.pinned.join(',') + ' at ' + session.tabs);
+        return (
+            <column>
+                <text>{id} shows {own ? own.view : 'list'} renders {renders[id]}</text>
+                <button key={'menu-' + id} onClick={menu}>menu {id}</button>
+                <text>{id} said {said}</text>
+            </column>
+        );
+    }
+    function Watching(props) {
+        useEffect(() => { effects++; }, [props.session]);
+        return <text>effects {effects}</text>;
+    }
+    export default function App() {
+        const [session, setSession] = useState({ tabs: 0, pinned: ['C:'], views: { a: { view: 'grid' } } });
+        return (
+            <window>
+                <button key="focus" onClick={() => setSession({ ...session, tabs: session.tabs + 1 })}>focus</button>
+                <button key="pin" onClick={() => setSession({ ...session, pinned: [...session.pinned, 'D:'] })}>pin</button>
+                <button key="view" onClick={() => setSession({ ...session, views: { ...session.views, b: { view: 'details' } } })}>view</button>
+                <Pane session={session} id="a" />
+                <Pane session={session} id="b" />
+                <Pane session={session} id="c" />
+                <Watching session={session} />
+            </window>
+        );
+    }
+"#;
+
+#[test]
+fn panes_given_the_whole_session_render_only_when_what_they_read_of_it_changes() {
+    let mut ui = start(SESSION);
+    // The app, and what watches the session in an effect, which renders as the session is another, as it would in React.
+    // (What it shows is how many times its effect ran before it rendered.)
+    assert_eq!(renders_for(&mut ui, "focus"), 2);
+    assert!(line_with(&ui, "effects").contains("effects 1"));
+    assert!(line_with(&ui, "a shows").contains("renders 1"));
+    // What's pinned is read only when the menu is used, which sees the session the app has now.
+    assert_eq!(renders_for(&mut ui, "pin"), 2);
+    assert!(line_with(&ui, "effects").contains("effects 2"));
+    ui.click(&key("menu-b")).unwrap();
+    assert!(line_with(&ui, "b said").contains("pinned C:,D: at 1"));
+    // Only the pane whose own view changed renders for it.
+    assert_eq!(renders_for(&mut ui, "view"), 3);
+    assert!(line_with(&ui, "b shows").contains("b shows details renders 3"));
+    assert!(line_with(&ui, "a shows").contains("renders 1"));
+    assert!(line_with(&ui, "c shows").contains("renders 1"));
+}
+
+/// Panes laid out by splits, each drawn by a function the app makes, which sees which pane has the keyboard, as the file
+/// explorer's `drawPane` is: the splits and their parts pass it down, and only what's at the bottom calls it.
+const SPLITS: &str = r#"
+    import { useState } from 'rsui';
+    const renders = {};
+    const count = (name) => { renders[name] = (renders[name] ?? 0) + 1; return renders[name]; };
+    function Pane(props) {
+        const times = count('pane ' + props.id);
+        return <button key={'pane-' + props.id} onClick={props.onActivate}>{props.id}{props.active ? ' active' : ''} renders {times}</button>;
+    }
+    function Slot(props) {
+        count('slot ' + props.id);
+        return props.pane(props.id);
+    }
+    function Part(props) {
+        count('part ' + props.id);
+        return <column><Slot {...props} /></column>;
+    }
+    function Splits(props) {
+        count('splits');
+        return <row>{props.ids.map((id) => <Part key={id} {...props} id={id} />)}</row>;
+    }
+    export default function App() {
+        const [focus, setFocus] = useState('a');
+        const [ids] = useState(['a', 'b', 'c']);
+        const drawPane = (id) => <Pane id={id} active={id === focus} onActivate={() => setFocus(id)} />;
+        return (
+            <window>
+                <Splits ids={ids} pane={drawPane} />
+                <text>splits {renders.splits}</text>
+            </window>
+        );
+    }
+"#;
+
+#[test]
+fn a_function_that_draws_each_pane_renders_only_the_panes_whose_drawing_changed() {
+    let mut ui = start(SPLITS);
+    // The app, the two slots whose function now gives something else, and their panes: not the splits, their parts, or the
+    // third slot.
+    assert_eq!(renders_for(&mut ui, "pane-b"), 5);
+    assert!(line_with(&ui, "pane-b").contains("b active renders 2"));
+    assert!(line_with(&ui, "pane-a").contains("a renders 2"));
+    assert!(line_with(&ui, "pane-c").contains("c renders 1"));
+    assert!(line_with(&ui, "splits").contains("splits 1"));
+    // The panes' handlers, which the splits kept from the first render, still set what they should.
+    assert_eq!(renders_for(&mut ui, "pane-c"), 5);
+    assert!(line_with(&ui, "pane-c").contains("c active renders 2"));
+    assert!(!line_with(&ui, "pane-b").contains("active"));
+}
+
+/// The file explorer's panes as they are: page elements around nested splits, each split's parts spreading what they were
+/// given into what's inside them, panes added one at a time, and a function that draws each pane, which sees which pane has
+/// the keyboard and hands each pane the app's handlers.
+const PAGE_SPLITS: &str = r#"
+    import { useRef, useState } from 'rsui';
+    const renders = {};
+    const count = (name) => { renders[name] = (renders[name] ?? 0) + 1; return renders[name]; };
+    function Pane(props) {
+        const times = count('pane ' + props.id);
+        return (
+            <div className="pane">
+                <button key={'pane-' + props.id} onClick={() => props.onActivate(props.id)}>
+                    {props.id}{props.active ? ' active' : ''}{props.marked ? ' marked' : ''} renders {times}
+                </button>
+            </div>
+        );
+    }
+    function Slot(props) {
+        return <div className="slot">{props.children}</div>;
+    }
+    function Part(props) {
+        const { share, children } = props;
+        return <div className="part" style={{ flexGrow: share }}>{children}</div>;
+    }
+    function Inside(props) {
+        const { node } = props;
+        if (node.kind === 'pane') {
+            return props.pane(node.id);
+        }
+        return node.children.map((child) => (
+            <Part key={child.id} share={1} grows={child.kind === 'pane' && props.fresh(child.id)}>
+                <Inside {...props} node={child} />
+            </Part>
+        ));
+    }
+    function Splits(props) {
+        const { layout } = props;
+        return (
+            <div className="splits">
+                <Inside {...props} node={layout} />
+            </div>
+        );
+    }
+    export default function App() {
+        const [view, setView] = useState({ panes: [{ id: 'a' }], focus: 'a', layout: { kind: 'split', id: 's', children: [{ kind: 'pane', id: 'a' }] } });
+        const fresh = useRef(new Set());
+        const viewFocus = view.focus;
+        const on = {
+            activate: (id) => setView((old) => ({ ...old, focus: id })),
+            split: () => {
+                const id = String.fromCharCode(97 + view.panes.length);
+                setView({ panes: [...view.panes, { id }], focus: id, layout: { ...view.layout, children: [...view.layout.children, { kind: 'pane', id }] } });
+            },
+        };
+        const drawPane = (id) => {
+            const state = view.panes.find((one) => one.id === id);
+            if (!state) {
+                return null;
+            }
+            return (
+                <Slot fresh={fresh.current.has(state.id)}>
+                    <Pane id={state.id} active={state.id === viewFocus} marked={view.panes.length > 1 && state.id === viewFocus} onActivate={on.activate} />
+                </Slot>
+            );
+        };
+        return (
+            <window>
+                <div className="root">
+                    <div className="bar">
+                        <button key="split" onClick={on.split}>split</button>
+                    </div>
+                    <div className="panes">
+                        <Splits layout={view.layout} pane={drawPane} fresh={(id) => fresh.current.has(id)} onStart={() => on.split()} />
+                    </div>
+                </div>
+            </window>
+        );
+    }
+"#;
+
+/// What pane `id` shows, as in `a active marked renders 2`.
+fn pane_shows(ui: &Headless, id: &str) -> String {
+    line_with(ui, &format!("text \"{id} "))
+}
+
+#[test]
+fn moving_the_keyboard_between_panes_in_page_splits_renders_the_two_it_moved_between() {
+    let mut ui = start(PAGE_SPLITS);
+    ui.click(&key("split")).unwrap();
+    ui.click(&key("split")).unwrap();
+    assert!(pane_shows(&ui, "c").contains("c active marked"), "{}", ui.outline());
+    // Clicking a pane that doesn't have the keyboard gives it the keyboard: only that pane, and the one that had it, render,
+    // with what calls the function that draws each, the slots, and what the page puts around each of their `<div>`s, which
+    // all show something else, and the app: 12, not 31, as nothing passing the function down renders, nor the third pane, and
+    // the `<div>`s are drawn in place in what each pane gives back (see `placeElement` in web.js).
+    let before = ui.runtime().renders();
+    ui.click(&key("pane-a")).unwrap();
+    assert!(pane_shows(&ui, "a").contains("a active marked"), "{}", ui.outline());
+    assert!(!pane_shows(&ui, "c").contains("active"), "{}", ui.outline());
+    let b = pane_shows(&ui, "b");
+    assert_eq!(ui.runtime().renders() - before, 12, "{}", ui.outline());
+    // Again and again, from what each has been handed since.
+    ui.click(&key("pane-b")).unwrap();
+    assert!(pane_shows(&ui, "b").contains("b active marked"), "{}", ui.outline());
+    assert!(!pane_shows(&ui, "a").contains("active"), "{}", ui.outline());
+    ui.click(&key("pane-c")).unwrap();
+    assert!(pane_shows(&ui, "c").contains("c active marked"), "{}", ui.outline());
+    assert!(!pane_shows(&ui, "b").contains("active"), "{}", ui.outline());
+    assert!(b.contains("renders 2"), "{b}");
 }

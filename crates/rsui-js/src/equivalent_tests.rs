@@ -232,8 +232,9 @@ fn a_handler_made_from_the_same_code_is_handed_what_the_new_one_sees_and_nothing
     assert!(handing_on(&mut engine, "inChildren"));
     assert_eq!(old_says(&mut engine, "inChildren", "children.0.props.onClick"), "refresh 2");
 
-    // Only a handler that can be is handed on. A function that isn't named as a handler can be called while rendering, as `renderRow` is.
-    assert!(!handing_on(&mut engine, "notNamedAsOne"));
+    // A function that isn't named as a handler, as `renderRow`, is handed on too, as nothing rendering called it without its
+    // reads being noted: what did, with them noted, is looked at again (see `reads_tests.rs`).
+    assert!(handing_on(&mut engine, "notNamedAsOne"));
     // Other code does something else, and an async one can be waiting part of the way through.
     assert!(!handing_on(&mut engine, "otherCode"));
     assert!(!handing_on(&mut engine, "async"));

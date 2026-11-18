@@ -609,6 +609,11 @@ pub(crate) struct NativeData {
     /// another function: the interpreter then calls that one itself (`Vm::forward_in_place`), rather than this
     /// starting the interpreter again from Rust.
     pub(crate) forwards: u8,
+    /// Whether what it gives depends only on what it's given, and it changes nothing but what it's given or makes, as the
+    /// language's own functions do, other than `Math.random`, `Date.now` and the like: a result worked out with one that
+    /// isn't is never kept for the next render (see `keeping.rs`). What isn't the language's, as anything of the host's or
+    /// of the program that runs the engine, isn't.
+    pub(crate) pure: bool,
 }
 
 /// [`NativeData::forwards`] for `Function.prototype.call`.
@@ -970,8 +975,19 @@ impl Drop for ItemsVec<'_> {
     }
 }
 
-/// What a closure has captured, in one word. The number of them is kept in front of them.
+/// What a closure has captured, in one word. The number of them is kept in front of them, with [`SHARED_BLOCK`] added
+/// once more than one closure holds the same block (see [`Upvalues::share`]).
 pub(crate) struct Upvalues(Option<NonNull<Value>>);
+
+/// Added to the count in front of a block of captured variables that more than one closure holds, which are counted in
+/// [`SHARED_HOLDS`] by where the block is.
+const SHARED_BLOCK: i32 = 1 << 30;
+
+thread_local! {
+    /// How many closures hold each block that more than one does, by where it is.
+    static SHARED_HOLDS: std::cell::RefCell<HashMap<usize, u32, FixedState>> =
+        std::cell::RefCell::new(HashMap::with_hasher(FixedState::default()));
+}
 
 #[allow(unsafe_code)]
 impl Upvalues {
@@ -1012,6 +1028,31 @@ impl Upvalues {
         unsafe { first.as_ptr().add(1 + at).write(value) }
     }
 
+    /// The same block, held once more, so that what's put in it is what each of the closures that hold it sees: a
+    /// handler handed on holds the block of the one it was handed, and whatever's handed to either from then on reaches
+    /// both (see `Vm::hand_on`).
+    pub(crate) fn share(&self) -> Upvalues {
+        let Some(first) = self.0 else {
+            return Self::NONE;
+        };
+        // SAFETY: the first place holds the count.
+        unsafe {
+            let count = first.as_ptr().read().as_int();
+            if count & SHARED_BLOCK == 0 {
+                first.as_ptr().write(Value::int(count | SHARED_BLOCK));
+                SHARED_HOLDS.with(|holds| holds.borrow_mut().insert(first.as_ptr() as usize, 2));
+            } else {
+                SHARED_HOLDS.with(|holds| *holds.borrow_mut().entry(first.as_ptr() as usize).or_insert(1) += 1);
+            }
+        }
+        Self(Some(first))
+    }
+
+    /// Where the block is, which says whether two hold the same one.
+    pub(crate) fn block(&self) -> usize {
+        self.0.map_or(0, |first| first.as_ptr() as usize)
+    }
+
     /// Where the first of them is. There's nothing to read there unless there are some.
     #[inline(always)]
     pub(crate) fn as_ptr(&self) -> *const Value {
@@ -1032,7 +1073,7 @@ impl Deref for Upvalues {
         match self.0 {
             // SAFETY: the first place holds how many more there are.
             Some(first) => unsafe {
-                let count = first.as_ptr().read().as_int() as usize;
+                let count = (first.as_ptr().read().as_int() & !SHARED_BLOCK) as usize;
                 std::slice::from_raw_parts(first.as_ptr().add(1), count)
             },
             None => &[],
@@ -1046,7 +1087,29 @@ impl Drop for Upvalues {
         if let Some(first) = self.0 {
             // SAFETY: this is the box `new` made, which the count in it gives the size of.
             unsafe {
-                let count = first.as_ptr().read().as_int() as usize;
+                let said = first.as_ptr().read().as_int();
+                if said & SHARED_BLOCK != 0 {
+                    // Only the last to hold a shared block lets go of it.
+                    // As the thread ends, what's left is let go of with it.
+                    let left = SHARED_HOLDS
+                        .try_with(|holds| {
+                            let mut holds = holds.borrow_mut();
+                            let at = first.as_ptr() as usize;
+                            let left = holds.get(&at).copied().unwrap_or(1).saturating_sub(1);
+                            if left == 0 {
+                                holds.remove(&at);
+                            } else {
+                                holds.insert(at, left);
+                            }
+                            left
+                        })
+                        .unwrap_or(1);
+                    if left > 0 {
+                        return;
+                    }
+                    first.as_ptr().write(Value::int(said & !SHARED_BLOCK));
+                }
+                let count = (said & !SHARED_BLOCK) as usize;
                 if count <= POOLED_UPVALUES {
                     upvalue_pool::give(count, first);
                     return;
@@ -1570,6 +1633,7 @@ pub(crate) fn object_layout() -> ObjectLayout {
         length: 0,
         is_constructor: false,
         forwards: 0,
+        pure: false,
     }));
     let array = Kind::Array(Items::from(vec![Value::int(1), Value::int(2)]));
     let Kind::Array(items) = &array else {

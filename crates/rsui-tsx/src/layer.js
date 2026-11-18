@@ -164,12 +164,56 @@ function newInstance(slot, parent) {
         more: null,
         // The page's element it draws, which 'rsui/web' says, here from the start as adding it would make room for many more.
         __pageLive: undefined,
+        // The page's elements drawn in place in what it gives back, which 'rsui/web' keeps: see `placeElement` there.
+        placed: undefined,
+        // For what stands for one of those, the component whose output it's in: see `newFrame`.
+        placedIn: undefined,
     };
     if (activity !== null) {
         activity.members.add(instance);
     }
     return instance;
 }
+
+/// What stands for a page's plain element that's drawn in place in the output of `owner`, as a host element, rather than as a
+/// component of its own: see `placeElement` in 'rsui/web'. It's where the element is among the components, for what's in it and
+/// what it reads of what's above it, as an instance would be, and what it passes down is on it as a component's is, but it has no
+/// hooks, effects or slot of its own, and nothing renders it: what it reads changing has its owner build what it gave back again,
+/// without calling it, and the element drawn again then (see `placedChanged`).
+function newFrame(parent, owner, type, live) {
+    const frame = newInstance(owner.slot, parent);
+    frame.type = type;
+    frame.placedIn = owner;
+    frame.__pageLive = live;
+    return frame;
+}
+
+/// Renders a page's element drawn in place as `frame` stands for it, which is what's rendering while it does.
+function renderPlaced(frame, type, props) {
+    const before = current;
+    const beforeAt = hookAt;
+    current = frame;
+    hookAt = 0;
+    frame.flags &= ~FORCED;
+    try {
+        return type(props);
+    } finally {
+        current = before;
+        hookAt = beforeAt;
+    }
+}
+
+/// Lets go of what stands for an element drawn in place once it's gone.
+function forgetFrame(frame) {
+    frame.activity?.members.delete(frame);
+    frame.flags |= DEAD;
+    runCleanups(frame);
+}
+
+/// What's said when what an element drawn in place reads changes: its owner builds what it gave back again, without calling it, as
+/// its state was set (see `render`), and the element's drawn again as it's come to, unless that's already under way and hasn't
+/// reached it.
+let placedChanged = null;
 
 /// What few components have: what takes in an error from something below, if it's an error boundary; what's being waited for
 /// below, if it's a `Suspense`; what it's waiting for itself, when there's no `Suspense` around it to wait instead; and the
@@ -527,7 +571,11 @@ function insideFirst(instances) {
 /// the error boundary above it, and the rest still run. What no boundary takes is thrown once they have.
 function commitEffects() {
     const instances = insideFirst(committed);
+    // What's drawn in place has its refs given their elements, and is on the page from now, before any layout effect runs, as
+    // React has a host element's ref: see `placedCommit` in 'rsui/web'.
+    const placedCommit = module.exports.__placedCommit;
     if (instances.length === 0) {
+        placedCommit?.();
         return;
     }
     const phases = phasesDue;
@@ -539,6 +587,11 @@ function commitEffects() {
             uncaught = undoEffects(instance, INSERTION, uncaught);
             uncaught = runEffects(instance, INSERTION, uncaught);
         }
+    }
+    try {
+        placedCommit?.();
+    } catch (error) {
+        uncaught = firstUncaught(uncaught, error);
     }
     // What `rsui/web` attaches once what's committed has rendered and before any layout effect runs, as React attaches refs then:
     // the refs of the parts of a page's `<svg>`, found as it renders (see `keepSvgElements`).
@@ -571,6 +624,9 @@ function commitEffects() {
 }
 
 function unmount(instance) {
+    if (instance.placed !== undefined) {
+        module.exports.__placedOwnerGone?.(instance);
+    }
     clearCompilerCache(instance);
     globalThis.__rsuiFlowInstance?.(instance.type, instance, false);
     instance.activity?.members.delete(instance);
@@ -880,7 +936,19 @@ function addHook(kind, hook) {
 
 // What an effect or a memo keeps when it's given no dependencies, rather than each of the empty lists it's given.
 const NO_DEPS = Object.freeze([]);
-const keptDeps = (deps) => (deps?.length === 0 ? NO_DEPS : deps);
+// A function kept as a dependency is kept as itself, so the engine never makes it do what a new one does (see `reads.rs` in
+// rsui-js): an effect that depends on it runs again when it's a new one, as React has it.
+const keptDeps = (deps) => {
+    if (deps === undefined || deps.length === 0) {
+        return deps?.length === 0 ? NO_DEPS : deps;
+    }
+    for (let at = 0; at < deps.length; at++) {
+        if (typeof deps[at] === 'function') {
+            host.keepAsItself(deps[at]);
+        }
+    }
+    return deps;
+};
 
 function depsChanged(old, deps) {
     if (old === undefined || deps === undefined || old.length !== deps.length) {
@@ -898,6 +966,10 @@ function depsChanged(old, deps) {
 function markDirty(instance) {
     if ((instance.flags & DEAD) === 0) {
         instance.flags |= FORCED;
+        if (instance.placedIn !== undefined) {
+            placedChanged?.(instance);
+            return;
+        }
         host.dirty(instance.slot);
     }
 }
@@ -1582,7 +1654,8 @@ function readContext(instance, context) {
     }
     if (watch(provider, instance)) {
         (instance.watching ??= []).push(provider);
-        if (tracing) {
+        // What stands for an element drawn in place isn't what a debugger says rendered: its owner is.
+        if (tracing && instance.placedIn === undefined) {
             // Where it's read from, which names it, for saying why what reads it rendered.
             (moreOf(instance).contextSites ??= new Map()).set(provider, host.hookSite());
         }
@@ -2989,7 +3062,17 @@ function newClickEvent(within, info) {
 // What's listening on a page's `document` and `window`, from 'rsui/web', if that's been loaded.
 let documentHeard = null;
 
-globalThis.__rsuiInternals = { rejected, setTracing(on) { tracing = on; }, describeHooks, restoreState, desktopEvent: (id, value) => desktopEvents?.(id, value), webDescription, newClickEvent, newEvent, rsuiEvents: (given) => require('rsui/events').rsuiEvents(given), documentEvent: (kind, event, prevented) => documentHeard?.(kind, event, prevented), passClick: PASS_CLICK, notKept: NOT_KEPT, pasted, colorSchemeChanged, windowResized, WindowRoot, newInstance, render, flushEffects, commitEffects, unmount, setReloading(on) { reloading = on; } };
+// What Rust asks of 'rsui/web' about a page's plain element drawn in place, which only exists once that's loaded: see
+// `placeElement` there.
+function placeElement(description, owner, parent, place) {
+    return module.exports.__placeElement(description, owner, parent, place);
+}
+
+function placedWalked(owner) {
+    return module.exports.__placedWalked?.(owner) ?? false;
+}
+
+globalThis.__rsuiInternals = { rejected, placeElement, placedWalked, setTracing(on) { tracing = on; }, describeHooks, restoreState, desktopEvent: (id, value) => desktopEvents?.(id, value), webDescription, newClickEvent, newEvent, rsuiEvents: (given) => require('rsui/events').rsuiEvents(given), documentEvent: (kind, event, prevented) => documentHeard?.(kind, event, prevented), passClick: PASS_CLICK, notKept: NOT_KEPT, pasted, colorSchemeChanged, windowResized, WindowRoot, newInstance, render, flushEffects, commitEffects, unmount, setReloading(on) { reloading = on; } };
 
 /// A promise that was rejected with nothing to catch it, once everything that was waiting has run, as Rust says. The window hears
 /// `unhandledrejection` about it, as a browser's does, and it's logged unless something there calls `preventDefault()`. The app
@@ -3308,6 +3391,16 @@ module.exports = {
     },
     __provideHere: provideHere,
     __readsHere: readsHere,
+    // For 'rsui/web', which draws a page's plain elements in place: see `newFrame`.
+    __newFrame: newFrame,
+    __renderPlaced: renderPlaced,
+    __forgetFrame: forgetFrame,
+    __framePending: (frame) => (frame.flags & FORCED) !== 0,
+    __markStateSet: (instance) => markStateSet(instance),
+    __everything: () => everything,
+    set __placedChanged(hear) {
+        placedChanged = hear;
+    },
     // For 'react-dom', whose `createPortal` into another document's node is this.
     __foreignPortal: (children, container, key) => (foreignContainer(container)
         ? __jsx(ForeignPortal, { container, children, key }, null, key !== undefined && key !== null)

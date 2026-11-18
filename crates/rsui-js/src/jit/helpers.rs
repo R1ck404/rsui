@@ -802,6 +802,29 @@ pub(crate) extern "C" fn op(vm: &mut Vm, pc: u32) -> u32 {
             reg!(dst) = closure;
         }
         Op::LoadCallee { dst } => reg!(dst) = Value::object(frame.closure),
+        Op::Note { kind, count, .. } => {
+            if vm.tracking {
+                if kind == crate::op::NOTE_KEEP || kind == crate::op::NOTE_KEPT {
+                    // A call made here, or given what it gave last time, is stepped over with the Note after it, in the
+                    // interpreter (see `keeping.rs`).
+                    match vm.noted(pc as usize) {
+                        // Compiled code goes on past the call, and the Note after it.
+                        Ok(true) if kind == crate::op::NOTE_KEEP => return TAKEN,
+                        Ok(true) => {
+                            if let Some(frame) = vm.frames.last_mut() {
+                                frame.pc = pc + 1 + u32::from(count) + 2;
+                            }
+                            return BAIL;
+                        }
+                        Ok(false) => {}
+                        Err(error) => return throw(vm, error),
+                    }
+                } else {
+                    vm.note(pc as usize);
+                }
+            }
+        }
+        Op::NoteKey { .. } | Op::NoteName { .. } => {}
 
         Op::NewObject { dst, capacity } => {
             let shape = vm.realm.object_shape;
@@ -1399,6 +1422,9 @@ pub(crate) extern "C" fn call(vm: &mut Vm, pc: u32) -> u32 {
                 }
                 Kind::Native(native) if new_target.is_none() => {
                     let func = native.func;
+                    if vm.keeping.working != 0 && !native.pure {
+                        vm.keeping.spoiled = true;
+                    }
                     let args = Args {
                         this: vm.stack[base + f as usize + 1],
                         start: base + f as usize + 2,
@@ -1763,6 +1789,12 @@ pub(crate) extern "C" fn call_native(vm: &mut Vm, func: usize, base: u32, operan
     };
     #[cfg(feature = "jit-opt")]
     super::feedback::native_called(vm, callee);
+    if vm.keeping.working != 0
+        && callee.is_object()
+        && matches!(&vm.objects[callee.index()].kind, Kind::Native(native) if !native.pure)
+    {
+        vm.keeping.spoiled = true;
+    }
     match func(vm, args) {
         Ok(value) => {
             // SAFETY: as above; the frame is still there.

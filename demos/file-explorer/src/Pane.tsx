@@ -2,7 +2,7 @@
 // its own. A tab has one of these, or several beside and above each other. Only the one that has the keyboard (`active`) hears it.
 // It's as big as layout makes it, and only knows how wide that is in the steps that change what it shows: see `useRoom`.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { clipboard, dialogs, drag, menus, shell, type MenuItem } from 'rsui/desktop';
 import { promises as fs, watch } from 'fs';
 import { exec } from 'child_process';
@@ -120,6 +120,51 @@ function useRoom(element: { current: any }, look: Look): Room {
     // The columns asked for, or the size of the icons, can change what fits too.
     useEffect(update, [look]);
     return room;
+}
+
+/** What a folder shows, in order: the drives for This PC, else what it holds or what a search found, as the settings say. */
+function shownItems(
+    folder: string,
+    listing: Listing,
+    found: { entries: Entry[] } | null,
+    drives: Drive[],
+    query: string,
+    settings: Settings,
+    sortKey: SortKey,
+    sortDescending: boolean,
+): Entry[] {
+    if (folder === COMPUTER) {
+        return drives.map((drive) => ({
+            name: (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')',
+            path: drive.path,
+            ext: '',
+            kind: 'folder' as const,
+            folder: true,
+            hidden: false,
+            system: false,
+            readonly: false,
+            link: false,
+            size: drive.total - drive.free,
+            modified: 0,
+            created: 0,
+            within: drive.total > 0 ? formatSize(drive.free, settings.sizeUnits) + ' free' : '',
+            rank: 0,
+        }));
+    }
+    const source = found ? found.entries : listing.folder === folder ? listing.entries : [];
+    const matches = found ? null : matcher(query.trim(), settings.searchMatch, settings.searchCase);
+    const shown = source.filter(
+        (entry) =>
+            (settings.showHidden || !entry.hidden || (entry.system && settings.showSystem)) &&
+            (settings.showSystem || !(entry.system && entry.hidden)) &&
+            (matches === null || matches(entry.name)),
+    );
+    return sortEntries(shown, settings, sortKey, sortDescending, !found);
+}
+
+/** Where each item is in the list, by its path. */
+function positions(items: Entry[]): Map<string, number> {
+    return new Map(items.map((item, at) => [item.path, at]));
 }
 
 export function Pane(props: {
@@ -268,45 +313,16 @@ export function Pane(props: {
         };
     }, [recursiveSearch, query, folder, settings.searchMatch, settings.searchCase, settings.searchDepth, settings.searchMaxResults, settings.searchHidden]);
 
-    // What's shown, in order
-
-    const sortTook = useRef(0);
-    const items = useMemo(() => {
-        const started = performance.now();
-        if (folder === COMPUTER) {
-            return drives.map((drive) => ({
-                name: (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')',
-                path: drive.path,
-                ext: '',
-                kind: 'folder' as const,
-                folder: true,
-                hidden: false,
-                system: false,
-                readonly: false,
-                link: false,
-                size: drive.total - drive.free,
-                modified: 0,
-                created: 0,
-                within: drive.total > 0 ? formatSize(drive.free, settings.sizeUnits) + ' free' : '',
-                rank: 0,
-            }));
-        }
-        const source = found ? found.entries : listing.folder === folder ? listing.entries : [];
-        const matches = found ? null : matcher(query.trim(), settings.searchMatch, settings.searchCase);
-        const shown = source.filter(
-            (entry) =>
-                (settings.showHidden || !entry.hidden || (entry.system && settings.showSystem)) &&
-                (settings.showSystem || !(entry.system && entry.hidden)) &&
-                (matches === null || matches(entry.name)),
-        );
-        const sorted = sortEntries(shown, settings, sortKey, sortDescending, !found);
-        sortTook.current = performance.now() - started;
-        return sorted;
-    }, [
-        listing, found, folder, drives, query, sortKey, sortDescending, settings.showHidden, settings.showSystem, settings.foldersFirst,
-        settings.naturalSort, settings.caseSensitiveSort, settings.searchMatch, settings.searchCase, settings.sizeUnits,
-    ]);
-    const byPath = useMemo(() => new Map(items.map((item, at) => [item.path, at])), [items]);
+    // What's shown, in order. The engine gives what these gave at the last render while what they're given is the same, so
+    // a folder of 25,000 is only sorted again when it, the search or the settings change. How long the last sort took is
+    // kept with what it made.
+    const sorting = useRef<{ items: Entry[]; took: number }>({ items: [], took: 0 });
+    const started = performance.now();
+    const items = shownItems(folder, listing, found, drives, query, settings, sortKey, sortDescending);
+    if (items !== sorting.current.items) {
+        sorting.current = { items, took: performance.now() - started };
+    }
+    const byPath = positions(items);
 
     // When a folder's read, keep what was selected, or choose what was asked for, or the first thing.
     useEffect(() => {
@@ -913,7 +929,7 @@ export function Pane(props: {
                     <span className="ml-auto flex items-center gap-3">
                         {settings.showPerf && folder !== COMPUTER ? (
                             <span className="font-mono">
-                                read {listing.took.toFixed(1)} ms · sort {sortTook.current.toFixed(1)} ms
+                                read {listing.took.toFixed(1)} ms · sort {sorting.current.took.toFixed(1)} ms
                             </span>
                         ) : null}
                         {drive && drive.total > 0 ? <span>{formatSize(drive.free, settings.sizeUnits)} free</span> : null}

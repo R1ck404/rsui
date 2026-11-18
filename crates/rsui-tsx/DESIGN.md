@@ -176,8 +176,9 @@ what's made, it notices that what's made again is the same, when the child's pro
   the latest does by hand. What the child drew and its effects call that, and an effect that depends on the handler doesn't run
   again, as it wouldn't for `useEvent`. That's only done once everything else in the props is the same, and only for a function
   written in the app's own files, which isn't async or a generator (one of those can be waiting part of the way through), and
-  whose own properties nobody has asked for. A function named anything else, as `renderRow` or `format`, can be called as the
-  child renders, so it's compared by what it sees.
+  whose own properties nobody has asked for. A function named anything else, as `renderRow` or `pane`, is handed on in the
+  same way as long as every call of it while something rendered had what it read noted, and no hook keeps it as a
+  dependency, as what called it is looked at again then: see "What a component read" below.
 - **Where.** The parser makes JSX call `__jsxMemo` (layer.js), which marks a component's element, and the compiler has it call
   `__jsx` instead in a file that isn't the app's own, as one in `node_modules`, so a library's elements are as React has them
   (TanStack Table's `flexRender` gives cells the same `row` object, which says something else once it's selected). Only a marked
@@ -194,7 +195,11 @@ what's made, it notices that what's made again is the same, when the child's pro
   as a component's props are, so that a component in it given the same ref or object with methods still renders. A field, an
   `<option>` or a page element a library made renders as before. What a page element passes down (its place among the others, for `:nth-child()` and `a + b`) is the
   same as before when what's before it only has handlers or refs made again, or a `style` holding the same, as those are never
-  attributes (`sameToCss`), so what's after it isn't drawn again either.
+  attributes (`sameToCss`), so what's after it isn't drawn again either. What a page element puts around each thing in it to
+  tell it something, where it is among the rest or that it's on a line (`wrappedIn` in web.js), is compared in the same way, so
+  it doesn't render again for being made again around what does the same, and nor does what's in it. A picture's shapes are
+  given the same function for what CSS says of them while the rules and variables it works from are the same, and a picture is
+  only drawn again for a variable that it or its shapes use.
 - **Being careful.** The same object is the same, as React's `memo` and React Compiler have it, as React's rules say what's given
   isn't changed in place, but not when it holds a function or `current`: a ref changes without a render, and an object with
   methods, as TanStack Table's `row`, can say something else when they're called, and a component can do either as it renders.
@@ -210,8 +215,8 @@ what's made, it notices that what's made again is the same, when the child's pro
 
 Why not compile it, as React Compiler does: that's working out, for each value in a component, what it's made from, and getting
 that wrong shows something old, where comparing can only cost a render. Comparing also works for what React Compiler can't
-keep, as elements made in a loop or in `renderRow`. What it doesn't save is the parent's own render: what the parent works out
-is worked out again, which `useMemo` is still for when that's slow. A component that says `memo` compares in the same way, as it's
+keep, as elements made in a loop or in `renderRow`. What the parent works out as it renders is kept in its own way: see "What a
+render works out" below. A component that says `memo` compares in the same way, as it's
 asking for the same thing, but without leaving out refs and objects with methods; given what wasn't the app's own JSX, `memo` is
 as React's, comparing each prop as `Object.is` does.
 
@@ -229,7 +234,261 @@ levels going round; the bar's buttons, whose handlers see what changed; and the 
 panel did, and told what's in them where it is anew whenever a handler before it was made again. What's left now is a `<div>` a
 handler made again is in that also holds what changed, which renders, as the hand-written one's does.
 
+### What a component read
+
+Comparing props whole renders a component whenever anything in them changed, even what it never looks at. The file explorer gave
+each pane the whole remembered session, which is saved again whenever another pane gets the keyboard, and a pane only reads its
+own folder's view and what's pinned: every pane rendered for every move of the keyboard. So the engine notes what each render
+reads of its props, and when they're new and not the same, a component whose reads all come out the same again doesn't render
+(`Vm::reads_same`, rsui-js `reads.rs`, which `JsProps::eq` asks after `Vm::props_equivalent_handing_on`).
+
+- **What's noted.** In an app's own files, a function named with a capital that's given its props first, as React has a
+  component, says when it's the one rendering (a Note at its start), and each read of its props, or of a name destructured
+  from them (`function Pane({ session, id })` or `const { session } = props` at the top), is noted as the whole chain of
+  property reads, as `session.views[id]`, with what came out at its end. That's compared when the props are new by the rules
+  above, as a prop would be, so `session.views[id]` is the same while that folder's view is. Each render notes its own, as what
+  a render reads depends on what it was given (`open ? a : b`). A read is one instruction, `Op::Note`, after the reads it's
+  about, which does nothing but test a byte while nothing's rendering, in compiled code too, and steps over the keys after it.
+- **Read whole.** What's read as itself is read whole: the props, or a name, given to an element or a call, spread, listed with
+  `Object.keys` or `for in`, gone through with `.map`, or anything else that isn't a property read. A method called on what was
+  read (`list.map(...)`, `pinned.includes(x)`) reads all of what it's called on, as it sees it as `this`, and a native goes
+  through all of it. A getter, a proxy, a `Map` and the rest are read whole where the chain gets to them, as looking into them
+  would run something, and then they're only the same as themselves. What's read whole and is the same object as before is the
+  same, as what's read of it is noted for itself, except, for what didn't say `memo`, what a method was called on or a function
+  read from (`careful`): TanStack Table's `row.getIsSelected` can say something else when it's called with nothing given anew,
+  so a `row` with methods renders whenever its parent does, as before.
+- **Read as itself.** What's compared with `===` or `==`, or given to a call, or put in the array given to a hook (a call of
+  `use...`: its dependencies), has to be the same value, not one that does the same, as an effect that depends on something
+  runs again when it's a new one in React. What's compared with `===` or `!==` and nothing else only says whether it was the
+  same as the other side, as in `active={id === focus}`: that's what's noted, so moving the focus between two other panes leaves
+  this one's the same. Only one side of a comparison is noted that way, as two such sides could each change into the other.
+- **Seen later.** What the component makes as it renders that sees its props, or a name destructured from them, as a menu's
+  handler that reads `session.pinned` when it's clicked, sees them through a cell (a component's props are always in one when
+  something inside sees them), and when it skips rendering, the cell is given the new props' value: what the last render made
+  then does what the new one's would, as handed-on handlers do. Read as the component renders, by a function it calls, what
+  that function reads is noted for it, through the cell. The component's props are the new ones after it skips, so what it
+  renders next for its own state reads them.
+- **Functions called as something renders.** A function in the props, as the file explorer's `pane={drawPane}`, which sees which
+  pane has the keyboard, is a new one each time the app renders, and everything that passes it down rendered for it. What it
+  reads of what it captured is noted when it's called as something renders, through where it was read from (`pane`, then what
+  it captured), and what it makes as it runs reads what it captured through it too. Then the component that called it doesn't
+  render while what it read is the same. What only passes it down, as the splits and their parts do, hands it on instead, as a
+  handler is: the old one is made to do what the new one does, and each render that called the old one is looked at again,
+  with what it read gone over with the function's new captures, and renders again if any of it changed (`take_unheld_readers`).
+  Handing on shares: the old function comes to hold the new one's block of captured variables (`Upvalues::share`, counted, so
+  the last to hold it frees it), and so does whatever held the same block as the old one (`Vm::join_handed`), and two found to
+  do the same are joined in the same way. That's what keeps a child that skipped, which holds the old function, following what
+  it's in, which holds the new one, or, as a page element that kept its old children does, an older one still: whichever of
+  them is handed on next, all of them are, and what read any of them is looked at again. Only one that's running keeps its
+  block, and gets the new captures put in it instead.
+  That's only for a function every call of which, as something rendered, had its reads noted, which is known as a read of a
+  captured variable that wasn't marks the function as one that can't be handed on (`NOT_HANDED_ON`), as can one made by such a
+  function; and one that no hook keeps as a dependency (`keepAsItself` in layer.js), as an effect that depends on it would run
+  again in React. What a function reads of the top of a module isn't noted: a component that reads something else that
+  changes as it renders isn't covered, as before.
+- **What it costs.** A Note that isn't for what's rendering, a component's own read when it isn't the one rendering, or a
+  captured variable that isn't a destructured name's cell or seen through a function read from the props, is a test of a byte,
+  and while something renders, a look in one map and a mark on the closure. A function that's marked is
+  `READ_ONLY_LENGTH`'s bit, which only an array uses: the collector's `OLD` bit is on every kind of object.
+- **What's still rendered.** A render whose frame wasn't found, as a component behind `forwardRef` is called by another function, or one that sees its `arguments`, has nothing noted, and is compared as above. `RSUI_READS=0` turns all of this off,
+  for comparing.
+- **Given to a function.** What a component reads and gives straight to a plain function of the app's, as `paint(look, selected)`
+  or `cell(width, formatDate(entry.modified, look.dateFormat))`, is read where that function reads it: the function notes what it
+  reads of its parameters through where each was read (`NOTE_PARAMS` in rsui-js `op.rs`), so `paint` reading `look.colors` and
+  `look.zebra` is the row reading those, and a row that isn't selected doesn't depend on `look.selection`, which `paint` only reads
+  for one that is. That's for a parameter that's a plain name nothing gives another value, of a function that isn't async or a
+  generator and doesn't look at its `arguments`; one that a function inside it sees is read whole, as that one can read anything
+  of it later. What's given to anything else, a native, a library's function, or one that's called some other way, is read as
+  itself, as before: the call notes what it's given just before it's made (`NOTE_CALLING`), and what's called takes it at its
+  start, or it's read as itself once it's clear nothing will.
+- **Given on to a child.** What a component only gives on to elements its own JSX makes, as a prop, as a row gives its `look` to
+  its `Icon`, is the same as long as what each component it went to read of it is: when the child renders, or is kept from
+  rendering, inside what's rendering, what it read is linked to what gave it that prop (`Vm::link_child`), and when the parent is
+  given new props, a prop of them it only gave on is checked against what each child read, with the new one in its place
+  (`given_hold` in `reads.rs`). That's only when every place it was given is such a child, by the count of times it was given,
+  and none of them read their props whole. If they all hold, each child's props are given the new value in place, as is what it
+  made that sees them through a cell, so that what it renders next by itself sees what the parent would have given it. A child
+  that renders again by itself keeps its link (`Vm::move_link`).
+- **Looked up.** `has` on a `Set` or a `Map`, and `get` on a `Map`, called on what was read, as `selected.has(entry.path)`, is
+  only what it gave: that's noted with what it was given (`NOTE_RESULT`, just after the call), and looked up again in the new
+  value when the props are compared, which runs nothing of the app's. So moving the selection only renders the rows whose
+  answer changed, rather than every row that looks in the set.
+- **A long list's rows.** Each row of `<list>` notes what `renderRow` read as it drew that row, through the function, as a
+  component's props are (`Vm::start_function_reads`), and when the list is given a new `renderRow`, a row whose reads are all the
+  same in it isn't drawn again (`RowProps` in bridge.rs). A row has a place among the components for being told to draw again,
+  and `renderRow` itself is never made to do what a new one does, as only the rows drawn inside what's rendering would hear about
+  that: each row compares for itself.
+
+What it comes to in `demos/file-explorer`, headless, with three panes split side by side and a file clicked in the first, which
+doesn't have the keyboard (the frames the click draws, added up). "Before" is the commit this started from; "the old app" is a
+copy that gives each pane the whole session again, as it did before it was given only what it uses:
+
+| | Components rendered | Splits, parts and what draws each pane (`Inside`) | Panes |
+|---|---|---|---|
+| The old app, before | 371 | 2 splits, 6 parts, 8 | 6 |
+| The old app, now | 255 | none, none, 3 | 4 |
+| The app as it is, before | 363 | 2 splits, 6 parts, 8 | 3 |
+| The app as it is, now | 252 | none, none, 2 | 3 |
+
+What's left is rsui/web's own around each page element, and the rows of the pane that was clicked, which render as its
+selection does. In the old app, the third pane's `Inside` renders too, as the function that draws it gives it the session,
+which is another, and then the pane itself, whose `look` the app makes again each time it renders and the pane gives to a hook.
+The Down key in a folder of 120 files took 1.84 ms a press before and 1.90 ms now (the median of 240 presses each, which move
+by 5% between runs), and starting took the same.
+
+What reading through functions, children, lookups and rows came to, in the same app, headless, with the inspector's count of
+what rendered and how much of that changed nothing (the frames of each step added up). Before is 16efa49e:
+
+| | Before | After |
+|---|---|---|
+| Three panes, a file clicked in the first, which doesn't have the keyboard | 257, 184 changing nothing | 52, 15 |
+| Another file clicked in the same pane | 47, 36 | 14, 3 |
+| Down, in a folder of 5,000 files | 47, 36 | 14, 3 |
+| Empty space clicked in a pane that doesn't have the keyboard | 121, 54 | 48, 17 |
+| Empty space clicked in the pane that has it | 21, 11 | 10, 5 |
+
+What's left changing nothing is a page element told where it is among the rest anew when what's before it changed how it looks,
+which `a + b` could ask about, and a few told something new by what they're in that comes out the same for them.
+
+### A page's plain elements, drawn in place
+
+Most of a page is `<div>`s, `<span>`s and `<p>`s that are only what CSS makes of them. Each was a component of its own (`Styled` in
+web.js), with its hooks, effects, and what Rust keeps for a component, for what a browser keeps as an element and its style. Now
+each of those the app's JSX makes, of the tags that do nothing more than that (`PLACED_TAGS`: not a field, link, button, form,
+picture or table), is drawn in place: as a host element of the component whose output it's in, by Rust as it builds that output
+(`placed_in_output` in bridge.rs, `placeElement` in web.js). What it comes to is worked out by the same `Styled` as before, and
+given back as it was each time that output's built again, until something it depends on changes, as a browser styles an element
+again only once what its style depends on has:
+
+- what it's given, unless that does the same as before, as a component's props would (`samePageProps`, which is `JsProps::eq`'s
+  comparison for a page's element), so a handler made again isn't a change;
+- its own state, as hovered or pressed, which the handlers Rust tells it with set;
+- what it read of what's above it: it reads contexts through what stands for it among the components (`newFrame` in layer.js),
+  which is told when one changes, and says what it read of the parent's look and variables as a component does (`readsHere`);
+- the page's CSS changing, as every element of the page hears.
+
+What it keeps is its `live`, the one object every element of the page has (`PlacedLive`), and that stand-in, which what's in it is
+under, for what that reads and for what it passes down. A component in it is that stand-in's child. It has no hooks of its own:
+its state, what `useMemo` kept, and where it is among what's in it are kept on its `live`, and what it does once it's on the page,
+and giving its ref its element, is done as the commit it's drawn in starts, and undone once it's not drawn again (`placedCommit`),
+as React has a host element's ref. When something it depends on changes, its owner builds what it gave back again without calling
+it, as when a component's state is set back to what it was, which works out again only the elements that changed, and gives Rust
+what's the same as the same object. Nothing in what scrolls or a long list's kept rows is drawn in place, as those are built by
+themselves later rather than as the owner's output; each of their page elements is a component as before, and their rows'
+own elements are drawn in place in the rows.
+
+A long list's row that skips what's in it while it's far from being seen keeps that as it was given, rather than copied to give
+each of its elements a key by where it is, and what's passed down to what's in an element drawn in place is only worked out once
+something's drawn in it.
+
+What code makes, with `document.createElement()` and the like, is drawn by a component of its own for each node already
+(`OwnElement` in dom.js, and `drawNative`), so it's drawn as before.
+
+It's on unless `RSUI_PLACED=0`, or the page says `globalThis.__rsuiPlaced = false`, as `tests/placed.rs` does, drawing each page both
+ways and comparing what's drawn and what the page's code finds out.
+
+What it came to, measured on 2026-11-18, headless, release builds (`lto=false`), the old and new one after the other on a machine
+other builds were using. In `bench/long-list` (rows of Tailwind `<div>`s, each in the app's own `Row` with a ref and a handler):
+
+| Rows | | Before | After |
+|---|---|---|---|
+| 1,000 | starting | 774-908 ms | 680-1,015 ms |
+| 1,000 | memory to start | 63-66 MB | 51 MB |
+| 5,000 | starting | 793-834 ms | 657-658 ms |
+| 5,000 | memory to start | 95 MB | 73 MB |
+| 25,000 | starting | 3,545-4,062 ms | 2,883-2,896 ms |
+| 25,000 | memory to start | 418-423 MB | 305 MB |
+| 25,000 | memory after the steps | 568-579 MB | 490 MB |
+| 25,000 | Down, median of 21 a run, five runs | 13-24 ms | 10.5-20 ms |
+| 25,000 | Down, scrolling, median of 40 a run, five runs | 20-33 ms | 17-32 ms |
+
+The key presses moved between two levels from run to run on both, as others were building, so they're no slower that can be
+told. What a row still costs to start is mostly working its look out, as each row's element is still styled as it's first drawn,
+and the app's own `Row` and what it makes. In `demos/file-explorer`, with three panes (the inspector's count of what rendered and
+how much of that changed nothing, as above):
+
+| | Before | After |
+|---|---|---|
+| A file clicked in a pane that doesn't have the keyboard | 52, 15 | 40, 12 |
+| Another file in the same pane | 14, 3 | 10, 2 |
+| Down, in a folder of 5,000 files | 14, 3 | 10, 2 |
+| Empty space clicked in the pane that has the keyboard | 14, 4 | 7, 1 |
+| Empty space clicked in a pane that doesn't have it | 54, 23 | 39, 18 |
+
+None of what's left changing nothing is a page element told where it is among the rest anew: drawn in place, one given the same
+as before isn't worked out again. It's the app's own components that read a context that changed, providers given new children,
+and the app's state set to what renders nothing new. The explorer's first frame and memory to start were the same (about 70 ms of
+script on this busy machine, both, and 25.6 MB private against 25.7).
+
 A child is the same component as last time if it's in the same place, as in React: where it is in the array of children it's in, with `null`, `false` and `undefined` keeping their places, and the same for each array and element around it. An array or a fragment is one place, with its own places inside. A key takes the place of where it is in its array. A component of another type in a place, or one inside an element of another type, is a new one, and what was there is unmounted.
+
+### What a render works out
+
+Skipping a component whose reads are the same saves its whole render, but a component that does render works out everything in
+it again. The file explorer's pane sorts a folder of 25,000 entries and makes a map of where each one is, and it renders whenever
+the selection moves. So a plain call in a component's or a hook's own body, as `const items = shownItems(folder, listing, ...)`,
+gives what it gave at the last render when it's given the same and nothing it was worked out from has changed, and an app writes
+the calculation plainly (rsui-js `keeping.rs`).
+
+- **Where.** The compiler puts a Note of `NOTE_KEEP` before each call of a function by name whose answer is used, in the body of
+  a component or a hook (`useSomething`) of the app's own files, and one of `NOTE_KEPT` after it. A hook is never one of these
+  calls, as React counts them, and nor is anything in a function inside the body, as a handler. Each place keeps what it gave
+  for each component, by the host's number for it, and for each time it runs in that render, so a loop in the body keeps one for
+  each turn. While nothing renders, each Note is a test of a byte, as the others are.
+- **Only what's worth it.** A place is timed the usual way, by the two Notes, and is only kept from once its last call took 50 µs
+  or made 64 KB, not counting its first, which compiles what it calls, so a quick call pays two clock reads and nothing more.
+  The first time a place is found to be worth it, the call is made the usual way; from the next, the Note makes it, and keeps
+  what it gave. In compiled code, a call given again or made by the Note is jumped over, so the rest of the render stays
+  compiled.
+- **What it's worked out from.** Everything that can be reached from the function and its arguments: what's in them, what's in
+  that, through prototypes, and through what each function reached captured, so the variables at the top of a module that a
+  function reads, and what those hold, are part of it, as `scale` in `return list.map((x) => x * scale)` is. Each object of it
+  is watched through the collector's write barrier: an old object goes the slow way when it's first changed anyway, and a young
+  one that's watched is given the old flag too, which is taken off before each collection and put back after it, so the
+  collector never sees it (`Watch` in gc.rs). Changing a watched object, by anything at all, stops it being watched and counts
+  a change. Each cell a function reached captures is kept with what it held. The result is watched in the same way.
+- **Given again** when the function is the same one, or one made from the same code that captured the same, its arguments are
+  each the same value or the same by the rules above (a props object made again with the same in it is), nothing watched has
+  changed since, and every cell kept holds what it did. Any change forgets everything kept, as it's one count for all of it.
+  What's watched has been looked through and hasn't changed, so working out the next call only looks through what's new: the
+  listing a sort was given is watched already when the query changes.
+- **What isn't kept.** A call that changed something it didn't make (a watched object or a kept cell, as `calls++` or
+  `cache.set(...)` on a module's own variables, or an argument changed in place), called something that isn't pure (the host's
+  functions, the program's that runs the engine, `Math.random`, `Date.now`, `new Date()`, `performance.now`, promises, `WeakRef`:
+  each native says, `NativeData::pure`), threw, or reached what can't be watched: a typed array's bytes, which change without the
+  barrier, a promise, a generator, an iterator, a proxy, what's held weakly, a function sharing its captures with a handler handed
+  on, or more than 400,000 objects. What a call like that did happens again at every render, as it would. Nor is one whose
+  arguments took longer to look through than the call took, as one that reads a little of something big and new each time. A
+  place that isn't kept three times in a row is made the usual way for sixteen calls before it's tried again.
+- **What it costs.** Watching a folder of 25,000 entries the first time looks through about 25,000 objects, a fraction of what
+  sorting it takes, and two bits for each object the engine has. At most 16 results are kept, the least recently given going
+  first, and none for more than 30 seconds without being given again, as nothing says when the component it's for has gone:
+  each holds on to what it was given and what it gave until then.
+- **What isn't covered.** What's reached only through the global object, which is watched itself, so a global set again is seen,
+  but isn't looked into, as everything is in it; and the language's own prototypes and what's on the global object as the
+  engine starts, as `Array.prototype` and `Math`, which aren't watched or looked into, as the engine changes some of them itself
+  (a method written in JavaScript is put in place the first time it's called) and a program doesn't.
+  And a caller that changes what it was given back, in place, after it was given it again: the next render works it out anew,
+  but in the render that changed it, the object is the one the last render had too, so a child given it then is given the same
+  object as before and can skip, where in React it would have a new one. React's rules say not to change what's rendered with.
+  `RSUI_KEEP=0` turns this off, for comparing, and `RSUI_KEEP_LOG=1` writes a line for each call worked out, each given again,
+  and each time what was kept is forgotten, with what changed.
+
+What it came to in `demos/file-explorer`, headless, on a folder of 25,040 entries, against the commit before, whose pane had
+`useMemo` for its order and its map of where each entry is (the median of 8 runs of each, alternating, on a machine others were
+using too, so only differences bigger than a few percent mean anything). With 40 presses of Down, the pane's order was worked
+out once and given again 40 times, and so was the map.
+
+| | `useMemo` | Plain calls, kept |
+|---|---|---|
+| Down, each press | 2.63 ms (best run 2.16) | 2.30 ms (best run 2.25) |
+| Typing in the filter, each key, sorting again each time | 23.5 ms | 20.7 ms |
+| Opening the folder, until its last frame | 459 ms (best 388) | 493 ms (best 382) |
+| Starting in it, until its last frame | 12.8 ms | 12.4 ms |
+| Peak private memory, starting / pressing Down | 58.9 / 61.1 MB | 61.6 / 61.1 MB |
+
+Watching the folder the first time looked through 25,166 objects. Typing looks through only what's new, as the listing is
+watched already.
 
 ### Saving a file
 
@@ -277,6 +536,17 @@ element of the page, for `querySelectorAll()` and refs, and the list is as long 
 hasn't been near yet isn't there for code to find, but the text written in it is what its box is named, for agents and screen
 readers. `content-visibility: hidden` is a box of that size until it stops saying so. `bench/long-list` measures a list of each
 kind with no window: see its README.
+
+What each of a page's elements costs is kept down as a browser keeps it down, by sharing what's the same. An element's handle,
+as a ref or `querySelector()` gives it, has only what's its own (its key, what it's of, what it says about itself), and gets
+everything an element does from one prototype for each tag; its `style` is made the first time code asks for it. A long list's
+rows of the same tag, classes and state, under the same things above them, start from the first one's look, as a browser shares one
+computed style between such siblings (`sharedLook` in `web.js`), where nothing on the page asks about `:has()`, `inherit` or where
+things are among what's around them, and the rules that reach a row are only about it alone, as Tailwind's are; anything else
+works its own out. `RSUI_SHARED_LOOKS=0`, or `globalThis.__rsuiSharedLooks = false`, turns that off. What's the same about how
+text is written is one object for everything that writes it so, and a row that skips what's in it passes nothing down to what's in
+it until it's drawn. What's still each row's own is its component, with its hooks, the host element Rust keeps for it, and its
+look as what it's drawn with: see the bench's README for what that comes to.
 
 ## Seeing why it renders
 

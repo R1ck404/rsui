@@ -371,6 +371,14 @@ pub struct Vm {
     pub(crate) timers: Vec<Timer>,
     pub(crate) next_timer: u32,
     pub(crate) debt: usize,
+    /// Whether a component is rendering, so that what it reads is noted (see `reads.rs`), which compiled code tests too.
+    pub(crate) tracking: bool,
+    /// What renders read: see `reads.rs`.
+    pub(crate) reads: crate::reads::Reads,
+    /// What renders worked out, kept for the next: see `keeping.rs`.
+    pub(crate) keeping: crate::keeping::Keeping,
+    /// Whether the natives being made are the language's own, which are pure (see `NativeData::pure`).
+    pub(crate) making_pure: bool,
     pub(crate) threshold: usize,
     pub(crate) stack_base: usize,
     pub(crate) stack_limit: usize,
@@ -492,6 +500,10 @@ impl Vm {
             timers: Vec::new(),
             next_timer: 0,
             debt: 0,
+            tracking: false,
+            reads: crate::reads::Reads::default(),
+            keeping: crate::keeping::Keeping::default(),
+            making_pure: false,
             threshold: crate::gc::first_threshold(),
             stack_base: crate::stack_position(),
             stack_limit: DEFAULT_STACK_LIMIT,
@@ -742,6 +754,7 @@ impl Vm {
                 length,
                 is_constructor,
                 forwards: 0,
+                pure: self.making_pure,
             })),
             0,
         );
@@ -1179,6 +1192,9 @@ impl Vm {
             Kind::Native(native) => {
                 let func = native.func;
                 let is_constructor = native.is_constructor;
+                if self.keeping.working != 0 && !native.pure {
+                    self.keeping.spoiled = true;
+                }
                 #[cfg(feature = "counts")]
                 crate::counts::native(self, func as usize, native.name);
                 if new_target.is_some() && !is_constructor {
@@ -1490,7 +1506,7 @@ impl Vm {
         } else {
             start
         };
-        let upvalues = match &mut self.objects[closure as usize].kind {
+        let upvalues = match &mut self.objects.for_the_engine(closure as usize).kind {
             Kind::Function {
                 upvalues,
                 entry: known,
@@ -2130,6 +2146,9 @@ impl Vm {
                                 // `call` and `apply` go to `call_indirect`, which calls what they would here.
                                 Kind::Native(native) if native.forwards == 0 => {
                                     let func = native.func;
+                                    if self.keeping.working != 0 && !native.pure {
+                                        self.keeping.spoiled = true;
+                                    }
                                     #[cfg(feature = "counts")]
                                     crate::counts::native(self, func as usize, native.name);
                                     let args = Args {
@@ -2942,6 +2961,23 @@ impl Vm {
                         let closure = self.make_closure(proto, base!());
                         reg!(dst) = closure;
                     }
+                    Op::Note { count, kind, .. } => {
+                        if self.tracking {
+                            let at = unsafe { ip.offset_from(code!()) } as usize - 1;
+                            if kind == crate::op::NOTE_KEEP || kind == crate::op::NOTE_KEPT {
+                                // A call that's been made here, or given what it gave last time, is stepped over, with
+                                // the Note after it (see `keeping.rs`).
+                                if attempt!(self.noted(at)) {
+                                    jump!(count as usize + 2);
+                                    continue;
+                                }
+                            } else {
+                                self.note(at);
+                            }
+                        }
+                        jump!(count);
+                    }
+                    Op::NoteKey { .. } | Op::NoteName { .. } => {}
                     Op::LoadCallee { dst } => {
                         let closure = unsafe { &*frame }.closure;
                         reg!(dst) = Value::object(closure);
@@ -4002,6 +4038,9 @@ impl Vm {
             0,
         );
         self.objects[closure.index()].flags |= LAZY_FUNCTION;
+        if self.tracking {
+            self.note_closure(closure);
+        }
         closure
     }
 

@@ -647,9 +647,10 @@ fn a_socket_with_nothing_to_say_does_not_hold_up_the_steps() {
     );
 }
 
-/// The rows are given `pick` rather than `onPick`, which, being a handler, would be handed what it sees rather than render them.
+/// The rows keep `pick` as an effect's dependency, which has a new one render them, as an effect that depends on it would run
+/// again in React: otherwise it would be handed what it sees rather than render them.
 const WHY: &str = r#"
-    import { useState, useRef, useContext, createContext, useCallback } from 'rsui';
+    import { useState, useRef, useContext, createContext, useCallback, useEffect } from 'rsui';
     const Theme = createContext('light');
     function useTodos() {
         const [items, setItems] = useState(['milk']);
@@ -658,7 +659,7 @@ const WHY: &str = r#"
     }
     function Row({ label, pick }: { label: string; pick: () => void }) {
         const theme = useContext(Theme);
-        return <button key={label} onClick={pick}>{label + ' ' + theme}</button>;
+        useEffect(() => {}, [pick]); return <button key={label} onClick={pick}>{label + ' ' + theme}</button>;
     }
     export default function App() {
         const [count, setCount] = useState(0);
@@ -1040,11 +1041,16 @@ fn props_a_component_is_first_seen_with_as_a_block_redraw_nothing_else() {
         function Swatch({ color, inline }) {
             return inline ? <span>{'inline ' + color}</span> : <div>{'swatch ' + color}</div>;
         }
+        // In a component of its own, which is what `why` says rendered it, as a page's `<p>` is drawn in place in what made it,
+        // and its look worked out again would render that.
+        function Unrelated() {
+            return <p>Unrelated</p>;
+        }
         export default function App() {
             const [colors, setColors] = useState(['red']);
             return (
                 <div>
-                    <p>Unrelated</p>
+                    <Unrelated />
                     <Swatch color="red" inline />
                     {colors.map((color) => <Swatch key={color} color={color} />)}
                     <button id="add" onClick={() => setColors((was) => [...was, 'c' + was.length])}>Add</button>
