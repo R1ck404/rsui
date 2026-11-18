@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    font-size: 13px;
+    color: var(--b-text);
+    background: var(--b-frame);
+    user-select: none;
+}
+
+button {
+    cursor: default;
+}
+
+input::placeholder {
+    color: var(--b-faint);
+}
+
+/* Popovers come in from a little above, and a little smaller. */
+@keyframes rise {
+    from {
+        opacity: 0;
+        transform: translateY(-6px) scale(0.985);
+    }
+}
+
+/* The tour's pages come in from the side they're on. */
+@keyframes enter-from-right {
+    from {
+        opacity: 0;
+        transform: translateX(28px);
+    }
+}
+
+@keyframes enter-from-left {
+    from {
+        opacity: 0;
+        transform: translateX(-28px);
+    }
+}
+
+@keyframes fade-in {
+    from {
+        opacity: 0;
+    }
+}

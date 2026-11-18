@@ -1,0 +1,37 @@
+expect "A calmer way to browse"
+click "Get started"
+click "Dark"
+click "Light"
+click "Continue"
+click "Google"
+click "Continue"
+click "Hacker News"
+click "Continue"
+expect "Ctrl"
+click "Start browsing"
+write example.com
+press enter
+webview title Example Domain
+expect "Example Domain"
+webview popup https://www.iana.org/domains/example
+expect "iana.org"
+webview key Ctrl+W
+expect no "iana.org"
+press ctrl+shift+t
+expect "iana.org"
+press ctrl+d
+press ctrl+t
+write exam
+expect "Switch to tab"
+press escape
+webview fail https://nope.invalid/ -105
+expect "This site can't be found"
+press ctrl+s
+expect "Show sidebar (Ctrl+S)"
+press ctrl+s
+press ctrl+,
+click "Spaces"
+expect "Keep sign-ins apart"
+press escape
+click "New space"
+expect "Space 2"

@@ -55,6 +55,10 @@ explains how it works, how it differs from React, and how to keep a long list fa
 (dragging a tab onto them too), details, list and grid views, search, previews, file operations, drag and drop, and 88 settings. It
 opens a folder of 25,000 files in about 80 ms.
 
+[`demos/browser`](demos/browser) is a calm, minimal web browser laid out like Arc: tabs in a sidebar on a tinted frame, a command
+bar, spaces with sign-ins kept apart, sleeping tabs and a first-run tour, all drawn by rsui, with each page in the system's
+browser view through rsui's `<webview>` element.
+
 ## For agents
 
 Working on an app needs no window and no person.
