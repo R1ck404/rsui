@@ -131,11 +131,12 @@ pub(crate) fn compute<M: Measure>(
     measure: &mut M,
     list_sizes: &mut Vec<(usize, f32, f32)>,
     paragraphs: &mut bool,
-) -> usize {
+) -> (usize, usize) {
     list_sizes.clear();
     let mut pass = Pass {
         measure,
         solved: 0,
+        looked_at: 0,
         paragraphs,
         window_width: available.width,
         window_height: available.height,
@@ -149,11 +150,11 @@ pub(crate) fn compute<M: Measure>(
         height: Axis::exact(available.height),
     };
     pass.solve(root, node, key, Mode::Layout);
-    let solved = pass.solved;
+    let counts = (pass.solved, pass.looked_at);
     if root.has(CONTAINS_OVERLAY) {
         place_overlays(root, node, root.x, root.y, available);
     }
-    solved
+    counts
 }
 
 /// Works out where everything on top of everything else goes. That depends on where its parent has
@@ -305,6 +306,8 @@ struct Pass<'a, M> {
     measure: &'a mut M,
     /// How many times a node's size has been worked out in this pass.
     solved: usize,
+    /// How many things in what's laid out one after another have been looked at in this pass, whether or not they were laid out.
+    looked_at: usize,
     /// Set if there's ever been a paragraph, which most programs never have.
     paragraphs: &'a mut bool,
     window_width: f32,
@@ -1695,6 +1698,7 @@ impl<M: Measure> Pass<'_, M> {
         for (index, (child_box, child)) in
             current.children.iter_mut().zip(&node.children).enumerate()
         {
+            self.looked_at += 1;
             let start = start_item(&mut items, child_box, child, room);
             if let Some(item) = items
                 .last_mut()
@@ -2060,6 +2064,7 @@ impl<M: Measure> Pass<'_, M> {
         for (index, (child_box, child)) in
             current.children.iter_mut().zip(&node.children).enumerate()
         {
+            self.looked_at += 1;
             let start = start_item(&mut items, child_box, child, room);
             match start {
                 ItemStart::Overlay => {

@@ -3000,7 +3000,17 @@ fn host_variables_same(vm: &mut Vm, args: Args) -> Run<Value> {
     Ok(Value::bool(vm.same_map_entries(before, after)))
 }
 
-pub(crate) const FUNCTIONS: [(&str, HostFunction); 13] = [
+/// `propsSame(a, b, shallow)`: whether two elements' props are the same, each one by one, in the same order, as an element made again
+/// with what it had is: and, unless `shallow`, with nothing in them that's an object or a function, which could say something else
+/// without being given anew. It's only ever sure: `false` is for what's to be looked at more closely, prop by prop, as `sameElements`
+/// in web.js does. That looked at each of a long list's rows each time it was rendered again, which this does at a fraction of
+/// the cost.
+fn host_props_same(vm: &mut Vm, args: Args) -> Run<Value> {
+    let (a, b, shallow) = (args.get(vm, 0), args.get(vm, 1), args.get(vm, 2) == Value::TRUE);
+    Ok(Value::bool(a.is_object() && b.is_object() && vm.shallow_equal(a, b) && (shallow || vm.holds_no_objects(b))))
+}
+
+pub(crate) const FUNCTIONS: [(&str, HostFunction); 14] = [
     ("cssKinds", host_kinds),
     ("cssForget", host_forget),
     ("cssChildren", host_children),
@@ -3014,6 +3024,7 @@ pub(crate) const FUNCTIONS: [(&str, HostFunction); 13] = [
     ("cssHost", host_host),
     ("cssVariableKeys", host_variable_keys),
     ("cssVariablesSame", host_variables_same),
+    ("propsSame", host_props_same),
 ];
 
 #[cfg(test)]

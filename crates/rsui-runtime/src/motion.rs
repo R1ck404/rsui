@@ -1881,6 +1881,12 @@ fn put_back(node: &mut Node, replaced: Vec<(usize, Node)>) {
 }
 
 fn match_children(old: &[Node], new: &[Node]) -> Vec<Option<usize>> {
+    // Each where it was, as most often: what a long list is as it's rendered again with a row changed. That's what finding each by its
+    // key comes to, as the first of a key that's there twice is matched with the first, without hashing all of them, which was most
+    // of what drawing a list of 25,000 rows again cost here.
+    if old.len() == new.len() && old.iter().zip(new).all(|(old, new)| Arc::ptr_eq(old, new) || (old.key == new.key && old.role == new.role)) {
+        return (0..new.len()).map(Some).collect();
+    }
     let mut unkeyed = old
         .iter()
         .enumerate()

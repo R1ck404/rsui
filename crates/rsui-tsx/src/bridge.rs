@@ -224,6 +224,33 @@ const NEAR_KEPT: isize = 4;
 /// paragraphs. What's in the next list that's the same description as before, in the same place or with a key of its own, is a
 /// child component that's given the same as it was, which is kept as it is, without describing it again: a list where a few have
 /// been put in or taken out costs what those do. See `build_long`.
+/// Where what's kept of a long list is kept, for the next time it's built, and where in the output it's built that list is.
+enum KeptIn {
+    /// A component's, by its slot, for the list that's the root of its output.
+    Slot(u32),
+    /// What scrolls, in its own state, for the list that's the one thing in it.
+    Scroll(std::rc::Rc<RefCell<Option<KeptKids>>>),
+}
+
+impl KeptIn {
+    /// Where the list is in the output: the root, or what's in what scrolls.
+    fn within(&self) -> &'static [u32] {
+        match self {
+            KeptIn::Slot(_) => &[],
+            KeptIn::Scroll(_) => &[0],
+        }
+    }
+
+    fn keep(&self, kids: KeptKids) {
+        match self {
+            KeptIn::Slot(slot) => HOST.with(|host| {
+                host.kept_kids.borrow_mut().insert(*slot, kids);
+            }),
+            KeptIn::Scroll(kept) => *kept.borrow_mut() = Some(kids),
+        }
+    }
+}
+
 struct KeptKids {
     /// The list, held, so that what's in it is what it was.
     list: Root,
@@ -2073,6 +2100,18 @@ fn count_render() {
     PART.with(|part| rsui::split::count(*part, 1));
 }
 
+/// With `RSUI_SPLIT` set, counts what's in a long list that's described and built again, rather than kept as it was, as `n:built`:
+/// see [`build_long`].
+fn count_built(count: usize) {
+    if !rsui::split::on() {
+        return;
+    }
+    thread_local! {
+        static PART: u16 = rsui::split::named("n:built");
+    }
+    PART.with(|part| rsui::split::count(*part, count as u64));
+}
+
 fn js_component(cx: &mut Cx<'_>, props: &JsProps) -> Node {
     count_render();
     let instance = cx.state(new_instance);
@@ -3051,7 +3090,7 @@ fn build_output(cx: &mut Cx<'_>, output: Value, keyed: bool, slot: Option<u32>) 
     // What was kept is only for this render's root, if that's a host with a long list in it again, which keeps it once more.
     let root = slot.map(|slot| {
         (
-            slot,
+            KeptIn::Slot(slot),
             HOST.with(|host| host.kept_kids.borrow_mut().remove(&slot)),
         )
     });
@@ -3142,7 +3181,7 @@ fn build_node(
     cx: &mut Cx<'_>,
     kid: Kid,
     keyed_root: bool,
-    root: Option<(u32, Option<KeptKids>)>,
+    root: Option<(KeptIn, Option<KeptKids>)>,
     auto: &mut AutoKeys,
     previous: Option<PreviousNode<'_>>,
 ) -> Node {
@@ -3222,7 +3261,7 @@ fn build_node(
 struct Kids {
     kids: Vec<Kid>,
     long: Option<(Value, Place)>,
-    root: Option<(u32, Option<KeptKids>)>,
+    root: Option<(KeptIn, Option<KeptKids>)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3415,7 +3454,7 @@ fn build_long(
     mut element: Element,
     list: Value,
     scope: Place,
-    root: Option<(u32, Option<KeptKids>)>,
+    root: Option<(KeptIn, Option<KeptKids>)>,
     auto: &mut AutoKeys,
     previous: Option<PreviousNode<'_>>,
 ) -> Element {
@@ -3425,7 +3464,8 @@ fn build_long(
             .map(<[Value]>::to_vec)
             .unwrap_or_default()
     });
-    let (slot, kept) = root.map_or((None, None), |(slot, kept)| (Some(slot), kept));
+    let (kept_in, kept) = root.map_or((None, None), |(kept_in, kept)| (Some(kept_in), kept));
+    let within = kept_in.as_ref().map_or(&[][..], KeptIn::within);
     let kept = kept.filter(|kept| kept.scope == scope);
     let old: Vec<Value> = kept.as_ref().map_or_else(Vec::new, |kept| {
         with_vm(|vm| {
@@ -3475,7 +3515,7 @@ fn build_long(
                 .filter(|&(at, output)| output.is_some_and(|(_, keyed)| keyed || at == index))
                 .map(|(_, output)| output)
             {
-                if let Some(node) = cx.keep_child(child as usize) {
+                if let Some(node) = cx.keep_child_in(within, child as usize) {
                     outputs.push(Some((element.children.len() as u32, keyed)));
                     element = element.child(node);
                     continue;
@@ -3500,18 +3540,14 @@ fn build_long(
             element = element.child(build_kid(cx, kid, auto, old));
         }
         outputs.push(component.map(|keyed| (first, keyed)));
+        count_built(1);
     }
-    if let Some(slot) = slot {
+    if let Some(kept_in) = kept_in {
         let list = with_vm(|vm| vm.root(list));
-        HOST.with(|host| {
-            host.kept_kids.borrow_mut().insert(
-                slot,
-                KeptKids {
-                    list,
-                    scope,
-                    outputs,
-                },
-            )
+        kept_in.keep(KeptKids {
+            list,
+            scope,
+            outputs,
         });
     }
     element
@@ -3677,6 +3713,10 @@ fn with_owner<R>(owner: &Option<Root>, action: impl FnOnce() -> R) -> R {
 
 fn scroll_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
     cx.trace_name("scroll");
+    // What was kept of the long list that's the one thing in it, as a page's scrolling `<div>` of rows has, for building it again
+    // as [`build_long`] does a component's: a key that moved the selection in 25,000 rows built each of them again here.
+    let kept_kids = cx.state(|| std::rc::Rc::new(RefCell::new(None::<KeptKids>)));
+    let kept_kids = cx.get(kept_kids);
     with_owner(&props.owner, || {
         let description = props.description.get();
         let read = with_vm(|vm| -> Result<_, Value> {
@@ -3760,14 +3800,15 @@ fn scroll_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
         let mut auto = AutoKeys::new();
         // The key it ends up with is the one its handlers go with, as what scrolls keeps them, hovered and clicked and all.
         let key = key.unwrap_or_else(|| Key::from("scroll"));
-        let content = build_host(
+        let only = (kids.len() == 1 && kids[0].value.is_object()).then(|| kids[0]);
+        let mut content = build_host(
             cx,
             Role::Group,
             false,
             Some(key.clone()),
             gathered,
             Kids {
-                kids,
+                kids: if only.is_some() { Vec::new() } else { kids },
                 long: None,
                 root: None,
             },
@@ -3776,6 +3817,10 @@ fn scroll_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
             &mut auto,
             None,
         );
+        if let Some(only) = only {
+            let kept = kept_kids.borrow_mut().take();
+            content = content.child(build_node(cx, only, false, Some((KeptIn::Scroll(kept_kids.clone()), kept)), &mut auto, None));
+        }
         let axis = match axis.as_deref() {
             Some("horizontal") => ScrollAxis::Horizontal,
             Some("both") => ScrollAxis::Both,

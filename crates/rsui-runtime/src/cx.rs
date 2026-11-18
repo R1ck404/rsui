@@ -446,9 +446,9 @@ pub struct Cx<'a> {
     skipped: bool,
     /// Finds old children when they don't. Built only if needed.
     lookup: Option<HashMap<(Option<Key>, u64), usize, RandomState>>,
-    /// For each child of the last output's root, which old child's output it was, for [`keep_child`](Self::keep_child). Built only
-    /// if that's used.
-    outputs: Option<Vec<u32>>,
+    /// For each child of a node of the last output, at the path given, which old child's output it was, for
+    /// [`keep_child_in`](Self::keep_child_in). Built only if that's used.
+    outputs: Option<(Vec<u32>, Vec<u32>)>,
     rendered: Vec<(u32, Node)>,
     unkeyed: u64,
     cause: Cause,
@@ -1049,22 +1049,33 @@ impl<'a> Cx<'a> {
     ///
     /// The kept child keeps its place and key, so the caller has to be giving it the same ones.
     pub fn keep_child(&mut self, index: usize) -> Option<Node> {
-        if self.outputs.is_none() {
-            let count = self.old_output.as_ref().map_or(0, |old| old.children.len());
+        self.keep_child_in(&[], index)
+    }
+
+    /// The same, for the `index`th child of what's at `within` in what this rendered last time, as the list in what scrolls is
+    /// the child of the area that scrolls. That has to be where it was, and what's at `within` the same as it was.
+    pub fn keep_child_in(&mut self, within: &[u32], index: usize) -> Option<Node> {
+        if self.outputs.as_ref().is_none_or(|(at, _)| at.as_slice() != within) {
+            let old = self.old_output.as_ref()?;
+            let count = within
+                .iter()
+                .try_fold(old, |node, &at| node.children.get(at as usize))
+                .map_or(0, |node| node.children.len());
             let mut outputs = vec![CLAIMED; count];
             for (at, &child) in self.old_children.iter().enumerate() {
                 if child == CLAIMED {
                     continue;
                 }
-                if let [only] = self.store.instances[child as usize].path[..] {
-                    if let Some(slot) = outputs.get_mut(only as usize) {
+                let path = &self.store.instances[child as usize].path;
+                if path.len() == within.len() + 1 && path.starts_with(within) {
+                    if let Some(slot) = outputs.get_mut(path[within.len()] as usize) {
                         *slot = at as u32;
                     }
                 }
             }
-            self.outputs = Some(outputs);
+            self.outputs = Some((within.to_vec(), outputs));
         }
-        let at = *self.outputs.as_ref()?.get(index)?;
+        let at = *self.outputs.as_ref()?.1.get(index)?;
         if at == CLAIMED {
             return None;
         }
@@ -1073,7 +1084,7 @@ impl<'a> Cx<'a> {
             return None;
         }
         self.old_children[at as usize] = CLAIMED;
-        let node = self.old_output.as_ref()?.children[index].clone();
+        let node = node_at(self.old_output.as_ref()?, within).children[index].clone();
         self.rendered.push((child, node.clone()));
         Some(node)
     }

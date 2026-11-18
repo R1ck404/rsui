@@ -1,6 +1,8 @@
 // A long list built the way a page builds one: rows of Tailwind-styled `<div>`s in a container that scrolls, with name, size
-// and date columns as the file explorer's details view has them. `LONG_LIST_N` says how many rows (1,000 unless it says), and
-// `LONG_LIST_MODE=cv` puts `content-visibility: auto` on each row, the explicit form of skipping what's off screen.
+// and date columns as the file explorer's details view has them. `LONG_LIST_N` says how many rows (1,000 unless it says),
+// `LONG_LIST_MODE=cv` puts `content-visibility: auto` on each row, the explicit form of skipping what's off screen, and
+// `LONG_LIST_MODE=native` has the same rows made of rsui's own `<row>` and `<text>` in a `<list>`, which only builds what shows,
+// for comparing with.
 //
 // The keyboard moves the selection, as a file list's does: Up and Down, Home and End, each bringing the selected row into view.
 
@@ -13,6 +15,7 @@ export const size = [1000, 700];
 
 const COUNT = Number(process.env.LONG_LIST_N || 1000);
 const EXPLICIT = process.env.LONG_LIST_MODE === 'cv';
+const NATIVE = process.env.LONG_LIST_MODE === 'native';
 
 interface Item {
     name: string;
@@ -53,6 +56,26 @@ const Row = memo(function Row({ index, selected, onPick }: { index: number; sele
     );
 });
 
+/// The same row, made of rsui's own elements.
+const NativeRow = memo(function NativeRow({ index, selected }: { index: number; selected: boolean }) {
+    const item = ITEMS[index];
+    const muted = '#71717a';
+    return (
+        <row height={28} paddingX={12} gap={8} align="center" borderWidth={0} background={selected ? '#dbeafe' : index % 2 === 1 ? '#fafafa' : undefined}>
+            <group width={16} height={16} shrink={0} radius={2} background={item.folder ? '#fbbf24' : '#d4d4d8'} />
+            <text grow={1} shrink={1} minWidth={0} ellipsis noWrap fontSize={14} color={selected ? '#172554' : '#18181b'}>
+                {item.name}
+            </text>
+            <text width={96} shrink={0} textAlign="right" fontSize={14} color={muted}>
+                {item.size}
+            </text>
+            <text width={160} shrink={0} fontSize={14} color={muted}>
+                {item.date}
+            </text>
+        </row>
+    );
+});
+
 function List() {
     const [selected, setSelected] = useState(0);
     const onPick = useCallback((index: number) => setSelected(index), []);
@@ -64,8 +87,9 @@ function List() {
             setSelected(Math.max(0, Math.min(COUNT - 1, next)));
         }
     };
+    const renderRow = useCallback((index: number) => <NativeRow key={index} index={index} selected={index === selected} />, [selected]);
     const rows = [];
-    for (let index = 0; index < COUNT; index++) {
+    for (let index = 0; index < (NATIVE ? 0 : COUNT); index++) {
         rows.push(<Row key={index} index={index} selected={index === selected} onPick={onPick} />);
     }
     return (
@@ -76,9 +100,15 @@ function List() {
                 <span className="w-24 shrink-0 text-right">Size</span>
                 <span className="w-40 shrink-0">Modified</span>
             </div>
-            <div id="rows" tabIndex={0} onKeyDown={onKeyDown} className="min-h-0 flex-1 overflow-y-auto outline-none">
-                {rows}
-            </div>
+            {NATIVE ? (
+                <div id="rows" tabIndex={0} onKeyDown={onKeyDown} className="relative min-h-0 flex-1 outline-none">
+                    <list count={COUNT} rowHeight={28} reveal={selected} renderRow={renderRow} position="absolute" top={0} left={0} right={0} bottom={0} />
+                </div>
+            ) : (
+                <div id="rows" tabIndex={0} onKeyDown={onKeyDown} className="min-h-0 flex-1 overflow-y-auto outline-none">
+                    {rows}
+                </div>
+            )}
             <div className="flex h-6 shrink-0 items-center border-t border-zinc-200 px-3 text-xs text-zinc-500">
                 {COUNT} items, row {selected + 1} selected
             </div>

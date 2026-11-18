@@ -1350,6 +1350,7 @@ impl App {
                 .compute(self.runtime.root(), available, &mut measuring);
             if rsui_alloc::split::on() {
                 rsui_alloc::split::count(rsui_alloc::split::named("n:solved"), self.layout.borrow().last_solved() as u64);
+                rsui_alloc::split::count(rsui_alloc::split::named("n:looked"), self.layout.borrow().last_looked_at() as u64);
             }
             // Lists find out how many rows they have room for from the layout, and that changes
             // which rows they build, which doesn't change how tall they are. Once is enough, and

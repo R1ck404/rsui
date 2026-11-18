@@ -2275,11 +2275,14 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
     if steps.is_empty() {
         return Err(format!("there are no steps. {STEPS}"));
     }
-    let mut desk = Desk::open(path, stack_limit, (960, 640))?;
-    // `RSUI_SAMPLE=<file>` samples the steps as it does a window, in a build with `sampling-profile`. It's made after the
-    // app, so it's dropped, and writes what it found, while the engine and its compiled code are still there.
+    // `RSUI_SAMPLE=<file>` samples the steps as it does a window, in a build with `sampling-profile`, from before the app's first
+    // render, which is most of what a long page costs to start. What finishes it is made after the app, so it's dropped, and
+    // writes what it found, while the engine and its compiled code are still there.
     #[cfg(all(windows, feature = "sampling-profile"))]
-    let _profile = crate::sampling_profile::NativeProfile::start().map(crate::sampling_profile::FinishOnDrop::new);
+    let sampling = crate::sampling_profile::NativeProfile::start();
+    let mut desk = Desk::open(path, stack_limit, (960, 640))?;
+    #[cfg(all(windows, feature = "sampling-profile"))]
+    let _profile = sampling.map(crate::sampling_profile::FinishOnDrop::new);
     rsui::mark("app made");
     rsui_js::write_startup_times("app made");
     // Things that move as the app starts only do if they're moving by then, as they are in a window.

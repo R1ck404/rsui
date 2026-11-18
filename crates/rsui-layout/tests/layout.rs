@@ -2782,6 +2782,38 @@ mod scrollbars_kept {
         again(&mut layout, &short, &long);
         assert_eq!(layout.rect(&[0, 0]).map(|rect| rect.width), Some(283.0));
     }
+
+    #[test]
+    fn scrolling_a_long_list_as_a_row_in_it_changes_lays_out_only_that_row() {
+        // The selection moving into view changes a row, and then the list scrolls to it, before it's laid out again; and a row that's
+        // come near being seen is drawn with what's in it then. With the row waiting to be laid out again, the scroll laid out the
+        // whole list again, looking at each of its 500 rows (`scrolled_without_layout` in tree.rs).
+        let with_part = |root: Node, at: usize, width: f32| {
+            let mut root = (*root).clone();
+            let mut area = (*root.children[0]).clone();
+            let mut row = (*area.children[at]).clone();
+            row.children.push(group(Style::new().width(width)).into_node());
+            area.children[at] = row.into_node();
+            root.children[0] = area.into_node();
+            root.into_node()
+        };
+        let mut layout = Layout::new();
+        let mut previous = page(500, 20.0, 0.0);
+        layout.compute(&previous, SIZE, &mut FixedMetrics::default());
+        let mut scrolled = 0.0;
+        for (scroll, at, width) in [(100.0, 9, 30.0), (400.0, 25, 10.0), (390.0, 25, 60.0), (1e9, 499, 20.0)] {
+            let changed = with_part(page(500, 20.0, scrolled), at, width);
+            layout.apply_needs_layout_since(&diff(&previous, &changed), Some(&previous));
+            previous = changed;
+            let root = with_part(page(500, 20.0, scroll), at, width);
+            let solved = again(&mut layout, &previous, &root);
+            assert!(solved < 10, "{scroll}: {solved} boxes were laid out again");
+            let looked = layout.last_looked_at();
+            assert!(looked < 50, "{scroll}: {looked} rows were looked at");
+            previous = root;
+            scrolled = scroll;
+        }
+    }
 }
 
 mod near_view {
@@ -2838,5 +2870,30 @@ mod near_view {
         // 40 past what shows of the area, at both ends, is two rows more each way, as far as there are rows.
         assert_eq!(near(&page(0.0), 40.0), names(0..7));
         assert_eq!(near(&page(200.0), 40.0), names(8..17));
+    }
+
+    #[test]
+    fn a_long_list_in_a_box_in_what_scrolls_is_looked_in_only_near_what_shows() {
+        // The rows are in a box of their own in what scrolls, as a page's list is in a `<div>` in its scrolling area. Looking in each
+        // of them, all 1,000 rows were asked about, and what's in each that isn't skipped.
+        let row = |at: usize| group(Style::new().height(20.0)).name(format!("{at}")).child(group(Style::new().height(10.0)).name(format!("in {at}")));
+        let rows = group(Style::new()).children((0..1000).map(row));
+        let area = group(Style::new().height(100.0).scroll_y(400.0)).child(rows);
+        let root = Element::new(Role::Window).child(area).into_node();
+        let mut layout = Layout::new();
+        layout.compute(&root, SIZE, &mut FixedMetrics::default());
+        let (mut looked, mut found) = (0, Vec::new());
+        layout.near_view(
+            &root,
+            20.0,
+            &mut |node| {
+                looked += 1;
+                node.name.parse::<usize>().is_ok()
+            },
+            &mut |_, node| found.push(node.name.to_string()),
+        );
+        // Scrolled down 400, rows 20 to 24 show, and one more each way is within 20 of that.
+        assert_eq!(found, names(19..26));
+        assert!(looked < 20, "{looked} looked at");
     }
 }

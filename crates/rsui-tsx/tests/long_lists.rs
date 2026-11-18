@@ -16,6 +16,11 @@ const ROWS: usize = 2000;
 /// The list, with rows 20 tall in an area that scrolls, which `css` can say more about. Up and End move the selection, which is
 /// scrolled into view, as a file list's is.
 fn app(name: &str, css: &str) -> PathBuf {
+    app_with(name, css, r#"<span className="name">Row {index}</span>"#)
+}
+
+/// The same, with `content` in each row, which can use `index`.
+fn app_with(name: &str, css: &str, content: &str) -> PathBuf {
     let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tsx-long-lists-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(
@@ -35,6 +40,9 @@ fn app(name: &str, css: &str) -> PathBuf {
         import {{ PageWindow }} from 'rsui/web';
         import './app.css';
         const COUNT = {ROWS};
+        function Name({{ index }}: {{ index: number }}) {{
+            return <span className="name">Row {{index}}</span>;
+        }}
         const Row = memo(function Row({{ index, selected }}: {{ index: number; selected: boolean }}) {{
             const ref = useRef<HTMLDivElement>(null);
             useLayoutEffect(() => {{
@@ -44,14 +52,14 @@ fn app(name: &str, css: &str) -> PathBuf {
             }}, [selected]);
             return (
                 <div ref={{ref}} data-index={{index}} className={{'row' + (selected ? ' selected' : '')}}>
-                    <span className="name">Row {{index}}</span>
+                    {content}
                 </div>
             );
         }});
         function List() {{
             const [selected, setSelected] = useState(0);
             const onKeyDown = (event: any) => {{
-                const next = {{ ArrowUp: selected - 1, End: COUNT - 1 }}[event.key as string];
+                const next = {{ ArrowUp: selected - 1, End: COUNT - 1, Home: 0 }}[event.key as string];
                 if (next !== undefined) {{
                     event.preventDefault();
                     setSelected(next);
@@ -79,8 +87,14 @@ fn app(name: &str, css: &str) -> PathBuf {
 
 /// Does the steps, sandboxed, with what each part costs said after each, and gives what was printed, failing if a step did.
 fn run(file: &PathBuf, steps: &str) -> String {
+    run_with(file, steps, &[])
+}
+
+/// The same, with more set in its environment.
+fn run_with(file: &PathBuf, steps: &str, more: &[(&str, &str)]) -> String {
     let sandbox = file.with_file_name("sandbox");
     let output = Command::new(TOOL)
+        .envs(more.iter().copied())
         .arg("--do")
         .arg(steps)
         .arg(file)
@@ -139,7 +153,8 @@ fn moving_the_selection_in_a_long_list_looks_at_what_changed() {
         "size 600 400\nwait 100\nclickat 100 10\npress end\npress up\n\
          eval \"document.querySelector('.selected').dataset.index\"\n\
          eval \"document.getElementById('rows').scrollTop\"\n\
-         eval \"document.querySelector('[data-index=\\\"1998\\\"]').getBoundingClientRect().bottom\"",
+         eval \"document.querySelector('[data-index=\\\"1998\\\"]').getBoundingClientRect().bottom\"\n\
+         press home",
     );
     // Row 1999 is the last, at the bottom of the 400 that show, and Up selects the one above it, which shows already.
     assert_eq!(value(&said, "eval \"document.querySelector('.selected')"), "1998", "{said}");
@@ -150,6 +165,16 @@ fn moving_the_selection_in_a_long_list_looks_at_what_changed() {
     // they're first drawn.
     let calls = times(&said, "press up", "js");
     assert!(calls < 200, "{calls} calls into JavaScript for {ROWS} rows\n{said}");
+    // And what's in the area that scrolls is kept as it was, apart from the two rows that changed, rather than each row described
+    // and built again (`scroll_component` in bridge.rs).
+    let built = times(&said, "press up", "n:built");
+    assert!(built < 20, "{built} rows built again of {ROWS}\n{said}");
+    // Each row is compared with what it was once each time the list's rendered again, once it's been kept, and not again as it's drawn
+    // again to be scrolled to the top (`keptKids` and `sameElements` in web.js).
+    for step in ["press up", "press home"] {
+        let compared = times(&said, step, "host:propsSame");
+        assert!(compared < ROWS as u64 + 100, "{step}: rows compared {compared} times for {ROWS} rows\n{said}");
+    }
     for step in ["press end", "press up"] {
         // Bringing the row into view finds what's around it, rather than making the whole page again (`nodeUpOf` in web.js).
         assert_eq!(times(&said, step, "pageTree-build"), 0, "{step}: the whole page was made again\n{said}");
@@ -250,4 +275,126 @@ fn hidden_rows_never_draw_what_is_in_them() {
     // The rows are 20 tall as `.row` says, whatever's said for what's in them.
     assert_eq!(value(&said, "eval \"document.querySelector('[data-index"), "20", "{said}");
     assert_eq!(value(&said, "eval \"document.getElementById('rows').scrollHeight"), format!("{}", ROWS * 20), "{said}");
+}
+
+/// Rows that are as tall as they say whatever's in them: flex boxes of a height of their own, in a block that scrolls.
+const OWN_BOX: &str = ".row { display: flex; align-items: center }";
+
+/// How many rows have what's in them drawn, as the boxes of their names in the window's tree as it's printed at the end.
+fn drawn(said: &str) -> usize {
+    said[said.rfind("\nwindow ").unwrap_or(0)..].matches("class=\"name\"").count()
+}
+
+/// What each `eval` gave, in order.
+fn values(said: &str) -> Vec<&str> {
+    said.lines().filter_map(|line| line.strip_prefix("  = ")).collect()
+}
+
+/// Steps that ask what's in the list as the page has it, wherever it's drawn.
+const ASKED: &str = "eval \"document.querySelectorAll('.row .name').length\"\n\
+    eval \"document.querySelector('[data-index=\\\"1500\\\"]').textContent\"\n\
+    eval \"document.querySelector('[data-index=\\\"1500\\\"] .name').parentElement.dataset.index\"\n\
+    eval \"[...document.querySelectorAll('.name')].slice(1498, 1502).map((one) => one.textContent).join('|')\"\n\
+    eval \"document.getElementById('rows').scrollHeight\"\n\
+    eval \"JSON.stringify(document.querySelector('[data-index=\\\"1500\\\"]').getBoundingClientRect())\"\n\
+    eval \"document.getElementById('rows').textContent.length\"";
+
+#[test]
+fn rows_of_a_long_list_far_from_being_seen_skip_what_is_in_them_by_themselves() {
+    let file = app("by-themselves", OWN_BOX);
+    let steps = format!("size 600 400\nwait 100\n{ASKED}");
+    let said = run(&file, &steps);
+    // What shows and what's within half the window of it is drawn, and the rest of the 2,000 isn't, with nothing said in CSS.
+    let shown = drawn(&said);
+    assert!((20..=100).contains(&shown), "{shown} rows drawn\n{said}");
+    // And the page is as it would be with all of them drawn: each row's element is there with what's in it, in order, with its text,
+    // and each row is where it would be.
+    assert_eq!(value(&said, "eval \"document.querySelectorAll('.row .name')"), format!("{ROWS}"), "{said}");
+    assert_eq!(value(&said, "eval \"document.querySelector('[data-index=\\\"1500\\\"]').textContent"), "Row 1500", "{said}");
+    assert_eq!(value(&said, "eval \"document.querySelector('[data-index=\\\"1500\\\"] .name')"), "1500", "{said}");
+    assert_eq!(value(&said, "eval \"[...document"), "Row 1498|Row 1499|Row 1500|Row 1501", "{said}");
+    assert_eq!(value(&said, "eval \"document.getElementById('rows').scrollHeight"), format!("{}", ROWS * 20), "{said}");
+    let text: usize = (0..ROWS).map(|at| format!("Row {at}").len()).sum();
+    assert_eq!(value(&said, "eval \"document.getElementById('rows').textContent"), format!("{text}"), "{said}");
+    // All of which is what it says with every row drawn, where the row is too.
+    let whole = run_with(&file, &steps, &[("RSUI_AUTO_SKIP", "0")]);
+    assert_eq!(drawn(&whole), ROWS, "{whole}");
+    assert_eq!(values(&said), values(&whole), "{said}\n{whole}");
+}
+
+#[test]
+fn rows_skipped_by_themselves_are_drawn_as_they_are_brought_near() {
+    let file = app("skipped-brought-near", OWN_BOX);
+    let steps = "size 600 400\nwait 100\nclickat 100 10\npress end\npress up\n\
+         eval \"document.querySelector('.selected').dataset.index\"\n\
+         eval \"document.getElementById('rows').scrollTop\"\n\
+         eval \"[...document.querySelectorAll('.name')].slice(1996).map((one) => one.textContent).join('|')\"\n\
+         eval \"document.querySelector('[data-index=\\\"1999\\\"] .name').getBoundingClientRect().bottom\"";
+    let said = run(&file, steps);
+    assert_eq!(value(&said, "eval \"document.querySelector('.selected')"), "1998", "{said}");
+    assert_eq!(value(&said, "eval \"document.getElementById('rows').scrollTop"), format!("{}", ROWS * 20 - 400), "{said}");
+    // What's at the end is in its place among the rest, drawn, where the window shows it.
+    assert_eq!(value(&said, "eval \"[...document"), "Row 1996|Row 1997|Row 1998|Row 1999", "{said}");
+    let bottom: f64 = value(&said, "eval \"document.querySelector('[data-index=\\\"1999\\\"] .name')").parse().unwrap();
+    assert!(bottom > 380.0 && bottom <= 400.0, "{bottom}\n{said}");
+    // The rows at the start were drawn, and the ones at the end, and few between.
+    let shown = drawn(&said);
+    assert!((40..=150).contains(&shown), "{shown} rows drawn\n{said}");
+    assert_eq!(values(&said), values(&run_with(&file, steps, &[("RSUI_AUTO_SKIP", "0")])), "{said}");
+}
+
+#[test]
+fn rows_whose_size_could_follow_what_is_in_them_are_drawn_whole() {
+    // A row that's a block, or as tall as what's in it, or that has a component in it, which only says what it makes once it's
+    // drawn, is drawn with all that's in it, as before.
+    for (name, css, content) in [
+        ("block", "", r#"<span className="name">Row {index}</span>"#),
+        ("auto", ".row { display: flex; height: auto }", r#"<span className="name">Row {index}</span>"#),
+        ("component", OWN_BOX, "<Name index={index} />"),
+    ] {
+        let file = app_with(name, css, content);
+        let said = run(&file, "size 600 400\nwait 100\neval \"document.querySelectorAll('.row .name').length\"");
+        assert_eq!(drawn(&said), ROWS, "{name}\n{said}");
+        assert_eq!(value(&said, "eval \"document.querySelectorAll('.row .name')"), format!("{ROWS}"), "{name}\n{said}");
+    }
+}
+
+#[test]
+fn what_code_asks_of_a_skipped_row_has_it_drawn() {
+    let file = app("asked", OWN_BOX);
+    // Where something in a row that's skipped is, and how it looks, is only known once it's drawn, which asking has it be: the next
+    // time it's asked, it says what it would with every row drawn. Bringing it into view brings its row, which draws it as it comes
+    // near. Its HTML is what's written in it.
+    let ask = "eval \"document.querySelector('[data-index=\\\"1500\\\"]').innerHTML\"\n\
+         eval \"document.querySelector('[data-index=\\\"1400\\\"] .name').offsetHeight > -1\"\n\
+         wait 100\n\
+         eval \"JSON.stringify(document.querySelector('[data-index=\\\"1400\\\"] .name').getBoundingClientRect())\"\n\
+         eval \"getComputedStyle(document.querySelector('[data-index=\\\"1400\\\"] .name')).display\"";
+    let steps = format!("size 600 400\nwait 100\n{ask}\neval \"document.querySelector('[data-index=\\\"1500\\\"] .name').scrollIntoView()\"\nwait 100\n\
+         eval \"Math.abs(document.getElementById('rows').scrollTop - 30000) <= 20\"\n\
+         eval \"document.querySelector('[data-index=\\\"1500\\\"] .name').getBoundingClientRect().height > 0\"");
+    let said = run(&file, &steps);
+    let whole = run_with(&file, &steps, &[("RSUI_AUTO_SKIP", "0")]);
+    assert_eq!(values(&said), values(&whole), "{said}\n{whole}");
+    assert_eq!(values(&said)[values(&said).len() - 2..], ["true", "true"], "{said}");
+}
+
+#[test]
+fn a_long_list_in_the_page_as_it_scrolls_skips_rows_too() {
+    // The rows are in the page, which scrolls, rather than in a box of their own that does.
+    let file = app("in-the-page", ".frame { height: auto; display: block } .rows { overflow: visible } .row { display: flex; align-items: center }");
+    let steps = format!("size 600 400\nwait 100\n{ASKED}");
+    let said = run(&file, &steps);
+    let shown = drawn(&said);
+    assert!((20..=100).contains(&shown), "{shown} rows drawn\n{said}");
+    let whole = run_with(&file, &steps, &[("RSUI_AUTO_SKIP", "0")]);
+    assert_eq!(drawn(&whole), ROWS, "{whole}");
+    assert_eq!(values(&said), values(&whole), "{said}\n{whole}");
+}
+
+#[test]
+fn rows_that_can_be_edited_are_drawn_whole() {
+    let file = app_with("edited", OWN_BOX, r#"<span className="name" contentEditable>Row {index}</span>"#);
+    let said = run(&file, "size 600 400\nwait 100");
+    assert_eq!(drawn(&said), ROWS, "{said}");
 }

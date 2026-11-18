@@ -231,8 +231,21 @@ habits matter once a list gets long, and both of them are in that app:
 A long list of a page's elements, as rows of `<div>`s in something that scrolls, costs what changed and what's seen when the
 selection moves or it scrolls, as far as `rsui/web` can tell: a list rendered again with the same rows, made anew as React makes
 them, isn't looked through again for what kind of thing each row is (`keptKids` in `web.js`), `scrollIntoView()` finds only what's
-around a row, and laying the list out again lays out only the rows that changed, with the scrollbar it had. What it costs to start,
-and what it takes, still goes with how many rows there are, as each is styled and made. `content-visibility: auto` on the rows,
+around a row, and laying the list out again lays out only the rows that changed, with the scrollbar it had, scrolled to or not.
+Each row is compared with what it was once each time the list renders again, in Rust where its props are the same (`propsSame`),
+and what scrolls keeps the rows that are the same as they were rather than building them again (`KeptIn` in `bridge.rs`).
+
+Rows far from being seen are skipped by themselves, as `content-visibility: auto` would skip them, where that changes nothing a
+browser shows or says (`LongRun` in `web.js`): in a block with 2,000 or more things in it, which scrolls or is in what scrolls, as
+the page does, and isn't edited, a row that's a flex box or a
+grid with a height of its own, which is as big as it is whatever's in it, so the list is as long and each row where it would be,
+and that has only the page's own elements and text in it, with no component, ref, field or link. Its elements are still the
+page's, kept as they're written (`skippedParts`), so `querySelectorAll()`, `textContent`, `innerHTML` and the rest find them in
+their place. What a browser does differently is lay one out the moment code asks where it is or how it looks; here that has its
+row drawn from the next frame on, and until then it's nowhere, as what isn't shown is. `scrollIntoView()` on one brings its row
+into view. A row that's near being seen is drawn as it is, and stays drawn. `RSUI_AUTO_SKIP=0`, or `globalThis.__rsuiAutoSkip =
+false`, turns it off. What it costs to start, and what it takes, still goes with how many rows there are, as each row itself is
+styled and made, but no longer with what's in each. `content-visibility: auto` on the rows,
 with `contain-intrinsic-size` for how big one is taken to be, has a row far from being seen made as a box of that size with
 nothing in it, until it's within half the window of what shows of it, and then as it is, from then on. Each row is still an
 element of the page, for `querySelectorAll()` and refs, and the list is as long as those sizes make it; what's in a row that

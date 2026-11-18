@@ -248,6 +248,9 @@ fn leftmost(current: &LayoutBox, element: &rsui_core::Element) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
+/// How many things a box has to have in it for [`Layout::near_view`] to look in only those of them that are near being seen.
+const LONG_NEAR_FROM: usize = 64;
+
 /// How many boxes [`Layout::draws_nothing`] looks at, at most, to find that something can't be seen.
 const UNSEEN_BOXES_LOOKED_AT: u32 = 64;
 
@@ -848,6 +851,7 @@ pub trait LayoutVisitor {
 pub struct Layout {
     root: LayoutBox,
     last_solved: usize,
+    last_looked_at: usize,
     list_sizes: Vec<(usize, f32, f32)>,
     paragraphs: bool,
     /// Says that this has gone when it does, for [`Layout::info_of`].
@@ -1209,7 +1213,10 @@ impl Layout {
             x += current.x;
             y += current.y;
         }
-        const WAITING: u32 = SELF_DIRTY | CHILD_DIRTY | MANY_CHILDREN_DIRTY | SPLICED | FORGOT_A_QUESTION;
+        // Something in it that's changed doesn't stop that: it's laid out again by itself, where it's been moved to, and should that
+        // change its size, this is laid out again for it, from where it says it's scrolled to. A long list's row that's changed as it
+        // was scrolled to, as the selection that moves into view is, laid out all of the list again with it.
+        const WAITING: u32 = SELF_DIRTY | SPLICED | FORGOT_A_QUESTION;
         if current.flags & (HAS_LAYOUT | SCROLLS | WAITING) != HAS_LAYOUT | SCROLLS {
             return false;
         }
@@ -1426,7 +1433,7 @@ impl Layout {
     /// tree that haven't changed since the last time aren't visited.
     pub fn compute(&mut self, root: &Node, available: Size, measure: &mut impl Measure) {
         layouts_changed();
-        self.last_solved = engine::compute(
+        (self.last_solved, self.last_looked_at) = engine::compute(
             &mut self.root,
             root,
             available,
@@ -1457,6 +1464,12 @@ impl Layout {
     /// too much work still comes out right.
     pub fn last_solved(&self) -> usize {
         self.last_solved
+    }
+
+    /// How many things laid out one after another the last [`compute`](Self::compute) looked at, laid out again or not, as each
+    /// one in what was laid out again is: a long list that's laid out again, with none of its rows, still looks at each of them.
+    pub fn last_looked_at(&self) -> usize {
+        self.last_looked_at
     }
 
     /// Where the node at `path` is, from the top left of the window. `None` if there's
@@ -1804,8 +1817,12 @@ impl Layout {
         } else {
             area
         };
+        // And so is each of a long list's rows, as what's in what scrolls is most often in one box that holds them: what's in a row
+        // that's laid out outside it isn't found from there either. Looking in each of 25,000 rows took a millisecond each time the
+        // list was laid out or scrolled.
+        let long = current.children.len() >= LONG_NEAR_FROM;
         for (index, (child_box, child)) in current.children.iter().zip(&node.children).enumerate() {
-            if scrolls
+            if (scrolls || long)
                 && !child_box.has(IS_OVERLAY)
                 && !meets(Rect::new(x + child_box.x, y + child_box.y, child_box.width, child_box.height), inner)
             {

@@ -818,20 +818,29 @@ const skippingLives = new Map();
 const NEAR_VIEW = 0.5;
 
 /// What's in `live` as drawn, as its `content-visibility` says, or `null` for what it was given. It takes what CSS said about that
-/// out of `look`, as that's nothing for the rest.
-function contentVisibility(look, live, children) {
+/// out of `look`, as that's nothing for the rest. `auto` is for a row of a long list that's skipped as if it said `auto` without
+/// saying anything (see `LongRun`), whose elements are kept for code to find (see `skippedParts`).
+function contentVisibility(look, live, children, auto = false) {
     const said = look.__contentVisibility;
     const sizes = [look.__intrinsicSize, look.__intrinsicWidth, look.__intrinsicHeight];
     delete look.__contentVisibility;
     delete look.__intrinsicSize;
     delete look.__intrinsicWidth;
     delete look.__intrinsicHeight;
-    const how = typeof said === 'string' ? said.trim().toLowerCase() : 'visible';
+    const how = auto ? 'auto' : typeof said === 'string' ? said.trim().toLowerCase() : 'visible';
     if ((how !== 'auto' && how !== 'hidden') || (how === 'auto' && live.contentSeen === true)) {
         if (skippingLives.get(live.domKey) === live) {
             skippingLives.delete(live.domKey);
         }
+        if (live.skippedKids !== undefined) {
+            forgetSkippedParts(live);
+        }
         return null;
+    }
+    if (live.skippedKids !== (auto ? children : undefined)) {
+        // What's in it is still the page's, for code to find, though it isn't drawn: see `skippedParts`.
+        live.skippedKids = auto ? children : undefined;
+        pageNow = null;
     }
     // It's looked for by its key, which it only has further on in its first render: see `skipsUntilNear`.
     live.skipsUntilNear = how === 'auto';
@@ -914,6 +923,221 @@ function textWrittenIn(children) {
         return ' ' + textWrittenIn(children.kids ?? children.props?.children) + ' ';
     }
     return '';
+}
+
+// A long list of a page's rows, as rows of `<div>`s in a `<div>` with `overflow-y: auto`, or in the page as it scrolls, has the rows
+// that are far from being seen skipped as `content-visibility: auto` would skip them, without the page saying so, where that changes nothing a
+// browser would show or say: each such row's box is as big as it is whatever's in it, as a row with a height of its own that's a flex
+// box or a grid is, in what lays it out as a block, so the list is as long, and each row where, as it would be with everything in it
+// drawn. What's in a row is only the page's own elements and text, which are kept as elements of the page as they're written, for
+// `querySelector()` and `textContent` to find (see `skippedParts`), with nothing that needs to be drawn to be what it is: no
+// component, ref, field or link, and nothing set from code. A row that's near being seen is drawn as it is, and stays drawn, as one
+// that says `auto` is. That's what a browser keeps of what isn't shown: its elements and their styles, not their boxes. And most of
+// what a long list costs to start, and what it takes, is what's in each row.
+
+/// What a block passes down to what's in it, when what's in it is a long list: the same object for as long as it is, and
+/// `null` otherwise, which every element of the page passes down to what's in it, so that only a list's own rows find it.
+const LongRun = createContext(null);
+/// How many things a list has to have in it for rows far from being seen to be skipped. Fewer cost less to draw all at once than
+/// they'd cost drawn as they come near: 1,000 rows started in 0.7 s drawn whole, and skipped, the first jump to the end took 29 ms
+/// rather than 6, and each turn of the wheel 8 ms rather than 1, as what came near was drawn.
+const LONG_RUN_FROM = 2000;
+/// Whether rows of long lists are skipped: unless `RSUI_AUTO_SKIP=0`, or the page says `globalThis.__rsuiAutoSkip = false`.
+const AUTO_SKIP_FROM_ENV = (() => {
+    try {
+        return globalThis.process?.env?.RSUI_AUTO_SKIP !== '0';
+    } catch {
+        return true;
+    }
+})();
+
+/// What a page's element with this look, given this, passes down as `LongRun`: a block, which scrolls or is in what scrolls, as the
+/// page itself does, with a long list in it, and nothing that can be edited.
+function longRunOf(live, look, given) {
+    const kids = given.children;
+    if (!AUTO_SKIP_FROM_ENV || globalThis.__rsuiAutoSkip === false || look.display !== undefined || look.__flex === true
+        || look.direction !== undefined || !Array.isArray(kids) || kids.length < 2) {
+        return null;
+    }
+    if (saysEditable(given) || editableSaidAbove(live) === true) {
+        // What's edited is all there to be selected and typed in.
+        return null;
+    }
+    let count = kids.length;
+    for (let at = 0; at < kids.length && count < LONG_RUN_FROM; at += 1) {
+        count += Array.isArray(kids[at]) ? kids[at].length - 1 : 0;
+    }
+    return count < LONG_RUN_FROM ? null : (live.longRun ??= { live });
+}
+
+/// Whether a row of a long list skips what's in it: see `LongRun`. `look` is what it is, worked out, and `given` what it was given.
+function skipsByItself(live, look, given, children) {
+    if (live.contentSeen === true || look.__contentVisibility !== undefined) {
+        return false;
+    }
+    // Only one that's skipping already, or that's starting: one that's been drawn with what's in it stays so.
+    if (live.given !== undefined && live.skippedKids === undefined) {
+        return false;
+    }
+    const ownBox = typeof look.height === 'number' && (look.__flex === true || look.display === 'grid') && look.__inline !== true
+        && (look.position === undefined || look.position === 'static' || look.position === 'relative') && look.__fixed !== true
+        && look.float === undefined;
+    if (!ownBox || hasWatched.size !== 0 || given.dangerouslySetInnerHTML !== undefined || saysEditable(given) || live.handle?.__kids !== undefined
+        || live.handle?.__replaced === true || live.codeOrder !== undefined || (live.portalKids !== undefined && live.portalKids.size > 0)) {
+        return false;
+    }
+    return plainKids(children, 0);
+}
+
+/// The page's own tags that are only what they're given, which can be found without being drawn.
+const PLAIN_TAGS = new Set(['div', 'span', 'p', 'strong', 'em', 'b', 'i', 'u', 's', 'small', 'code', 'mark', 'sub', 'sup', 'time', 'abbr',
+    'li', 'ul', 'ol', 'dl', 'dt', 'dd', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'kbd', 'samp', 'var', 'q', 'cite', 'del', 'ins', 'bdi', 'br']);
+/// What a plain element can be given that needs nothing of it to be drawn.
+const PLAIN_PROP = /^(children|className|id|title|style|lang|dir|hidden|role|translate|(data|aria)-.*)$/;
+
+/// Whether everything in `children` is text and plain elements, for skipping it: see `skipsByItself`.
+function plainKids(children, depth) {
+    if (children === null || children === undefined || typeof children === 'boolean' || typeof children === 'string' || typeof children === 'number') {
+        return true;
+    }
+    if (depth > 6) {
+        return false;
+    }
+    if (Array.isArray(children)) {
+        for (const one of children) {
+            if (!plainKids(one, depth)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (!isValidElement(children) || typeof children.type !== 'function' || children.type.__webStyled !== true
+        || !PLAIN_TAGS.has(children.type.__webTag) || children.ref != null) {
+        return false;
+    }
+    const props = children.props;
+    if (props !== null && typeof props === 'object') {
+        for (const name in props) {
+            if (props[name] !== undefined && !PLAIN_PROP.test(name)) {
+                return false;
+            }
+        }
+    }
+    return plainKids(children.kids ?? props?.children, depth + 1);
+}
+
+/// What's in a row that's skipping it, as elements of the page that aren't drawn, made as they're first looked for and kept for
+/// as long as it's given the same: each with the tag, attributes and text it was written with, under the row, as `children` has
+/// them. They're the page's for as long as the row skips them, after which what's drawn of them is.
+function skippedParts(live) {
+    if (live.skippedPartsOf === live.skippedKids) {
+        return live.skippedParts;
+    }
+    const before = live.skippedParts ?? [];
+    const parts = [];
+    const add = (children, parent) => {
+        if (Array.isArray(children)) {
+            for (const one of children) {
+                add(one, parent);
+            }
+            return;
+        }
+        if (children === null || children === undefined || typeof children === 'boolean') {
+            return;
+        }
+        if (typeof children === 'string' || typeof children === 'number') {
+            parent.pieces.push(String(children));
+            return;
+        }
+        if (!isValidElement(children)) {
+            return;
+        }
+        const at = parts.length;
+        const tag = children.type.__webTag;
+        // The same element as last time, where it's the same kind in the same place, so that what code holds is still it.
+        const kept = before[at]?.tag === tag ? before[at] : { domKey: live.domKey + '~' + at, tag, state: 0, look: {}, current: null };
+        const { children: inside, ...given } = children.props ?? {};
+        kept.given = given;
+        // What it was given to have in it, which the DOM's nodes in it are made from, as a drawn element's are (see `drawnChildren`).
+        kept.children = children.kids ?? inside;
+        kept.parentKey = parent.domKey;
+        kept.notShown = true;
+        // The row that's skipping it, which is drawn once code asks where it is or how it looks: see `drawSkipped`.
+        kept.skippedBy = live;
+        // What's in it, in order: its text, and the place in `parts` of each element.
+        kept.pieces = [];
+        kept.weak ??= new WeakRef(kept);
+        pageLives.set(kept.domKey, kept.weak);
+        parent.pieces.push(at);
+        parts.push(kept);
+        add(children.kids ?? inside, kept);
+    };
+    const top = { domKey: live.domKey, pieces: [] };
+    add(live.skippedKids, top);
+    for (const one of before.slice(parts.length)) {
+        if (pageLives.get(one.domKey) === one.weak) {
+            pageLives.delete(one.domKey);
+        }
+    }
+    for (const one of parts) {
+        one.text = one.pieces.every((piece) => typeof piece === 'string') ? one.pieces.join('') : undefined;
+    }
+    live.skippedParts = parts;
+    live.skippedPartsOf = live.skippedKids;
+    live.skippedTop = top.pieces;
+    return parts;
+}
+
+/// Has a row that's skipping what's in it draw it, from the next frame on, as code has asked where something in it is or how it looks,
+/// which a browser would lay out there and then. Until it's drawn, what's in it says it's nowhere, as what isn't shown does.
+function drawSkipped(live) {
+    if (live.skippedKids === undefined || live.contentSeen === true) {
+        return;
+    }
+    if (skippingLives.get(live.domKey) === live) {
+        skippingLives.delete(live.domKey);
+    }
+    live.contentSeen = true;
+    live.redraw?.();
+}
+
+/// Lets go of the elements kept for what a row skipped, once it's drawn, or gone.
+function forgetSkippedParts(live) {
+    for (const one of live.skippedParts ?? []) {
+        if (pageLives.get(one.domKey) === one.weak) {
+            pageLives.delete(one.domKey);
+        }
+    }
+    live.skippedKids = undefined;
+    live.skippedParts = undefined;
+    live.skippedPartsOf = undefined;
+    live.skippedTop = undefined;
+    pageNow = null;
+}
+
+/// Puts what a row skipped into the page's tree under `node`, the row, in the order it was written, with its text in its place.
+function withSkippedParts(node, live, texts, shown, byKey, ordered) {
+    const parts = skippedParts(live);
+    const put = (pieces, parent) => {
+        for (const piece of pieces) {
+            if (typeof piece === 'string') {
+                texts.push(piece);
+                shown.push(piece);
+                continue;
+            }
+            const part = parts[piece];
+            const given = part.given;
+            const entry = [part.domKey, part.text !== undefined ? 'text' : 'group', typeof given.className === 'string' ? given.className : undefined,
+                typeof given.id === 'string' ? given.id : undefined, undefined, part.text ?? '', 0, 0, 0, 0, undefined, part.domKey];
+            const kid = { entry, key: part.domKey, live: part, parent, children: NO_PAGE_KIDS, index: parent.children.length, own: null, textFrom: texts.length, textTo: texts.length };
+            withPageKid(parent, kid);
+            byKey.set(part.domKey, kid);
+            ordered.push(kid);
+            put(part.pieces, kid);
+            kid.textTo = texts.length;
+        }
+    };
+    put(live.skippedTop, node);
 }
 
 /// Draws what's in each of the elements that are skipping it that's near being seen now, as the window last laid it out.
@@ -8574,6 +8798,9 @@ function makeStyled(target, settings = {}) {
                     if (skippingLives.get(live.domKey) === live) {
                         skippingLives.delete(live.domKey);
                     }
+                    if (live.skippedKids !== undefined) {
+                        forgetSkippedParts(live);
+                    }
                     const forgotHas = hasWatched.delete(live);
                     if (forgotHas) hasRecipesChanged();
                     if (forgotHas | containerWatched.delete(live)) {
@@ -8611,6 +8838,8 @@ function makeStyled(target, settings = {}) {
             const fontAbove = useContext(InheritedFont);
             const variablesAbove = useContext(InheritedVariables);
             const parentLook = useContext(ParentLook);
+            // The long list this is a row of, if it's one: see `LongRun`.
+            const runAbove = useContext(LongRun);
             // Whether this is the legend of the fieldset it's in, or the fieldset whose legend is still to be found.
             const legendClaim = useContext(FieldsetLegend);
             const typeTag = typeof (given.as ?? target) === 'string' ? (given.as ?? target) : Styled.__webTag;
@@ -8922,6 +9151,10 @@ function makeStyled(target, settings = {}) {
             passDown(NestedRules, inner);
             passDown(InheritedVariables, isHost && holdsFixed(look) ? withFixedBox(variablesInside ?? variablesAbove) : variablesInside ?? variablesAbove);
             passDown(ParentLook, lookForInside ?? parentLook);
+            if (isHost) {
+                // What's in it is a long list's rows when it's a long list that scrolls, and nothing deeper in is.
+                passDown(LongRun, longRunOf(live, look, given));
+            }
             rsui.__readsHere(InheritedVariables, varsNote);
             rsui.__readsHere(ParentLook, { props: parentReads, through: lookForInside === null, live });
             // Where this is among what's around it is only about this, and not what's in it.
@@ -8997,7 +9230,8 @@ function makeStyled(target, settings = {}) {
             }
             // What CSS says to skip while it's far from being seen (`content-visibility`) has a box of the size it says in place of
             // what's in it until then, and what's in it from then on: see `contentVisibility`.
-            const skipping = isHost ? contentVisibility(look, live, children) : null;
+            // A long list's row that's far from being seen is skipped the same way where that changes nothing (see `LongRun`).
+            const skipping = isHost ? contentVisibility(look, live, children, runAbove !== null && skipsByItself(live, look, given, children)) : null;
             if (skipping !== null) {
                 children = skipping;
             }
@@ -10099,6 +10333,7 @@ function drawNative(node, props, kids, render, propsOf) {
         passDown(NestedRules, template.inner);
         passDown(InheritedVariables, down[2]);
         passDown(ParentLook, down[3]);
+        passDown(LongRun, null);
         passDown(NthContext, null);
         passDown(FlowContext, down[4]);
         tellNativeKids(live, down);
@@ -10177,13 +10412,22 @@ function sameElements(last, next) {
         if (!Array.isArray(last) || last.length !== next.length) {
             return next;
         }
-        let all = true;
-        const out = next.map((one, at) => {
-            const kept = sameElements(last[at], one);
-            all &&= kept === last[at];
-            return kept;
-        });
-        return all ? last : out;
+        // Each that's the same as before is kept, and only what isn't the same element is looked at, as in a long list that's kept
+        // most are (see `keptKids`).
+        let out = null;
+        for (let at = 0; at < next.length; at += 1) {
+            const was = last[at];
+            const one = next[at];
+            if (one === was) {
+                continue;
+            }
+            const kept = sameElements(was, one);
+            if (kept !== was) {
+                out ??= last.slice();
+                out[at] = kept;
+            }
+        }
+        return out ?? last;
     }
     if (next === null || typeof next !== 'object' || last === null || typeof last !== 'object' || next.type === undefined
         || last.type !== next.type || last.key !== next.key) {
@@ -10199,6 +10443,11 @@ function sameElements(last, next) {
     // A component that isn't an element's, or `memo`'s, is rendered again given an object, or a function, as React has it, which
     // may say something else now (see `JsProps` in bridge.rs), so it isn't kept.
     const shallow = typeof next.type !== 'function' || next.type.__rsuiShallow === true;
+    // Props given again as they were, which is what's found for each of a long list's rows each time it's rendered again, are found
+    // so in Rust. What that isn't sure of, as what's in it that's the same though it isn't the same list, is looked at here.
+    if (natives.propsSame(a, b, shallow)) {
+        return last;
+    }
     let count = 0;
     for (const name in b) {
         count += 1;
@@ -10295,6 +10544,9 @@ function sameKid(was, kid) {
     if (before === null || now === null || typeof before !== 'object' || typeof now !== 'object') {
         return false;
     }
+    if (natives.propsSame(before, now, true)) {
+        return true;
+    }
     let count = 0;
     for (const name in before) {
         if (!Object.is(before[name], now[name])) {
@@ -10321,12 +10573,31 @@ function keptKids(kept, kids, said, tag, inner) {
     if (old === kids) {
         return kids;
     }
+    // Given what it was given last time, as it is when it's drawn again to be scrolled from code, it's what that came to.
+    if (last.given === kids) {
+        return old;
+    }
     let added;
+    // What's in it, with each that's the same element as before, as `sameElements` says, being that one, which is what it'd come to
+    // after this anyway: each is looked at once, here, rather than again there. Before is what it was given last time, as that kept
+    // them, which can be the same elements as what was kept here, or others like them, from when it was last given what wasn't kept.
+    let merged = kids;
     if (old.length === kids.length) {
         added = [];
+        const shown = Array.isArray(kept.children) && kept.children.length === old.length ? kept.children : old;
         for (let at = 0; at < kids.length; at += 1) {
-            if (!sameKid(old[at], kids[at])) {
-                added.push(kids[at]);
+            const was = shown[at];
+            const kid = kids[at];
+            if (was === kid) {
+                continue;
+            }
+            if (sameElements(was, kid) === was) {
+                if (merged === kids) {
+                    merged = kids.slice();
+                }
+                merged[at] = was;
+            } else if (!sameKid(old[at], kid)) {
+                added.push(kid);
             }
         }
     } else {
@@ -10348,8 +10619,9 @@ function keptKids(kept, kids, said, tag, inner) {
             return null;
         }
     }
-    last.list = kids;
-    return kids;
+    last.list = merged;
+    last.given = kids;
+    return merged;
 }
 
 function makeHandlers(setState) {
@@ -13537,6 +13809,10 @@ function pageTree() {
         if (ownDrawing) {
             drawnOnly -= 1;
         }
+        if (node !== parent && live.skippedKids !== undefined) {
+            // What a long list's row skips is still in it: see `skippedParts`.
+            withSkippedParts(node, live, texts, shown, byKey, ordered);
+        }
         if (node !== parent) {
             if (listParts !== null) {
                 withListParts(node);
@@ -14008,6 +14284,9 @@ function svgChild(element) {
 function computedStyleOf(element) {
     if (element === body || element === documentElement) {
         return wholePageStyle();
+    }
+    if (element?.__live?.skippedBy !== undefined) {
+        drawSkipped(element.__live.skippedBy);
     }
     const look = lookNow(element);
     if (element?.__live?.svgPart === true && (look === undefined || look.display === undefined)) {
@@ -14591,6 +14870,13 @@ function scrollPlace(first, second) {
 /// Scrolls what's around something so that it shows, nearest first, as `scrollIntoView()` does: its start at the start of each,
 /// unless `block` says otherwise, and only as far as it has to with `nearest`.
 function scrollIntoView(element, how) {
+    const skippedBy = element?.__live?.skippedBy;
+    if (skippedBy !== undefined) {
+        // What a long list's row is skipping is brought into view with its row, which is where it is, and drawn as it comes near.
+        drawSkipped(skippedBy);
+        scrollIntoView(handleOf(skippedBy, skippedBy.tag), how);
+        return;
+    }
     const block = how === false ? 'end' : how?.block ?? 'start';
     const inline = how?.inline ?? 'nearest';
     // Only what it's in is looked at, which is found from the chain to it rather than the whole page made again, as that was most
@@ -15066,6 +15352,9 @@ function createClientRect(x, y, width, height) {
 /// its own `transform` and every one above it (each about its own `transform-origin`), as a browser has it. Without, its box as it's
 /// laid out, which `offsetWidth` and the like say, whatever moves it.
 function clientBoxOf(element, transformed) {
+    if (element.__live?.skippedBy !== undefined) {
+        drawSkipped(element.__live.skippedBy);
+    }
     if (element.__live?.svgOf !== undefined) {
         return svgShapeRect(element.__live);
     }

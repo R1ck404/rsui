@@ -4,9 +4,42 @@ What a list of thousands of rows costs when it's made the way a page makes one: 
 that scrolls (`overflow-y-auto`), inside `PageWindow`, with name, size and date columns as the file explorer's details view has
 them. The whole list renders again whenever the selection moves, as it would in React, with each row in `memo`.
 
-`app.tsx` is the list. `LONG_LIST_N` says how many rows (1,000 unless it says), and `LONG_LIST_MODE=cv` gives each row
-`content-visibility: auto; contain-intrinsic-size: auto 28px` (`.row-cv` in `app.css`). Up, Down, Home, End, Page Up and Page Down
-move the selection, which `scrollIntoView({ block: 'nearest' })` brings into view, as a file list does.
+`app.tsx` is the list. `LONG_LIST_N` says how many rows (1,000 unless it says), `LONG_LIST_MODE=cv` gives each row
+`content-visibility: auto; contain-intrinsic-size: auto 28px` (`.row-cv` in `app.css`), and `LONG_LIST_MODE=native` makes the same
+rows of rsui's own `<row>` and `<text>` in a `<list>`, which only builds what shows, to compare with. Up, Down, Home, End, Page Up
+and Page Down move the selection, which `scrollIntoView({ block: 'nearest' })` brings into view, as a file list does.
+
+## Skipping rows by themselves
+
+Measured on 2026-11-18 as below, with what's described in DESIGN.md (rows far from being seen skipped by themselves, each row
+compared once, what scrolls keeping its rows, scrolling as a row changes moving the rows rather than laying them out again): before
+is the commit this started from (b84a6192), after is with it, each run twice, one after the other, with nothing else running. Down
+is the median of 17 presses that move the selection within what shows, and Down, scrolling, of 40 that each scroll the list a row,
+from `steps-down.txt` (22 presses, a wait, then 40 more), run as `steps.txt` is, beside it.
+
+| Rows | | Before | After | Native `<list>` |
+|---|---|---|---|---|
+| 1,000 | starting | 695-745 ms | 717-1,011 ms | 107 ms |
+| 1,000 | memory after | 86 MB | 80 MB | 10 MB |
+| 1,000 | Down | 3.1 ms | 2.3 ms | 0.5 ms |
+| 1,000 | Down, scrolling | 5.5 ms | 3.0 ms | 0.5 ms |
+| 5,000 | starting | 3,212-3,241 ms | 1,005-1,014 ms | 106 ms |
+| 5,000 | memory after | 352 MB | 181 MB | 13 MB |
+| 5,000 | Down | 9.1 ms | 3.9 ms | 0.5 ms |
+| 5,000 | Down, scrolling | 20 ms | 6 ms | 0.5 ms |
+| 5,000 | End | 105-109 ms | 5.1-5.4 ms | 0.8 ms |
+| 25,000 | starting | 17,153-17,214 ms | 4,965-5,116 ms | 114 ms |
+| 25,000 | memory after | 1,765 MB | 850 MB | 18 MB |
+| 25,000 | Down | 83 ms | 12.5-14 ms | 0.5 ms |
+| 25,000 | Down, scrolling | 186-188 ms | 19-23 ms | 0.5 ms |
+| 25,000 | End, Home | 165-214 ms | 17-38 ms | 0.8 ms |
+| 25,000 | wheel | 40-71 ms | 4.5-15 ms | 1.3-1.4 ms |
+
+Lists of fewer than 2,000 are drawn whole, as before: the 1,000-row numbers are from what renders them again costing less. Where
+a step had a garbage collection in it, it's slower, by 10-40 ms at 25,000 rows (the slowest Down was 157 ms), which comes with
+how much there is: what's left per row is its own element styled and made, and the app making 25,000 of them each time the list
+renders. With `content-visibility: auto` said on each row, after: starting 5.0 s, Down 13 ms, Down, scrolling, 19 ms at 25,000.
+The native list costs what shows, whatever the count.
 
 ## Running it
 

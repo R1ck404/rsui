@@ -380,6 +380,19 @@ pub fn report(samples: &[Vec<u64>], names: &mut Names, top: usize) -> String {
             ));
         }
     }
+    // With `RSUI_PROF_FOLDED=<file>`, each stack as one line of what called what, outermost first, with how many samples were in
+    // it, as flame graph tools read them: which of the callers of something its time came from.
+    if let Some(file) = std::env::var_os("RSUI_PROF_FOLDED").filter(|file| !file.is_empty()) {
+        let mut folded: HashMap<String, u32> = HashMap::new();
+        for stack in samples {
+            let line: Vec<String> = stack.iter().rev().map(|&pc| names.name(pc).replace(';', ":")).collect();
+            *folded.entry(line.join(";")).or_default() += 1;
+        }
+        let text: String = sorted(folded).into_iter().map(|(line, count)| format!("{line} {count}\n")).collect();
+        if let Err(error) = std::fs::write(&file, text) {
+            eprintln!("folded stacks {}: {error}", std::path::Path::new(&file).display());
+        }
+    }
     out.push_str("\ncallers of the top self functions\n");
     let mut own_sorted: Vec<(String, u32)> = callers
         .iter()
