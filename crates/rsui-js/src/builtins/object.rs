@@ -726,6 +726,11 @@ fn object_assign(vm: &mut Vm, args: Args) -> Run<Value> {
             continue;
         }
         let source = vm.to_object(source)?;
+        // From a plain object of plain properties into a plain object, what goes where for their two shapes is worked out once
+        // and remembered (see bulk.rs), so copying is reading and writing slots.
+        if vm.assign_remembered(target, source) {
+            continue;
+        }
         // An ordinary object with only plain properties can't change what it has while this is going through it.
         let found = &vm.objects[source.index()];
         if matches!(found.kind, Kind::Plain)

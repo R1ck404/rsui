@@ -9,6 +9,7 @@ mod arena;
 mod ast;
 mod background;
 mod builtins;
+mod bulk;
 mod census;
 mod code_bytes;
 mod codecache;
@@ -53,6 +54,7 @@ pub use parser::{JsxAttributeMark, JsxMark};
 
 use std::path::Path;
 
+pub use bulk::Keys;
 pub use census::{Census, CensusGroup};
 pub use codecache::CompiledCode;
 pub use embed::{DataProperty, DataSurfaceError, HostFunction, Root};
@@ -639,6 +641,8 @@ pub struct JitCode {
 mod equivalent_tests;
 #[cfg(test)]
 mod keeping_tests;
+#[cfg(test)]
+mod bulk_tests;
 #[cfg(test)]
 mod reads_tests;
 #[cfg(test)]

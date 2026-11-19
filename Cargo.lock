@@ -709,6 +709,7 @@ dependencies = [
 name = "rsui-tsx"
 version = "0.1.0"
 dependencies = [
+ "foldhash",
  "rsui",
  "rsui-agent",
  "rsui-headless",

@@ -98,6 +98,26 @@ block the syntax tree lives in (`ast.rs`), the loops in `builtins/host/zlib` tha
 it ahead, and the processor's carry-less multiply for CRC-32, and what Windows is asked through: sockets and pipes (`iocp.rs` and `net.rs`) and
 watching for changes (`builtins/host/watch.rs`). Each says what makes it sound.
 
+### Many properties at once
+
+Rust that makes, reads and fills objects for every element, as rsui-tsx's styling does, has its own way in (`bulk.rs`), as
+going through `get_property` and `set_property` a property at a time finds where each is again: a list of names found once
+(`Keys`), objects made with just those names with the shape found once (`new_object_with`), reads of them with where each is
+remembered for the last few shapes (`read_keys`) or found from the shape alone for names no prototype has (`read_own_keys`),
+keys taken out keeping a shape other objects share rather than a dictionary (`delete_keys`), and `assign`, which remembers for
+each pair of shapes what goes where and the shape the target ends with, so copying is reading and writing slots. What's
+remembered is forgotten when a full collection frees shapes (`Shapes::generation`), and an addition is only trusted for the
+`epoch` it was found in. Measured with the JIT in `bulk_speed`: 12 numbers made 97 ns (109 as an object literal in JS), 6 reads
+17 ns (11 in JS), a rule's props put on a look 28 ns (`Object.assign` in JS 52). `Object.assign` itself uses `assign` for a
+plain source and target, which on Mantine's page was 4% of its steps (1114.6 against 1161.2 ms) and on shadcn's 1%; Test262's
+`built-ins/Object`, object literals and assignment pass as before (4,834 of 5,066).
+
+What `bulk.rs` remembers is kept in the box `number_strings` already was (`NumberStrings`, which derefs to the array it was),
+not in a field of `Vm` of its own: there, its 136 bytes moved the fields after it, and js-bench's interpreter, which never runs
+any of it, was 2% slower (prop_mono and prop_poly 7%, int_loop 6%, the same in two runs of ten rounds); as a box at the end of
+`Vm`, 14% (fib 40%). With `Vm`'s fields as they were, those benches are where they were. A field added to `Vm` is measured
+with js-bench for that reason.
+
 ## What made it fast
 
 Two of the biggest wins aren't what you'd guess, and are easy to lose by accident. They were found by measuring on a

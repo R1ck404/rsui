@@ -681,6 +681,12 @@ A request to the pipe and its answer are each a line of JSON, so anything else c
 one more for each hook, so an app that isn't being looked at costs the same, apart from the light spans above. A trace saved since
 version 2 has the spans in it too, so its Performance tab is the same as it was live. A program made with `--pack` has none of this.
 
+Sampling sees compiled JavaScript as one frame, without what it called, so `rsui/web`'s own parts are timed by hand while
+working on it: `profMark(n)`, a host function, adds the time since the last mark to mark `n` (`0` only starts again), and
+`profMarks()` says what each has had. They're put in a copy of web.js and taken out after, as a call costs a little even
+when nothing reads it, and `RSUI_DEV_WEB_JS=<file>` runs that copy in place of the web.js that's built in, so trying a change
+to it needs no build.
+
 ## What's different from React
 
 - A component's output is one element, so an array or a fragment at the top of one is put in a `group`, which can change
@@ -896,6 +902,276 @@ What CSS can't do here is said once when the app runs, starting with `rsui/web:`
 A sheet's rules count in the order a browser has them: what's in `@layer`s first, a layer at a time in the order the layers were first named (`@layer a, b;` names them), then what isn't in one. `@supports (name: value)` holds if `rsui/web` can do that without leaving anything out, with `not`, `and`, `or` and `selector()` as they are, so a check for what only Safari or Firefox has is false here. `@media` has `(min-width: ...)` and `(width >= 40rem)` alike. A rule inside another, as CSS nesting writes it, is a rule of its own, and what's under a condition inside a rule is part of it when the condition holds. A name with `\:` or `\[` in it, as tools write classes like `hover:bg-red-500`, is the name it says. `:is()`, `:where()` and `:not()` take whole selectors, which are checked against what something's inside and the page, so `:is(.dark *)` holds when `html` has `dark`. `+` and `~` are about what comes before something, `:nth-child(an+b of S)` counts only what `S` says, and something a step of a rule says has to be hovered, focused, pressed or ticked, as `.group:hover .x` and `.peer:checked ~ .x` do, keeps track of that, so Tailwind's `group-hover:` and `peer-checked:` follow it: something before others says how it is to what it's in, which draws them again (see `PEER` in `web.js`). In CSS, `:has()` looks at what an element's been given, and in `querySelector()` at what's in it in the tree, and `:host` is nothing, as there's no shadow tree. `scrollbar-width` and `scrollbar-color` draw a browser's own scrollbar in those colors, 11 across with `thin` and none with `none`, which still scrolls, and go over what `::-webkit-scrollbar` says, as Chromium has it. `svh`, `dvh` and the like are the window, as nothing comes and goes around it.
 
 Variables are the page's, from `:root` and from classes on `html` and `body`, and also each element's own: what the rules on an element set, as `.shadow-sm { --shadow: ...; box-shadow: var(--shadow) }` does, is what it uses, and what's inside it has it too, unless `@property` says it doesn't go down. `@property`'s `initial-value` is what a variable is when nothing sets it, and so is what `*` sets. What uses a variable an element can set is worked out with the page's when a rule's read, as everything else is, and again for an element that sets one, as it's drawn, so an element that doesn't pays nothing more. `translate`, `rotate` and `scale` are put together with `transform` as CSS has it.
+
+What a rule's declarations come to is kept for as long as what it read is the same, rather than worked out again each time
+anything about the page's CSS may have changed. Working a sheet's rules out, or a rule about one class or one kind of element,
+notes what it read that can change (`readsStill` in web.js): each page variable's value, whether each variable a `var()` names
+is one an element can set, how big a rem is, and whether anything in it, or a variable it read, is in the window's units, as
+`vh` is. While all of that is the same, and nothing's said that anything at all may have changed, as `@media` changing with the
+window's size does, it's what it was, the same objects, so what was found from them is too: the page's rules' index, and each
+element's plan, which says which of the page's rules could be about something with its classes, kind and id, and in which
+order (`planOf`). A plan checks that the lists of rules about its classes and its kind are the same lists, with the same rules,
+rather than being made again whenever the page's CSS changes (`planStill`). So a window made bigger, which only changes what's
+in `vh`, works out the rules that use it and the elements they're about, rather than every sheet and every plan, and so does a
+modal that sets a variable on `body` that the page's own sheet doesn't read. `RSUI_RESTYLE_CHECK=1` also works out again what's
+kept this way, and says if it's different.
+
+Measured on 2026-11-19, headless, `fastrel` builds (release without LTO), the commit before and this one alternately, seven
+rounds each, the median of each step's median a run:
+
+| | Before | After |
+|---|---|---|
+| `demos/file-explorer` on `C:\Windows\System32`, the window resized | 5.24 ms | 3.41 ms |
+| the same, Down | 1.59 ms | 1.56 ms |
+| Mantine's page, a `Modal` opened the first time, closed, opened again | 130, 107, 112 ms | 94, 80, 95 ms |
+| shadcn's page, a `Dialog` opened the first time, closed, opened again | 197, 135, 144 ms | 174, 121, 146 ms |
+| `bench/long-list`, 5,000 rows, Down | 6.9 ms | 7.1 ms, within the runs' spread |
+| Private memory at the end: explorer, Mantine, shadcn, long list | 40.0, 153.2, 135.0, 87.4 MB | 39.4, 158.1, 136.2, 90.5 MB |
+
+What's kept is held for longer, as every plan is now kept while it's what it would be made as, rather than only those made
+since the page's CSS last changed: Mantine's page ends 3% bigger. A plan is one array of numbers for its items, and a count of
+how often its rules were made again, to keep that small.
+
+A plan is put together in Rust (`plans.rs`, `madePlanInRust` in web.js). web.js still finds the rules that could be about the
+element, as they're found by its tag, id and classes, and the rules about its classes and kind, which finding works out; what it
+hands over is numbers, six for each: where the rule is, what it says, how much, its sheet's place, its place in its sheet, and
+whether it's about the element alone. What a rule says, the props it sets and which of them are `!important`, is a number Rust
+gives the first time it's told them, the same for the same props, kept on the rule as its `weight` is (`saidIdOf`). Rust puts
+the items in the cascade's order and finds whether what's about the element alone can go on all together (`itemsApart`), which
+read every rule's props again for every plan: a Mantine modal made 95 plans each time it opened, as the page's list of rules is
+another once react-remove-scroll adds its `<style>`, and those were about 170 µs each (they're taken from the index before now:
+see `keptPlan` below). `RSUI_JS_STYLED=1` makes plans in web.js
+as before, and `RSUI_CASCADE_CHECK=1` makes each both ways and says where they differ (`rsui cascade check: plan for ...`);
+the explorer, Mantine's page and shadcn's had none.
+
+What it costs to call Rust from web.js was measured first (`cssProbe` in layout.rs, called in each element of the explorer
+with a copy of web.js put in with `RSUI_DEV_WEB_JS`, timed with `profMark`): a call that does nothing takes 0.06 µs, reading the
+element's tag, classes and every prop 0.6 µs, as a JavaScript function reading them does, and making an object of 12 numbers to
+give back 1.2 µs more (32 numbers, 2.2-4.8 µs more). What's slow is what's done, not getting there.
+
+Measured on 2026-11-19 as above, plan making alone (marked in web.js, the same exe with and without `RSUI_JS_STYLED=1`): shadcn's
+page starting 117-125 ms in web.js and 49-51 ms with Rust (1,303 plans), its first `Dialog` open 8.9 and 3.9 ms (145 plans). The
+commit before and this one, seven rounds:
+
+| | Before | After |
+|---|---|---|
+| Mantine's page, a `Modal` opened the first time, closed, opened again | 98.2, 80.9, 93.3 ms | 85.5, 72.5, 81.8 ms |
+| shadcn's page, a `Dialog` opened the first time, closed, opened again | 176.8, 117.1, 145.1 ms | 184.1, 113.0, 122.8 ms |
+| Mantine's and shadcn's pages started and closed (wall time) | 2,455 and 1,954 ms | 2,368 and 1,938 ms |
+| `demos/file-explorer` on System32, Down and a resize; `bench/long-list`, 5,000 rows, Down | 1.61, 3.47, 4.63 ms | 1.60, 3.49, 4.55 ms |
+
+shadcn's first open and its 40 keys typed (144 to 159 ms, each run's median key the same, 3.0 ms) are where a full collection
+lands: a shadcn session has 17 full ones and 63 small ones with Rust's plans, and 15 and 68 without, with as much time in them
+all (204-212 ms and 208-215 ms), and one of the 17 comes while it's typed in, for 14 ms. Over eight lengths of the environment
+(`RSUI_PAD`, which moves where collections land) the keys came to 147-158 ms with Rust's plans and 135-143 ms without.
+
+Private memory at the end, the median over eight lengths of the environment: Mantine's page 155.5 and 152.5 MB, shadcn's 133.1
+and 137.9 MB, the explorer 39.6 and 40.9 MB, the long list 220.6 and 220.3 MB. shadcn's 4.8 MB more is there with
+`RSUI_JS_STYLED=1` against without in the same exe, and is the process heap's: 3 MB more committed with as much allocated (38.7
+and 41.7 MB committed, 31.5 and 31.3 MB allocated), and 1.2 MB more of the engine's objects, after 73 collections rather than 83.
+What Rust keeps is about 100 KB: what 1,207 of shadcn's rules say, 4,408 props in all.
+
+Whether each of a plan's rules about more than the element itself is about it is found in Rust too (`matching.rs`,
+`matchedInRust` in web.js). Mantine has some sixty of those for every element, nearly none about it: rules whose last step is
+`*:where(h1, h2, ...)`, as its typography's `.m_d08caa0 :where(h1)` is, are found by `*`, so every element looks at them, and
+`ruleMatches` took about 0.6 µs each, 37 µs an element. Each rule's selector is read into Rust once, from the steps
+`readSelector` made, and the number it's kept by is on the rule; a plan keeps those of its rules, with which states each is
+about. For an element, one call says of each of them whether it's about it, about it only in a state it isn't in
+(`stateNeeds`), or for web.js to work out; what they say is put on in web.js, in order, as before. Rust matches each step as
+`stepMatches` does, and remembers what it found for each place above an element as `matchedAbove` does, by a number kept on that
+place, for as long as `version` and `flowLearnedCount` are the same. `+` and `~` go on from what's before the element among
+what it's in, which web.js gives each element it describes (`prevs`), with the same chain above, as `matchChain` and `matchFrom`
+do (since 8174ab30; below). It doesn't read a selector with `:has()`, validity, `:nth-child(... of S)`, `@container` or
+`:scope`, and says to work out `:focus-visible` on what's focused without a ring and an attribute whose value is an object,
+which web.js matches as it did. `RSUI_JS_STYLED=1` matches in web.js, and
+`RSUI_CASCADE_CHECK=1` matches each both ways and says where they differ (`rsui cascade check: match for ...`); the explorer,
+Mantine's page and shadcn's had none.
+
+On Mantine's page, the same exe with and without `RSUI_JS_STYLED=1`, all of `fromAbove` (plans and matching): the first modal
+open 36.2 and 18.3 ms, 20 keys typed 14.9 and 7.9 ms, 20 turns of the wheel 45.9 and 23.3 ms, starting 580 and 330 ms. The Rust
+call is about 10 µs an element, most of it in long `:where()` lists, each of which is looked at one selector at a time.
+
+The commit before plans were made in Rust and this one, seven rounds:
+
+| | Before | After |
+|---|---|---|
+| Mantine's page, a `Modal` opened the first time, closed, opened again | 97.0, 82.6, 92.0 ms | 78.8, 64.6, 75.2 ms |
+| Mantine's page, 40 keys typed in a field; a turn of the wheel | 321, 19.1 ms | 296, 16.3 ms |
+| shadcn's page, a `Dialog` opened the first time, closed, opened again | 175.9, 117.7, 143.4 ms | 165.1, 115.0, 125.5 ms |
+| Mantine's and shadcn's pages started and closed (wall time) | 2,464 and 1,951 ms | 2,206 and 1,935 ms |
+| `demos/file-explorer` on System32, Down and a resize; `bench/long-list`, 5,000 rows, Down | 1.62, 3.52, 4.65 ms | 1.61, 3.41, 4.69 ms |
+
+shadcn's 40 keys are where a full collection lands, as above (146 and 160 ms). An `expect` step, which looks for text in the
+whole tree, came to 0.7 ms more on both pages (5.5 and 6.2 ms on Mantine's), which plans made in Rust alone didn't, and which
+isn't explained yet: the tree it looks in is the same. Private memory at the end, the median over four lengths of the
+environment: Mantine's page 155.7 and 154.8 MB, shadcn's 133.1 and 135.7 MB, the explorer 39.7 and 41.1 MB.
+
+Most of those sixty rules couldn't be about the element whatever is above it: `*:where(h1, h2, …)` is only ever about an `h1`
+to an `h6`. What a step needs of an element's tag, id and classes, and what's last in at least one selector of each `:is()` and
+`:where()` it has, is the same for every element a plan is for, as a plan is made for one list of classes, kind of element and
+id (`planOf`). So once for each plan, `cssMatchPlan` marks each rule whose last step couldn't be about it (`Store::could_be`),
+and `cssMatchItems` says no to those without looking. The same exe, with and without it (a copy of web.js put in with
+`RSUI_DEV_WEB_JS`), five alternating rounds on Mantine's page: a turn of the wheel 16.5 -> 15.7 ms, the `Modal` opened again
+72.2 -> 71.1 ms, 40 keys the same (295 ms). `RSUI_CASCADE_CHECK=1` had no differences on Mantine's page or shadcn's.
+
+Two exes of the same JavaScript can differ by more than that: the commit before this one, against this one, seven rounds, had
+Mantine's 40 keys at 302.6 and 274.7 ms, and an `expect` step at 6.0 and 5.5 ms, while each exe gave the same with either
+web.js put in (forty `expect`s in a row on a page that's still: 4.6 ms in one exe whichever web.js, 4.0 in the other, 3.9 in
+the one before plans were made in Rust). An `expect` restyles nothing, and looks for its text in Rust; the 0.7 ms an `expect`
+came to more since rules about more than an element were matched in Rust was the exe, not what it does. So a change to web.js
+is measured in one exe, with and without it, and a change to Rust over the session as a whole.
+
+Why shadcn's 40 keys have a full collection in them now (looked at on 2026-11-19, with each collection placed in the step it
+came in, over eight lengths of the environment): plans and matching in Rust make less garbage, not more (57 small collections in
+a shadcn session rather than 68, as much made old in all or less), so more of the small collections keep most of what was made
+since the one before, and each of those makes the next full one come early (`Generations::full_due`, once a quarter of the old
+budget has become old). As shadcn's page starts, five of its full collections came that way rather than two, which moves the
+rest along: one lands in the keys on every length of the environment (147-160 ms), where before it did on one of eight
+(136-158 ms). Those early ones freed 19-46% of what small collections had made old since the last full one. Making them wait
+for half the old budget once the last full one found most of that alive gave 13 full collections and the keys at 131-138 ms,
+but `bench/long-list` ended 8 MB bigger in private memory (228.5 against 220.3 MB, the same working set: room the list of
+objects had kept, on empty pages), and the explorer 0.8 MB, so it wasn't kept. A window collects when it's quiet after
+starting, which `--do`'s `wait` doesn't, and which would put the collections somewhere else again.
+
+shadcn's 2-4 MB more at the end is room, not what's kept: the small blocks' chunks are 2.6 MB more with 3.4 MB less of them in
+use (57.5 and 40.0 MB, against 54.9 and 43.4), and the strings' list 1 MB more with more of it free, after a higher peak of
+short-lived objects between collections that are fewer (73 rather than 83). Giving the engine's empty pages back after each
+full collection (`RSUI_GIVE_BACK=1`) or the allocator's empty chunks (`idle`) still left 2-3 MB of it, in chunks that are
+only partly used. What Rust keeps for plans and matching is about 100 KB.
+
+An element's own variables are worked out in Rust (`variables.rs`, `withElementVariables` in web.js): what the rules on it set,
+as Mantine's `--button-bg: var(--mantine-primary-color-filled)`, taken out of its look and worked out with what's around it,
+what in its look waits for one of them declared again with them put in, and what goes down to what's inside it given back as a
+`Map`, as web.js gave it. It reads and writes the look, the `Map`s and the note of what was read in the order web.js did, so what
+comes out is the same props in the same order; it asks web.js what a page variable is (`variableValue`, which notes the read),
+which props a property sets (`propertyKeys`), and, for two objects JSON alone can't tell apart, `sameValue`. What a declaration
+came to with its variables put in is kept in Rust, as `resolvedDeclarations` kept it. A Mantine element has about ten
+variables of its own and five declarations that wait for one, and web.js took 60-90 µs of an element's 300 on key presses for
+them, in building strings, regular expressions and copying maps. Timed with `profMark` in one exe, two copies of web.js with
+and without it: on Mantine's page 62-65 -> 18-22 µs an element on key presses, 69-78 -> 21-26 µs as its modal opens, 35-42 ->
+13 µs as it starts; on shadcn's 37-50 -> 16-18 µs on key presses and 10-12 -> 6-9 µs as its dialog opens. `RSUI_JS_STYLED=1` works
+them out in web.js, and `RSUI_CASCADE_CHECK=1` works them out both ways, on a copy of the look, and says where they differ
+(`rsui cascade check: variables for ...`); the explorer, Mantine's page and shadcn's had none.
+
+Rules found by an attribute, as shadcn's `[data-slot=...]` are, are matched in Rust too, as a plan's are (`extraMatchedInRust`).
+That alone was no quicker: about half of shadcn's elements have such rules, and each of those took 70-80 µs in `indexedRulesOn`,
+which was in putting every one of the plan's rules on one at a time, in order with the others, rather than all of what's about
+the element alone together (see `orderWith` below).
+
+Putting rules on, `mergeLook`, was tried in Rust first and was slower: with what `indexedRulesOn` found handed over to
+`cssMergeLooks` all at once, shadcn's elements took 73-74 µs in `fromAbove` on key presses rather than 58-60, as a rule says a
+few props, and web.js's `Object.assign` and its reads of a look keep where each prop is from one time to the next, where Rust
+read and wrote each one through the engine. It's in Rust now (`looks.rs`, `cssMergeLook`, 313433ca), on what rsui-js gained for
+it (crates/rsui-js/DESIGN.md, "Many properties at once"): the names it reads of a look and of a rule are a list found once and
+read from the shape alone (`read_own_keys`), what waits for one of the element's own variables and is said again is found once
+for each shape of look and taken out keeping a shape other looks share (`delete_keys`), and the props are copied with what goes
+where remembered for each pair of shapes (`assign`). What's rarer (`!important`, a `display: flex` over a direction said before
+it, a declaration whose props aren't known yet, one said again only in part) goes back to `mergeLookHere`. In one exe against
+`RSUI_JS_STYLED=1`, seven rounds, merges an element: shadcn's key presses 34.4 -> 12.7 µs, Mantine's 8.0 -> 3.0. With all
+of what's in Rust then (plans, matching, variables and this) against `RSUI_JS_STYLED=1`, `fromAbove` an element: shadcn's key
+presses 83 -> 65 µs, its dialog opening 110 -> 72; Mantine's 77 -> 24 and 158 -> 55. `RSUI_CASCADE_CHECK=1`
+merges a copy of the look in web.js as well, and compares them prop by prop and in order, the longhands of `transition` and
+`animation` by what they hold (`rsui cascade check: merge of ...`).
+
+The commit before variables were worked out in Rust (41416697) and the one after rules found by an attribute were matched there,
+measured on 2026-11-19 as above, seven rounds each, with the machine busier than for the tables before:
+
+| | Before | After |
+|---|---|---|
+| Mantine's page, a `Modal` opened the first time, closed, opened again | 91.1, 70.3, 86.0 ms | 86.5, 64.8, 76.8 ms |
+| Mantine's page, 40 keys typed in a field; a turn of the wheel | 366, 22.6 ms | 367, 20.2 ms |
+| shadcn's page, a `Dialog` opened the first time, closed, opened again | 187.3, 132.7, 157.7 ms | 201.5, 127.5, 139.9 ms |
+| shadcn's page, 40 keys typed | 203 ms | 187 ms |
+| `demos/file-explorer` on System32, Down and a resize; `bench/long-list`, 5,000 rows, Down | 1.57, 3.37, 6.87 ms | 1.54, 3.37, 6.79 ms |
+
+shadcn's first open is where its collections land, as above: in one exe with and without variables in Rust, `fromAbove` alone
+went from 64 to 143 µs an element from one run to the next as it opened, while what variables took went down in each.
+
+Private memory at the end, the median over eight lengths of the environment: Mantine's page 152.1 and 151.4 MB, shadcn's 136.4
+and 135.8 MB, the explorer 41.2 and 41.2 MB, and the long list 220.7 and 228.6 MB. The long list has no variables, and neither
+change runs for it: its private working set is the same (216.0 and 215.3 MB), and the 8 MB is pages of objects left empty
+(62,848 free places against 1,664) after a peak of short-lived ones, as it was when collections were made to land elsewhere
+above. It stays with both changes turned off in a copy of web.js, and doesn't come with the commit before's web.js with a
+comment or an unused function added, so it's where collections land with the new web.js, not what's kept.
+
+After `mergeLook`, what an element's page rules came to was split up with `profMark` (one exe, a marked copy of web.js), and
+what was left was moved where it measured faster:
+
+- **Rules with `+` and `~`** (8174ab30). They were handed back to web.js, and on shadcn's page they were nearly all of what
+  was: Tailwind's `space-x-*`/`space-y-*` (`> :not([hidden]) ~ :not([hidden])`) end on a step about anything, so every
+  element asked about each of them. As shadcn's page starts, rules matched in web.js went from 43,285 to 400, taking 188.8 ms
+  rather than 8.0, and `fromAbove` 421 -> 275 ms in all; its first dialog open 48.6 -> 25.4 ms, closing it 29.7 -> 19.6.
+  What's left for web.js is `:has()` (shadcn's 400 as it starts, 8 ms; Mantine's 1,342, 8-30 ms, and 240 in 40 key presses,
+  0.3-0.4 ms) and `:where()` lists with something in them Rust doesn't read (Mantine's 132): `:has()` asks about what an
+  element's been given to have in it, React elements and components found later to make something, which only web.js has,
+  for 2-3% of `fromAbove` as a page starts and less after. Validity, `:nth-child(… of S)`, `@container` and `:scope` aren't on
+  Mantine's page, shadcn's or the explorer.
+- **Plans kept when react-remove-scroll adds its `<style>`** (abd98cba). Any change to the page's rules made a new index, and
+  plans are kept for an index, so as a dialog opened (react-remove-scroll puts four rules into the middle of the page's) and
+  closed, every plan was made again: shadcn 145 and 116, Mantine 95 and 85, a third of what an element took then. A new index
+  keeps the one before it, three back at most, and the keys of the rules that are different (`indexBefore`); a plan none of
+  whose keys are among them is taken from it (`keptPlan`), with where its rules are among the page's and where their sheets
+  are worked out again (a rule about one class keeps its sheet for that), and is looked at as any plan is (`planStill`).
+  shadcn's second open makes no plan and takes 145. `fromAbove` an element: Mantine's modal opening 48.0 -> 42.1 µs, closing
+  45.7 -> 31.4; shadcn's dialog opening 49.4 -> 35.0, closing 47.4 -> 43.4.
+- **Only the rules about an element are gone through** (0f5add0e). `cssMatchItems` gives back which states all the rules it
+  said of care about, put together as `ruleOnSaid` gives each (`said_needs`), and `indexedRulesOn` only goes on for a rule
+  that's about the element or one for web.js to match. Mantine's key presses 22.6 -> 18.7 µs, shadcn's page starting 61.3 ->
+  55.5. `RSUI_CASCADE_CHECK=1` goes through each rule as before and compares what Rust put together (`matchedNeedsCheck`).
+- **What's about an element alone put on together, with rules found by an attribute** (6dd163a6). For each plan and list of
+  such rules (which depends only on the names of what an element's given), where each goes among the plan's and whether each
+  half's rules about the element alone can go on all together first, as `plan.apart` says for a plan alone, is worked out once
+  (`orderWith`, `selfLasts`); what waits for a variable counts as saying what that sets. 1,667 of shadcn's 1,883 such elements
+  put one half or both on together. That part of `fromAbove`, key presses 17.9 -> 11.5 µs, the page starting 17.5 -> 16.5; a
+  focus is 16.1 -> 18.1, as new plans have what their rules say found the first time. `RSUI_CASCADE_CHECK=1` puts the rules on
+  one at a time first, keeps that, puts the look back and compares (`togetherCheck`), as `passedOn` puts things on the look
+  itself.
+- **`Object.assign`** uses the pairs of shapes `assign` remembers, for a plain source and target (5e9434d8): see
+  crates/rsui-js/DESIGN.md.
+
+Each was measured in one exe, the web.js before against the one after (put in with `RSUI_DEV_WEB_JS`), seven rounds, with a
+different length of the environment each round (`RSUI_PAD`), as shadcn's collections land in its first open and a different
+web.js moves them. `RSUI_CASCADE_CHECK=1` had no differences on shadcn's page, Mantine's or the explorer after each.
+
+What an element costs now, all of `Styled` split up with `profMark` (key presses, Mantine's / shadcn's, µs an element): to
+`fromAbove` 11.6 / 14.8, `fromAbove` 18.6 / 26.9, its inline style 10.9 / 1.1, inheriting 5.1 / 22.1, its own variables
+19.7 / 18.2, `dir` and its own font 7.3 / 9.2, its font and what goes down 21.0 / 24.1, what's in it 20.8 / 11.2, `withNth`
+12.2 / 12.7, lines 12.0 / 10.6, host props and events 8.8 / 9.8, and the rest to the end 44.5 / 43.2: about 200 µs. What's
+still in web.js there is mostly making the objects that are what it gives (props, closures for handlers, React elements),
+which Rust makes no faster than JavaScript's own literals (bulk_speed: 12 numbers in an object 97 ns from Rust, 109 ns as a
+literal). `withNth`, split the same way: finding each child's kind, the counts and how much is as it was 4.5 / 2.6 µs, each
+child's `Place` 1.6 / 1.9, describing each (`describe`, which `+`, `~` and `:has()` read) 3.4 / 6.7, `cloneElement` or the
+provider round it 2.0 / 2.3, the rest 4.5 / 3.5: the indices are a few nanoseconds of it, and the rest are objects Styled,
+matching and React read, so it stays in web.js.
+
+The native sampler (`RSUI_SAMPLE`, `--features sampling-profile`, crates/rsui-tsx/src/sampler.rs) ended a JIT build at once with
+an access violation in ntdll: compiled JS has no unwind information, and the walk took the word on top of the stack for a
+return address, as for a leaf, and gave `RtlVirtualUnwind` a context that pointed anywhere. It now checks every step against
+the stack's bounds from the thread's TEB, finds a frame with no unwind information's return address above it (at `rsp + 40`
+first in a compiled function's body, else the first word that's just after a call in committed code), and finds the
+interpreter loop's frame pointer again where the JIT's `rbp` was left in it. It also stops the thread only to read its
+registers and copy the stack it's using, and walks the copy with it going again, as finding unwind information can wait for a
+lock the stopped thread holds (one start in eight hung). 99.8% of stacks reach the thread's start. The inspector's sampler
+(`sampling.rs`) only copies the engine's list of frames with `ReadProcessMemory`, and ran with it.
+
+The session as a whole (t3/css-rust-styled's head, 67f35351, and the commit before variables were worked out in Rust,
+41416697, against this one), measured on 2026-11-19 as above, fastrel exes, seven rounds, medians of steps:
+
+| | 67f35351 | 41416697 | This |
+|---|---|---|---|
+| Mantine's page, a `Modal` opened the first time, closed, opened again | 89.2, 67.8, 79.6 ms | 86.0, 71.8, 81.0 ms | 81.4, 63.9, 73.9 ms |
+| Mantine's page, 40 keys typed in a field; a turn of the wheel | 388, 20.8 ms | 371, 17.6 ms | 398, 18.8 ms |
+| shadcn's page, a `Dialog` opened the first time, closed, opened again | 235.6, 139.0, 160.9 ms | 202.3, 137.0, 160.0 ms | 165.5, 126.0, 153.1 ms |
+| shadcn's page, 40 keys typed | 200 ms | 213 ms | 200 ms |
+| shadcn's and Mantine's steps, all together | 917, 1,131 ms | 900, 1,030 ms | 848, 1,088 ms |
+| `demos/file-explorer` on System32, Down and a resize; `bench/long-list`, 5,000 rows, Down | 1.56, 3.46, 6.08 ms | 1.59, 3.43, 6.07 ms | 1.55, 3.36, 6.44 ms |
+
+Mantine's 40 keys typed range 315-436 ms in each exe, as its collections land; eleven more rounds of Mantine's page alone,
+against 67f35351, had them 390.7 and 382.3 ms, its modal 84.1, 68.9, 81.0 ms against 79.4, 60.2, 73.7, and all its steps
+1,121.6 against 1,090.0 ms. The long list's Down is 4.5-7.5 ms in each exe, so its 6.1 against 6.4 is within what one run of it moves by.
+
+Private memory at the end, the median over eight lengths of the environment, 67f35351 and this: shadcn's page 136.1 and 137.3
+MB, Mantine's 151.9 and 148.2 MB, the explorer 41.0 and 39.0 MB, the long list 228.6 and 228.8 MB.
 
 Boxes are laid out as a browser lays them out, in `rsui-layout`, which knows nothing about CSS but has the same rules:
 

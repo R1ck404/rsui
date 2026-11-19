@@ -824,3 +824,89 @@ fn set_values(vm: &mut Vm, args: Args) -> Run<Value> {
 fn set_entries(vm: &mut Vm, args: Args) -> Run<Value> {
     iterator_of(vm, args.this, IterKind::SetEntries)
 }
+
+// What a host function uses to read and make maps, as `new Map(old)`, `map.get(key)` and `map.set(key, value)` do with the
+// built-in methods, without going through what the program can see: rsui-tsx works out an element's variables with them.
+impl Vm {
+    /// Whether this is a `Map`.
+    pub fn is_map(&self, value: Value) -> bool {
+        value.is_object() && matches!(self.objects[value.index()].kind, Kind::Map(_))
+    }
+
+    /// What a `Map` has for this key, as `map.get(key)` says, or `None` if it isn't a `Map`.
+    pub fn map_value(&self, map: Value, key: Value) -> Option<Value> {
+        if !self.is_map(map) {
+            return None;
+        }
+        let Kind::Map(data) = &self.objects[map.index()].kind else {
+            return None;
+        };
+        Some(match self.find_hashed(map, key, self.key_hash(key)) {
+            Some(Some(at)) => data.entries[at].1,
+            _ => Value::UNDEFINED,
+        })
+    }
+
+    /// What a `Map` has for a string key with this text, as `map.get(text)` says, without making the string for a small one,
+    /// or `None` if it isn't a `Map`.
+    pub fn map_text_value(&mut self, map: Value, text: &str) -> Option<Value> {
+        let size = self.map_size(map)?;
+        if size > 16 {
+            let key = self.new_str(text);
+            return self.map_value(map, key);
+        }
+        let Kind::Map(data) = &self.objects[map.index()].kind else {
+            return None;
+        };
+        for &(key, value) in &data.entries {
+            if key.is_string() {
+                let found = self.text_of(key);
+                let same = match found.ascii() {
+                    Some(bytes) => bytes == text.as_bytes(),
+                    None => found.to_rust() == text,
+                };
+                if same {
+                    return Some(value);
+                }
+            }
+        }
+        Some(Value::UNDEFINED)
+    }
+
+    /// How many entries a `Map` has, as `map.size` says, or `None` if it isn't a `Map`.
+    pub fn map_size(&self, map: Value) -> Option<usize> {
+        match self.is_map(map).then(|| &self.objects[map.index()].kind) {
+            Some(Kind::Map(data)) => Some(data.live as usize),
+            _ => None,
+        }
+    }
+
+    /// A new `Map` with what another has in it, in its order, as `new Map(old)` makes, or an empty one for anything that isn't
+    /// a `Map`.
+    pub fn map_copied(&mut self, from: Value) -> Value {
+        let entries: Vec<(Value, Value)> = match self.is_map(from).then(|| &self.objects[from.index()].kind) {
+            Some(Kind::Map(data)) => data.entries.iter().copied().filter(|entry| !entry.0.is_empty()).collect(),
+            _ => Vec::new(),
+        };
+        let proto = self.realm.map_proto;
+        let map = self.new_object_with_proto(proto, Kind::Map(Box::default()));
+        let live = entries.len() as u32;
+        if live > 0 {
+            self.debt += live as usize * 32;
+            if let Kind::Map(data) = &mut self.objects[map.index()].kind {
+                data.entries = entries;
+                data.live = live;
+            }
+            self.rebuild_buckets(map);
+        }
+        map
+    }
+
+    /// Puts an entry in a `Map`, as `map.set(key, value)` does.
+    pub fn map_put(&mut self, map: Value, key: Value, value: Value) -> Run<()> {
+        if !self.is_map(map) {
+            return Err(self.type_error("Method Map.prototype.set called on incompatible receiver"));
+        }
+        self.insert_entry(map, key, value)
+    }
+}

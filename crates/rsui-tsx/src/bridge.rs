@@ -1041,6 +1041,48 @@ fn host_now(_: &mut Vm, _: Args) -> Result<Value, Value> {
     Ok(Value::number(HOST.with(|host| host.now_ms.get())))
 }
 
+thread_local! {
+    /// When `profMark` was last called, and the time and count that's gone to each mark since `profMarks` last said them.
+    static MARKS: RefCell<(Option<Instant>, Vec<(Duration, u64)>)> = const { RefCell::new((None, Vec::new())) };
+}
+
+/// `profMark(n)`: for timing parts of web.js by hand, which nothing that's committed calls, as sampling can't see into compiled
+/// JavaScript's own calls: the time since the last mark goes to mark `n`, and `0` only starts again from now. Marks are put
+/// in a copy of web.js while measuring, and taken out after. `profMarks()` says what each has had, and starts again.
+fn host_prof_mark(vm: &mut Vm, args: Args) -> Result<Value, Value> {
+    let number = args.get(vm, 0);
+    let slot = if number.is_number() { number.as_number() as usize } else { 0 };
+    let now = Instant::now();
+    MARKS.with(|marks| {
+        let mut marks = marks.borrow_mut();
+        let last = marks.0.replace(now);
+        if let (Some(last), true) = (last, slot > 0) {
+            if marks.1.len() <= slot {
+                marks.1.resize(slot + 1, (Duration::ZERO, 0));
+            }
+            marks.1[slot].0 += now - last;
+            marks.1[slot].1 += 1;
+        }
+    });
+    Ok(Value::UNDEFINED)
+}
+
+fn host_prof_marks(vm: &mut Vm, _: Args) -> Result<Value, Value> {
+    let said = MARKS.with(|marks| {
+        let mut marks = marks.borrow_mut();
+        let said: Vec<String> = marks
+            .1
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, count))| *count > 0)
+            .map(|(at, (time, count))| format!("p{at}={:.3}ms/{count}", time.as_secs_f64() * 1000.0))
+            .collect();
+        marks.1.clear();
+        said.join(" ")
+    });
+    Ok(vm.new_string(&said))
+}
+
 /// `appName()`: what the program's own files go by.
 fn host_app_name(vm: &mut Vm, _: Args) -> Result<Value, Value> {
     let name = program_name();
@@ -1216,12 +1258,28 @@ pub(crate) const HOST_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
+/// `rsui/web`'s code: what's built in, or, for measuring a change to it without building again, the file `RSUI_DEV_WEB_JS`
+/// names, read once.
+fn web_source() -> &'static str {
+    static READ: LazyLock<&'static str> = LazyLock::new(|| {
+        std::env::var_os("RSUI_DEV_WEB_JS")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map_or(WEB, |text| Box::leak(text.into_boxed_str()))
+    });
+    *READ
+}
+
 fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
     // An app's libraries are the ones written for a page, so each package's build for browsers is what it gets, as a bundler
     // for one would give it.
     engine.vm().set_browser_packages(true);
+    // What another engine on this thread kept of its page's rules is nothing to this one's.
+    crate::plans::reset();
+    crate::matching::reset();
+    crate::variables::reset();
+    crate::looks::reset();
     for (name, source) in HOST_MODULES {
-        engine.add_module(name, source);
+        engine.add_module(name, if *name == "rsui/web" { web_source() } else { source });
     }
     // Files and requests finish on other threads, and this brings what they found back to this one.
     let remote = HOST.with(|host| host.remote.clone());
@@ -1243,7 +1301,9 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
     let failed = |engine: &mut Engine, error: Value| engine.error_message(error).message;
     let vm = engine.vm();
     let natives = vm.new_object();
-    let functions: [(&str, rsui_js::HostFunction); 38] = [
+    let functions: [(&str, rsui_js::HostFunction); 40] = [
+        ("profMark", host_prof_mark),
+        ("profMarks", host_prof_marks),
         ("wantDrops", host_want_drops),
         ("stopEvent", host_stop_event),
         ("passEvent", host_pass_event),
@@ -1303,6 +1363,10 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
         .into_iter()
         .chain(crate::declare::FUNCTIONS)
         .chain(crate::layout::FUNCTIONS)
+        .chain(crate::plans::FUNCTIONS)
+        .chain(crate::matching::FUNCTIONS)
+        .chain(crate::variables::FUNCTIONS)
+        .chain(crate::looks::FUNCTIONS)
         .chain(crate::css_build::FUNCTIONS)
     {
         let function = vm.host_function(name, 0, function);

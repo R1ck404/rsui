@@ -3061,7 +3061,55 @@ fn host_props_same(vm: &mut Vm, args: Args) -> Run<Value> {
     Ok(Value::bool(a.is_object() && b.is_object() && vm.shallow_equal(a, b) && (shallow || vm.holds_no_objects(b))))
 }
 
-pub(crate) const FUNCTIONS: [(&str, HostFunction); 14] = [
+/// `cssProbe(tag, classes, props, mode, size)`: for measuring what it costs to hand an element to Rust, which nothing that's
+/// committed calls. Mode 0 does nothing; 1 reads the tag, each class and each prop (a string's text); 2 does that and makes an
+/// object of `size` numbers to give back, as a finished look would be.
+fn host_probe(vm: &mut Vm, args: Args) -> Run<Value> {
+    let (tag, classes, props, mode, size) = (args.get(vm, 0), args.get(vm, 1), args.get(vm, 2), args.get(vm, 3), args.get(vm, 4));
+    let mode = if mode.is_number() { mode.as_number() as u32 } else { 0 };
+    if mode == 0 {
+        return Ok(Value::UNDEFINED);
+    }
+    let mut read = 0usize;
+    if let Some(text) = vm.string_text(tag) {
+        read += text.len();
+    }
+    if let Some(items) = vm.array_elements(classes) {
+        for &item in items {
+            if let Some(text) = vm.string_text(item) {
+                read += text.len();
+            }
+        }
+    }
+    let mut found = Vec::new();
+    vm.properties_into(props, &mut found)?;
+    for &(name, value) in &found {
+        read += vm.atom_name(name).len();
+        if let Some(text) = vm.string_text(value) {
+            read += text.len();
+        } else if value.is_number() {
+            read += value.as_number() as usize & 1;
+        }
+    }
+    if mode == 1 {
+        return Ok(Value::number(read as f64));
+    }
+    let size = if size.is_number() { size.as_number() as usize } else { 8 };
+    let out = vm.new_object();
+    const NAMES: [&str; 32] = [
+        "display", "width", "height", "color", "background", "padding", "margin", "border", "fontSize", "fontWeight", "lineHeight",
+        "gap", "flex", "direction", "align", "justify", "radius", "opacity", "cursor", "overflow", "position", "top", "left", "right",
+        "bottom", "zIndex", "shadow", "transition", "textAlign", "whiteSpace", "minWidth", "maxWidth",
+    ];
+    for (at, name) in NAMES.iter().take(size).enumerate() {
+        let atom = vm.atom(name);
+        vm.set_property(out, atom, Value::number((read + at) as f64))?;
+    }
+    Ok(out)
+}
+
+pub(crate) const FUNCTIONS: [(&str, HostFunction); 15] = [
+    ("cssProbe", host_probe),
     ("cssKinds", host_kinds),
     ("cssForget", host_forget),
     ("cssChildren", host_children),

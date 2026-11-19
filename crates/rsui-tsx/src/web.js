@@ -190,9 +190,17 @@ let variablesTouched = false;
 const listeners = new Set();
 let tellSoon = false;
 
+/// How many times anything at all about what declarations come to may have changed (`changed()`), as `@media` changing with the
+/// window's size does, rather than only what they read: see `readsStill`.
+let declaredAll = 0;
+/// While declarations are worked out, what they read that can change, for what they came to to be kept while that's the same:
+/// see `readsStill`.
+let compileReads = null;
+
 /// Says that anything about what CSS comes to may have changed.
 function changed() {
     declared += 1;
+    declaredAll += 1;
     restyleAll('changed()');
     restyled();
 }
@@ -204,6 +212,17 @@ function changed() {
 // (`changed()`) still has everything drawn again. `RSUI_RESTYLE_CHECK=1` draws everything again after each time only some of it
 // was, and says what came out different, which would have been missed.
 
+/// `RSUI_JS_STYLED=1` keeps what Rust works out for an element's look in web.js, as it was, and `RSUI_CASCADE_CHECK=1` works out
+/// both and says where they differ (`rsui cascade check: ...`). What Rust does now: making each element's plan (see `madePlanInRust`),
+/// matching rules about more than an element, `+` and `~` among them (`matchedInRust`), with which states they care about put
+/// together, its own variables (`withElementVariables`), and putting rules on its look (`mergeLook`).
+const STYLED_ENV = (() => {
+    try {
+        return { js: globalThis.process?.env?.RSUI_JS_STYLED === '1', check: globalThis.process?.env?.RSUI_CASCADE_CHECK === '1' };
+    } catch {
+        return { js: false, check: false };
+    }
+})();
 const RESTYLE_ENV = (() => {
     try {
         return { check: globalThis.process?.env?.RSUI_RESTYLE_CHECK === '1', log: globalThis.process?.env?.RSUI_RESTYLE_LOG === '1' };
@@ -1407,7 +1426,16 @@ function declareBlock(declarations, fontSize) {
         props.__startingSaid = true;
         return props;
     }
-    const waits = (value) => value.includes('var(') && namesIn(value).some((one) => elementVariables.has(one));
+    const waits = (value) => value.includes('var(') && namesIn(value).some((one) => {
+        const set = elementVariables.has(one);
+        if (compileReads !== null && !(compileReads.element ??= new Map()).has(one)) {
+            compileReads.element.set(one, set);
+        }
+        return set;
+    });
+    if (compileReads !== null && !compileReads.viewport && declarations.some(([, value]) => usesViewportUnits(value))) {
+        compileReads.viewport = true;
+    }
     let waiting = declarations.filter(([name, value]) => !name.startsWith('--') && waits(value));
     if (waiting.length > 0 && declarations.length > 1) {
         // What's said after it about the same thing, or that's `!important` when it isn't, goes over it, as the classes of
@@ -1528,6 +1556,58 @@ function withElementVariables(look, inherited, fresh = false, note) {
     if (look.__vars !== true) {
         return null;
     }
+    if (!STYLED_ENV.js && !VARIABLE_DELTAS) {
+        // Worked out in Rust (`variables.rs`), which gives back `false` for what it leaves to this.
+        if (STYLED_ENV.check) {
+            return variablesChecked(look, inherited, fresh, note);
+        }
+        const down = natives.cssElementVariables(look, inherited, fresh, note, remSize, variablesContext ??= variablesAsked());
+        if (down !== false) {
+            return down;
+        }
+    }
+    return variablesHere(look, inherited, fresh, note);
+}
+
+/// What `variables.rs` asks of web.js as it works an element's variables out.
+let variablesContext = null;
+function variablesAsked() {
+    return { pageValue: variableValue, propertyKeys, sameValue, declare: natives.cssDeclare, declaring, registered, ownVariables: OWN_VARIABLES };
+}
+
+/// `RSUI_CASCADE_CHECK`: an element's variables worked out in Rust, against what they come to here, on a copy of its look, said
+/// where they differ.
+function variablesChecked(look, inherited, fresh, note) {
+    const copy = { ...look };
+    const noteCopy = note === undefined ? undefined : { names: [...note.names], own: Array.isArray(note.own) ? [...note.own] : note.own, live: note.live };
+    const here = variablesHere(copy, inherited, fresh, noteCopy);
+    const down = natives.cssElementVariables(look, inherited, fresh, note, remSize, variablesContext ??= variablesAsked());
+    if (down === false) {
+        return variablesHere(look, inherited, fresh, note);
+    }
+    const differs = [];
+    const keys = Object.keys(look);
+    const keysHere = Object.keys(copy);
+    if (keys.join('\u0000') !== keysHere.join('\u0000')) {
+        differs.push('keys ' + keys.filter((key) => !keysHere.includes(key)).join(',') + ' vs ' + keysHere.filter((key) => !keys.includes(key)).join(','));
+    } else {
+        const values = keys.filter((key) => !Object.is(look[key], copy[key]) && !sameValue(look[key], copy[key]) && !sameValue(copy[key], look[key]));
+        if (values.length > 0) differs.push('values ' + values.map((key) => key + ' ' + JSON.stringify(look[key]) + '/' + String(look[key]) + ' vs ' + JSON.stringify(copy[key]) + '/' + String(copy[key])).join(','));
+    }
+    const mapSays = (map) => (map === null || map === undefined ? String(map) : JSON.stringify([...map]) + (map[OWN_VARIABLES] === undefined ? '' : ' own ' + JSON.stringify([...map[OWN_VARIABLES]])));
+    if (mapSays(down) !== mapSays(here)) differs.push('down ' + mapSays(down) + ' vs ' + mapSays(here));
+    if (note !== undefined) {
+        if (note.names.join(',') !== noteCopy.names.join(',')) differs.push('names ' + note.names.join(',') + ' vs ' + noteCopy.names.join(','));
+        if (JSON.stringify(note.own) !== JSON.stringify(noteCopy.own)) differs.push('own ' + JSON.stringify(note.own) + ' vs ' + JSON.stringify(noteCopy.own));
+    }
+    if (differs.length > 0) {
+        console.error('rsui cascade check: variables for ' + (note?.live?.me?.tag ?? '?') + '.' + (note?.live?.me?.classes ?? []).slice(0, 4).join('.') + ': ' + differs.join('; '));
+    }
+    return down;
+}
+
+/// What `withElementVariables` does, here.
+function variablesHere(look, inherited, fresh, note) {
     delete look.__vars;
     let own = null;
     const used = [];
@@ -1950,11 +2030,42 @@ function measureOf(text) {
 }
 
 /// Puts what `props` says over what `look` says, apart from what `look` has that was `!important`, unless `props` says that's
-/// `!important` too.
+/// `!important` too. That's done in Rust (`looks.rs`), apart from what's rarer, which it leaves to `mergeLookHere`.
 function mergeLook(look, props) {
     if (props === undefined || props === null) {
         return look;
     }
+    if (!STYLED_ENV.js) {
+        const before = STYLED_ENV.check ? { ...look } : null;
+        if (natives.cssMergeLook(look, props, mergeWeight, mergeInOrder)) {
+            if (before !== null) {
+                mergeCheck(before, props, look);
+            }
+            return look;
+        }
+    }
+    return mergeLookHere(look, props);
+}
+
+/// `RSUI_CASCADE_CHECK`: what Rust made of a look with a rule's props put on it, against what `mergeLookHere` makes of a copy of
+/// it as it was, prop by prop and in the same order.
+function mergeCheck(before, props, look) {
+    mergeLookHere(before, props);
+    const want = Object.keys(before);
+    const got = Object.keys(look);
+    // What's made anew for the longhands of `transition` and `animation` is another object each way, alike in what it holds.
+    const same = (key) => Object.is(before[key], look[key])
+        || ((key === '__transitionParts' || key === '__animationParts') && JSON.stringify(before[key]) === JSON.stringify(look[key]));
+    const at = want.length !== got.length ? Math.min(want.length, got.length)
+        : want.findIndex((key, at) => got[at] !== key || !same(key));
+    if (at >= 0) {
+        console.error('rsui cascade check: merge of ' + Object.keys(props).slice(0, 6).join(',') + ' differs at ' + at + ': '
+            + got.slice(at, at + 4).join(',') + ' in Rust and ' + want.slice(at, at + 4).join(',') + ' here');
+    }
+}
+
+/// `mergeLook`, here.
+function mergeLookHere(look, props) {
     const kept = look.__important;
     const strong = props.__important;
     if (look.__vars === true) {
@@ -2092,8 +2203,12 @@ let mergeInOrder = false;
 
 // Cascading another declaration only needs to revisit declarations waiting on variables, not all the layout/color values
 // already in the look. Sidecars hold names, never computed values, so changed variables are still resolved normally.
+// With looks put together in Rust (`looks.rs`), which finds them for each shape of look, a look's are found from it each time.
 const pendingVariableFields = new WeakMap();
 function pendingVariablesOf(look) {
+    if (!STYLED_ENV.js) {
+        return Object.keys(look).filter((key) => key.startsWith('__var '));
+    }
     let keys = pendingVariableFields.get(look);
     if (keys === undefined) {
         keys = Object.keys(look).filter((key) => key.startsWith('__var '));
@@ -2103,7 +2218,7 @@ function pendingVariablesOf(look) {
 }
 
 function variablesAssigned(look, props) {
-    if (props.__vars !== true) {
+    if (props.__vars !== true || !STYLED_ENV.js) {
         return;
     }
     const before = look.__vars === true ? pendingVariablesOf(look) : [];
@@ -2351,6 +2466,19 @@ function variableValue(name) {
     if (variableReader !== null) {
         (variableReader.pageVarsRead ??= new Set()).add(name);
     }
+    if (compileReads !== null && !(compileReads.values ??= new Map()).has(name)) {
+        const value = variableValueNow(name);
+        compileReads.values.set(name, value);
+        if (usesViewportUnits(value)) {
+            compileReads.viewport = true;
+        }
+        return value;
+    }
+    return variableValueNow(name);
+}
+
+/// What a variable is on the page now, as `variableValue` says, without noting that anything's read it.
+function variableValueNow(name) {
     if (pageVariables.has(name)) {
         return pageVariables.get(name);
     }
@@ -3348,6 +3476,7 @@ const usesViewportUnits = (value) => typeof value === 'string' && /(?:\d|\.)\s*[
 
 function resizedCss() {
     resolvedViewportDeclarations.clear();
+    natives.cssVariablesResized();
     let mediaChanged = false;
     if (sizeQueries) {
         for (const one of sheets) {
@@ -6866,6 +6995,8 @@ function pageOwners() {
             // The same list, with what's in it now, as everything in the page has it from above, so that what isn't about what's
             // changed isn't drawn again for a new one. What looks at what's in it finds it again then: see `ruleIndex`.
             if (rules.length !== pageRuleList.length || rules.some((rule, at) => rule !== pageRuleList[at])) {
+                const was = ruleIndexes.get(pageRuleList);
+                pageIndexWas = was === undefined ? null : { index: was, rules: pageRuleList.slice() };
                 pageRuleList.length = 0;
                 pageRuleList.push(...rules);
                 ruleIndexes.delete(pageRuleList);
@@ -6878,6 +7009,11 @@ function pageOwners() {
 }
 const pageRuleList = [];
 let pageOwnersKept = null;
+/// The index the page's rules had before they last changed, and what they were, for the next index to take plans from: see
+/// `keptPlan`.
+let pageIndexWas = null;
+/// How many rules can be added or taken out of the page's for plans to be taken from the index before.
+const KEPT_PLANS_CHANGE = 256;
 /// Where something is among what's around it, for what's about that, as `:last-of-type` is.
 const NthContext = createContext(null);
 NthContext.Provider.displayName = 'NthContext';
@@ -7109,8 +7245,14 @@ function watchedSteps(steps) {
 
 /// Whether a step is about something, apart from how it is.
 function stepMatchesAnyState(step, own) {
-    const pseudo = step.pseudo.filter((one) => !STATES.has(one.name));
-    return stepMatches(pseudo.length === step.pseudo.length ? step : { ...step, pseudo }, own);
+    // The step without what it says about states, made once for each step, as it's asked for each element that might be it.
+    let anyState = step.anyState;
+    if (anyState === undefined) {
+        const pseudo = step.pseudo.filter((one) => !STATES.has(one.name));
+        anyState = pseudo.length === step.pseudo.length ? step : { ...step, pseudo };
+        Object.defineProperty(step, 'anyState', { value: anyState, enumerable: false, writable: true });
+    }
+    return stepMatches(anyState, own);
 }
 
 /// What those above say about something, as it is now, put into its look and its parts. It gives back which of its states those care
@@ -7143,12 +7285,13 @@ function fromAbove(owners, own, look, parts, classes = false, between = null) {
             paged = true;
             const index = ruleIndex(rules);
             if (index.watched.size > 0) {
-                keys ??= keysOf(own);
-                for (const [rule, at] of candidates(index.watched, keys)) {
-                    cascadeLookedAround = true;
-                    const bits = watchedStep(rule, at, own);
-                    watched |= bits;
-                    needs |= bits;
+                for (const found of watchedOf(index, own)) {
+                    for (const [rule, at] of found) {
+                        cascadeLookedAround = true;
+                        const bits = watchedStep(rule, at, own);
+                        watched |= bits;
+                        needs |= bits;
+                    }
                 }
             }
             needs |= indexedRulesOn(index, rules, owner, own, look, parts, classes, between);
@@ -7169,11 +7312,12 @@ function fromAbove(owners, own, look, parts, classes = false, between = null) {
         // they're in, as the rest can't be.
         const index = ruleIndex(rules);
         if (index.watched.size > 0) {
-            keys ??= keysOf(own);
-            for (const [rule, at] of candidates(index.watched, keys)) {
-                const bits = watchedStep(rule, at, own);
-                watched |= bits;
-                needs |= bits;
+            for (const found of watchedOf(index, own)) {
+                for (const [rule, at] of found) {
+                    const bits = watchedStep(rule, at, own);
+                    watched |= bits;
+                    needs |= bits;
+                }
             }
         }
         needs |= indexedRulesOn(index, rules, owner, own, look, parts, false, null);
@@ -7251,14 +7395,16 @@ function compoundSelfReads(step, reads, depth) {
 /// are about it alone, and what they read of what it's given, are found here too. Kept for each index, by the list of classes,
 /// which is the same list for the same `className`: see `classesOf`. `classes` says whether its rules about one class count.
 const plansOf = new WeakMap();
+/// What a plan keeps for each item, in its `columns`: where it is in the page's rules (-1 for a rule about one class or kind),
+/// how much it says (specificity), its sheet's place, its place in its sheet, and 1 if it's about the element alone.
+const PLAN_COLUMNS = 5;
+const PLAN_AT = 0;
+const PLAN_WEIGHT = 1;
+const PLAN_RANK = 2;
+const PLAN_ORDER = 3;
+const PLAN_SELF = 4;
 function planOf(index, rules, own, classes) {
     let byClasses = plansOf.get(index);
-    // What's said about one class or kind of element is in them, which can have changed when the rest hasn't.
-    if (byClasses !== undefined && index.plannedAt !== version) {
-        if (RESTYLE_ENV.log) logRestylePlanActivity(index.plannedAt, false);
-        byClasses = undefined;
-    }
-    index.plannedAt = version;
     if (byClasses === undefined) {
         byClasses = new WeakMap();
         plansOf.set(index, byClasses);
@@ -7270,85 +7416,306 @@ function planOf(index, rules, own, classes) {
     }
     const kind = (classes ? 'c' : '') + (own.tag ?? '') + '#' + (own.id ?? '');
     let plan = byKind.get(kind);
+    let kept = false;
+    if (plan === undefined && index.before !== undefined) {
+        plan = keptPlan(index, rules, own, kind);
+        if (plan !== undefined) {
+            kept = true;
+            byKind.set(kind, plan);
+        }
+    }
+    if (plan !== undefined && plan.checkedAt !== version) {
+        // What's said about one class or kind of element is in it, which can have changed when the rest hasn't.
+        if (planStill(plan)) {
+            plan.checkedAt = version;
+        } else {
+            if (RESTYLE_ENV.log) logRestylePlanActivity(plan.checkedAt, false);
+            plan = undefined;
+        }
+    }
     if (plan === undefined) {
         if (RESTYLE_ENV.log) logRestylePlanActivity(null, classes);
-        const keys = ['*'];
-        if (own.id !== undefined && own.id !== null) {
-            keys.push('#' + own.id);
+        plan = STYLED_ENV.js ? madePlan(index, rules, own, classes) : madePlanInRust(index, rules, own, classes);
+        if (STYLED_ENV.check && !STYLED_ENV.js) {
+            planCheck(plan, madePlan(index, rules, own, classes), own);
         }
-        for (const name of own.classes) {
-            keys.push('.' + name);
-        }
-        if (own.tag !== null && own.tag !== undefined) {
-            keys.push(own.tag);
-        }
-        const rank = sheetRanks();
-        const items = [];
-        for (const at of new Set(candidates(index.last, keys))) {
-            const rule = rules[at];
-            items.push({ rule, at, weight: (rule.weight ??= specificity(rule.steps)), rank: rank.get(rule.sheet) ?? -1, order: rule.order ?? -1, self: selfReads(rule) !== null });
-        }
-        if (classes) {
-            const seen = new Set();
-            for (const name of own.classes) {
-                if (seen.has(name) || madeClasses.has(name)) {
-                    continue;
-                }
-                seen.add(name);
-                for (const entry of rulesIn('classes', name) ?? []) {
-                    items.push({ rule: classRule(entry), at: -1, weight: 100, rank: rank.get(entry.sheet) ?? -1, order: entry.at, self: true });
-                }
-            }
-        }
-        // What's said about the kind of element is under everything else, unless a rule about more says no more than it does, as
-        // `:where(ul) li` doesn't: then it's put in order with that, again, so that the later of the two goes over the other.
-        if (items.some((item) => item.at >= 0 && item.weight <= 1)) {
-            for (const [tag, weight] of [['*', 0], [own.tag, 1]]) {
-                for (const entry of (tag === null || tag === undefined ? null : rulesIn('tagRules', tag)) ?? []) {
-                    items.push({ rule: tagRule(entry), at: -1, weight, rank: rank.get(entry.sheet) ?? -1, order: entry.at, self: true });
-                }
-            }
-        }
-        // A sort that keeps the order of those it can't tell apart, which is the order the rules were found in.
-        items.sort((x, y) => x.weight - y.weight || x.rank - y.rank || x.order - y.order);
-        const reads = new Set();
-        let others = false;
-        let split = items.length;
-        items.forEach((item, slot) => {
-            if (item.weight > 100 && split === items.length) {
-                split = slot;
-            }
-            if (!item.self) {
-                others = true;
-            } else if (item.at >= 0) {
-                selfReads(item.rule).forEach((name) => reads.add(name));
-            }
-        });
-        // Candidate entries repeat for every class combination. Keep references and dense numeric columns, rather than
-        // one six-property JavaScript object per candidate. The sort's temporary entries are not retained by the plan.
-        plan = {
-            items: items.map((item) => item.rule),
-            at: Float64Array.from(items, (item) => item.at),
-            weight: Float64Array.from(items, (item) => item.weight),
-            rank: Float64Array.from(items, (item) => item.rank),
-            order: Float64Array.from(items, (item) => item.order),
-            self: Uint8Array.from(items, (item) => item.self ? 1 : 0),
-            split,
-            reads: [...reads],
-            others,
-            results: new Map(),
-            apart: [itemsApart(items.slice(0, split)), itemsApart(items.slice(split))],
-        };
         byKind.set(kind, plan);
+    } else if (kept && STYLED_ENV.check) {
+        // `RSUI_CASCADE_CHECK`: a plan taken from the index before, against one made now.
+        planCheck(plan, madePlan(index, rules, own, classes), own);
     }
     return plan;
 }
 
-/// A rule about one class, as an item of a plan, with what it says worked out as everything else is.
+/// A plan, worked out here: see `planOf`.
+function madePlan(index, rules, own, classes) {
+    const keys = ['*'];
+    if (own.id !== undefined && own.id !== null) {
+        keys.push('#' + own.id);
+    }
+    for (const name of own.classes) {
+        keys.push('.' + name);
+    }
+    if (own.tag !== null && own.tag !== undefined) {
+        keys.push(own.tag);
+    }
+    const rank = sheetRanks();
+    const items = [];
+    // What it's made from apart from the page's rules, which are the index's: see `planStill`.
+    const from = { shape: sheetsShape, made: madeClasses.size, lists: [], remade: 0 };
+    for (const at of new Set(candidates(index.last, keys))) {
+        const rule = rules[at];
+        items.push({ rule, at, weight: (rule.weight ??= specificity(rule.steps)), rank: rank.get(rule.sheet) ?? -1, order: rule.order ?? -1, self: selfReads(rule) !== null });
+    }
+    if (classes) {
+        const seen = new Set();
+        for (const name of own.classes) {
+            if (seen.has(name) || madeClasses.has(name)) {
+                continue;
+            }
+            seen.add(name);
+            const list = rulesIn('classes', name);
+            from.lists.push('classes', name, list);
+            for (const entry of list ?? []) {
+                items.push({ rule: classRule(entry), at: -1, weight: 100, rank: rank.get(entry.sheet) ?? -1, order: entry.at, self: true });
+            }
+        }
+    }
+    // What's said about the kind of element is under everything else, unless a rule about more says no more than it does, as
+    // `:where(ul) li` doesn't: then it's put in order with that, again, so that the later of the two goes over the other.
+    if (items.some((item) => item.at >= 0 && item.weight <= 1)) {
+        for (const [tag, weight] of [['*', 0], [own.tag, 1]]) {
+            const list = tag === null || tag === undefined ? null : rulesIn('tagRules', tag);
+            if (list !== null) {
+                from.lists.push('tagRules', tag, list);
+            }
+            for (const entry of list ?? []) {
+                items.push({ rule: tagRule(entry), at: -1, weight, rank: rank.get(entry.sheet) ?? -1, order: entry.at, self: true });
+            }
+        }
+    }
+    from.remade = remadeIn(from.lists);
+    // A sort that keeps the order of those it can't tell apart, which is the order the rules were found in.
+    items.sort((x, y) => x.weight - y.weight || x.rank - y.rank || x.order - y.order);
+    const reads = new Set();
+    let others = false;
+    let split = items.length;
+    items.forEach((item, slot) => {
+        if (item.weight > 100 && split === items.length) {
+            split = slot;
+        }
+        if (!item.self) {
+            others = true;
+        } else if (item.at >= 0) {
+            selfReads(item.rule).forEach((name) => reads.add(name));
+        }
+    });
+    // Candidate entries repeat for every class combination. Keep references and one dense array of numbers, `PLAN_COLUMNS`
+    // to an item, rather than one six-property JavaScript object per candidate, or an array for each column, as every plan
+    // is kept while it's what it would be made as. The sort's temporary entries are not retained by the plan.
+    const columns = new Float64Array(items.length * PLAN_COLUMNS);
+    items.forEach((item, slot) => {
+        columns.set([item.at, item.weight, item.rank, item.order, item.self ? 1 : 0], slot * PLAN_COLUMNS);
+    });
+    return {
+        items: items.map((item) => item.rule),
+        columns,
+        split,
+        reads: [...reads],
+        others,
+        results: new Map(),
+        apart: [itemsApart(items.slice(0, split)), itemsApart(items.slice(split))],
+        from,
+        checkedAt: version,
+    };
+}
+
+/// A plan, as `madePlan` makes it, with what's found put in the cascade's order, and looked at for what goes on apart, in Rust
+/// (`plans.rs`): what's handed over is numbers, each rule's place, what it says (`saidIdOf`), how much, its sheet's place and its
+/// place in it, and whether it's about the element alone.
+function madePlanInRust(index, rules, own, classes) {
+    const keys = ['*'];
+    if (own.id !== undefined && own.id !== null) {
+        keys.push('#' + own.id);
+    }
+    for (const name of own.classes) {
+        keys.push('.' + name);
+    }
+    if (own.tag !== null && own.tag !== undefined) {
+        keys.push(own.tag);
+    }
+    const rank = sheetRanks();
+    const from = { shape: sheetsShape, made: madeClasses.size, lists: [], remade: 0 };
+    const found = [];
+    planGiven ??= new Float64Array(6 * 256);
+    planSources ??= new Float64Array(256);
+    let given = planGiven;
+    const give = (rule, at, weight, sheetRank, order, alone) => {
+        const slot = found.length * 6;
+        if (slot + 6 > given.length) {
+            const more = new Float64Array(given.length * 2);
+            more.set(given);
+            given = planGiven = more;
+        }
+        given[slot] = at;
+        given[slot + 1] = saidIdOf(rule);
+        given[slot + 2] = weight;
+        given[slot + 3] = sheetRank;
+        given[slot + 4] = order;
+        given[slot + 5] = alone ? 1 : 0;
+        found.push(rule);
+    };
+    let low = false;
+    for (const at of new Set(candidates(index.last, keys))) {
+        const rule = rules[at];
+        const weight = (rule.weight ??= specificity(rule.steps));
+        low ||= weight <= 1;
+        give(rule, at, weight, rank.get(rule.sheet) ?? -1, rule.order ?? -1, selfReads(rule) !== null);
+    }
+    if (classes) {
+        const seen = new Set();
+        for (const name of own.classes) {
+            if (seen.has(name) || madeClasses.has(name)) {
+                continue;
+            }
+            seen.add(name);
+            const list = rulesIn('classes', name);
+            from.lists.push('classes', name, list);
+            for (const entry of list ?? []) {
+                give(classRule(entry), -1, 100, rank.get(entry.sheet) ?? -1, entry.at, true);
+            }
+        }
+    }
+    // What's said about the kind of element goes in too where a rule about more says no more than it does: see `madePlan`.
+    if (low) {
+        for (const [tag, weight] of [['*', 0], [own.tag, 1]]) {
+            const list = tag === null || tag === undefined ? null : rulesIn('tagRules', tag);
+            if (list !== null) {
+                from.lists.push('tagRules', tag, list);
+            }
+            for (const entry of list ?? []) {
+                give(tagRule(entry), -1, weight, rank.get(entry.sheet) ?? -1, entry.at, true);
+            }
+        }
+    }
+    from.remade = remadeIn(from.lists);
+    const size = found.length;
+    const columns = new Float64Array(size * PLAN_COLUMNS);
+    if (planSources.length < size) {
+        planSources = new Float64Array(Math.max(size, planSources.length * 2));
+    }
+    const sources = planSources;
+    const shape = natives.cssPlanMake(size, given, columns, sources);
+    const items = new Array(size);
+    const reads = new Set();
+    for (let slot = 0; slot < size; slot += 1) {
+        const rule = found[sources[slot]];
+        items[slot] = rule;
+        if (columns[slot * PLAN_COLUMNS + PLAN_AT] >= 0 && columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
+            for (const name of selfReads(rule)) {
+                reads.add(name);
+            }
+        }
+    }
+    return {
+        items,
+        columns,
+        split: shape >> 3,
+        reads: [...reads],
+        others: (shape & 4) !== 0,
+        results: new Map(),
+        apart: [(shape & 2) !== 0, (shape & 1) !== 0],
+        from,
+        checkedAt: version,
+    };
+}
+/// What `madePlanInRust` hands over, and where it's told each item came from, made again only when a plan has more items, and
+/// made the first time a plan is, as a page with no rules about more than one class, as `bench/long-list` is, makes none.
+let planGiven = null;
+let planSources = null;
+
+/// The number Rust knows what a rule says by, as `itemsApart` looks at it: the props it sets, or the part it's about, and which
+/// of them are `!important`. It's kept on the rule, as its `weight` is, and found again once its props are another object.
+function saidIdOf(rule) {
+    if (rule.saidFrom !== rule.props) {
+        const said = rule.part === null ? Object.keys(rule.props).filter((key) => key !== '__important') : ['::' + rule.part];
+        const important = rule.part === null ? rule.props.__important ?? [] : [];
+        rule.saidId = natives.cssPlanSaid(said, important);
+        rule.saidFrom = rule.props;
+    }
+    return rule.saidId;
+}
+
+/// `RSUI_CASCADE_CHECK`: what a plan made with Rust comes to, against what it comes to made here, said where they differ.
+function planCheck(rust, js, own) {
+    const where = () => (own.tag ?? '?') + '.' + own.classes.slice(0, 4).join('.');
+    const differs = [];
+    if (rust.items.length !== js.items.length || rust.items.some((item, at) => item !== js.items[at])) {
+        differs.push('items ' + rust.items.length + ' vs ' + js.items.length);
+    } else if (rust.columns.some((value, at) => value !== js.columns[at])) {
+        differs.push('columns');
+    }
+    if (rust.split !== js.split) differs.push('split ' + rust.split + ' vs ' + js.split);
+    if (rust.others !== js.others) differs.push('others');
+    if (rust.apart[0] !== js.apart[0] || rust.apart[1] !== js.apart[1]) differs.push('apart ' + rust.apart + ' vs ' + js.apart);
+    if (rust.reads.join(',') !== js.reads.join(',')) differs.push('reads ' + rust.reads + ' vs ' + js.reads);
+    if (rust.from.lists.length !== js.from.lists.length || rust.from.lists.some((one, at) => one !== js.from.lists[at]) || rust.from.remade !== js.from.remade) {
+        differs.push('from');
+    }
+    if (differs.length > 0) {
+        console.error('rsui cascade check: plan for ' + where() + ': ' + differs.join(', '));
+    }
+}
+
+/// Whether a plan made before what CSS says last changed is still what it would be made as now: the sheets are in the same order,
+/// no class has been made up for a styled component, the lists of rules about its classes and its kind are the same lists, and
+/// what each of their rules says is the same object, as nothing it read is different (see `classRule` and `remadeIn`). The page's rules are
+/// the index's, which is another index once they change: see `pageOwners`.
+function planStill(plan) {
+    const from = plan.from;
+    if (from.shape !== sheetsShape || from.made !== madeClasses.size) {
+        return false;
+    }
+    for (let at = 0; at < from.lists.length; at += 3) {
+        if (rulesIn(from.lists[at], from.lists[at + 1]) !== from.lists[at + 2]) {
+            return false;
+        }
+    }
+    return remadeIn(from.lists) === from.remade;
+}
+
+/// How many times, in all, what the rules in a plan's lists say has been worked out again since it was first, which is more than
+/// it was once any of them is different (see `classRule`). Each is worked out as it is now first, as a plan's items are.
+function remadeIn(lists) {
+    let remade = 0;
+    for (let at = 0; at < lists.length; at += 3) {
+        for (const entry of lists[at + 2] ?? []) {
+            if (lists[at] === 'tagRules') {
+                tagRule(entry);
+            } else {
+                classRule(entry);
+            }
+            remade += entry.remade ?? 0;
+        }
+    }
+    return remade;
+}
+
+/// A rule about one class, as an item of a plan, with what it says worked out as everything else is. It's the same object for as
+/// long as nothing it read is different (see `readsStill`), so that a plan with it in it still is what it was.
 function classRule(entry) {
     if (entry.declaredAt !== version) {
         entry.declaredAt = version;
-        entry.rule = { steps: null, part: null, props: lookFrom(entry.declarations) };
+        if (entry.rule === undefined || !readsStill(entry.reads)) {
+            if (entry.rule !== undefined) {
+                entry.remade = (entry.remade ?? 0) + 1;
+            }
+            entry.reads = newReads();
+            // Its sheet, as a page's rule has it, for where it goes to be found again (see `keptPlan`).
+            entry.rule = { steps: null, part: null, props: readingInto(entry.reads, () => lookFrom(entry.declarations)), sheet: entry.sheet };
+        } else if (RESTYLE_ENV.check) {
+            keptCheck('a class rule', entry.rule.props, () => lookFrom(entry.declarations));
+        }
     }
     return entry.rule;
 }
@@ -7397,16 +7764,16 @@ function selfResults(plan, owner, own) {
         const fits = [];
         let needs = 0;
         plan.items.forEach((rule, slot) => {
-            if (!plan.self[slot]) {
+            if (!plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
                 fits.push(false);
                 return;
             }
-            const fit = plan.at[slot] < 0 || ruleMatches(rule.steps, owner.above, own, owner.page);
+            const fit = plan.columns[slot * PLAN_COLUMNS + PLAN_AT] < 0 || ruleMatches(rule.steps, owner.above, own, owner.page);
             fits.push(fit);
             if (fit) {
                 putOn(rule, halves[slot < plan.split ? 0 : 1].look, halves[slot < plan.split ? 0 : 1].parts);
             }
-            if (plan.at[slot] >= 0) {
+            if (plan.columns[slot * PLAN_COLUMNS + PLAN_AT] >= 0) {
                 needs |= stateNeeds(rule, owner, own, fit);
             }
         });
@@ -7448,9 +7815,20 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
     }
     const self = plan.items.length === 0 ? null : selfResults(plan, owner, own);
     let needs = self?.needs ?? 0;
+    // Whether each of the rules about more than the element itself is about it, found in Rust all at once: see `matchedInRust`.
+    const codes = plan.others && !STYLED_ENV.js ? matchedInRust(plan, owner, own) : null;
+    // What Rust found, apart from what's for here to work out, cares about states as `ruleOnSaid` would say, all together, so
+    // only the rules that are about it and those to work out here are gone through, but for `RSUI_CASCADE_CHECK`, which looks
+    // at each.
+    const said = codes !== null && !STYLED_ENV.check;
+    if (said) {
+        needs |= matchedNeeds;
+    }
     if (byAttribute === null) {
-        for (const half of [0, 1]) {
-            const [from, to] = half === 0 ? [0, plan.split] : [plan.split, plan.items.length];
+        const lastSelf = (plan.lastSelf ??= lastSelfOf(plan));
+        for (let half = 0; half < 2; half += 1) {
+            const from = half === 0 ? 0 : plan.split;
+            const to = half === 0 ? plan.split : plan.items.length;
             if (plan.apart[half]) {
                 // What's about it alone first, all together, and then the rest, as nothing they say is said again after.
                 if (self !== null) {
@@ -7460,16 +7838,20 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
                     mergeParts(parts, self.halves[half].parts);
                 }
                 // What comes after all of what's about it alone is in the cascade's order after it.
-                let lastSelf = from - 1;
                 for (let slot = from; slot < to; slot += 1) {
-                    if (plan.self[slot]) {
-                        lastSelf = slot;
+                    if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
+                        continue;
                     }
-                }
-                for (let slot = from; slot < to; slot += 1) {
-                    if (!plan.self[slot]) {
-                        mergeInOrder = slot > lastSelf;
-                        needs |= ruleOn(plan.items[slot], owner, own, look, parts);
+                    if (said) {
+                        const code = codes[slot];
+                        if (code === 1 || code === 3) {
+                            mergeInOrder = slot > lastSelf[half];
+                            needs |= code === 1 ? saidOn(plan.items[slot], look, parts) : ruleOn(plan.items[slot], owner, own, look, parts);
+                            mergeInOrder = false;
+                        }
+                    } else {
+                        mergeInOrder = slot > lastSelf[half];
+                        needs |= codes === null ? ruleOn(plan.items[slot], owner, own, look, parts) : ruleOnSaid(codes[slot], plan.items[slot], owner, own, look, parts);
                         mergeInOrder = false;
                     }
                 }
@@ -7477,14 +7859,21 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
                 mergeInOrder = true;
                 for (let slot = from; slot < to; slot += 1) {
                     const item = plan.items[slot];
-                    if (plan.self[slot]) {
+                    if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
                         if (self.fits[slot]) {
-                            mergeWeight = plan.weight[slot];
+                            mergeWeight = plan.columns[slot * PLAN_COLUMNS + PLAN_WEIGHT];
                             putOn(item, look, parts);
                             mergeWeight = Infinity;
                         }
+                    } else if (said) {
+                        const code = codes[slot];
+                        if (code === 1) {
+                            saidOn(item, look, parts);
+                        } else if (code === 3) {
+                            needs |= ruleOn(item, owner, own, look, parts);
+                        }
                     } else {
-                        needs |= ruleOn(item, owner, own, look, parts);
+                        needs |= codes === null ? ruleOn(item, owner, own, look, parts) : ruleOnSaid(codes[slot], item, owner, own, look, parts);
                     }
                 }
                 mergeInOrder = false;
@@ -7493,60 +7882,441 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
                 between?.();
             }
         }
+        giveCodesBack(codes);
         return needs;
     }
     // With rules found by an attribute too, everything in order, with what's about the element alone as it was found.
     const extra = [...new Set(byAttribute)].map((at) => ({ rule: rules[at], weight: (rules[at].weight ??= specificity(rules[at].steps)), at }));
     extra.sort((x, y) => x.weight - y.weight || x.at - y.at);
-    let slot = 0;
-    let more = 0;
+    // Whether each is about it, found in Rust as a plan's are.
+    const extraCodes = STYLED_ENV.js ? null : extraMatchedInRust(extra, owner, own);
+    if (extraCodes !== null && !STYLED_ENV.check) {
+        needs |= matchedNeeds;
+    }
+    const order = orderWith(plan, extra);
+    const together = self === null ? NOT_TOGETHER : order.together;
+    if (STYLED_ENV.check && (together[0] || together[1])) {
+        // `RSUI_CASCADE_CHECK`: each of what's about it alone put on in turn, as it was, against all of it together. What's
+        // between (`passedOn`) puts things on this look itself, so it's done the first way, kept, and put back as it was.
+        const before = { ...look };
+        const partsBefore = { ...parts };
+        const one = inOrderOn(plan, self, NOT_TOGETHER, order.all, codes, extra, extraCodes, owner, own, look, parts, between) | needs;
+        const oneWay = { ...look };
+        const onePartsWay = { ...parts };
+        putBack(look, before);
+        putBack(parts, partsBefore);
+        const all = inOrderOn(plan, self, together, order.rest, codes, extra, extraCodes, owner, own, look, parts, between) | needs;
+        togetherCheck(oneWay, look, onePartsWay, parts, one, all, own);
+        needs = all;
+    } else {
+        needs |= inOrderOn(plan, self, together, self === null ? order.all : order.rest, codes, extra, extraCodes, owner, own, look, parts, between);
+    }
+    giveCodesBack(codes);
+    if (extraCodes !== null) {
+        extraCodesKept = extraCodes;
+    }
+    return needs;
+}
+
+/// Neither half of what's about an element alone put on together: see `orderWith`.
+const NOT_TOGETHER = [false, false];
+
+/// Where `between` goes in an order `orderWith` makes, where what says more than one class does starts.
+const BETWEEN = -0x40000000;
+
+/// A plan's rules and those found by an attribute, put on in the cascade's order (`order`, from `orderWith`), with `between`
+/// done between what says no more than one class does and what says more. Where `together` says so for a half, what's about the
+/// element alone in it is put on all at once, first, as `selfResults` put it together, and isn't in the order: shadcn has
+/// rules found by an attribute for about half of its elements, which each have twenty or so rules about them alone (its
+/// utility classes), and putting those on one at a time, and finding the order for each element, was most of what those
+/// elements took.
+function inOrderOn(plan, self, together, order, codes, extra, extraCodes, owner, own, look, parts, between) {
+    let needs = 0;
     let betweenDone = false;
     // Each goes in in the cascade's order, so what's said later goes over what waits for a variable before it, whatever it says
     // about, as sonner's `@media (max-width: 600px) { [data-sonner-toaster] { width: 100% } }` does over its
     // `[data-sonner-toaster] { width: var(--width) }`.
     mergeInOrder = true;
-    while (slot < plan.items.length || more < extra.length) {
-        const takeItem = more >= extra.length || (slot < plan.items.length && cascadeBefore(plan, slot, extra[more]));
-        const weight = takeItem ? plan.weight[slot] : extra[more].weight;
-        if (!betweenDone && weight > 100) {
-            betweenDone = true;
-            between?.();
-        }
-        if (takeItem) {
+    if (together[0]) {
+        mergeLook(look, self.halves[0].look);
+        mergeParts(parts, self.halves[0].parts);
+    }
+    for (let at = 0; at < order.length; at += 1) {
+        const slot = order[at];
+        if (slot >= 0) {
             const item = plan.items[slot];
-            if (plan.self[slot]) {
+            if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
                 if (self.fits[slot]) {
-                    mergeWeight = plan.weight[slot];
+                    mergeWeight = plan.columns[slot * PLAN_COLUMNS + PLAN_WEIGHT];
                     putOn(item, look, parts);
                     mergeWeight = Infinity;
                 }
-            } else {
+            } else if (codes === null) {
+                needs |= ruleOn(item, owner, own, look, parts);
+            } else if (STYLED_ENV.check) {
+                needs |= ruleOnSaid(codes[slot], item, owner, own, look, parts);
+            } else if (codes[slot] === 1) {
+                saidOn(item, look, parts);
+            } else if (codes[slot] === 3) {
                 needs |= ruleOn(item, owner, own, look, parts);
             }
-            slot += 1;
+        } else if (slot === BETWEEN) {
+            betweenDone = true;
+            between?.();
+            if (together[1]) {
+                mergeLook(look, self.halves[1].look);
+                mergeParts(parts, self.halves[1].parts);
+            }
         } else {
-            needs |= ruleOn(extra[more].rule, owner, own, look, parts);
-            more += 1;
+            const more = -1 - slot;
+            if (extraCodes === null) {
+                needs |= ruleOn(extra[more].rule, owner, own, look, parts);
+            } else if (STYLED_ENV.check) {
+                needs |= ruleOnSaid(extraCodes[more], extra[more].rule, owner, own, look, parts);
+            } else if (extraCodes[more] === 1) {
+                saidOn(extra[more].rule, look, parts);
+            } else if (extraCodes[more] === 3) {
+                needs |= ruleOn(extra[more].rule, owner, own, look, parts);
+            }
         }
     }
     mergeInOrder = false;
     if (!betweenDone) {
         between?.();
+        if (together[1]) {
+            mergeInOrder = true;
+            mergeLook(look, self.halves[1].look);
+            mergeParts(parts, self.halves[1].parts);
+            mergeInOrder = false;
+        }
     }
     return needs;
 }
 
+/// The order a plan's rules and these rules found by an attribute are put on in for an element (`all`, as slots of the plan from
+/// 0, and of `extra` as -1 - its place, with `BETWEEN` before the first that says more than one class does, if any does), and
+/// whether, for each half, what's about the element alone can be put on all together, first (`together`), with that order
+/// without those (`rest`). It can where, as `itemsApart` says of a plan alone, nothing else in that half (the plan's rules about
+/// more than the element, and these) says what one about it alone after it says (see `selfLasts`). Kept on the plan for each
+/// list of rules found by an attribute, as which an element has depends only on the names of what it's given.
+function orderWith(plan, extra) {
+    let key = '';
+    for (const one of extra) {
+        key += one.at + ',';
+    }
+    const kept = (plan.together ??= new Map());
+    let found = kept.get(key);
+    if (found === undefined) {
+        const lasts = selfLasts(plan);
+        const together = [lasts.together[0], lasts.together[1]];
+        // Each of `extra` goes in before the first of the plan's slots that isn't before it in the cascade's order.
+        const at = new Int32Array(extra.length);
+        let slot = 0;
+        extra.forEach((one, more) => {
+            while (slot < plan.items.length && cascadeBefore(plan, slot, one)) {
+                slot += 1;
+            }
+            at[more] = slot;
+            const half = one.weight > 100 ? 1 : 0;
+            if (together[half] && saidAgain(saysOf(one.rule), lasts, half, slot)) {
+                together[half] = false;
+            }
+        });
+        const all = [];
+        const rest = [];
+        let betweenDone = false;
+        for (let next = 0, more = 0; next < plan.items.length || more < extra.length;) {
+            const takeExtra = more < extra.length && at[more] <= next;
+            const weight = takeExtra ? extra[more].weight : plan.columns[next * PLAN_COLUMNS + PLAN_WEIGHT];
+            if (!betweenDone && weight > 100) {
+                betweenDone = true;
+                all.push(BETWEEN);
+                rest.push(BETWEEN);
+            }
+            if (takeExtra) {
+                all.push(-1 - more);
+                rest.push(-1 - more);
+                more += 1;
+            } else {
+                all.push(next);
+                if (!(plan.columns[next * PLAN_COLUMNS + PLAN_SELF] && together[next < plan.split ? 0 : 1])) {
+                    rest.push(next);
+                }
+                next += 1;
+            }
+        }
+        found = { together, all: Int32Array.from(all), rest: Int32Array.from(rest) };
+        if (kept.size >= 256) {
+            kept.clear();
+        }
+        kept.set(key, found);
+    }
+    return found;
+}
+
+/// For each half of a plan, the last slot about the element alone that says each prop (and each that's `!important`), and
+/// whether its own rules about more than that say nothing one about it alone after them says. Kept on the plan.
+function selfLasts(plan) {
+    let lasts = plan.selfLasts;
+    if (lasts === undefined) {
+        lasts = { plain: [new Map(), new Map()], important: [new Map(), new Map()], together: [true, true] };
+        for (let slot = 0; slot < plan.items.length; slot += 1) {
+            if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
+                const half = slot < plan.split ? 0 : 1;
+                const says = saysOf(plan.items[slot]);
+                for (const one of says.keys) {
+                    lasts.plain[half].set(one, slot);
+                }
+                for (const one of says.important) {
+                    lasts.important[half].set(one, slot);
+                }
+            }
+        }
+        for (let slot = 0; slot < plan.items.length; slot += 1) {
+            const half = slot < plan.split ? 0 : 1;
+            if (!plan.columns[slot * PLAN_COLUMNS + PLAN_SELF] && saidAgain(saysOf(plan.items[slot]), lasts, half, slot + 1)) {
+                lasts.together[half] = false;
+            }
+        }
+        plan.selfLasts = lasts;
+    }
+    return lasts;
+}
+
+/// Whether something a rule says is said again by a rule about the element alone at `from` or after it in a half of a plan.
+function saidAgain(says, lasts, half, from) {
+    return says.keys.some((one) => ((says.important.includes(one) ? lasts.important : lasts.plain)[half].get(one) ?? -1) >= from);
+}
+
+/// What a rule says, for `orderWith`: its props, with what each that waits for a variable would set, or the part it's
+/// about, and which of them are `!important`. Kept on the rule, until its props are another object.
+function saysOf(rule) {
+    if (rule.saysFrom !== rule.props) {
+        const keys = [];
+        if (rule.part !== null) {
+            keys.push('::' + rule.part);
+        } else {
+            for (const key of Object.keys(rule.props)) {
+                if (key === '__important') {
+                    continue;
+                }
+                keys.push(key);
+                const said = rule.props[key];
+                if (key.startsWith('__var ') && said !== null && typeof said === 'object') {
+                    keys.push(...(said.keys ??= varKeys(key.slice(6), said.made)));
+                }
+            }
+        }
+        rule.says = { keys, important: rule.part === null ? rule.props.__important ?? [] : [] };
+        rule.saysFrom = rule.props;
+    }
+    return rule.says;
+}
+
+/// Makes an object have just what `was` has, in its order, for `RSUI_CASCADE_CHECK` to work something out again in it.
+function putBack(into, was) {
+    for (const key of Object.keys(into)) {
+        delete into[key];
+    }
+    Object.assign(into, was);
+}
+
+/// `RSUI_CASCADE_CHECK`: what an element's rules came to put on one at a time and with what's about it alone together, said where
+/// they differ. What waits for a variable and has all of what it sets said again after it is the same as not being there.
+function togetherCheck(oneLook, allLook, oneParts, allParts, oneNeeds, allNeeds, own) {
+    const shown = (look) => {
+        const out = {};
+        for (const key of Object.keys(look)) {
+            const said = look[key];
+            if (key.startsWith('__var ') && said !== null && typeof said === 'object' && said.keys !== undefined && said.over !== undefined
+                && said.keys.every((one) => said.over.includes(one))) {
+                continue;
+            }
+            out[key] = key.startsWith('__var ') && said !== null && typeof said === 'object' ? { ...said, over: undefined } : said;
+        }
+        return out;
+    };
+    const a = shown(oneLook);
+    const b = shown(allLook);
+    const differs = [];
+    for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+        const same = Object.is(a[key], b[key]) || JSON.stringify(a[key]) === JSON.stringify(b[key]);
+        if (!same) {
+            differs.push(key);
+        }
+    }
+    for (const name of new Set([...Object.keys(oneParts), ...Object.keys(allParts)])) {
+        if (JSON.stringify(oneParts[name]) !== JSON.stringify(allParts[name])) {
+            differs.push('::' + name);
+        }
+    }
+    if (oneNeeds !== allNeeds) {
+        differs.push('needs ' + oneNeeds + ' vs ' + allNeeds);
+    }
+    if (differs.length > 0) {
+        console.error('rsui cascade check: rules together for ' + (own.tag ?? '?') + '.' + own.classes.slice(0, 4).join('.') + ' differ in '
+            + differs.slice(0, 6).join(', '));
+    }
+}
+
+/// What Rust says of each rule found by an attribute for an element, as `matchedInRust` says of a plan's: each rule's selector
+/// is read in once, and what's handed over is made again for each element, as which of them it has varies with what it's given.
+function extraMatchedInRust(extra, owner, own) {
+    if (extraGiven === null || extraGiven.length < extra.length * 2) {
+        extraGiven = new Float64Array(Math.max(64, extra.length * 4));
+    }
+    const given = extraGiven;
+    extra.forEach(({ rule }, at) => {
+        rule.rustSelector ??= natives.cssSelector(rule.steps);
+        given[at * 2] = rule.rustSelector;
+        given[at * 2 + 1] = (rule.needs ??= needsOf(rule.steps[rule.steps.length - 1].pseudo));
+    });
+    let codes = extraCodesKept;
+    extraCodesKept = null;
+    if (codes === null || codes.length < extra.length) {
+        codes = new Uint8Array(Math.max(extra.length, 64));
+    }
+    matchedNeeds = natives.cssMatchItems(extra.length, given, own, owner.above, owner.page === undefined ? pageElement() : owner.page, version, flowLearnedCount, codes);
+    if (STYLED_ENV.check) {
+        matchedNeedsCheck(extra.map((one) => one.rule), codes, own);
+    }
+    return codes;
+}
+let extraGiven = null;
+let extraCodesKept = null;
+
+/// What Rust says of each of a plan's rules about more than an element itself, for it (`matching.rs`): 0 not about it, 1 about
+/// it, 2 not, but about it in a state it isn't in, 3 to be worked out here. Each rule's selector is read into Rust once, and
+/// the number it's kept by is on the rule (`-1` for one that's only matched here, as one with `+` or `:has()` is), and a plan
+/// keeps those of its rules, with which states each is about. What's said is in `matchCodes`, which is this call's until it
+/// gives it back, as another element can be worked out while it's used, as `:has()` can have one.
+function matchedInRust(plan, owner, own) {
+    let given = plan.rustMatch;
+    if (given === undefined) {
+        given = plan.rustMatch = new Float64Array(plan.items.length * 2);
+        plan.items.forEach((rule, slot) => {
+            if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
+                given[slot * 2] = -2;
+                return;
+            }
+            rule.rustSelector ??= natives.cssSelector(rule.steps);
+            given[slot * 2] = rule.rustSelector;
+            given[slot * 2 + 1] = (rule.needs ??= needsOf(rule.steps[rule.steps.length - 1].pseudo));
+        });
+        // What couldn't be about an element of this kind, by its tag, id and classes, isn't looked at for each element.
+        natives.cssMatchPlan(plan.items.length, given, own);
+    }
+    let codes = matchCodes;
+    matchCodes = null;
+    if (codes === null || codes.length < plan.items.length) {
+        codes = new Uint8Array(Math.max(plan.items.length, 256));
+    }
+    matchedNeeds = natives.cssMatchItems(plan.items.length, given, own, owner.above, owner.page === undefined ? pageElement() : owner.page, version, flowLearnedCount, codes);
+    if (STYLED_ENV.check) {
+        matchedNeedsCheck(plan.items.map((rule, slot) => (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF] ? null : rule)), codes, own);
+    }
+    return codes;
+}
+
+/// `RSUI_CASCADE_CHECK`: which states Rust said the rules it said of care about, all together, against what `ruleOnSaid` gives for
+/// each here (`null` for a slot that isn't one).
+function matchedNeedsCheck(rules, codes, own) {
+    let want = 0;
+    rules.forEach((rule, at) => {
+        const code = codes[at];
+        if (rule === null || code === 3) {
+            return;
+        }
+        const needs = (rule.needs ??= needsOf(rule.steps[rule.steps.length - 1].pseudo));
+        want |= code === 1 || code === 2 || ((own.state ?? 0) & needs) !== 0 ? needs : 0;
+    });
+    if (want !== matchedNeeds) {
+        console.error('rsui cascade check: states rules care about for ' + (own.tag ?? '?') + '.' + own.classes.slice(0, 4).join('.') + ': '
+            + matchedNeeds + ' in Rust and ' + want + ' here');
+    }
+}
+let matchCodes = null;
+/// Which states the rules the last `matchedInRust` or `extraMatchedInRust` said of care about, put together, as `ruleOnSaid` would
+/// give each, apart from those it said to work out here. It's to be read as soon as they give back.
+let matchedNeeds = 0;
+
+/// For each half of a plan, its last slot about the element alone, or one before the half for none.
+function lastSelfOf(plan) {
+    const out = [-1, plan.split - 1];
+    for (let slot = 0; slot < plan.items.length; slot += 1) {
+        if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
+            out[slot < plan.split ? 0 : 1] = slot;
+        }
+    }
+    return out;
+}
+
+/// What a rule Rust found is about the element says, put on, as `ruleOnSaid` does it.
+function saidOn(rule, look, parts) {
+    if (rule.part === null) {
+        mergeWeight = rule.weight ??= specificity(rule.steps);
+        mergeLook(look, rule.props);
+        mergeWeight = Infinity;
+    } else {
+        parts[rule.part] = { ...parts[rule.part], ...rule.props };
+    }
+    return 0;
+}
+function giveCodesBack(codes) {
+    if (codes !== null) {
+        matchCodes = codes;
+    }
+}
+
+/// `ruleOn`, with whether the rule's about the element said by Rust (`matchedInRust`), and `stateNeeds` from that.
+function ruleOnSaid(code, rule, owner, own, look, parts) {
+    if (code === 3) {
+        return ruleOn(rule, owner, own, look, parts);
+    }
+    const needs = (rule.needs ??= needsOf(rule.steps[rule.steps.length - 1].pseudo));
+    if (STYLED_ENV.check) {
+        matchCheck(code, rule, owner, own);
+    }
+    if (code === 1) {
+        if (rule.part === null) {
+            mergeWeight = rule.weight ??= specificity(rule.steps);
+            mergeLook(look, rule.props);
+            mergeWeight = Infinity;
+        } else {
+            parts[rule.part] = { ...parts[rule.part], ...rule.props };
+        }
+        return needs;
+    }
+    if (needs === 0 || ((own.state ?? 0) & needs) !== 0) {
+        return needs;
+    }
+    return code === 2 ? needs : 0;
+}
+
+/// `RSUI_CASCADE_CHECK`: what Rust said of a rule for an element, against what `ruleMatches` and `stateNeeds` say here.
+function matchCheck(code, rule, owner, own) {
+    const matched = ruleMatches(rule.steps, owner.above, own, owner.page);
+    const some = matched ? null : stateNeeds(rule, owner, own, false) !== 0;
+    const needs = rule.needs;
+    const rustSome = needs !== 0 && (((own.state ?? 0) & needs) !== 0 || code === 2);
+    if (matched !== (code === 1) || (!matched && some !== rustSome)) {
+        console.error('rsui cascade check: match for ' + (own.tag ?? '?') + '.' + own.classes.slice(0, 4).join('.') + ': rule '
+            + rule.steps.map((step) => keyOfStep(step) + (step.pseudo.length > 0 ? ':' + step.pseudo.map((one) => one.name).join(':') : '')).join(' ')
+            + ' is ' + code + ' in Rust and ' + (matched ? 1 : some ? 2 : 0) + ' here');
+    }
+}
+
 /// Whether an item of a plan comes before a rule found by an attribute, in the cascade's order.
 function cascadeBefore(plan, slot, other) {
-    if (plan.weight[slot] !== other.weight) {
-        return plan.weight[slot] < other.weight;
+    if (plan.columns[slot * PLAN_COLUMNS + PLAN_WEIGHT] !== other.weight) {
+        return plan.columns[slot * PLAN_COLUMNS + PLAN_WEIGHT] < other.weight;
     }
-    if (plan.at[slot] >= 0) {
-        return plan.at[slot] < other.at;
+    if (plan.columns[slot * PLAN_COLUMNS + PLAN_AT] >= 0) {
+        return plan.columns[slot * PLAN_COLUMNS + PLAN_AT] < other.at;
     }
     const rank = sheetRanks();
     const otherRank = rank.get(other.rule.sheet) ?? -1;
-    return plan.rank[slot] < otherRank || (plan.rank[slot] === otherRank && plan.order[slot] < (other.rule.order ?? -1));
+    return plan.columns[slot * PLAN_COLUMNS + PLAN_RANK] < otherRank || (plan.columns[slot * PLAN_COLUMNS + PLAN_RANK] === otherRank && plan.columns[slot * PLAN_COLUMNS + PLAN_ORDER] < (other.rule.order ?? -1));
 }
 
 /// Which of the last element `fromAbove` looked at's states rules about what's inside it or after it care about, as
@@ -7626,6 +8396,61 @@ function keyOfStep(step) {
     return step.tag ?? '*';
 }
 
+/// The lists of an index's steps that keep track of states, as `index.watched` has them, that something can be found by, as
+/// `keysOf` has it. A page has few of those keys and an element many, so each of them is looked for on the element, rather than
+/// making each element's keys, which comes to the same lists, each once: which order they're looked at in doesn't matter, as
+/// what each says is put together with `|`.
+function watchedOf(index, own) {
+    let keys = index.watchedKeys;
+    if (keys === undefined) {
+        keys = index.watchedKeys = [];
+        for (const [key, found] of index.watched) {
+            const kind = key === '*' ? 0 : key[0] === '#' ? 1 : key[0] === '.' ? 2 : key[0] === '[' ? 3 : 4;
+            const name = kind === 0 || kind === 4 ? key : key.slice(1);
+            keys.push(kind, kind === 3 ? (name === 'class' ? 'className' : name === 'for' ? 'htmlFor' : name) : name, found);
+        }
+    }
+    const out = [];
+    for (let at = 0; at < keys.length; at += 3) {
+        const kind = keys[at];
+        const name = keys[at + 1];
+        if (kind === 0 || (kind === 1 ? own.id !== undefined && own.id !== null && String(own.id) === name
+            : kind === 2 ? own.classes.includes(name)
+                : kind === 3 ? givenAsKey(own.props, name)
+                    : own.tag === name)) {
+            out.push(keys[at + 2]);
+        }
+    }
+    return out;
+}
+
+/// Whether something's given what a step's `[name` key is about, as `keysOf` finds it: by `for...in`, with `className` and
+/// `htmlFor` as `class` and `for`.
+function givenAsKey(props, name) {
+    if (props === undefined || props === null) {
+        return false;
+    }
+    const given = (one) => {
+        if (!(one in props)) {
+            return false;
+        }
+        for (let at = props; at !== null; at = Object.getPrototypeOf(at)) {
+            const said = Object.getOwnPropertyDescriptor(at, one);
+            if (said !== undefined) {
+                return said.enumerable === true;
+            }
+        }
+        return false;
+    };
+    if (name === 'class') {
+        return given('className') || given('class');
+    }
+    if (name === 'for') {
+        return given('htmlFor') || given('for');
+    }
+    return name !== 'className' && name !== 'htmlFor' && given(name);
+}
+
 /// What something can be found by, as `keyOfStep` has it, each once.
 function keysOf(own) {
     const keys = new Set(['*']);
@@ -7651,6 +8476,10 @@ function ruleIndex(rules) {
     let index = ruleIndexes.get(rules);
     if (index === undefined) {
         index = { last: new Map(), watched: new Map() };
+        if (rules === pageRuleList && pageIndexWas !== null) {
+            index.before = indexBefore(pageIndexWas, rules);
+            pageIndexWas = null;
+        }
         rules.forEach((rule, at) => {
             const key = keyOfStep(rule.steps[rule.steps.length - 1]);
             if (key.startsWith('[')) {
@@ -7676,6 +8505,79 @@ function ruleIndex(rules) {
         ruleIndexes.set(rules, index);
     }
     return index;
+}
+
+/// What a new index of the page's rules keeps of the one before (`was`, with the rules it had), for `keptPlan`: that index,
+/// and the keys of what's been added or taken out, which no plan taken from it may have. Nothing if too much changed. As a
+/// dialog opens, react-remove-scroll adds a `<style>` to the page (its rules in the middle of the page's, after its sheet)
+/// and takes it out as it closes, and every plan was made again each time, which was a third of what each element on a
+/// page that changed took.
+function indexBefore(was, rules) {
+    const now = new Set(rules);
+    const then = new Set(was.rules);
+    const changed = new Set();
+    let count = 0;
+    for (const [from, other] of [[was.rules, now], [rules, then]]) {
+        for (const rule of from) {
+            if (!other.has(rule)) {
+                count += 1;
+                changed.add(keyOfStep(rule.steps[rule.steps.length - 1]));
+            }
+        }
+    }
+    if (count > KEPT_PLANS_CHANGE) {
+        return undefined;
+    }
+    // Only a few indexes back are kept, as each keeps its plans.
+    let depth = 0;
+    for (let at = was.index; at !== undefined && at.before !== undefined;) {
+        depth += 1;
+        const next = at.before.index;
+        if (depth >= 3) {
+            at.before = undefined;
+        }
+        at = next;
+    }
+    return { index: was.index, changed };
+}
+
+/// A plan for something of this kind, with these classes and keys (as `madePlanInRust` finds its rules by), from an index of the
+/// page's rules before this one (see `indexBefore`), if none of the rules that are different since are under its keys: it's
+/// what it would be made as now, but for where its rules are in the page's and where their sheets are, which are worked out
+/// again. It's the new index's from then on, and is looked at as any plan is (`planStill`). Nothing if there's none.
+function keptPlan(index, rules, own, kind) {
+    const changed = new Set();
+    for (let before = index.before; before !== undefined; before = before.index.before) {
+        before.changed.forEach((key) => changed.add(key));
+        const byKind = plansOf.get(before.index)?.get(own.classes);
+        const plan = byKind?.get(kind);
+        if (plan === undefined) {
+            continue;
+        }
+        if (plan.from.shape !== sheetsShape || changed.has('*') || changed.has(own.tag ?? '') || (own.id != null && changed.has('#' + own.id))
+            || own.classes.some((name) => changed.has('.' + name))) {
+            return undefined;
+        }
+        const at = (index.at ??= new Map(rules.map((rule, place) => [rule, place])));
+        const rank = sheetRanks();
+        for (let slot = 0; slot < plan.items.length; slot += 1) {
+            const item = plan.items[slot];
+            if (plan.columns[slot * PLAN_COLUMNS + PLAN_AT] >= 0) {
+                const place = at.get(item);
+                if (place === undefined) {
+                    return undefined;
+                }
+                plan.columns[slot * PLAN_COLUMNS + PLAN_AT] = place;
+            }
+            plan.columns[slot * PLAN_COLUMNS + PLAN_RANK] = rank.get(item.sheet) ?? -1;
+        }
+        byKind.delete(kind);
+        // What's kept for elements with rules found by an attribute is by where those are in the page's rules.
+        plan.together = undefined;
+        plan.checkedAt = -1;
+        return plan;
+    }
+    return undefined;
 }
 
 /// Everything in an index under any of these keys, each once, as keys are.
@@ -20371,19 +21273,92 @@ function pageRules() {
     return now.complex;
 }
 
+/// What working out declarations is to note of what it reads: see `readsStill`.
+function newReads() {
+    return { all: declaredAll, rem: remSize, size: globalThis.__rsuiPageSize, viewport: false, values: null, element: null };
+}
+
+/// What `work` gives, with what it reads noted in `reads`.
+function readingInto(reads, work) {
+    const was = compileReads;
+    compileReads = reads;
+    try {
+        return work();
+    } finally {
+        compileReads = was;
+    }
+}
+
+/// Whether what declarations were worked out from is all as it was, so that what they came to still is: nothing's said that
+/// anything at all may have changed (`changed()`), a rem is as big, each page variable they read is the same, each variable a
+/// `var()` in them names is an element's or not as it was (see `declareBlock`), and the window's the same size if anything in
+/// them, or a variable they read, is in its units.
+function readsStill(reads) {
+    if (reads === undefined || reads.all !== declaredAll || reads.rem !== remSize) {
+        return false;
+    }
+    const size = globalThis.__rsuiPageSize;
+    if (reads.size !== size && reads.viewport && String(reads.size) !== String(size)) {
+        return false;
+    }
+    for (const [name, set] of reads.element ?? []) {
+        if (elementVariables.has(name) !== set) {
+            return false;
+        }
+    }
+    for (const [name, value] of reads.values ?? []) {
+        if (variableValueNow(name) !== value) {
+            return false;
+        }
+    }
+    // As it is at this size, whatever it read of the window.
+    reads.size = size;
+    return true;
+}
+
+/// `RSUI_RESTYLE_CHECK`'s look at what's kept because nothing it read is different: what it comes to worked out again, from
+/// nothing, which is said if it's different. `null` from `fresh` is something it can't be compared with.
+function keptCheck(what, kept, fresh) {
+    // What's noted on a field that waits for a variable once it's first used (`keys`, `names`) is left out.
+    const said = (value) => JSON.stringify(value, (key, one) => (key === '__hidden' || key === 'keys' || key === 'names' ? undefined : one));
+    const now = fresh();
+    if (now !== null && said(now) !== said(kept)) {
+        const [a, b] = [said(kept), said(now)];
+        let at = 0;
+        while (at < a.length && a[at] === b[at]) {
+            at += 1;
+        }
+        console.error('rsui restyle check: KEPT ' + what + ' that is different now, from ' + at + ': ' + a.slice(Math.max(0, at - 80), at + 120) + ' | ' + b.slice(Math.max(0, at - 80), at + 120));
+    }
+}
+
 /// What one sheet's rules that are only known as they're drawn come to. It's worked out once, and only what's been added to the
 /// sheet since is worked out after that, until what declarations come to changes, or the sheet's emptied.
 function sheetRules(one) {
     let made = one.compiled;
+    if (made !== undefined && made.declared !== declared && readsStill(made.reads)) {
+        // Nothing its rules read is different, so they're what they were, the same objects, and what was found from them, as the
+        // plans for each element (see `planOf`), still is: a window made bigger only changes what's in `vh`, and a modal that
+        // locks scrolling sets a variable that the page's own sheet doesn't read.
+        made.declared = declared;
+        if (RESTYLE_ENV.check) {
+            const nested = made.nested;
+            keptCheck('a sheet\'s rules', nested.map((rule) => rule.props), () => {
+                const fresh = compile(readCss(one.complex.slice(0, made.count).join('\n')), 16, false).nested;
+                fresh.sort((a, b) => (a.weight ??= specificity(a.steps)) - (b.weight ??= specificity(b.steps)));
+                return fresh.length === nested.length ? fresh.map((rule) => rule.props) : null;
+            });
+        }
+    }
     if (made === undefined || made.declared !== declared) {
         if (RESTYLE_ENV.log) console.error('rsui css sheet-reset: sheet=' + sheets.indexOf(one) + ' version=' + version
             + ' declared=' + (made?.declared ?? 'none') + '->' + declared + ' previous_count=' + (made?.count ?? 0)
             + ' previous_nested=' + (made?.nested.length ?? 0) + ' source_count=' + one.complex.length);
-        made = one.compiled = { declared, count: 0, nested: [] };
+        made = one.compiled = { declared, reads: newReads(), count: 0, nested: [] };
     }
     if (made.count < one.complex.length) {
         // In the order they're written, each the rule one of them is, to say where each is in the cascade, then in order.
-        const more = compile(readCss(one.complex.slice(made.count).join('\n')), 16, false).nested;
+        const more = readingInto(made.reads, () => compile(readCss(one.complex.slice(made.count).join('\n')), 16, false).nested);
         if (more.length === one.complex.length - made.count) {
             more.forEach((rule, at) => {
                 rule.sheet = one;

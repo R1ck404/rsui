@@ -182,6 +182,54 @@ impl Vm {
         self.set(object, name, value)
     }
 
+    /// Whether this is an object an object literal makes (or one with no prototype), rather than an array, a function or any
+    /// other kind, whose properties are all there is to it.
+    pub fn is_plain_object(&self, value: Value) -> bool {
+        if !value.is_object() {
+            return false;
+        }
+        let object = &self.objects[value.index()];
+        if !matches!(object.kind, Kind::Plain) {
+            return false;
+        }
+        let proto = self.shapes.proto_of(object.shape);
+        proto == self.realm.object_proto || proto == NONE
+    }
+
+    /// Takes a property out, as `delete object.name` does.
+    pub fn delete_property(&mut self, object: Value, name: Atom) -> Result<bool, Value> {
+        if !object.is_object() {
+            return Ok(true);
+        }
+        self.delete(object.handle(), name)
+    }
+
+    /// What a value is as the name of a property, as `object[key]` takes it: a symbol is its own.
+    pub fn property_atom(&mut self, key: Value) -> Result<Atom, Value> {
+        self.to_atom(key)
+    }
+
+    /// Puts a value on the end of an array, as `array.push(value)` does on one that's plain.
+    pub fn push_item(&mut self, array: Value, value: Value) -> Result<(), Value> {
+        if let Some(Kind::Array(items)) = array.is_object().then(|| &mut self.objects[array.index()].kind) {
+            items.push(value);
+            self.debt += 8;
+            return Ok(());
+        }
+        let push = self.intern_str("push");
+        let method = self.get(array, push)?;
+        self.call(method, array, &[value])?;
+        Ok(())
+    }
+
+    /// Keeps a value alive until this host function gives back, as one it made itself would be, for one it's taken from where
+    /// the program had it, as a property it's deleted, while it calls into JavaScript.
+    pub fn hold(&mut self, value: Value) {
+        if value.is_object() || value.is_string() || value.is_bigint() {
+            self.nursery.push(value);
+        }
+    }
+
     /// Calls a function. Whatever it gives back is safe until this comes back to the top, as it's on the list of what
     /// natives are holding, unless [`release_new_values`](Self::release_new_values) gets rid of it first.
     pub fn call_function(

@@ -262,6 +262,30 @@ pub(crate) struct ConstructorMemo {
 /// How many numbers' strings [`Vm::number_strings`] keeps, in one place each by the number's bits.
 pub(crate) const NUMBER_STRINGS: usize = 256;
 
+/// The strings [`Vm::number_strings`] keeps, which it reads and changes as the array they're in, and what Rust that reads, makes
+/// and fills objects many properties at a time remembers (see bulk.rs) beside them, in the same box. That's not about numbers;
+/// it's there so that `Vm` is laid out as it was. In a field of its own (136 bytes, or a box of 8 at its end) it moved what
+/// the interpreter reads of `Vm`, and js-bench's interpreter was 2% slower for it (prop_mono and prop_poly 7%, int_loop 6%),
+/// or with the box 14% (fib 40%), without running any of it.
+pub(crate) struct NumberStrings {
+    strings: [(u64, u32); NUMBER_STRINGS],
+    pub(crate) bulk: crate::bulk::Bulk,
+}
+
+impl std::ops::Deref for NumberStrings {
+    type Target = [(u64, u32); NUMBER_STRINGS];
+
+    fn deref(&self) -> &Self::Target {
+        &self.strings
+    }
+}
+
+impl std::ops::DerefMut for NumberStrings {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.strings
+    }
+}
+
 pub struct Vm {
     pub(crate) objects: crate::gc::Objects,
     pub(crate) free_objects: crate::gc::FreeSlots,
@@ -314,7 +338,7 @@ pub struct Vm {
     /// The strings numbers were last turned into, by the number's bits, so that text made of the same numbers over and
     /// over (a chart's labels and sizes, `'' + 1.2`) makes and formats each once between collections, which empty it,
     /// as what it names may be freed by then. See [`Vm::number_string`].
-    pub(crate) number_strings: Box<[(u64, u32); NUMBER_STRINGS]>,
+    pub(crate) number_strings: Box<NumberStrings>,
     /// Where the last few proxy handlers keep their traps, by the handler's shape and the trap's name: (shape, name,
     /// slot). A collection empties it, as a shape it names may be freed and its number given to another.
     pub(crate) trap_cache: [(u32, u32, u32); 4],
@@ -466,7 +490,7 @@ impl Vm {
             instance_of_cache: [InstanceOfCache::EMPTY; 8],
             char_strings: Vec::new(),
             regexp_input: (NONE, Vec::new()),
-            number_strings: Box::new([(0, NONE); NUMBER_STRINGS]),
+            number_strings: Box::new(NumberStrings { strings: [(0, NONE); NUMBER_STRINGS], bulk: crate::bulk::Bulk::default() }),
             trap_cache: [(NONE, 0, 0); 4],
             piece_cache: [(NONE, 0, 0, NONE); 8],
             match_shape: NONE,
@@ -578,7 +602,7 @@ impl Vm {
         crate::MemoryUse {
             objects,
             strings,
-            shapes: self.shapes.memory(),
+            shapes: self.shapes.memory() + self.number_strings.bulk.memory(),
             code: self.code_bytes(),
             stack: self.stack.capacity() * 8 + self.frames.capacity() * size_of::<Frame>(),
         }
