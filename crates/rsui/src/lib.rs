@@ -50,6 +50,7 @@ pub mod geometry;
 mod input;
 mod input_log;
 pub mod inspect;
+mod pill;
 mod marks;
 #[cfg(feature = "idle-probe")]
 mod native_cycles;

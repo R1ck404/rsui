@@ -36,6 +36,16 @@ pub(crate) struct Arena<T> {
 }
 
 impl<T> Arena<T> {
+    /// Where the first item is, which stays the same for as long as the list does.
+    pub(crate) fn base_ptr(&self) -> *const T {
+        self.base
+    }
+
+    /// Where the count of items is kept, for a sampler that reads it while this thread is stopped.
+    pub(crate) fn len_ptr(&self) -> *const usize {
+        &raw const self.len
+    }
+
     /// A list with room for this many items at most. Nothing but addresses is used until something's added.
     pub(crate) fn with_limit(reserved: usize) -> Self {
         Self::with_limit_at(reserved, 0)

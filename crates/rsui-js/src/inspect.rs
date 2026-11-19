@@ -87,7 +87,7 @@ impl Vm {
         found
     }
 
-    fn proto_origin(&self, proto_id: u32, pc: Option<u32>) -> Origin {
+    pub(crate) fn proto_origin(&self, proto_id: u32, pc: Option<u32>) -> Origin {
         let proto = &self.protos[proto_id as usize];
         let line = if proto.start == NOT_COMPILED {
             // It's never run, so all there is is where it starts.

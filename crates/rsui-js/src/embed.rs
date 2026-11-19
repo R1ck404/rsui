@@ -191,6 +191,7 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, Value> {
         let _split = rsui_alloc::split::enter(rsui_alloc::split::JS);
+        let _span = rsui_spans::span(rsui_spans::Kind::Script);
         self.call(function, this, args)
     }
 

@@ -30,6 +30,7 @@ alloc-owners = ["rsui/alloc-owners", "rsui-js/owners"]
 system-alloc = []
 
 [dependencies]
+rsui-spans = { path = "../rsui-spans" }
 rsui = { path = "../rsui" }
 rsui-agent = { path = "../rsui-agent" }
 rsui-js = { path = "../rsui-js" }

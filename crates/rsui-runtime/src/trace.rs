@@ -122,6 +122,27 @@ impl Tracer {
         render.took = took;
         render.own = took.saturating_sub(inside);
         render.changed = changed;
+        // Each render is a block of its own in the inspector's flame chart, with what it's called, whether it changed
+        // anything, and why it rendered.
+        if rsui_spans::wants(rsui_spans::Kind::Render) {
+            let label = render
+                .name
+                .as_ref()
+                .map_or(0, |name| rsui_spans::intern(name.as_str()));
+            let cause = match render.cause {
+                Cause::Mounted => 0,
+                Cause::Props => 1,
+                Cause::State => 2,
+            };
+            let start = rsui_spans::nanos(started);
+            rsui_spans::record(
+                rsui_spans::Kind::Render,
+                start,
+                start + took.as_nanos() as u64,
+                label,
+                cause | (u32::from(!changed) << 2),
+            );
+        }
         if let Some((_, outer)) = self.open.last_mut() {
             *outer += took;
         }

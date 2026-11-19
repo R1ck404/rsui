@@ -627,8 +627,20 @@ impl Runtime {
         let placeholder: HandlerFn = Box::new(|_, _| {});
         let mut run = std::mem::replace(&mut handlers[index].run, placeholder);
         let started = self.store.tracer.is_some().then(Instant::now);
+        let span = rsui_spans::span(rsui_spans::Kind::Handler);
         run(&mut Updates::new(&mut self.store), input.as_ref());
         self.store.instances[holder as usize].handlers[index].run = run;
+        if let Some(mut span) = span {
+            let note = self
+                .store
+                .tracer
+                .as_ref()
+                .and_then(|tracer| tracer.handler_note.as_deref());
+            span.label(&match note {
+                Some(note) => format!("{} on #{key}, {note}", action.name()),
+                None => format!("{} on #{key}", action.name()),
+            });
+        }
 
         let rejected = self.store.rejected.take();
         if let (Some(started), Some(tracer)) = (started, self.store.tracer.as_mut()) {
@@ -1183,6 +1195,7 @@ impl Runtime {
     }
 
     fn run_effects(&mut self) {
+        let _span = rsui_spans::span(rsui_spans::Kind::Effects);
         for cleanup in std::mem::take(&mut self.store.cleanups) {
             cleanup(&mut Updates::new(&mut self.store));
         }

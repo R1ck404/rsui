@@ -4202,6 +4202,14 @@ pub(crate) fn forget_what_ran() {
 }
 
 /// Works out what's written, as code at the top of a script, the way a browser's console does, and says what it came to.
+/// Does something with the app's engine, on its thread, unless it's in the middle of running the app's code.
+pub(crate) fn with_engine<R>(work: impl FnOnce(&mut Engine) -> R) -> Option<R> {
+    HOST.with(|host| {
+        let mut engine = host.engine.try_borrow_mut().ok()?;
+        Some(work(engine.as_mut()?))
+    })
+}
+
 pub(crate) fn evaluate(code: &str) -> Result<String, String> {
     let said = HOST.with(|host| {
         let Ok(mut engine) = host.engine.try_borrow_mut() else {

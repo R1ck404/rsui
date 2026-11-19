@@ -78,6 +78,36 @@ pub(crate) struct Recording {
     modifiers: Modifiers,
 }
 
+impl Input {
+    /// What it's called in a trace, as `buttonup`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Input::Move { .. } => "move",
+            Input::Leave => "leave",
+            Input::Down { .. } => "down",
+            Input::Up { .. } => "up",
+            Input::ButtonDown { .. } => "buttondown",
+            Input::ButtonUp { .. } => "buttonup",
+            Input::CancelPress => "cancel",
+            Input::Active(_) => "active",
+            Input::Shown(_) => "shown",
+            Input::Modifiers(_) => "held",
+            Input::Key(_) => "key",
+            Input::KeyUp(_) => "keyup",
+            Input::Text(_) => "text",
+            Input::Composition { .. } => "composition",
+            Input::Scroll { .. } => "scroll",
+            Input::ScrollPixels { .. } => "scrollpixels",
+            Input::Resize { .. } => "resize",
+            Input::Files { .. } => "files",
+            Input::DragFromOutside { .. } => "drag",
+            Input::DarkMode(_) => "dark",
+            Input::Access { .. } => "access",
+            Input::Close => "close",
+        }
+    }
+}
+
 impl App {
     /// Starts keeping what comes in through [`App::feed`], from now, with nothing kept before.
     pub fn record_inputs(&mut self) {
@@ -96,7 +126,14 @@ impl App {
     /// `*`s, so a trace never has one in it.
     pub fn feed(&mut self, input: &Input) -> Result<bool, DispatchError> {
         let _logged = crate::input_log::Span::new("phase-feed");
+        if self.pill_took(input) {
+            return Ok(true);
+        }
         let _split = rsui_alloc::split::enter(rsui_alloc::split::INPUT);
+        let _span = rsui_spans::span(rsui_spans::Kind::Input).map(|mut span| {
+            span.label(input.kind());
+            span
+        });
         let masked;
         let kept_input = if self.recording.is_some()
             && matches!(input, Input::Key(_) | Input::KeyUp(_) | Input::Text(_) | Input::Composition { .. })

@@ -1586,6 +1586,10 @@ impl TextEngine {
     /// infinity for no limit. This is the same as the size of [`layout`](Self::layout),
     /// without keeping the glyphs.
     pub fn measure(&mut self, text: &str, style: TextStyle, max_width: f32) -> Size {
+        let _span = rsui_spans::span(rsui_spans::Kind::Text).map(|mut span| {
+            span.arg(text.len() as u32);
+            span
+        });
         let max_width = self.balanced_width(text, style, max_width);
         self.prepare_font(style);
         let primary = self.primary(style);
@@ -1660,6 +1664,10 @@ impl TextEngine {
     /// Arranges text into lines, breaking them to stay within `max_width` if it can. Use
     /// infinity for no limit.
     pub fn layout(&mut self, text: &str, style: TextStyle, max_width: f32) -> TextLayout {
+        let _span = rsui_spans::span(rsui_spans::Kind::Text).map(|mut span| {
+            span.arg(text.len() as u32);
+            span
+        });
         let mut layout = TextLayout::default();
         self.layout_into(text, style, max_width, &mut layout);
         layout

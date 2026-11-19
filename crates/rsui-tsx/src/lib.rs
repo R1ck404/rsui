@@ -145,7 +145,14 @@ fn run_here(path: &Path, options: Options) -> Result<(), Error> {
         eprintln!("rsui-tsx: Windows wasn't told which app this is: {error}");
     }
     // Someone working on it can see what renders and why, and save it. Someone it's been handed to has no use for that.
-    rsui::allow_inspector(!rsui_js::running_packed() || rsui_js::packed_diagnostics());
+    let worked_on = !rsui_js::running_packed() || rsui_js::packed_diagnostics();
+    // The viewer is a tool, not something being worked on: it has no inspector of its own, nor the pill.
+    rsui::allow_inspector(worked_on && !trace_file::is_viewer());
+    if worked_on && !trace_file::is_viewer() {
+        // Where each frame's time goes is kept from the start, lightly, so it's there once something's been slow.
+        rsui::inspect::keep_spans_lightly();
+        rsui::inspect::set_opener(live::open_viewer);
+    }
     rsui::inspect::set_trace_saver(trace_file::save_beside_app);
     // The viewer can look at it while it runs, unless it's the viewer, which has nothing to look at in itself.
     if (!rsui_js::running_packed() || rsui_js::packed_diagnostics()) && !trace_file::is_viewer() {

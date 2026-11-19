@@ -3666,6 +3666,15 @@ unsafe fn open_a_window(
             let handle = handle;
             let _ = PostMessageW(Some(HWND(handle.0)), WAKE, WPARAM(0), LPARAM(0));
         });
+        // The first window of a program that's being worked on has the pill in its corner, and keeps where frames'
+        // time goes from the start.
+        if crate::inspect::inspector_allowed() {
+            crate::inspect::keep_spans_lightly();
+            static GIVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !options.modal && !GIVEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                app.set_pill(true);
+            }
+        }
         let disabled_owner = owner.filter(|_| options.modal);
         if let Some(owner) = disabled_owner {
             let _ = EnableWindow(owner, false);

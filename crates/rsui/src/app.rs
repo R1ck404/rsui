@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use rsui_core::{ActionKind, Element, IntoNode, Key, Node, Patch, PropValue, Role, Symbol, symbol};
 use rsui_layout::{HitRegion, Layout, Measure, Rect, Size, is_inert, is_paragraph, takes_pointer};
 use rsui_render::{
-    Color, Editing, EditingLines, Images, Interaction, Painter, RenderError, Renderer,
+    Color, Editing, EditingLines, Images, Interaction, Overlay, Painter, RenderError, Renderer,
     SCROLL_BAR_REACH, Scene, byte_from_mask, byte_in_mask, content_box, has_hover, has_pressed,
     input_indent, input_value, natural_shape_size, password_mask, scroll_for_thumb, scroll_thumb, text_line_count,
 };
@@ -34,6 +34,10 @@ mod interaction_tests;
 #[cfg(test)]
 #[path = "app_hit_cell_tests.rs"]
 mod hit_cell_tests;
+
+#[cfg(test)]
+#[path = "app_pill_tests.rs"]
+mod pill_tests;
 
 pub use events::DropPhase;
 use events::{Captured, Kind, follow_along, keys_along};
@@ -571,6 +575,19 @@ pub struct App {
     clipboard: Box<dyn Clipboard>,
     /// What's kept for looking at the app while it runs, while something is.
     inspector: Option<Box<Inspector>>,
+    /// When the frame being made started, in `rsui_spans`'s time, while spans are kept.
+    frame_began: Option<u64>,
+    /// How many frames have been drawn while spans are kept, which numbers them.
+    frames_drawn: u32,
+    /// The pill in the corner, in a window of a program being worked on.
+    pill: crate::pill::Pill,
+    /// What the pill draws, when there's no inspector to draw it with.
+    pill_overlay: Overlay,
+    /// Whether the next click picks what it's on for a viewer, rather than reaching the app, and what it picked.
+    picking: bool,
+    picked: Option<Vec<u32>>,
+    /// Whether the release of the press that picked is to be kept from the app too.
+    pick_release: bool,
     /// Whether this is the app that what another program asks of the app being looked at is done with. See
     /// [`run_in_app`](crate::inspect::run_in_app).
     live: bool,
@@ -740,6 +757,13 @@ impl App {
             caret_changes_left: CARET_CHANGES,
             clipboard: Box::new(MemoryClipboard::default()),
             inspector: None,
+            frame_began: None,
+            frames_drawn: 0,
+            pill: crate::pill::Pill::default(),
+            pill_overlay: Overlay::default(),
+            picking: false,
+            picked: None,
+            pick_release: false,
             live: false,
             recording: None,
             dock_wanted: None,
@@ -786,6 +810,16 @@ impl App {
         }
         self.runtime.set_tracing(on);
         self.inspector = on.then(|| Box::new(Inspector::new()));
+        // While it's being looked at, everything's kept, down to each render; otherwise, as little as was before.
+        if on {
+            rsui_spans::set_level(rsui_spans::Level::Detail);
+        } else if rsui_spans::detail() {
+            rsui_spans::set_level(if crate::inspect::inspector_allowed() {
+                rsui_spans::Level::Light
+            } else {
+                rsui_spans::Level::Off
+            });
+        }
         self.invalidate_automatic();
         self.repaint = true;
     }
@@ -830,6 +864,154 @@ impl App {
                 self.repaint = true;
             }
         }
+    }
+
+    /// Has this window show the pill in its corner, with how long frames take, which opens the inspector. It's only
+    /// shown where the inspector's allowed.
+    pub fn set_pill(&mut self, on: bool) {
+        let on = on && crate::inspect::pill_allowed();
+        if on != self.pill.wanted {
+            self.pill.wanted = on;
+            self.invalidate_automatic();
+            self.repaint = true;
+        }
+    }
+
+    /// Opens the inspector, as F12 does: in a window of its own, docked to this one, if the program can, and otherwise
+    /// what's drawn over the app.
+    pub fn open_inspector(&mut self) {
+        match crate::inspect::opener() {
+            Some(open) => open(self),
+            None => self.show_inspector(!self.inspector_showing()),
+        }
+    }
+
+    /// Has the next click on the app pick what it's on, for a viewer, rather than reach the app, with what the pointer's on
+    /// filled in until then, as a browser's inspector does. [`take_picked`](Self::take_picked) says what was picked.
+    pub fn set_picking(&mut self, on: bool) {
+        self.picking = on;
+        if !on {
+            self.highlight(None);
+        }
+    }
+
+    pub fn picking(&self) -> bool {
+        self.picking
+    }
+
+    /// What a click picked, once, since [`set_picking`](Self::set_picking).
+    pub fn take_picked(&mut self) -> Option<Vec<u32>> {
+        self.picked.take()
+    }
+
+    /// The deepest element at `x, y`, in physical pixels, with what it is, for picking.
+    fn element_at(&mut self, x: f32, y: f32) -> Option<(Vec<u32>, String)> {
+        self.lay_out();
+        let path = self.layout.borrow().hit_test(x / self.scale, y / self.scale)?;
+        let node = find(self.runtime.root(), &path)?;
+        let name = if node.name.is_empty() {
+            node.role.name().to_owned()
+        } else {
+            format!("{} \u{201c}{}\u{201d}", node.role.name(), node.name)
+        };
+        Some((path, name))
+    }
+
+    /// Whether a pointer input is for picking, which handles it if so.
+    fn pick_took(&mut self, input: &crate::replay::Input) -> bool {
+        use crate::replay::Input;
+        if self.pick_release {
+            if let Input::Up { .. } = input {
+                self.pick_release = false;
+                return true;
+            }
+        }
+        if !self.picking {
+            return false;
+        }
+        match input {
+            Input::Move { x, y } => {
+                let at = self.element_at(*x, *y);
+                self.highlight(at);
+                true
+            }
+            Input::Down { x, y, .. } => {
+                self.picked = self.element_at(*x, *y).map(|(path, _)| path);
+                self.picking = false;
+                self.pick_release = true;
+                self.highlight(None);
+                true
+            }
+            Input::Up { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Whether a pointer input is for the pill, or for picking, rather than the app, which it handles if so.
+    pub(crate) fn pill_took(&mut self, input: &crate::replay::Input) -> bool {
+        use crate::pill::PillHit;
+        use crate::replay::Input;
+        if self.pick_took(input) {
+            return true;
+        }
+        if !self.pill.showing() && !self.pill.pressed {
+            return false;
+        }
+        match input {
+            Input::Move { x, y } => {
+                let over = self.pill.hit(*x, *y).is_some();
+                if over != self.pill.hovered {
+                    self.pill.hovered = over;
+                    self.invalidate_automatic();
+                    self.repaint = true;
+                }
+                // The app still hears where the pointer is, unless it's on the pill.
+                over
+            }
+            Input::Leave => {
+                if self.pill.hovered {
+                    self.pill.hovered = false;
+                    self.invalidate_automatic();
+                    self.repaint = true;
+                }
+                false
+            }
+            Input::Down { x, y, .. } => {
+                if self.pill.hit(*x, *y).is_some() {
+                    self.pill.pressed = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::Up { x, y } if self.pill.pressed => {
+                self.pill.pressed = false;
+                match self.pill.hit(*x, *y) {
+                    Some(PillHit::Open) => self.open_inspector(),
+                    Some(PillHit::Close) => self.pill.dismiss(),
+                    None => {}
+                }
+                self.invalidate_automatic();
+                self.repaint = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Draws where time went over the app, as a viewer worked it out: each element, how hot it is from 0 to 1, and what to
+    /// say on it. Nothing takes it away. Like [`highlight`](Self::highlight), it's shown whether or not the rest is.
+    pub fn set_heat(&mut self, heat: Vec<(Vec<u32>, f32, String)>) {
+        if heat.is_empty() && self.inspector.is_none() {
+            return;
+        }
+        self.set_inspecting(true);
+        if let Some(inspector) = self.inspector.as_mut() {
+            inspector.heat = heat;
+            inspector.redraw = true;
+        }
+        self.invalidate_automatic();
+        self.repaint = true;
     }
 
     pub fn inspector_showing(&self) -> bool {
@@ -1179,12 +1361,23 @@ impl App {
     /// Applies any state that has changed, and says whether the screen needs drawing.
     pub fn update(&mut self) -> Frame {
         let _logged = crate::input_log::Span::new("phase-update");
+        // A frame starts with the first update after the last one was drawn, for the inspector's flame chart.
+        if rsui_spans::on() && self.frame_began.is_none() {
+            self.frame_began = Some(rsui_spans::now());
+        }
+        let span = rsui_spans::span(rsui_spans::Kind::Update);
         // With nothing moving, as for an agent or a test, what's scrolled is told at once rather than after a frame, so that
         // each result is there straight away.
         if !self.animations && self.runtime.scrolled_waiting() {
             self.runtime.deliver_scrolled();
         }
-        self.update_now()
+        let frame = self.update_now();
+        drop(span);
+        if frame == Frame::Unchanged {
+            // Nothing's drawn for it, so it wasn't a frame.
+            self.frame_began = None;
+        }
+        frame
     }
 
     fn update_now(&mut self) -> Frame {
@@ -1201,9 +1394,11 @@ impl App {
         drop(split);
         let tree_owner = rsui_alloc::owners::scope(rsui_alloc::owners::TREE);
         let split = rsui_alloc::split::enter(rsui_alloc::split::FLUSH);
+        let span = rsui_spans::span(rsui_spans::Kind::Flush);
         // What it was before, which says more about what the patches change (see `apply_needs_layout_since`).
         let before = self.runtime.root().clone();
         let patches = self.runtime.flush();
+        drop(span);
         drop(split);
         drop(tree_owner);
         #[cfg(feature = "mutation-pilot")]
@@ -1225,11 +1420,13 @@ impl App {
         if !patches.is_empty() {
             self.tree_changes += 1;
             let split = rsui_alloc::split::enter(rsui_alloc::split::LAYOUT_APPLY);
+            let span = rsui_spans::span(rsui_spans::Kind::LayoutApply);
             let needs_layout = !pilot_local
                 && self
                     .layout
                     .borrow_mut()
                     .apply_needs_layout_since(&patches, Some(&before));
+            drop(span);
             drop(split);
             if needs_layout {
                 self.laid_out = false;
@@ -1335,6 +1532,7 @@ impl App {
     fn lay_out_now(&mut self) {
         let _owner = rsui_alloc::owners::scope(rsui_alloc::owners::LAYOUT);
         let _split = rsui_alloc::split::enter(rsui_alloc::split::LAYOUT);
+        let mut span = rsui_spans::span(rsui_spans::Kind::Layout);
         self.text_selection_stale = true;
         {
             let available = Size::new(
@@ -1348,6 +1546,10 @@ impl App {
             self.layout
                 .borrow_mut()
                 .compute(self.runtime.root(), available, &mut measuring);
+            if let Some(span) = span.as_mut() {
+                // How many boxes were worked out, which says how much of the window this layout was about.
+                span.arg(self.layout.borrow().last_solved() as u32);
+            }
             if rsui_alloc::split::on() {
                 rsui_alloc::split::count(rsui_alloc::split::named("n:solved"), self.layout.borrow().last_solved() as u64);
                 rsui_alloc::split::count(rsui_alloc::split::named("n:looked"), self.layout.borrow().last_looked_at() as u64);
@@ -1363,7 +1565,9 @@ impl App {
                 crate::geometry::changing(&self.layout);
                 let tree_owner = rsui_alloc::owners::scope(rsui_alloc::owners::TREE);
                 let split = rsui_alloc::split::enter(rsui_alloc::split::FLUSH);
+                let flush = rsui_spans::span(rsui_spans::Kind::Flush);
                 let patches = self.runtime.flush();
+                drop(flush);
                 drop(split);
                 drop(tree_owner);
                 self.tree_changes += 1;
@@ -1379,8 +1583,12 @@ impl App {
             }
             self.laid_out = true;
             let split = rsui_alloc::split::enter(rsui_alloc::split::GEOMETRY);
+            let geometry = rsui_spans::span(rsui_spans::Kind::Geometry);
             crate::geometry::laid_out(&self.layout, self.runtime.root());
+            drop(geometry);
             drop(split);
+            // Layout's own time ends here: what's told about it next is the app's.
+            drop(span.take());
             // What watches where things are hears about it now, as a page's `ResizeObserver` does after layout. What it changes is
             // drawn on the next frame.
             let split = rsui_alloc::split::on().then(|| rsui_alloc::split::enter(rsui_alloc::split::named("laid-out")));
@@ -1483,6 +1691,26 @@ impl App {
     }
 
     /// Draws the current state, and then tells what hears that something's scrolled (see [`tell_scrolled`](Self::tell_scrolled)).
+    /// Keeps where a frame's time went that was drawn from `started`, handed to the GPU by `drawn`, and taken by the
+    /// screen now, for the inspector's flame chart and the corner pill.
+    fn frame_drawn(&mut self, started: Instant, drawn: Instant) {
+        if !rsui_spans::on() {
+            return;
+        }
+        let (start, handed, end) = (
+            rsui_spans::nanos(started),
+            rsui_spans::nanos(drawn),
+            rsui_spans::now(),
+        );
+        rsui_spans::record(rsui_spans::Kind::Gpu, start, handed, 0, 0);
+        rsui_spans::record(rsui_spans::Kind::Present, handed, end, 0, 0);
+        self.frames_drawn += 1;
+        let began = self.frame_began.take().unwrap_or(start).min(start);
+        // A frame is the app's own time, up to handing it to the GPU: waiting for the screen after is its own span.
+        rsui_spans::record(rsui_spans::Kind::Frame, began, handed, 0, self.frames_drawn);
+        self.pill.frame(began, start, handed, end);
+    }
+
     pub fn render(&mut self, renderer: &mut Renderer) -> Result<(), RenderError> {
         let result = self.draw_only(renderer);
         if result.is_ok() {
@@ -1512,8 +1740,10 @@ impl App {
                 .painting = true;
             self.prepare_scene::<false>();
             self.pilot.as_mut().expect("automatic state").painting = false;
-            let started =
-                (self.inspector.is_some() || cfg!(feature = "idle-probe")).then(Instant::now);
+            let started = (self.inspector.is_some()
+                || cfg!(feature = "idle-probe")
+                || rsui_spans::on())
+            .then(Instant::now);
             let draw_log = crate::input_log::Span::new("phase-draw-api");
             #[cfg(feature = "idle-probe")]
             if std::env::var_os("RSUI_011D_GPU").is_some() {
@@ -1537,6 +1767,9 @@ impl App {
             let _present_log = crate::input_log::Span::new("phase-present-api");
             let result = renderer.present();
             drop(_present_log);
+            if let (Some(started), Some(drawn)) = (started, drawn) {
+                self.frame_drawn(started, drawn);
+            }
             #[cfg(feature = "idle-probe")]
             {
                 self.render_times = (
@@ -1576,7 +1809,10 @@ impl App {
                 return renderer.present();
             }
         }
-        let timed = self.inspector.is_some() || cfg!(feature = "idle-probe") || crate::input_log::on();
+        let timed = self.inspector.is_some()
+            || cfg!(feature = "idle-probe")
+            || crate::input_log::on()
+            || rsui_spans::on();
         let see_through = self.see_through;
         let scene = self.scene_now();
         let clear = clear_color(scene.window_color, see_through);
@@ -1616,6 +1852,7 @@ impl App {
         let present_log = crate::input_log::Span::new("phase-present-api");
         let result = renderer.present();
         drop(present_log);
+        self.frame_drawn(started, drawn);
         #[cfg(feature = "idle-probe")]
         {
             self.render_times = (drawn - started, drawn.elapsed());
@@ -1717,6 +1954,7 @@ impl App {
         self.reconcile_external_runtime();
         let _owner = rsui_alloc::owners::scope(rsui_alloc::owners::SCENE);
         let _split = rsui_alloc::split::enter(rsui_alloc::split::PAINT);
+        let _span = rsui_spans::span(rsui_spans::Kind::Paint);
         #[cfg(feature = "mutation-pilot")]
         {
             let invalid = !self.laid_out || self.animating() || self.inspector.is_some();
@@ -1844,12 +2082,22 @@ impl App {
                 self.pointer,
             );
         }
+        // The pill goes on top of what the inspector draws, or on its own.
+        self.pill_overlay.clear();
+        if self.pill.showing() {
+            let overlay = match self.inspector.as_mut() {
+                Some(inspector) => &mut inspector.overlay,
+                None => &mut self.pill_overlay,
+            };
+            self.pill.draw(overlay, self.scale, self.size);
+        }
         let interaction = Interaction {
             overlay: self
                 .inspector
                 .as_ref()
                 .map(|inspector| &inspector.overlay)
-                .filter(|overlay| !overlay.is_empty()),
+                .filter(|overlay| !overlay.is_empty())
+                .or(Some(&self.pill_overlay).filter(|overlay| !overlay.is_empty())),
             ..interaction
         };
         #[cfg(feature = "mutation-pilot")]
@@ -3819,10 +4067,22 @@ impl App {
     }
 
     fn key_here(&mut self, key: KeyPress) -> Result<(), DispatchError> {
+        let inspect_key = (key.ctrl
+            && key.shift
+            && !key.alt
+            && matches!(key.code, KeyCode::Character('i' | 'I')))
+            || (key.code == KeyCode::Function(12) && !key.ctrl && !key.alt && !key.shift);
+        if inspect_key && crate::inspect::inspector_allowed() {
+            if !key.repeat {
+                self.open_inspector();
+            }
+            return Ok(());
+        }
+        // What's drawn over the app, the flashes and the meter, without the inspector.
         if key.ctrl
             && key.shift
             && !key.alt
-            && matches!(key.code, KeyCode::Character('i' | 'I'))
+            && matches!(key.code, KeyCode::Character('f' | 'F'))
             && crate::inspect::inspector_allowed()
         {
             if !key.repeat {

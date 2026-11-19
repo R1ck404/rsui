@@ -152,6 +152,8 @@ pub struct OverlayBox {
     pub color: Color,
     /// How wide its outline is, or 0 to fill it.
     pub outline: f32,
+    /// How round its corners are, in physical pixels.
+    pub radius: f32,
 }
 
 /// Text in a box of its own color, kept inside the window.
@@ -3528,9 +3530,9 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
     fn paint_overlay(&mut self, overlay: &Overlay, window: PixelRect) {
         for one in &overlay.boxes {
             self.quads.push(if one.outline > 0.0 {
-                outline_quad(one.rect, one.color, 0.0, one.outline)
+                outline_quad(one.rect, one.color, one.radius, one.outline)
             } else {
-                solid_quad(one.rect, one.color, 0.0)
+                solid_quad(one.rect, one.color, one.radius)
             });
         }
         let (right, bottom) = (window.right as f32, window.bottom as f32);

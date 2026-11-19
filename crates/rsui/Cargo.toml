@@ -20,6 +20,7 @@ render-diagnostics = ["rsui-render/render-diagnostics"]
 alloc-owners = ["rsui-alloc/owners"]
 
 [dependencies]
+rsui-spans = { path = "../rsui-spans" }
 rsui-alloc = { path = "../rsui-alloc" }
 rsui-core = { path = "../rsui-core" }
 rsui-headless = { path = "../rsui-headless" }

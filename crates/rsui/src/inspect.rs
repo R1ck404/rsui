@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use rsui_core::Text;
@@ -41,7 +41,43 @@ const PANEL_TEXT: Color = Color::hex(0xE6EDF3);
 const HIGHLIGHT: Color = Color::rgba(0x6F, 0xA8, 0xDC, 0xA8);
 const HIGHLIGHT_EDGE: Color = Color::hex(0x1A73E8);
 
-static ALLOWED: AtomicBool = AtomicBool::new(false);
+/// Whether the inspector's allowed: 0 until someone says, which is as the build is, 1 for no and 2 for yes.
+static ALLOWED: AtomicU8 = AtomicU8::new(0);
+static PILL_ALLOWED: AtomicBool = AtomicBool::new(true);
+static OPENER: Mutex<Option<Opener>> = Mutex::new(None);
+
+/// What opens the inspector for an app, as F12 and the pill do: rsui-tsx opens its viewer, docked to the app's window.
+pub type Opener = fn(&mut crate::App);
+
+/// Has F12, ctrl+shift+I and the pill open the inspector with this, rather than draw what it keeps over the app.
+pub fn set_opener(opener: Opener) {
+    *OPENER.lock().expect("lock is not poisoned") = Some(opener);
+}
+
+pub(crate) fn opener() -> Option<Opener> {
+    *OPENER.lock().expect("lock is not poisoned")
+}
+
+/// Whether a window can have the pill in its corner, where the inspector's allowed. `RSUI_PILL=0` says it can't too.
+pub fn allow_pill(allowed: bool) {
+    PILL_ALLOWED.store(allowed, Ordering::Relaxed);
+}
+
+pub(crate) fn pill_allowed() -> bool {
+    PILL_ALLOWED.load(Ordering::Relaxed)
+        && inspector_allowed()
+        && std::env::var_os("RSUI_PILL").is_none_or(|value| value != "0")
+}
+
+/// Starts keeping where each frame's time goes, lightly, for a program that's being worked on, unless `RSUI_SPANS=0` says
+/// not to or more is being kept already.
+pub fn keep_spans_lightly() {
+    if rsui_spans::level() == rsui_spans::Level::Off
+        && std::env::var_os("RSUI_SPANS").is_none_or(|value| value != "0")
+    {
+        rsui_spans::set_level(rsui_spans::Level::Light);
+    }
+}
 static SAVER: std::sync::Mutex<Option<TraceSaver>> = std::sync::Mutex::new(None);
 /// How long what ctrl+shift+S did shows.
 const TOLD_FOR: Duration = Duration::from_secs(4);
@@ -78,11 +114,18 @@ pub(crate) fn wanted_from_start() -> Option<bool> {
 /// Lets ctrl+shift+I show the inspector in a window, for a program that's being worked on. A program handed to someone
 /// shouldn't have it.
 pub fn allow_inspector(allowed: bool) {
-    ALLOWED.store(allowed, Ordering::Relaxed);
+    ALLOWED.store(if allowed { 2 } else { 1 }, Ordering::Relaxed);
+    if !allowed {
+        rsui_spans::set_level(rsui_spans::Level::Off);
+    }
 }
 
+/// Whether the inspector's allowed: where nothing's said, in a debug build only, as one of those is being worked on.
 pub(crate) fn inspector_allowed() -> bool {
-    ALLOWED.load(Ordering::Relaxed)
+    match ALLOWED.load(Ordering::Relaxed) {
+        0 => cfg!(debug_assertions),
+        allowed => allowed == 2,
+    }
 }
 
 /// Something another thread wants done with the app being looked at, on its own thread, as a viewer in another program
@@ -155,6 +198,8 @@ pub struct FrameRecord {
     /// Waiting for the screen to take it, which isn't counted in [`total`](Self::total), as it's the screen's time, not
     /// the app's.
     pub present: Duration,
+    /// When it was painted, in `rsui_spans`'s time, which says which of the spans kept are this frame's.
+    pub painted: u64,
 }
 
 impl FrameRecord {
@@ -397,6 +442,8 @@ pub(crate) struct Inspector {
     told: Option<(String, Instant)>,
     /// What a viewer's pointing at, and what to call it, which is shown whether or not the rest is.
     pub(crate) highlight: Option<(Vec<u32>, String)>,
+    /// Where time went, as a viewer worked it out: each element, how hot it is from 0 to 1, and what to say on it.
+    pub(crate) heat: Vec<(Vec<u32>, f32, String)>,
 }
 
 impl Inspector {
@@ -413,6 +460,7 @@ impl Inspector {
             kept_last: false,
             told: None,
             highlight: None,
+            heat: Vec::new(),
         }
     }
 
@@ -485,6 +533,7 @@ impl Inspector {
             let mut frame = std::mem::take(&mut self.current);
             frame.number = self.next_number;
             frame.at = now - self.started;
+            frame.painted = rsui_spans::nanos(now);
             self.next_number += 1;
             self.frames.push_back(frame);
         }
@@ -527,6 +576,7 @@ impl Inspector {
         pointer: Option<(f32, f32)>,
     ) {
         self.overlay.clear();
+        self.add_heat(layout, scale);
         self.add_highlight(layout, scale);
         if !self.showing {
             return;
@@ -555,6 +605,7 @@ impl Inspector {
                 rect,
                 color: faded(base, left),
                 outline: 2.0 * scale,
+                radius: 0.0,
             });
             if named {
                 if let Some(name) = &flash.name {
@@ -608,6 +659,46 @@ impl Inspector {
         }
     }
 
+    /// Where time went, drawn over the app: each element a viewer said was hot, from blue for a little to red for the most,
+    /// with its share written on the hottest.
+    fn add_heat(&mut self, layout: &Layout, scale: f32) {
+        let mut labelled = 0;
+        for (path, heat, label) in &self.heat {
+            let Some(rect) = layout.rect(path) else {
+                continue;
+            };
+            let rect = [rect.x * scale, rect.y * scale, rect.width * scale, rect.height * scale];
+            if rect[2] < 1.0 || rect[3] < 1.0 {
+                continue;
+            }
+            let color = heat_color(*heat);
+            self.overlay.boxes.push(OverlayBox {
+                rect,
+                color: faded(color, 0.18 + 0.42 * heat.clamp(0.0, 1.0)),
+                outline: 0.0,
+                radius: 0.0,
+            });
+            self.overlay.boxes.push(OverlayBox {
+                rect,
+                color: faded(color, 0.9),
+                outline: scale.max(1.0),
+                radius: 0.0,
+            });
+            if !label.is_empty() && labelled < MOST_NAMED_FLASHES && rect[3] >= 14.0 * scale {
+                labelled += 1;
+                self.overlay.texts.push(OverlayText {
+                    text: label.clone(),
+                    left: rect[0] + 2.0 * scale,
+                    top: rect[1] + 2.0 * scale,
+                    size: 10.0,
+                    widest: (rect[2] / scale).max(60.0),
+                    color: Color::WHITE,
+                    background: faded(color, 0.92),
+                });
+            }
+        }
+    }
+
     /// What a viewer's pointing at, as a browser's inspector shows it: filled in, with its name and size by it.
     fn add_highlight(&mut self, layout: &Layout, scale: f32) {
         let Some((path, name)) = &self.highlight else {
@@ -621,11 +712,13 @@ impl Inspector {
             rect,
             color: HIGHLIGHT,
             outline: 0.0,
+            radius: 0.0,
         });
         self.overlay.boxes.push(OverlayBox {
             rect,
             color: HIGHLIGHT_EDGE,
             outline: 1.0 * scale,
+            radius: 0.0,
         });
         let label = format!(
             "{name}  {} \u{d7} {}",
@@ -659,6 +752,7 @@ impl Inspector {
             rect: [left, top, width, height],
             color: PANEL,
             outline: 0.0,
+            radius: 0.0,
         });
         // Two frames' worth fits, so the budget is halfway up.
         let per_ms = height / (2.0 * FRAME_BUDGET.as_secs_f32() * 1000.0);
@@ -679,6 +773,7 @@ impl Inspector {
                         rect: [x, y, bar, tall.max(1.0)],
                         color,
                         outline: 0.0,
+                        radius: 0.0,
                     });
                 }
             }
@@ -687,6 +782,7 @@ impl Inspector {
             rect: [left, top + height / 2.0, width, scale.max(1.0)],
             color: faded(Color::WHITE, 0.5),
             outline: 0.0,
+            radius: 0.0,
         });
         let text = match self.frames.back() {
             Some(frame) => format!(
@@ -746,6 +842,22 @@ impl Inspector {
         out.push_str(&describe_render(last));
         Some(out)
     }
+}
+
+/// From blue for cool through yellow to red for hot.
+fn heat_color(heat: f32) -> Color {
+    let stops: [(f32, [f32; 3]); 4] = [
+        (0.0, [0x38 as f32, 0x8B as f32, 0xFD as f32]),
+        (0.45, [0x3F as f32, 0xB9 as f32, 0x50 as f32]),
+        (0.7, [0xE3 as f32, 0xB3 as f32, 0x41 as f32]),
+        (1.0, [0xF8 as f32, 0x51 as f32, 0x49 as f32]),
+    ];
+    let heat = heat.clamp(0.0, 1.0);
+    let after = stops.iter().position(|(at, _)| *at >= heat).unwrap_or(stops.len() - 1).max(1);
+    let (from, to) = (stops[after - 1], stops[after]);
+    let along = if to.0 > from.0 { (heat - from.0) / (to.0 - from.0) } else { 1.0 };
+    let mix = |at: usize| (from.1[at] + (to.1[at] - from.1[at]) * along).round() as u8;
+    Color::rgba(mix(0), mix(1), mix(2), 0xFF)
 }
 
 fn faded(color: Color, amount: f32) -> Color {

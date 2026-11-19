@@ -585,6 +585,7 @@ dependencies = [
  "rsui-layout",
  "rsui-render",
  "rsui-runtime",
+ "rsui-spans",
  "rsui-text",
  "windows",
  "windows-core",
@@ -642,6 +643,7 @@ version = "0.1.0"
 dependencies = [
  "foldhash",
  "rsui-alloc",
+ "rsui-spans",
 ]
 
 [[package]]
@@ -680,9 +682,14 @@ dependencies = [
  "proptest",
  "rsui-alloc",
  "rsui-core",
+ "rsui-spans",
  "thin-vec",
  "triomphe",
 ]
+
+[[package]]
+name = "rsui-spans"
+version = "0.1.0"
 
 [[package]]
 name = "rsui-text"
@@ -695,6 +702,7 @@ dependencies = [
  "rsui-core",
  "rsui-image",
  "rsui-layout",
+ "rsui-spans",
 ]
 
 [[package]]
@@ -706,6 +714,7 @@ dependencies = [
  "rsui-headless",
  "rsui-image",
  "rsui-js",
+ "rsui-spans",
  "rsui-webview",
  "serde_json",
  "windows",

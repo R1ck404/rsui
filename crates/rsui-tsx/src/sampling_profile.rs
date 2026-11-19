@@ -40,6 +40,20 @@ impl NativeProfile {
         if let Err(error) = std::fs::write(&self.output, report) {
             eprintln!("native sampling report {}: {error}", self.output.display());
         }
+        // Each sample's stack, outermost first, one a line with `;` between, and how many there were of each, as flame graph
+        // tools and a script that wants who called what both read.
+        let mut folded: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for sample in &samples {
+            let line: Vec<String> = sample.iter().rev().map(|&pc| names.name(pc).replace(';', ":")).collect();
+            *folded.entry(line.join(";")).or_default() += 1;
+        }
+        let mut text = String::new();
+        for (stack, count) in folded {
+            text.push_str(&format!("{stack} {count}\n"));
+        }
+        let mut path = self.output.clone().into_os_string();
+        path.push(".folded");
+        let _ = std::fs::write(path, text);
     }
 }
 

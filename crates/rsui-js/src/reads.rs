@@ -39,7 +39,11 @@ pub const NO_READS: u32 = u32::MAX;
 /// How far a read goes into what it read, at most, which is a chain of property reads after one another.
 const MOST_STEPS: usize = 32;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// How many paths, or entries, a render has before they're found by a table rather than by looking along them. A row reads a
+/// few; a list that reads each of thousands of items would otherwise look along all it's read for each one it reads.
+const INDEX_FROM: usize = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Step {
     /// A property, by the key it was read with.
     Key(u64),
@@ -94,8 +98,15 @@ pub(crate) struct Record {
     /// Where things were read, with the props themselves first.
     paths: Vec<Path>,
     entries: Vec<Entry>,
+    /// Which path is where, by what it's in and how it's reached, and which entry is each path's, once there are
+    /// [`INDEX_FROM`] of them. Nothing's ever taken out of either list, so these only grow with them.
+    path_index: Option<Box<HashMap<(u32, Step), u32, FixedState>>>,
+    entry_index: Option<Box<HashMap<u32, u32, FixedState>>>,
     /// What was only compared with `===` or `!==`: where it was, what with, and whether it was the same.
     comparisons: Vec<(u32, Value, bool)>,
+    /// Each of `comparisons`, once there are [`INDEX_FROM`]: a list whose rows each compare an item with what's picked
+    /// compares thousands, and each one would otherwise look along all those before it.
+    comparison_index: Option<Box<std::collections::HashSet<(u32, u64, bool), FixedState>>>,
     /// The cells the props, or what they were destructured as, are in, which functions inside can see, and where in the
     /// props each is.
     cells: Vec<(Value, u32)>,
@@ -140,7 +151,10 @@ impl Record {
                 key: Value::UNDEFINED,
             }],
             entries: Vec::new(),
+            path_index: None,
+            entry_index: None,
             comparisons: Vec::new(),
+            comparison_index: None,
             cells: Vec::new(),
             function_cells: Vec::new(),
             functions: Vec::new(),
@@ -150,22 +164,95 @@ impl Record {
     }
 
     fn path(&mut self, parent: u32, step: Step, key: Value) -> u32 {
-        if let Some(at) = self
-            .paths
-            .iter()
-            .position(|path| path.parent == parent && path.step == step)
-        {
-            return at as u32;
+        let found = match &self.path_index {
+            Some(index) => index.get(&(parent, step)).copied(),
+            None => self
+                .paths
+                .iter()
+                .position(|path| path.parent == parent && path.step == step)
+                .map(|at| at as u32),
+        };
+        if let Some(at) = found {
+            return at;
         }
         self.paths.push(Path { parent, step, key });
         if key.is_string() || key.is_symbol() {
             self.held.push(key);
         }
-        (self.paths.len() - 1) as u32
+        let at = (self.paths.len() - 1) as u32;
+        match &mut self.path_index {
+            Some(index) => {
+                index.insert((parent, step), at);
+            }
+            None if self.paths.len() >= INDEX_FROM => {
+                let mut index = HashMap::with_capacity_and_hasher(self.paths.len() * 2, FixedState::default());
+                // The first of two the same is the one looking along them finds, though there are never two.
+                for (at, path) in self.paths.iter().enumerate().rev() {
+                    index.insert((path.parent, path.step), at as u32);
+                }
+                self.path_index = Some(Box::new(index));
+            }
+            None => {}
+        }
+        at
+    }
+
+    /// Where the entry for `path` is in `entries`, if there's one.
+    fn entry_at(&self, path: u32) -> Option<usize> {
+        match &self.entry_index {
+            Some(index) => index.get(&path).map(|&at| at as usize),
+            None => self.entries.iter().position(|entry| entry.path == path),
+        }
+    }
+
+    /// Notes that what's at `path` was compared with `other`, and whether it was the same, unless that's been noted.
+    fn compared(&mut self, path: u32, other: Value, was: bool) {
+        let key = (path, other.bits(), was);
+        let known = match &self.comparison_index {
+            Some(index) => index.contains(&key),
+            None => self
+                .comparisons
+                .iter()
+                .any(|&(at, with, same)| at == path && with.bits() == other.bits() && same == was),
+        };
+        if known {
+            return;
+        }
+        self.comparisons.push((path, other, was));
+        self.held.push(other);
+        match &mut self.comparison_index {
+            Some(index) => {
+                index.insert(key);
+            }
+            None if self.comparisons.len() >= INDEX_FROM => {
+                let index = self.comparisons.iter().map(|&(at, with, same)| (at, with.bits(), same)).collect();
+                self.comparison_index = Some(Box::new(index));
+            }
+            None => {}
+        }
+    }
+
+    /// Adds an entry, keeping the table of them up to date.
+    fn push_entry(&mut self, entry: Entry) {
+        self.entries.push(entry);
+        let at = (self.entries.len() - 1) as u32;
+        match &mut self.entry_index {
+            Some(index) => {
+                index.entry(entry.path).or_insert(at);
+            }
+            None if self.entries.len() >= INDEX_FROM => {
+                let mut index = HashMap::with_capacity_and_hasher(self.entries.len() * 2, FixedState::default());
+                for (at, one) in self.entries.iter().enumerate().rev() {
+                    index.insert(one.path, at as u32);
+                }
+                self.entry_index = Some(Box::new(index));
+            }
+            None => {}
+        }
     }
 
     fn note(&mut self, path: u32, value: Value, itself: bool, careful: bool) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+        if let Some(entry) = self.entry_at(path).map(|at| &mut self.entries[at]) {
             if entry.value != value {
                 entry.changing = true;
             }
@@ -174,7 +261,7 @@ impl Record {
             entry.only_given = false;
             return;
         }
-        self.entries.push(Entry {
+        self.push_entry(Entry {
             path,
             value,
             itself,
@@ -187,12 +274,12 @@ impl Record {
 
     /// Notes that what was read at `path` was given to an element the app's JSX made, as its prop `prop`.
     fn note_given(&mut self, path: u32, value: Value, prop: Value) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+        if let Some(entry) = self.entry_at(path).map(|at| &mut self.entries[at]) {
             if entry.value != value {
                 entry.changing = true;
             }
         } else {
-            self.entries.push(Entry {
+            self.push_entry(Entry {
                 path,
                 value,
                 itself: false,
@@ -1517,14 +1604,7 @@ impl Vm {
             // All that's known of it is whether it's what it was compared with.
             let was = self.strict_equals(leaf, other);
             let record = self.reads.records[id as usize].as_mut().expect("just found");
-            if !record
-                .comparisons
-                .iter()
-                .any(|&(at, with, same)| at == path && with == other && same == was)
-            {
-                record.comparisons.push((path, other, was));
-                record.held.push(other);
-            }
+            record.compared(path, other, was);
             return;
         }
         if let Some(this) = this

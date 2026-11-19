@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rsui-spans = { path = "../rsui-spans" }
 foldhash = "0.2.0"
 rsui-core = { path = "../rsui-core" }
 thin-vec = "0.2.21"

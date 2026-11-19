@@ -308,30 +308,7 @@ fn app_path() -> PathBuf {
 }
 
 fn kind(input: &Input) -> &'static str {
-    match input {
-        Input::Move { .. } => "move",
-        Input::Leave => "leave",
-        Input::Down { .. } => "down",
-        Input::Up { .. } => "up",
-        Input::ButtonDown { .. } => "buttondown",
-        Input::ButtonUp { .. } => "buttonup",
-        Input::CancelPress => "cancel",
-        Input::Active(_) => "active",
-        Input::Shown(_) => "shown",
-        Input::Modifiers(_) => "held",
-        Input::Key(_) => "key",
-        Input::KeyUp(_) => "keyup",
-        Input::Text(_) => "text",
-        Input::Composition { .. } => "composition",
-        Input::Scroll { .. } => "scroll",
-        Input::ScrollPixels { .. } => "scrollpixels",
-        Input::Resize { .. } => "resize",
-        Input::Files { .. } => "files",
-        Input::DragFromOutside { .. } => "drag",
-        Input::DarkMode(_) => "dark",
-        Input::Access { .. } => "access",
-        Input::Close => "close",
-    }
+    input.kind()
 }
 
 /// An input as a person would say it.

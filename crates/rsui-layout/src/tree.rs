@@ -125,11 +125,13 @@ pub(crate) const ONE_PIECE: u32 = 1 << 26;
 /// The props that have something drawn as one piece, turned, resized or faded: see [`drawn_as_one`] and [`ONE_PIECE`].
 const ONE_PIECE_PROPS: [&str; 6] = ["opacity", "scale", "scale_x", "scale_y", "rotate", "transform"];
 
+/// [`ONE_PIECE_PROPS`] as symbols, which are looked for by pointer, and mostly found not to be there by one test of a bit.
+static ONE_PIECE_SYMBOLS: std::sync::LazyLock<[rsui_core::Symbol; 6]> =
+    std::sync::LazyLock::new(|| ONE_PIECE_PROPS.map(rsui_core::Symbol::new));
+
 /// Whether this is one of [`ONE_PIECE_PROPS`].
 pub(crate) fn is_one_piece_prop(name: rsui_core::Symbol) -> bool {
-    static NAMES: std::sync::LazyLock<[rsui_core::Symbol; 6]> =
-        std::sync::LazyLock::new(|| ONE_PIECE_PROPS.map(rsui_core::Symbol::new));
-    NAMES.contains(&name)
+    ONE_PIECE_SYMBOLS.contains(&name)
 }
 
 /// Whether a prop can make something draw outside its own box, or change how what's in it is drawn, or where or when that's
@@ -416,9 +418,11 @@ fn cut_off_by(root_box: &LayoutBox, root: &Node, path: &[u32]) -> Vec<bool> {
 
 /// Whether something is drawn as one piece, faded or turned, which what's in it has to be drawn with.
 fn drawn_as_one(node: &Element) -> bool {
-    ONE_PIECE_PROPS
+    // By symbol rather than by name: layout asks this of every box, and comparing six names with each of a box's props was
+    // a percent of what a list's frame cost.
+    ONE_PIECE_SYMBOLS
         .iter()
-        .any(|name| node.props.get(name).is_some())
+        .any(|name| node.props.get_symbol(*name).is_some())
 }
 
 /// Whether the node at `path` in `root` has any of [`ONE_PIECE_PROPS`].

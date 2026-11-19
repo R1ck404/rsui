@@ -1321,6 +1321,10 @@ impl Vm {
     /// string's can even be past the end of the list, in the last word of marks, and is left alone.
     fn collect(&mut self, full: bool) {
         let _split = rsui_alloc::split::enter(rsui_alloc::split::GC);
+        let _span = rsui_spans::span(rsui_spans::Kind::Gc).map(|mut span| {
+            span.arg(u32::from(full));
+            span
+        });
         self.gc_count += 1;
         let lengths = (
             self.objects.list.len(),

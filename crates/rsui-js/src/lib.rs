@@ -38,6 +38,7 @@ mod op;
 mod packed;
 mod parser;
 mod props;
+mod sampling;
 mod reads;
 mod regex;
 mod source_overlay;
@@ -237,6 +238,7 @@ impl Engine {
     /// Runs a script: its `var`s and functions are globals, and its `return` is the result, if it has one.
     pub fn eval(&mut self, source: &str, file: &str) -> Result<Value, JsError> {
         let _split = rsui_alloc::split::enter(rsui_alloc::split::JS);
+        let _span = rsui_spans::span_about(rsui_spans::Kind::Script, file);
         self.enter();
         let vm = &mut self.vm;
         let file = vm.intern_str(file);
@@ -291,6 +293,9 @@ impl Engine {
     /// Runs everything that's waiting: finished promises, and so on. It runs nothing if nothing's waiting.
     pub fn run_jobs(&mut self) -> Result<(), JsError> {
         let _split = rsui_alloc::split::enter(rsui_alloc::split::JS);
+        let _span = (rsui_spans::wants(rsui_spans::Kind::Jobs) && self.vm.has_jobs())
+            .then(|| rsui_spans::span(rsui_spans::Kind::Jobs))
+            .flatten();
         self.enter();
         self.vm.collect_background();
         let result = self.vm.run_jobs().map(|()| Value::UNDEFINED);
@@ -393,6 +398,29 @@ impl Engine {
         Ok(())
     }
 
+    /// Starts sampling where JavaScript is, about every `every`, for the inspector: see `sampling.rs`. What's sampled is
+    /// kept as spans by [`take_samples`](Self::take_samples). It does nothing where there's no way to sample, which is
+    /// anywhere but Windows.
+    pub fn start_sampling(&mut self, every: std::time::Duration) {
+        self.vm.start_sampling(every);
+    }
+
+    /// Stops sampling, keeping what's been sampled as spans.
+    pub fn stop_sampling(&mut self) {
+        self.vm.stop_sampling();
+    }
+
+    /// Whether this thread's being sampled.
+    pub fn sampling(&self) -> bool {
+        self.vm.sampling()
+    }
+
+    /// Keeps what's been sampled since this was last asked as spans of kind `Sample`, each with a stack of labels,
+    /// outermost first, that say `function\u{1}file:line`.
+    pub fn take_samples(&mut self) {
+        self.vm.take_samples();
+    }
+
     /// Whether there's anything for [`run_jobs`](Self::run_jobs) or [`run_timers`](Self::run_timers) to do.
     pub fn has_pending(&self) -> bool {
         !self.vm.jobs.is_empty()
@@ -452,6 +480,10 @@ impl Engine {
     /// Runs the timers that are due, and says how many milliseconds until the next, if there's one waiting.
     pub fn run_timers(&mut self) -> Result<Option<f64>, JsError> {
         let _split = rsui_alloc::split::enter(rsui_alloc::split::JS);
+        let _span = (rsui_spans::wants(rsui_spans::Kind::Timer)
+            && self.vm.timers.iter().any(|timer| timer.at <= Vm::now_ms()))
+        .then(|| rsui_spans::span(rsui_spans::Kind::Timer))
+        .flatten();
         self.enter();
         let now = Vm::now_ms();
         match self.vm.run_timers(now) {

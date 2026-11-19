@@ -894,3 +894,48 @@ fn moving_the_keyboard_between_panes_in_page_splits_renders_the_two_it_moved_bet
     assert!(!pane_shows(&ui, "b").contains("active"), "{}", ui.outline());
     assert!(b.contains("renders 2"), "{b}");
 }
+
+/// A list given what's picked, which each of many rows compares its item with, as a file list compares each file with the
+/// selection: what it read is kept in a table once there's much of it, and it still renders exactly when what it compared
+/// comes out otherwise, and not when only something it didn't read changed.
+const COMPARED_ROWS: &str = r#"
+    import { useState } from 'rsui';
+    function List(props) {
+        return (
+            <column>
+                {props.items.map((item) => (
+                    <text key={'row' + item.id}>{item.id === props.selected ? 'item ' + item.id + ' (picked)' : 'item ' + item.id}</text>
+                ))}
+            </column>
+        );
+    }
+    export default function App() {
+        const [selected, setSelected] = useState(3);
+        const [other, setOther] = useState(0);
+        const [items] = useState(() => Array.from({ length: 60 }, (_, id) => ({ id })));
+        return (
+            <window>
+                <button key="next" onClick={() => setSelected(selected + 20)}>next</button>
+                <button key="other" onClick={() => setOther(other + 1)}>{'other ' + other}</button>
+                <List items={items} selected={selected} unread={other} />
+            </window>
+        );
+    }
+"#;
+
+#[test]
+fn a_list_comparing_many_items_with_what_is_picked_renders_when_that_moves() {
+    let mut ui = start(COMPARED_ROWS);
+    assert!(ui.outline().contains("item 3 (picked)"), "{}", ui.outline());
+    ui.click(&key("next")).unwrap();
+    assert!(ui.outline().contains("item 23 (picked)"), "{}", ui.outline());
+    assert!(!ui.outline().contains("item 3 (picked)"), "{}", ui.outline());
+    ui.click(&key("next")).unwrap();
+    assert!(ui.outline().contains("item 43 (picked)"), "{}", ui.outline());
+    // Only what it didn't read changed, so the list doesn't render: the button does, with the app.
+    let before = ui.runtime().renders();
+    ui.click(&key("other")).unwrap();
+    assert!(ui.outline().contains("other 1"), "{}", ui.outline());
+    assert_eq!(ui.runtime().renders() - before, 1, "only the app renders\n{}", ui.outline());
+    assert!(ui.outline().contains("item 43 (picked)"), "{}", ui.outline());
+}

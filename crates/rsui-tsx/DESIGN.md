@@ -556,7 +556,28 @@ look as what it's drawn with: see the bench's README for what that comes to.
 
 ## Seeing why it renders
 
-Ctrl+shift+I in a window shows what renders as it happens. Each component that renders gets an outline where its output is, blue
+**The inspector is always there** in an app that's being worked on, which is any app run with `rsui-tsx` that isn't a packed
+one. F12, or ctrl+shift+I, opens it docked along the bottom of the app's window, in the viewer described below, and pressing it
+again puts it away. The first window also has a small pill in its bottom right corner: how long the last frame took, with a dot
+that's green while frames take less than half the 16.7 ms there is, yellow up to all of it and red over, the last 24 frames as
+bars, and how many frames a second there are while something's moving. Clicking it opens the inspector too, and its × puts it
+away until the app starts again. It's only drawn when the app draws anyway, so it never costs a frame of its own, and
+`RSUI_PILL=0` leaves it out. A packed program has none of this: no F12, no pill, no pipe and nothing kept. An app written in Rust
+has it in a debug build, or with `rsui::allow_inspector(true)`.
+
+**Where the time goes is kept from the start.** Every app being worked on keeps, lightly, the last 30 seconds of timed spans
+(`rsui-spans`): each frame, and in it what came in, each handler, timer and lot of promise jobs, reconciling, layout, paint, handing
+it to the GPU, waiting for the screen, and each garbage collection, a dozen or so a frame, so a stutter that's already happened is
+there when the inspector opens. While the inspector's looking, everything is kept: each component's render, effects, invalidating
+layout, telling geometry, shaping text and each call into JavaScript. `RSUI_SPANS=0` keeps nothing; with no window, as with
+`--do`, nothing's kept unless `RSUI_SPANS=light` or `detail` says. While nothing's kept, each place a span could start loads one
+byte.
+
+**Recording JavaScript** samples where it is about every millisecond: another thread stops the app's thread, copies the top of
+its list of running functions out of memory, and lets it go, so the engine checks for nothing while it's off and does nothing
+extra while it's on. Each sample is the stack of functions, each with its file and line, outermost first.
+
+Ctrl+shift+F draws what renders over the app as it happens, without the inspector. Each component that renders gets an outline where its output is, blue
 if that changed something and yellow if it didn't, with its name and how many times it's rendered while that's showing. A meter in
 the corner has the last 60 frames, each split into script, layout, paint and handing it to the GPU, with a line at the 16.7 ms there
 is for one. Pointing at anything says which component made it, how often that's rendered in the last 30 seconds, and why it last did:
@@ -618,8 +639,8 @@ the same wherever it's opened. It's JSON, so anything else can read it too.
 browser's is, with its tabs, dark or light as the system is. Each app run with
 `rsui-tsx` listens on a named pipe for that, which only its own user can write to, and says it's there with a file in
 `%TEMP%\rsui-live` that goes when it ends. The viewer finds it, or asks which if there are several, and `--view 1234` picks one by
-its process. Listening is a thread that waits: the app keeps nothing until the viewer asks, and from then keeps what ctrl+shift+I
-would.
+its process. Listening is a thread that waits: the app keeps only the light spans until the viewer asks, and from then keeps
+everything, as F12 would. F12 starts this viewer itself, with `RSUI_VIEW_DOCK` set so it docks itself along the app's bottom.
 
 - **Elements** is what's in its window as a tree of tags, with what the pointer's on filled in in the app's window. Beside the
   one chosen are its props, its box (margin, border, padding and what's inside), the component that made it with why that
@@ -631,8 +652,18 @@ would.
   else. Stopped, the line it's on is marked, and beside it are what's watched, the breakpoints, what's in the variables of the
   function chosen, and each function that's running; "Step over", "Step into" and "Step out" go on a statement at a time, and
   "Resume" to the next breakpoint. Its window doesn't draw while it's stopped, and it carries on by itself if the viewer goes.
-- **Performance** is each frame as a bar, split into where its time went, and what came in, what rendered and why in the one
-  chosen, with "Summary" for what `profile` says. **Rendering** is each component's time and how often it rendered for nothing.
+- **Performance** is where the time went, as a browser's profiler shows it. Across the top is every frame kept, as bars as tall
+  as the slowest frame in each part of the time, green, yellow or red; dragging across them picks a range, and clicking moves
+  there. Under that is a flame chart of the range: the frames, then the main thread's spans as blocks inside what they were inside
+  (a render that changed nothing is yellow), then, while JavaScript's being recorded, each function it was in. The wheel zooms
+  where the pointer is, dragging moves along, and following what's newest stops once a range is picked. Clicking a block says what
+  it was, how long it took and how long itself, and for a render why it happened; a function goes to its line in Sources.
+  Below are **Summary** (how many frames, how many slow, and where the time went by kind), **Bottom-up** (everything by the time
+  it took itself, spans and sampled functions together), **Treemap** (the components, or the functions, each as big as the time it
+  took itself), **Renders** (the busiest frame's renders, with why each happened) and, with "As text", what `profile` says.
+  "Heat in app" draws over the app's window how hot each element is over the range: by render time, by how many renders, or by
+  renders that changed nothing, from blue to red, with the hottest named. The record button starts and stops sampling
+  JavaScript. **Rendering** is each component's time and how often it rendered for nothing.
 - **State** is each change of state, with a button that goes back or forward to it, as `goto` does.
 - **Replay** is what came in. "Replay to here" starts the app again in a window of its own, replaying it all up to that one, and
   "Replay and stop in it" stops in what that one did; the inspector goes over to the new one.
@@ -645,9 +676,10 @@ and the last saves a trace next to the app. When the app stops, what was kept st
 
 A request to the pipe and its answer are each a line of JSON, so anything else can ask too: see `src/live.rs` for what there is.
 
-`RSUI_INSPECT=1` starts a window with it showing, which works for an app written in Rust too, and `RSUI_INSPECT=keep` keeps it without
-showing it. While none of this is on, rendering checks one thing to find that out, and the layer one more for each hook, so an app that
-isn't being looked at costs the same. A program made with `--pack` doesn't have ctrl+shift+I.
+`RSUI_INSPECT=1` starts a window with what ctrl+shift+F draws showing, which works for an app written in Rust too, and
+`RSUI_INSPECT=keep` keeps it without showing it. While no viewer's looking, rendering checks one thing to find that out, and the layer
+one more for each hook, so an app that isn't being looked at costs the same, apart from the light spans above. A trace saved since
+version 2 has the spans in it too, so its Performance tab is the same as it was live. A program made with `--pack` has none of this.
 
 ## What's different from React
 

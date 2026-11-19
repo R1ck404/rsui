@@ -220,6 +220,13 @@ impl Desk {
         default_size: (u32, u32),
     ) -> Result<Self, String> {
         bridge::answer_dialogs_here();
+        // With no window, nothing's kept of where time goes unless `RSUI_SPANS` asks, as a measurement of what keeping it
+        // costs does: `light` as a window being worked on keeps, `detail` as while an inspector's looking.
+        match std::env::var("RSUI_SPANS").as_deref() {
+            Ok("light" | "1") => rsui_spans::set_level(rsui_spans::Level::Light),
+            Ok("detail" | "2") => rsui_spans::set_level(rsui_spans::Level::Detail),
+            _ => {}
+        }
         // A logpoint has the code taken in again, which keeps each component's state, as `--agent` and a watched window do.
         bridge::keep_state_across_reloads();
         // What comes in is kept, with the clock and where random numbers start, so it can be replayed as a window's is.
@@ -1127,6 +1134,19 @@ impl Desk {
                 for line in crate::debugger::list().lines() {
                     println!("  {line}");
                 }
+                return Ok(());
+            }
+            // Sampling where JavaScript is, as the inspector's Record does, for what `save` keeps.
+            ("record", [how]) if !how.quoted && (how.text == "on" || how.text == "off") => {
+                let on = how.text == "on";
+                crate::bridge::with_engine(|engine| {
+                    if on {
+                        engine.start_sampling(Duration::from_millis(1));
+                    } else {
+                        engine.stop_sampling();
+                    }
+                })
+                .ok_or("the app's in the middle of running its code")?;
                 return Ok(());
             }
             ("save", [file]) => {
@@ -2181,7 +2201,7 @@ fn print_split() {
     println!("  split {}", parts.join(" "));
 }
 
-pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"PATH\", dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide. A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT. For what a web page in a <WebView> would do: webview load URL, webview inpage URL, webview fail URL [CODE], webview title TEXT, webview popup URL, webview key KEYS, webview fullscreen on|off, webview message JSON, webview close, webview crash, webview unavailable";
+pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"PATH\", dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide, record on|off (sample where JavaScript is, for save). A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT. For what a web page in a <WebView> would do: webview load URL, webview inpage URL, webview fail URL [CODE], webview title TEXT, webview popup URL, webview key KEYS, webview fullscreen on|off, webview message JSON, webview close, webview crash, webview unavailable";
 
 /// A word of a step, with whether it was in quotes, which is what makes `"#1"` some text rather than a key.
 #[derive(Debug, Clone)]

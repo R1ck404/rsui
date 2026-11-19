@@ -7,8 +7,17 @@
 //! A request and its answer are each a line of JSON, and what's asked is done on the app's own thread, at its next update:
 //!
 //! - `{"ask":"hello"}`: which app this is.
-//! - `{"ask":"news","after":FRAME,"heard":LINE}`: the frames kept after FRAME, every change of state kept and which one
-//!   things are as they were after, what's been said after LINE, and the logpoints there are.
+//! - `{"ask":"news","after":FRAME,"heard":LINE,"spans":SPAN,"labels":LABEL,"stacks":STACK}`: the frames kept after FRAME,
+//!   every change of state kept and which one things are as they were after, what's been said after LINE, and the
+//!   logpoints there are. With `spans`, the timed spans kept from number SPAN on (see `rsui-spans`), as `spans.recs`, six
+//!   numbers each: kind, thread, start and length in nanoseconds, label and a number that goes with it, with the labels
+//!   from LABEL on and the stacks of labels (what JavaScript was sampled doing) from STACK on. `close` says the viewer's
+//!   been asked to go, as F12 in the app does when it's open.
+//! - `{"ask":"record","on":true}`: starts sampling where JavaScript is, about every millisecond, or stops.
+//! - `{"ask":"pick","on":true}`: has the next click on the app pick what it's on, rather than reach the app, which `news`
+//!   says as `picked`, with what the pointer's on filled in until then.
+//! - `{"ask":"heat","cells":[[PATH,HEAT,"LABEL"],..]}`: draws where time went over the app, each element as hot as HEAT
+//!   says, from 0 to 1, or nothing with no cells.
 //! - `{"ask":"goto","change":N}`: puts state back to how it was after change N.
 //! - `{"ask":"logpoint","at":"FILE:LINE","expression":"EXPRESSION"}`, or with no expression to take it away.
 //! - `{"ask":"show","on":true}`: shows the inspector in the app's window, or hides it.
@@ -58,6 +67,56 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 const MOST_FRAMES: usize = 600;
 /// How many lines of what's been said are kept for a viewer to ask about.
 const MOST_HEARD: usize = 1000;
+/// The most spans one answer has, the oldest of those asked for, so one that's been away catches up over a few answers.
+const MOST_SPANS: usize = 40_000;
+/// How often JavaScript is sampled while a viewer's recording.
+const SAMPLE_EVERY: Duration = Duration::from_millis(1);
+
+/// Whether the viewer F12 opened has been asked to go, by F12 again.
+static CLOSE_ASKED: AtomicBool = AtomicBool::new(false);
+/// The viewer F12 opened, while it's running.
+static OPENED: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+/// Opens the viewer docked to the app's window, as F12 and the pill do, or asks the one that's open to go.
+pub(crate) fn open_viewer(app: &mut App) {
+    if !listening() {
+        // A packed app has nothing for a viewer to look at, so it has what's drawn over it instead.
+        app.show_inspector(!app.inspector_showing());
+        return;
+    }
+    let mut opened = OPENED.lock().expect("lock is not poisoned");
+    let running = opened
+        .as_mut()
+        .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    if running || viewer_looking() {
+        // F12 again puts it away, as a browser's does: it's told with its next news, gives its window back and goes.
+        CLOSE_ASKED.store(true, Ordering::Relaxed);
+        app.dock(None);
+        *opened = None;
+        return;
+    }
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("--view")
+        .arg(std::process::id().to_string())
+        .env(crate::trace_file::DOCK_VAR, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    {
+        use std::os::windows::process::CommandExt;
+        // It has a window of its own, and no console.
+        command.creation_flags(0x0800_0000);
+    }
+    CLOSE_ASKED.store(false, Ordering::Relaxed);
+    match command.spawn() {
+        Ok(child) => *opened = Some(child),
+        Err(error) => eprintln!("rsui-tsx: the inspector couldn't be started: {error}"),
+    }
+}
 
 const PIPE_ACCESS_DUPLEX: u32 = 3;
 const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
@@ -499,6 +558,41 @@ pub(crate) fn answer(app: &mut App, request: &Value) -> Value {
             Ok(json!({ "showing": app.inspector_showing() }))
         }
         "summary" => Ok(json!({ "summary": rsui::summary(app.frames()) })),
+        "record" => {
+            let on = request["on"].as_bool().unwrap_or(true);
+            let recording = crate::bridge::with_engine(|engine| {
+                if on {
+                    engine.start_sampling(SAMPLE_EVERY);
+                } else {
+                    engine.stop_sampling();
+                }
+                engine.sampling()
+            });
+            match recording {
+                Some(recording) => Ok(json!({ "recording": recording })),
+                None => Err("the app's in the middle of running its code".to_owned()),
+            }
+        }
+        "pick" => {
+            app.set_picking(request["on"].as_bool().unwrap_or(true));
+            Ok(json!({ "picking": app.picking() }))
+        }
+        "heat" => {
+            let cells = request["cells"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|cell| {
+                    Some((
+                        path_of(cell.get(0)?),
+                        cell.get(1)?.as_f64()? as f32,
+                        cell.get(2).and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    ))
+                })
+                .collect();
+            app.set_heat(cells);
+            Ok(json!({}))
+        }
         "breakpoint" => breakpoint(request),
         "tree" => Ok(tree(app)),
         "element" => {
@@ -591,7 +685,61 @@ fn news(app: &mut App, request: &Value) -> Value {
     news["now"] = json!(crate::why::history_now());
     news["showing"] = json!(app.inspector_showing());
     news["inputs"] = json!(app.recorded_inputs().0.len());
+    news["close"] = json!(CLOSE_ASKED.swap(false, Ordering::Relaxed));
+    news["picking"] = json!(app.picking());
+    if let Some(picked) = app.take_picked() {
+        news["picked"] = json!(picked);
+    }
+    if request.get("spans").is_some() {
+        news["spans"] = spans_news(request, MOST_SPANS);
+    }
     news
+}
+
+/// The spans kept from what the viewer asks for on, at most `most` of them, with the labels and stacks it doesn't have yet.
+pub(crate) fn spans_news(request: &Value, most: usize) -> Value {
+    let recording = crate::bridge::with_engine(|engine| {
+        engine.take_samples();
+        engine.sampling()
+    })
+    .unwrap_or(false);
+    let after = request["spans"].as_u64().unwrap_or(0);
+    let (recs, next) = rsui_spans::since(after);
+    let skipped = recs.len().saturating_sub(most);
+    let given = recs.len() - skipped;
+    // The oldest of what's asked for, so the next answer goes on from where this one stops.
+    let mut flat = Vec::with_capacity(given * 6);
+    for rec in recs.iter().take(most) {
+        flat.extend([
+            u64::from(rec.kind),
+            u64::from(rec.thread),
+            rec.start,
+            rec.end.saturating_sub(rec.start),
+            u64::from(rec.label),
+            u64::from(rec.arg),
+        ]);
+    }
+    let next = next - skipped as u64;
+    let labels_from = request["labels"].as_u64().unwrap_or(0) as usize;
+    let stacks_from = request["stacks"].as_u64().unwrap_or(0) as usize;
+    let mut said = json!({
+        "next": next,
+        "recs": flat,
+        "labels": rsui_spans::labels_from(labels_from),
+        "stacks": rsui_spans::stacks_from(stacks_from),
+        "now": rsui_spans::now(),
+        "threads": rsui_spans::threads(),
+        "level": rsui_spans::level() as u8,
+        "recording": recording,
+        "dropped": rsui_spans::dropped(),
+    });
+    if after == 0 {
+        said["kinds"] = rsui_spans::KINDS
+            .iter()
+            .map(|(name, category, _, about)| json!([name, category.name(), about]))
+            .collect();
+    }
+    said
 }
 
 /// What `news` says whether or not the app's stopped: what's been said after the line the viewer's had, the logpoints and
@@ -795,7 +943,11 @@ export default function App() {
         wait no \"Paused in debugger\" 3000
         click \"Performance\"
         shot performance.png
-        click \"Summary\"
+        wait \"Every frame kept\" 5000
+        click \"Bottom-up\"
+        click \"Treemap\"
+        shot treemap.png
+        click \"As text\"
         wait \"with something happening\" 3000
         click \"Rendering\"
         shot rendering.png

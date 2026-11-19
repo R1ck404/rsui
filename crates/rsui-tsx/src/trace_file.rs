@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 
 /// What it says it is, and which version of what's in it.
 const KIND: &str = "rsui trace";
-const VERSION: u32 = 1;
+/// 2 has `spans`, where each frame's time went, as the viewer's Performance tab shows it.
+const VERSION: u32 = 2;
 
 fn ms(duration: Duration) -> f64 {
     (duration.as_secs_f64() * 1_000_000.0).round() / 1000.0
@@ -29,6 +30,7 @@ pub(crate) fn frame_json(frame: &FrameRecord) -> Value {
         "paint": ms(frame.paint),
         "gpu": ms(frame.gpu),
         "present": ms(frame.present),
+        "painted": frame.painted,
         "handled": frame.handled.iter().map(|handled| json!({
             "action": handled.action.name(),
             "key": handled.key.to_string(),
@@ -47,6 +49,7 @@ pub(crate) fn frame_json(frame: &FrameRecord) -> Value {
             "own": ms(render.own),
             "changed": render.changed,
             "depth": render.depth,
+            "path": render.path,
             "why": rsui::inspect::describe_render(render)
                 .split_once(": ")
                 .map(|(_, why)| why.to_owned()),
@@ -75,6 +78,7 @@ pub(crate) fn trace_of(app: &App, title: &str) -> Value {
         "history": history,
         "summary": rsui::summary(app.frames()),
         "replay": crate::replay::json(app),
+        "spans": crate::live::spans_news(&json!({ "spans": 0, "labels": 0, "stacks": 0 }), usize::MAX),
     })
 }
 
@@ -130,22 +134,42 @@ pub(crate) fn check(path: &Path) -> Result<(), String> {
 pub(crate) const TRACE_VAR: &str = "RSUI_TRACE";
 pub(crate) const LIVE_VAR: &str = "RSUI_LIVE";
 pub(crate) const PID_VAR: &str = "RSUI_LIVE_PID";
+/// Has the viewer dock itself to the app it's looking at, as it does when F12 opened it.
+pub(crate) const DOCK_VAR: &str = "RSUI_VIEW_DOCK";
 
 /// Whether this is the viewer, which isn't itself to be looked at.
 pub(crate) fn is_viewer() -> bool {
     std::env::var_os(TRACE_VAR).is_some() || std::env::var_os(LIVE_VAR).is_some()
 }
 
-/// The viewer, as an app, which reads the trace that `RSUI_TRACE` names, or looks at an app in `RSUI_LIVE`.
-pub(crate) const VIEWER: &str = include_str!("viewer.tsx");
+/// The viewer, as an app, which reads the trace that `RSUI_TRACE` names, or looks at an app in `RSUI_LIVE`: each of its files,
+/// by its name in the folder it's run from, and what's in it. `main.tsx` is the one that's run.
+pub(crate) const VIEWER_FILES: &[(&str, &str)] = &[
+    ("main.tsx", include_str!("viewer/main.tsx")),
+    ("theme.ts", include_str!("viewer/theme.ts")),
+    ("link.ts", include_str!("viewer/link.ts")),
+    ("ui.tsx", include_str!("viewer/ui.tsx")),
+    ("elements.tsx", include_str!("viewer/elements.tsx")),
+    ("console.tsx", include_str!("viewer/console.tsx")),
+    ("sources.tsx", include_str!("viewer/sources.tsx")),
+    ("state.tsx", include_str!("viewer/state.tsx")),
+    ("replay.tsx", include_str!("viewer/replay.tsx")),
+    ("performance.tsx", include_str!("viewer/performance.tsx")),
+    ("rendering.tsx", include_str!("viewer/rendering.tsx")),
+    ("spans.ts", include_str!("viewer/spans.ts")),
+    ("timeline.tsx", include_str!("viewer/timeline.tsx")),
+    ("palette.tsx", include_str!("viewer/palette.tsx")),
+];
 
-/// Puts the viewer where it can be run from, and says where.
+/// Puts the viewer where it can be run from, and says where its `main.tsx` is.
 pub(crate) fn viewer_file() -> Result<PathBuf, String> {
     let folder = std::env::temp_dir().join("rsui-viewer");
     std::fs::create_dir_all(&folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-    let file = folder.join("viewer.tsx");
-    if std::fs::read_to_string(&file).ok().as_deref() != Some(VIEWER) {
-        std::fs::write(&file, VIEWER).map_err(|error| format!("{}: {error}", file.display()))?;
+    for (name, code) in VIEWER_FILES {
+        let file = folder.join(name);
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(*code) {
+            std::fs::write(&file, code).map_err(|error| format!("{}: {error}", file.display()))?;
+        }
     }
-    Ok(file)
+    Ok(folder.join("main.tsx"))
 }

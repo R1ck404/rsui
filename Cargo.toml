@@ -11,6 +11,7 @@ members = [
     "crates/rsui-layout",
     "crates/rsui-render",
     "crates/rsui-runtime",
+    "crates/rsui-spans",
     "crates/rsui-text",
     "crates/rsui-tsx",
     "crates/rsui-webview",

@@ -26,6 +26,7 @@ jit-opt = ["jit"]
 counts = []
 
 [dependencies]
+rsui-spans = { path = "../rsui-spans" }
 foldhash = "0.2.0"
 rsui-alloc = { path = "../rsui-alloc" }
 
