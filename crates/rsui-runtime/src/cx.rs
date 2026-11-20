@@ -547,7 +547,7 @@ impl<'a> Cx<'a> {
     }
 
     /// Says why this rendered, in a sentence, for what's tracing. It does nothing if nothing is.
-    pub fn trace_why(&mut self, why: impl Into<String>) {
+    pub fn trace_why(&mut self, why: impl Into<Text>) {
         if let Some(render) = self
             .store
             .tracer

@@ -824,6 +824,12 @@ impl App {
         self.repaint = true;
     }
 
+    /// What the inspector's keeping takes, for measuring memory, if it's inspecting.
+    #[doc(hidden)]
+    pub fn inspector_footprint(&self) -> Option<String> {
+        self.inspector.as_ref().map(|inspector| inspector.footprint())
+    }
+
     pub fn inspecting(&self) -> bool {
         self.inspector.is_some()
     }

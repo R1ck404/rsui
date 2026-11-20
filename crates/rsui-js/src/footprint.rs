@@ -41,6 +41,8 @@ pub struct Footprint {
     pub items: VecFootprint,
     /// Pages of the list of objects by how many of their 64 places are free: none, 1-15, 16-31, 32-47, 48-63, all.
     pub pages_by_free: [usize; 6],
+    /// What Rust holds through `Root`s: places in use, places free, and the room the list has.
+    pub roots: (usize, usize, usize),
 }
 
 /// What a block of this many bytes takes in rsui-alloc's size classes, or with a heap's header past its biggest class.
@@ -86,7 +88,8 @@ impl std::fmt::Display for Footprint {
             f,
             "pages of objects by free places: none {}, 1-15 {}, 16-31 {}, 32-47 {}, 48-63 {}, all {}",
             pages[0], pages[1], pages[2], pages[3], pages[4], pages[5]
-        )
+        )?;
+        writeln!(f, "roots: {} held, {} free places, room for {}", self.roots.0 - self.roots.1, self.roots.1, self.roots.2)
     }
 }
 
@@ -164,6 +167,7 @@ impl Vm {
             slots,
             items,
             pages_by_free,
+            roots: self.held.counts(),
             objects: list(
                 self.objects.list.len(),
                 size_of::<Object>(),

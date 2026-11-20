@@ -1191,10 +1191,31 @@ impl Desk {
                     println!("  {line}");
                 }
                 println!(
-                    "  allocator: {} B in chunks of small blocks, {} B of blocks in use",
+                    "  allocator: {} B in chunks of small blocks, {} B of blocks in use, {} B in empty chunks",
                     rsui::UiAlloc.retained_bytes(),
-                    rsui::UiAlloc.live_bytes()
+                    rsui::UiAlloc.live_bytes(),
+                    rsui::UiAlloc.empty_bytes()
                 );
+                let (spans, room) = rsui_spans::footprint();
+                println!("  spans: {spans} kept in {room} B");
+                for one in &self.windows {
+                    if let Some(line) = one.app.inspector_footprint() {
+                        println!("  {line}");
+                    }
+                }
+                println!("  {}", bridge::tracing_footprint());
+                if std::env::var_os("RSUI_STRING_DUPES").is_some() {
+                    let (count, bytes, again) = bridge::duplicate_strings();
+                    println!("  strings with text of their own: {count}, {bytes} B, {again} B of it the same as another's");
+                }
+                return Ok(());
+            }
+            ("regions", []) => {
+                // Where the process's memory is, by what each reservation of addresses is for, and the heaps' blocks by size.
+                self.pass()?;
+                for line in crate::process_memory::regions() {
+                    println!("  {line}");
+                }
                 return Ok(());
             }
             ("timers", []) => {

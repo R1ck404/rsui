@@ -106,6 +106,18 @@ pub(crate) struct Shapes {
 }
 
 impl Shapes {
+    /// Makes room for one more shape if there isn't any: by doubling, as a `Vec` does, while the list is under a megabyte, and
+    /// by a quarter once it's bigger. Doubling had Mantine's page, with 46,000 shapes of 72 bytes, keep room for 131,072 of
+    /// them, 9 MB committed for 3.3 MB of shapes. (A list of its own that commits as it grows, as the list of objects is, was
+    /// 40-120 KB more for a program with few shapes, which a `Vec` in the process heap has room for already.)
+    #[inline]
+    fn room_for_one(&mut self) {
+        let capacity = self.items.capacity();
+        if self.items.len() == capacity && capacity * size_of::<Shape>() >= 1 << 20 {
+            self.items.reserve_exact(capacity / 4);
+        }
+    }
+
     /// Puts a shape somewhere, in a free place if there is one.
     fn place(&mut self, shape: Shape) -> u32 {
         if let Some(handle) = self.free.pop() {
@@ -116,12 +128,14 @@ impl Shapes {
         // A pinned number the end of the list gave back (see `sweep`) isn't given out again: its place comes back
         // empty.
         while self.is_pinned(self.items.len() as u32) {
+            self.room_for_one();
             self.items.push(Shape {
                 free: true,
                 ..Shape::new(NONE, NONE)
             });
             self.retired += 1;
         }
+        self.room_for_one();
         self.items.push(shape);
         let handle = (self.items.len() - 1) as u32;
         self.touched.push(handle);

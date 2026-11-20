@@ -58,6 +58,9 @@ struct Why {
     slots: RefCell<HashMap<(u32, u32, u32), u32>>,
     components: RefCell<HashMap<u32, (u32, u32, u32)>>,
     history: RefCell<History>,
+    /// Each place hooks are called from, as `hookSite` gives it, once: every component made by the same code calls its
+    /// hooks from the same places, and a string for each of them was 3.6 MB of Mantine's page.
+    sites: RefCell<HashMap<String, Root>>,
 }
 
 thread_local! {
@@ -80,8 +83,30 @@ pub(crate) fn set_tracing(on: bool) -> bool {
             why.components.borrow_mut().clear();
             *why.history.borrow_mut() = History::default();
             why.sources.borrow_mut().clear();
+            why.sites.borrow_mut().clear();
         }
         true
+    })
+}
+
+/// What's kept here, for measuring memory.
+pub(crate) fn footprint() -> String {
+    WHY.with(|why| {
+        let notes: usize = why.notes.borrow().values().map(|kept| kept.iter().map(String::capacity).sum::<usize>()).sum();
+        let sources: usize = why
+            .sources
+            .borrow()
+            .values()
+            .map(|lines| lines.as_ref().map_or(0, |lines| lines.iter().map(String::capacity).sum::<usize>()))
+            .sum();
+        format!(
+            "{} B of notes, {} files' lines ({sources} B), {} slots, {} changes, {} hook sites",
+            notes,
+            why.sources.borrow().len(),
+            why.slots.borrow().len(),
+            why.history.borrow().changes.len(),
+            why.sites.borrow().len()
+        )
     })
 }
 
@@ -167,7 +192,14 @@ fn host_hook_site(vm: &mut Vm, _: Args) -> Result<Value, Value> {
             break;
         }
     }
-    Ok(vm.new_string(site.trim_end()))
+    site.truncate(site.trim_end().len());
+    if let Some(kept) = WHY.with(|why| why.sites.borrow().get(&site).map(Root::get)) {
+        return Ok(kept);
+    }
+    let made = vm.new_string(&site);
+    let kept = vm.root(made);
+    WHY.with(|why| why.sites.borrow_mut().insert(site, kept));
+    Ok(made)
 }
 
 fn is_hook_name(name: &str) -> bool {

@@ -1493,6 +1493,8 @@ pub fn load(path: &Path, stack_limit: usize) -> Result<Entry, String> {
     // A timer that an app that ran on this thread before was waiting for is that app's, whose runtime won't run it: this one's
     // timers are armed for themselves, rather than left waiting behind it.
     HOST.with(|host| host.timer_due.set(None));
+    // An app makes the same class names, styles and labels again and again, and what's kept of them is one string each.
+    rsui_js::share_same_text(true);
     let mut engine = Engine::new();
     engine.set_stack_limit(stack_limit);
     // A window that's gone quiet can collect all of the JavaScript's garbage too (`RSUI_IDLE_GC`).
@@ -2520,6 +2522,17 @@ fn js_component(cx: &mut Cx<'_>, props: &JsProps) -> Node {
     node
 }
 
+/// See `Engine::duplicate_strings`.
+pub(crate) fn duplicate_strings() -> (usize, usize, usize) {
+    HOST.with(|host| host.engine.borrow().as_ref().map_or((0, 0, 0), rsui_js::Engine::duplicate_strings))
+}
+
+/// What tracing what renders keeps here and in `why.rs`, for measuring memory.
+pub(crate) fn tracing_footprint() -> String {
+    let traced = HOST.with(|host| host.traced.borrow().len());
+    format!("tracing: {traced} components' last props kept, {}", crate::why::footprint())
+}
+
 /// Tells the layer whether to note what it does for a debugger, if that's changed.
 fn follow_tracing(on: bool) {
     if crate::why::set_tracing(on) {
@@ -2590,8 +2603,29 @@ fn explain_render(cx: &mut Cx<'_>, object: &Root, slot: u32, props: &JsProps) {
     });
     cx.trace_name(name);
     for line in why {
-        cx.trace_why(line);
+        cx.trace_why(shared_sentence(line));
     }
+}
+
+/// The same sentence as one string, for the renders the inspector keeps: a component that renders again for the same
+/// reason says the same thing each time, and Mantine's page had 2.9 MB of them.
+fn shared_sentence(line: String) -> rsui::core::Text {
+    thread_local! {
+        static SAID: RefCell<std::collections::HashMap<String, rsui::core::Text>> = RefCell::default();
+    }
+    SAID.with(|said| {
+        let mut said = said.borrow_mut();
+        if let Some(text) = said.get(&line) {
+            return text.clone();
+        }
+        // Not kept for ever: sentences with values in them can each be different.
+        if said.len() >= 4096 {
+            said.clear();
+        }
+        let text = rsui::core::Text::from(line.as_str());
+        said.insert(line, text.clone());
+        text
+    })
 }
 
 /// What the hooks of the component that has this number in that runtime hold, a line each, if it's a JavaScript one.
@@ -4467,14 +4501,16 @@ fn collect_when_quiet(quiet: rsui::Quiet) -> bool {
 /// does between what someone does.
 pub fn between_frames() {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("RSUI_FRAME_GC").as_deref() != Ok("0")) {
-        return;
-    }
+    let collect = *ON.get_or_init(|| std::env::var("RSUI_FRAME_GC").as_deref() != Ok("0"));
     HOST.with(|host| {
         if let Ok(mut engine) = host.engine.try_borrow_mut()
             && let Some(engine) = engine.as_mut()
         {
-            engine.collect_if_due_soon();
+            // What only makes loading code quicker isn't wanted once a frame's up.
+            engine.let_go_of_loading_caches();
+            if collect {
+                engine.collect_if_due_soon();
+            }
         }
     });
 }

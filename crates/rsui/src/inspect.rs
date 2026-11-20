@@ -447,6 +447,26 @@ pub(crate) struct Inspector {
 }
 
 impl Inspector {
+    /// What the frames kept take, for measuring memory: how many, their renders and handled actions, and about how many bytes.
+    pub(crate) fn footprint(&self) -> String {
+        let (mut renders, mut handled, mut bytes, mut why, mut paths) = (0, 0, 0, 0, 0);
+        bytes += self.frames.capacity() * size_of::<FrameRecord>();
+        for frame in self.frames.iter().chain([&self.current]) {
+            renders += frame.renders.len();
+            handled += frame.handled.len();
+            bytes += frame.renders.capacity() * size_of::<Rendered>() + frame.handled.capacity() * size_of::<Handled>();
+            for render in &frame.renders {
+                why += render.why.capacity() * size_of::<Text>();
+                paths += render.path.as_ref().map_or(0, |path| path.capacity() * 4);
+                bytes += render.name.as_ref().map_or(0, |name| if name.len() > 15 { name.len() } else { 0 });
+            }
+        }
+        format!(
+            "inspector: {} frames, {renders} renders, {handled} handled, {bytes} B of records, {why} B of why, {paths} B of paths",
+            self.frames.len()
+        )
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             showing: false,

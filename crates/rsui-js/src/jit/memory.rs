@@ -71,6 +71,8 @@ impl Drop for Views {
         unsafe {
             UnmapViewOfFile(self.base.cast());
             UnmapViewOfFile(self.writable.cast());
+            rsui_alloc::regions::forget(self.base.cast());
+            rsui_alloc::regions::forget(self.writable.cast());
             CloseHandle(self.mapping);
             #[cfg(feature = "jit-opt")]
             if !self.feedback.is_null() {
@@ -216,6 +218,8 @@ impl CodeMemory {
             } else {
                 std::ptr::null_mut()
             };
+            rsui_alloc::regions::note(writable.cast(), "jit code, written through");
+            rsui_alloc::regions::note(base.cast(), "jit code, run from");
             Some(Self {
                 views: std::sync::Arc::new(Views {
                     mapping,

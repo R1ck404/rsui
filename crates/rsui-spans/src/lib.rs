@@ -196,17 +196,111 @@ pub fn nanos(at: Instant) -> u64 {
     at.saturating_duration_since(origin()).as_nanos() as u64
 }
 
+/// A span as it's kept: [`Rec`] with how long it took in place of when it ended, which is 24 bytes rather than 32. One that
+/// took longer than `u32::MAX` nanoseconds (4.3 s) has `u32::MAX` here, and its end in [`Store::long`].
+#[derive(Clone, Copy)]
+struct Packed {
+    start: u64,
+    took: u32,
+    label: u32,
+    arg: u32,
+    kind: u8,
+    thread: u8,
+}
+
+/// How many spans each piece of [`Store`] holds. The spans kept are in pieces of this many, rather than in one list that
+/// doubles as it grows: 30,000 spans were 2 MB as a list with room for 65,536, and are 0.7 MB in pieces.
+const PIECE: usize = 4096;
+
 struct Store {
-    recs: VecDeque<Rec>,
-    /// The number of the first span in `recs`, counting every span ever kept.
+    /// The spans, oldest first, in pieces that are full but for the last, the first starting at `head`.
+    pieces: VecDeque<Vec<Packed>>,
+    head: usize,
+    len: usize,
+    /// The number of the first span kept, counting every span ever kept.
     first: u64,
     pushed_since_trim: u32,
+    /// The end of each span kept that took too long to say in [`Packed::took`], by its number.
+    long: VecDeque<(u64, u64)>,
+}
+
+impl Store {
+    fn push(&mut self, rec: Rec) {
+        let took = rec.end.saturating_sub(rec.start);
+        let packed = Packed {
+            start: rec.start,
+            took: u32::try_from(took).unwrap_or(u32::MAX),
+            label: rec.label,
+            arg: rec.arg,
+            kind: rec.kind,
+            thread: rec.thread,
+        };
+        if packed.took == u32::MAX {
+            self.long.push_back((self.first + self.len as u64, rec.end));
+        }
+        if self.pieces.back().is_none_or(|piece| piece.len() == PIECE) {
+            self.pieces.push_back(Vec::with_capacity(PIECE));
+        }
+        if let Some(piece) = self.pieces.back_mut() {
+            piece.push(packed);
+            self.len += 1;
+        }
+    }
+
+    fn pop_front(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        self.head += 1;
+        self.len -= 1;
+        self.first += 1;
+        let front = self.pieces.front().map_or(0, Vec::len);
+        if self.head == front {
+            if self.pieces.len() > 1 || front == PIECE {
+                self.pieces.pop_front();
+            } else if let Some(piece) = self.pieces.front_mut() {
+                piece.clear();
+            }
+            self.head = 0;
+        }
+        while self.long.front().is_some_and(|(number, _)| *number < self.first) {
+            self.long.pop_front();
+        }
+    }
+
+    /// The `at`th span kept, from the oldest.
+    fn get(&self, at: usize) -> Rec {
+        let place = self.head + at;
+        let packed = self.pieces[place / PIECE][place % PIECE];
+        let end = if packed.took == u32::MAX {
+            let number = self.first + at as u64;
+            let found = self.long.binary_search_by_key(&number, |(number, _)| *number);
+            found.map_or(u64::MAX, |found| self.long[found].1)
+        } else {
+            packed.start + u64::from(packed.took)
+        };
+        Rec {
+            start: packed.start,
+            end,
+            label: packed.label,
+            arg: packed.arg,
+            kind: packed.kind,
+            thread: packed.thread,
+        }
+    }
+
+    fn front_end(&self) -> Option<u64> {
+        (self.len > 0).then(|| self.get(0).end)
+    }
 }
 
 static STORE: Mutex<Store> = Mutex::new(Store {
-    recs: VecDeque::new(),
+    pieces: VecDeque::new(),
+    head: 0,
+    len: 0,
     first: 0,
     pushed_since_trim: 0,
+    long: VecDeque::new(),
 });
 
 /// How many spans have been dropped because there were too many at once, which says the newest are all there is.
@@ -226,19 +320,17 @@ pub fn record(kind: Kind, start: u64, end: u64, label: u32, arg: u32) {
     let Ok(mut store) = STORE.lock() else {
         return;
     };
-    if store.recs.len() >= MOST_KEPT {
-        store.recs.pop_front();
-        store.first += 1;
+    if store.len >= MOST_KEPT {
+        store.pop_front();
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
-    store.recs.push_back(rec);
+    store.push(rec);
     store.pushed_since_trim += 1;
     if store.pushed_since_trim >= 512 {
         store.pushed_since_trim = 0;
         let oldest = end.saturating_sub(KEPT_FOR_NANOS);
-        while store.recs.front().is_some_and(|rec| rec.end < oldest) {
-            store.recs.pop_front();
-            store.first += 1;
+        while store.front_end().is_some_and(|end| end < oldest) {
+            store.pop_front();
         }
     }
 }
@@ -257,9 +349,14 @@ pub fn since(after: u64) -> (Vec<Rec>, u64) {
     let Ok(store) = STORE.lock() else {
         return (Vec::new(), after);
     };
-    let next = store.first + store.recs.len() as u64;
-    let skip = after.saturating_sub(store.first) as usize;
-    (store.recs.iter().skip(skip).copied().collect(), next)
+    let next = store.first + store.len as u64;
+    let skip = (after.saturating_sub(store.first) as usize).min(store.len);
+    ((skip..store.len).map(|at| store.get(at)).collect(), next)
+}
+
+/// How many spans are kept, and how many bytes the room for them takes, for measuring memory.
+pub fn footprint() -> (usize, usize) {
+    STORE.lock().map_or((0, 0), |store| (store.len, store.pieces.len() * PIECE * size_of::<Packed>()))
 }
 
 /// How many spans have been dropped, as there were too many to keep.
@@ -471,6 +568,38 @@ pub fn threads() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spans_kept_in_pieces_come_back_as_they_went_in() {
+        let mut store = Store { pieces: VecDeque::new(), head: 0, len: 0, first: 0, pushed_since_trim: 0, long: VecDeque::new() };
+        let rec = |at: u64| Rec {
+            start: at * 10,
+            // Every thousandth took longer than the packed form says, which is kept aside.
+            end: at * 10 + if at % 1000 == 7 { 5_000_000_000 } else { at % 9 },
+            label: at as u32,
+            arg: 3,
+            kind: 1,
+            thread: 2,
+        };
+        for at in 0..(PIECE as u64 * 3 + 5) {
+            store.push(rec(at));
+        }
+        for _ in 0..(PIECE + 9) {
+            store.pop_front();
+        }
+        assert_eq!(store.first, PIECE as u64 + 9);
+        assert_eq!(store.len, PIECE * 2 - 4);
+        for at in 0..store.len {
+            assert_eq!(store.get(at), rec(store.first + at as u64));
+        }
+        // Emptied, it starts again where it was, with its memory.
+        while store.len > 0 {
+            store.pop_front();
+        }
+        assert!(store.long.is_empty() && store.pieces.len() <= 1);
+        store.push(rec(1));
+        assert_eq!(store.get(0), rec(1));
+    }
 
     #[test]
     fn keeps_spans_by_level() {

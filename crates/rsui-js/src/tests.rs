@@ -2806,6 +2806,42 @@ fn text_built_a_piece_at_a_time_counts_once_however_many_steps_are_kept() {
 }
 
 #[test]
+fn strings_kept_with_the_same_text_share_it_and_stay_as_they_were() {
+    crate::share_same_text(true);
+    let (mut engine, _) = engine_with_gc();
+    engine
+        .eval(
+            "globalThis.kept = [];
+             globalThis.wide = '\u{e9}'.repeat(40);
+             for (let i = 0; i < 4000; i++) {
+                 kept.push('flex h-7 items-center gap-2 border-b px-3 text-sm ' + (i % 2 ? 'odd' : 'even'));
+                 kept.push(wide + (i % 2));
+             }
+             gc(); gc();",
+            "same.js",
+        )
+        .unwrap();
+    // 8,000 strings of 50 to 80 bytes, which are four texts.
+    let strings = engine.memory().strings;
+    assert!(strings < 600 * 1024, "{strings} bytes of strings");
+    let checked = engine
+        .eval(
+            "const a = kept[0], b = kept[4];
+             const longer = a + ' more', other = b + ' else';
+             gc();
+             [a === b, a.length, longer, other, kept[1] === kept[5], kept[1].length, kept[1].charCodeAt(0),
+              kept.every((s, i) => s === (i % 2 ? wide + ((i >> 1) % 2) : 'flex h-7 items-center gap-2 border-b px-3 text-sm ' + ((i >> 1) % 2 ? 'odd' : 'even')))].join()",
+            "check.js",
+        )
+        .unwrap();
+    let text = engine.vm().plain_text(checked).unwrap();
+    assert_eq!(
+        text,
+        "true,54,flex h-7 items-center gap-2 border-b px-3 text-sm even more,flex h-7 items-center gap-2 border-b px-3 text-sm even else,true,41,233,true"
+    );
+}
+
+#[test]
 fn a_quiet_collection_gives_back_and_shrinks_and_an_ordinary_one_does_not() {
     let (mut engine, _) = engine_with_gc();
     let make = "globalThis.kept = [];

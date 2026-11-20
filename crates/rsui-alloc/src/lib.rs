@@ -16,6 +16,7 @@
 //! ```
 
 pub mod owners;
+pub mod regions;
 pub mod split;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -313,6 +314,25 @@ impl UiAlloc {
             .iter()
             .zip(CLASS_SIZES)
             .map(|(c, size)| c.with(|s| s.blocks * size))
+            .sum()
+    }
+
+    /// The bytes of chunks with nothing in them, which [`Self::reclaim`] would give back, for measuring memory.
+    pub fn empty_bytes(&self) -> usize {
+        CLASSES
+            .iter()
+            .map(|c| {
+                c.with(|s| {
+                    let mut count = 0;
+                    let mut at = s.empty;
+                    while !at.is_null() {
+                        count += 1;
+                        // SAFETY: the empty list is only changed under the class lock, which is held.
+                        at = unsafe { (*at).empty_next };
+                    }
+                    count * CHUNK_SIZE
+                })
+            })
             .sum()
     }
 

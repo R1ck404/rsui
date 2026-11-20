@@ -108,6 +108,8 @@ mod counting {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         pub(crate) const RATE: usize = 61;
+        /// Blocks this big or bigger are all kept, counted as themselves rather than as standing for [`RATE`] blocks.
+        const BIG: usize = 64 * 1024;
         const DEPTH: usize = 28;
 
         static ON: AtomicBool = AtomicBool::new(false);
@@ -120,7 +122,7 @@ mod counting {
 
         #[derive(Default)]
         struct Kept {
-            live: HashMap<usize, (u32, usize)>,
+            live: HashMap<usize, (u32, usize, usize)>,
             stacks: HashMap<([usize; DEPTH], u8), u32>,
             /// Each stack, with its owner, the bytes it has live, and how many.
             each: Vec<([usize; DEPTH], u8, isize, isize)>,
@@ -178,9 +180,15 @@ mod counting {
         }
 
         pub(crate) fn maybe_sample(block: *mut u8, owner: u8, size: usize) -> bool {
-            if !ON.load(Ordering::Relaxed) || COUNT.fetch_add(1, Ordering::Relaxed) % RATE != 0 {
+            if !ON.load(Ordering::Relaxed) {
                 return false;
             }
+            let big = size >= BIG;
+            if !big && COUNT.fetch_add(1, Ordering::Relaxed) % RATE != 0 {
+                return false;
+            }
+            // What it stands for: a small one for RATE of them.
+            let (weight, size) = if big { (1, size) } else { (RATE, size * RATE) };
             inside(|| {
                 let mut frames = [std::ptr::null_mut::<c_void>(); DEPTH];
                 // SAFETY: there's room for DEPTH frames.
@@ -199,8 +207,8 @@ mod counting {
                     kept.each.push((stack, owner, 0, 0));
                 }
                 kept.each[id as usize].2 += size as isize;
-                kept.each[id as usize].3 += 1;
-                kept.live.insert(block as usize, (id, size));
+                kept.each[id as usize].3 += weight as isize;
+                kept.live.insert(block as usize, (id, size, weight));
                 true
             })
             .unwrap_or(false)
@@ -211,10 +219,10 @@ mod counting {
             let entered = INSIDE.try_with(|inside| inside.replace(true)).unwrap_or(true);
             if let Ok(mut kept) = KEPT.lock()
                 && let Some(kept) = kept.as_mut()
-                && let Some((id, size)) = kept.live.remove(&(block as usize))
+                && let Some((id, size, weight)) = kept.live.remove(&(block as usize))
             {
                 kept.each[id as usize].2 -= size as isize;
-                kept.each[id as usize].3 -= 1;
+                kept.each[id as usize].3 -= weight as isize;
             }
             if !entered {
                 let _ = INSIDE.try_with(|inside| inside.set(false));
@@ -247,6 +255,8 @@ mod counting {
         /// What's live of what was sampled, by owner and the first calls that made it that aren't the allocator's own or the
         /// standard library's, scaled up by [`RATE`], the most bytes first.
         pub(crate) fn report(top: usize, frames: usize) -> Vec<String> {
+            // Off before the lock's taken: copying what's kept makes a block that would be sampled, which takes the lock.
+            ON.store(false, Ordering::Relaxed);
             let each = {
                 let Ok(kept) = KEPT.lock() else {
                     return Vec::new();
@@ -256,7 +266,6 @@ mod counting {
                 };
                 kept.each.clone()
             };
-            ON.store(false, Ordering::Relaxed);
             // SAFETY: dbghelp is asked about this process, once.
             let process = unsafe { GetCurrentProcess() };
             unsafe {
@@ -303,7 +312,7 @@ mod counting {
             out.sort_by(|a, b| b.1.0.cmp(&a.1.0));
             out.into_iter()
                 .take(top)
-                .map(|(key, (bytes, count))| format!("{:>12} B {:>9} blocks  {key}", bytes * RATE as isize, count * RATE as isize))
+                .map(|(key, (bytes, count))| format!("{:>12} B {:>9} blocks  {key}", bytes, count))
                 .collect()
         }
     }

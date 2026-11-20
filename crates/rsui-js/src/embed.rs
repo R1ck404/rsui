@@ -43,6 +43,12 @@ pub(crate) struct Held {
 }
 
 impl Held {
+    /// How many places there are, how many of them are free, and how many there's room for.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        let slots = self.slots.borrow();
+        (slots.len(), self.free.borrow().len(), slots.capacity())
+    }
+
     /// Every value being held, for the collector.
     pub(crate) fn each(&self, mut visit: impl FnMut(Value)) {
         for (value, count) in self.slots.borrow().iter() {

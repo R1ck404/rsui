@@ -69,6 +69,7 @@ impl<T> Arena<T> {
         let start =
             unsafe { VirtualAlloc(std::ptr::null_mut(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!start.is_null(), "there are no addresses left to reserve");
+        rsui_alloc::regions::note(start.cast(), std::any::type_name::<T>());
         Self {
             // SAFETY: that's inside what was just reserved.
             base: unsafe { start.cast::<u8>().add(offset).cast() },
@@ -298,6 +299,7 @@ impl<T> Drop for Arena<T> {
             }
             VirtualFree(self.start().cast(), 0, MEM_RELEASE);
         }
+        rsui_alloc::regions::forget(self.start());
     }
 }
 

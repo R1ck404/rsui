@@ -39,6 +39,9 @@ struct Buffer<T> {
     added_to: Cell<bool>,
     /// The last [`Tally`] that counted this buffer, so that one counts it once, however many strings share it.
     counted: Cell<u32>,
+    /// Whether it's text that strings with the same text share ([`share_text`]), which nothing adds to: adding to one of
+    /// them copies it, as adding to text that isn't in a buffer does, so that they don't keep what's added alive.
+    same_text: bool,
 }
 
 thread_local! {
@@ -66,6 +69,28 @@ impl Tally {
 
 #[allow(unsafe_code)]
 impl<T: Copy> Growing<T> {
+    /// Text that other strings with the same text are to share, in a buffer of its own that nothing's adding to.
+    fn shared(items: Vec<T>) -> Self {
+        let length = items.len() as u32;
+        Self {
+            buffer: Rc::new(Buffer {
+                items: UnsafeCell::new(items),
+                added_to: Cell::new(false),
+                counted: Cell::new(0),
+                same_text: true,
+            }),
+            length,
+        }
+    }
+
+    /// The same text, in the same buffer.
+    fn share(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            length: self.length,
+        }
+    }
+
     fn new(items: Vec<T>) -> Self {
         let length = items.len() as u32;
         Self {
@@ -73,6 +98,7 @@ impl<T: Copy> Growing<T> {
                 items: UnsafeCell::new(items),
                 added_to: Cell::new(true),
                 counted: Cell::new(0),
+                same_text: false,
             }),
             length,
         }
@@ -107,7 +133,7 @@ impl<T: Copy> Growing<T> {
     /// The text with some more added, or nothing if this isn't where the buffer ends.
     fn append(&self, added: usize, fill: impl FnOnce(&mut Vec<T>)) -> Option<Self> {
         let length = self.length as usize + added;
-        if !self.is_at_the_end() || length > u32::MAX as usize {
+        if self.buffer.same_text || !self.is_at_the_end() || length > u32::MAX as usize {
             return None;
         }
         // SAFETY: only `Strings::concat` comes here, holding `&mut Strings`, so no slice of this buffer is around,
@@ -263,6 +289,40 @@ impl Text {
             Self::Wide(units) => units.len() * 2,
             Self::GrowingAscii(growing) => growing.length as usize,
             Self::GrowingWide(growing) => growing.length as usize * 2,
+        }
+    }
+
+    /// Has `second`, which has the same text as `first`, use the memory `first`'s text is in, which `first` then keeps in a
+    /// buffer that can be shared ([`Growing`]), if it didn't already. Text built a piece at a time shares a buffer the same way,
+    /// so nothing that reads or adds to text is any different.
+    ///
+    /// Only text that's settled is shared: text in a buffer that's being added to is left as it is, as sharing it would have
+    /// each addition copy all of it.
+    fn share(first: &mut Text, second: &mut Text) {
+        let settled = |text: &Text| match text {
+            Self::Ascii(_) | Self::Wide(_) => true,
+            Self::GrowingAscii(growing) => growing.buffer.same_text,
+            Self::GrowingWide(growing) => growing.buffer.same_text,
+            Self::Small { .. } => false,
+        };
+        if !matches!(second, Self::Ascii(_) | Self::Wide(_)) || !settled(first) {
+            return;
+        }
+        match first {
+            Self::Ascii(bytes) => {
+                let bytes = std::mem::take(bytes);
+                *first = Self::GrowingAscii(Growing::shared(bytes.into_vec()));
+            }
+            Self::Wide(units) => {
+                let units = std::mem::take(units);
+                *first = Self::GrowingWide(Growing::shared(units.into_vec()));
+            }
+            _ => {}
+        }
+        match (&*first, &*second) {
+            (Self::GrowingAscii(one), Self::Ascii(_)) => *second = Self::GrowingAscii(one.share()),
+            (Self::GrowingWide(one), Self::Wide(_)) => *second = Self::GrowingWide(one.share()),
+            _ => {}
         }
     }
 
@@ -460,6 +520,85 @@ pub(crate) struct Strings {
     pub(crate) items: Arena<StringData>,
     pub(crate) free: crate::gc::FreeSlots,
     pub(crate) marks: Vec<u64>,
+}
+
+thread_local! {
+    /// The last string kept with each text, by what the text hashes to and how long it is: see [`share_text`]. It's here
+    /// rather than in [`Strings`], as a field more in `Vm` moves the ones after it, which had js-bench's interpreter 17%
+    /// slower on `prop_mono` (see "Many properties at once" in `DESIGN.md`). Engines on one thread share it, which is as
+    /// sound as one engine using it: a place is only used once its text has been compared, in the engine that's collecting.
+    static SAME_TEXT: std::cell::RefCell<std::collections::HashMap<u64, u32, foldhash::fast::FixedState>> =
+        std::cell::RefCell::default();
+}
+
+/// Whether strings with the same text are to share it ([`share_text`]), as [`crate::share_same_text`] says, unless
+/// `RSUI_SHARE_TEXT` (`0` or `1`) says otherwise.
+static SHARE_SAME_TEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_sharing_same_text(on: bool) {
+    SHARE_SAME_TEXT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn sharing_same_text() -> bool {
+    static SAID: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let said = *SAID.get_or_init(|| std::env::var_os("RSUI_SHARE_TEXT").map(|value| value != "0"));
+    said.unwrap_or_else(|| SHARE_SAME_TEXT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Text at least this long, and at most [`SHARED_UP_TO`], is shared with the strings that have the same text. Shorter isn't
+/// worth looking for, and longer is text a program is working on (a document, JSON, what it's building a piece at a time),
+/// which hashing and sharing had js-bench's `json` and `string_build` a quarter slower; what an app makes again and again
+/// (class names, styles, labels) is in between.
+const SHARED_FROM: usize = 32;
+const SHARED_UP_TO: usize = 1024;
+/// The most places [`SAME_TEXT`] notes before it starts again, about a megabyte.
+const MOST_NOTED: usize = 64 * 1024;
+
+
+/// Has the string at `at`, which a collection has kept for the first time, share the memory its text is in with the last
+/// string kept that has the same text, if there is one. Apps make the same text again and again (the long list's rows each
+/// join the same classes for their `className`, which was 1.6 MB of its 1.8 MB of text), and what's kept of it is then one
+/// buffer. A place that's been used again since it was noted is told apart by its text, which is compared. What's noted is
+/// let go of past [`MOST_NOTED`] places. (Letting go of it at each full collection too had shadcn's page 2.6 MB higher, as
+/// it makes the same text again across them.)
+pub(crate) fn share_text(items: &mut [StringData], at: usize) {
+    if !sharing_same_text() {
+        return;
+    }
+    let Some(data) = items.get(at) else {
+        return;
+    };
+    let length = data.text.len();
+    if !(SHARED_FROM..=SHARED_UP_TO).contains(&data.text.heap_bytes()) {
+        return;
+    }
+    let key = (u64::from(data.hash()) << 32) | length as u64;
+    let noted = SAME_TEXT.try_with(|same| {
+        let Ok(mut same) = same.try_borrow_mut() else {
+            return None;
+        };
+        let other = same.insert(key, at as u32);
+        if other.is_none() && same.len() > MOST_NOTED {
+            same.clear();
+        }
+        other
+    });
+    let Ok(Some(other)) = noted else {
+        return;
+    };
+    let other = other as usize;
+    if other == at || other >= items.len() || items[other].text != items[at].text {
+        return;
+    }
+    let (first, second) = if other < at {
+        let (low, high) = items.split_at_mut(at);
+        (&mut low[other], &mut high[0])
+    } else {
+        let (low, high) = items.split_at_mut(other);
+        (&mut high[0], &mut low[at])
+    };
+    Text::share(&mut first.text, &mut second.text);
 }
 
 impl Strings {

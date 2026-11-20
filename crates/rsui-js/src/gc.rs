@@ -131,6 +131,35 @@ fn age() -> u8 {
     }
 }
 
+/// How much may be made between small collections, in eighths of what's alive: 3, or what `RSUI_GC_YOUNG` says (1-8).
+fn young_eighths() -> usize {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static EIGHTHS: AtomicU8 = AtomicU8::new(0);
+    match EIGHTHS.load(Ordering::Relaxed) {
+        0 => {
+            let eighths = std::env::var("RSUI_GC_YOUNG").ok().and_then(|value| value.parse::<u8>().ok()).filter(|n| (1..=8).contains(n)).unwrap_or(3);
+            EIGHTHS.store(eighths, Ordering::Relaxed);
+            usize::from(eighths)
+        }
+        eighths => usize::from(eighths),
+    }
+}
+
+/// The most that may be made between small collections, whatever is alive: what `RSUI_GC_YOUNG_CAP` says, in megabytes,
+/// or no limit.
+fn young_cap() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CAP: AtomicUsize = AtomicUsize::new(0);
+    match CAP.load(Ordering::Relaxed) {
+        0 => {
+            let cap = std::env::var("RSUI_GC_YOUNG_CAP").ok().and_then(|value| value.parse::<usize>().ok()).filter(|mb| *mb > 0).map_or(usize::MAX, |mb| mb << 20);
+            CAP.store(cap, Ordering::Relaxed);
+            cap
+        }
+        cap => cap,
+    }
+}
+
 /// Whether `RSUI_GC_VERIFY` asks for the heap to be checked around every small collection: that each old object or cell
 /// that refers to something young was remembered. It finds a missing write barrier where it's missing, rather than
 /// when what it lost is used, and is slow. It's meant to be used with `RSUI_GC_STRESS`.
@@ -692,7 +721,7 @@ impl Generations {
     /// small collection collect four times as often, as what could be made shrank to a quarter of the budget. It's
     /// [`MIN_YOUNG`] at least.
     fn budget(&self) -> usize {
-        ((self.full_live + self.surviving_bytes) / 8 * 3).max(MIN_YOUNG)
+        ((self.full_live + self.surviving_bytes) / 8 * young_eighths()).min(young_cap()).max(MIN_YOUNG)
     }
 
     /// The least that's made between two collections, a quarter of the budget.
@@ -2046,8 +2075,8 @@ impl Vm {
             let mut word = first;
             while word != 0 {
                 let bit = word & word.wrapping_neg();
-                let Some(string) = items.get_mut(word_index * 64 + bit.trailing_zeros() as usize)
-                else {
+                let at = word_index * 64 + bit.trailing_zeros() as usize;
+                let Some(string) = items.get_mut(at) else {
                     break;
                 };
                 // Only a string kept for the first time is settled (after a small collection, one that stays young).
@@ -2057,7 +2086,15 @@ impl Vm {
                 // share 2 MB (`text_built_a_piece_at_a_time_counts_once_however_many_steps_are_kept`).
                 if full || young & bit != 0 {
                     string.text.settle();
+                    // Kept for the first time, it shares its text with a string kept before that has the same: by a small
+                    // collection, a string that's young now, and by a full one, one that wasn't old before it.
+                    let first_time = young & bit != 0
+                        || (full && strings_before.get(word_index).copied().unwrap_or(0) & bit == 0);
+                    if first_time {
+                        crate::text::share_text(items, at);
+                    }
                 }
+                let string = &items[at];
                 let bytes = string.text.heap_bytes_in(tally) + 32;
                 if full && strings_before.get(word_index).copied().unwrap_or(0) & bit == 0 {
                     young_string_bytes += bytes;

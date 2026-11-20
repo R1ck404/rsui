@@ -1326,6 +1326,66 @@ doing much. The cause of the higher Rust run wasn't looked into.
 
 A saved file showed on screen about 50 ms after it was written, 40 ms of which is waiting for the save to finish.
 
+### Where the memory goes
+
+Measured on 2026-11-20 with the `regions` step (`process_memory.rs`), which puts each reservation of the process's
+addresses down to what it's for, and `memory`, which says what the engine's lists, the allocator, the span recorder, the
+inspector's frames and tracing keep. Headless, with the steps of the bench scripts (shadcn's and Mantine's pages, the
+explorer on System32, the long list of 5,000 rows), at their end, in MB, before this round's changes (3253d551):
+
+| | shadcn | Mantine | explorer | long list |
+|---|---|---|---|---|
+| Private bytes | 132.4 | 145.9 | 38.1 | 220.6 |
+| rsui-alloc's chunks (blocks of 1 KB or less), of them in use | 52.2, 37.5 | 64.8, 55.8 | 11.7, 9.7 | 98.6, 89.4 |
+| The process heap committed, of it allocated | 36.7, 28.2 | 34.8, 31.5 | 15.8, 11.4 | 31.7, 27.5 |
+| The engine's list of objects, of it free places | 24.0, 10.0 | 30.0, 3.3 | 3.9, 0.5 | 78.0, 4.7 |
+| The engine's list of strings | 5.6 | 8.0 | 1.5 | 7.1 |
+| The engine's code: instructions, caches, prototypes, constants | 11.0 | 4.4 | 2.7 | 2.6 |
+| Parse trees, threads' stacks, the program's pages made private | 1.6 | 1.5 | 1.5 | 1.1 |
+| JIT code (a section of the page file, so not private bytes) | 7.6 | 8.4 | 4.1 | 3.1 |
+| Working set, of it private | 157.7, 126.5 | 169.6, 138.2 | 57.2, 34.5 | 235.9, 216.7 |
+
+The working set has the program's own pages (7.5 MB here, a build without LTO), Windows' DLLs (7-8 MB) and the JIT's code
+twice, once for each of its two views. The rest of where it goes:
+
+- **Tracing renders.** Under `--do` and `--agent` the inspector keeps what renders and why from the start, which was 11 MB
+  of shadcn's page, 18 of Mantine's, 7 of the explorer's and 10 of the long list's (`RSUI_INSPECT=0` turns it off): the
+  span recorder at its `Detail` level, the inspector's frames (a render is 120 bytes, with its path and why), a string
+  for each hook of each component saying where it's called from, and the sentences saying why each render happened.
+- **JavaScript objects for each element.** The long list's 25,000 elements are 4.8 KB of the engine's objects each: a
+  `PlacedLive` (544 bytes, with 60 properties), seven `PassedHere`s for the contexts a `Styled` passes down, two component
+  instances, three of React's elements, a look, a `Map` of what it read, and a dozen smaller ones. Rust keeps another 1.4
+  KB for each (its props as a `ThinArc`, the runtime's slots, layout's answers). That's most of the long list's memory,
+  and the floor below what's here needs fewer and smaller objects for each element in `web.js` and `layer.js`.
+- **Room between collections.** A small collection comes after three-eighths as much again as what's alive has been made,
+  which is the 40% of free places in the list of objects after one: the long list makes 34 MB between small collections.
+- **What loading leaves.** Finding modules kept every folder's listing (3 MB on shadcn's page, two 1 MB ones for the
+  explorer's icon package), the compiler kept a map of every constant (1.1 MB), and the shapes' `Vec` doubled (9 MB
+  committed for Mantine's 3.3 MB of shapes).
+- **The same text many times.** Strings with text of their own were 1.8 MB on the long list, 1.6 MB of it the same as
+  another's (its rows' `className`s), and 2.2 MB of Mantine's 3.4.
+
+What was done about it (t3/memory-floor): tracing keeps each hook's call site and each reason a render gives once, and
+the span recorder keeps its spans packed in pieces (`rsui-spans`); what loading leaves is let go of between frames
+(`Engine::let_go_of_loading_caches`); the shapes' list doubles only up to a megabyte; strings with the same text share it
+once a collection keeps them (see rsui-js's `DESIGN.md`). Private memory at the end, the median over eight lengths of
+the environment, against 3253d551, in MB:
+
+| | shadcn | Mantine | explorer | long list |
+|---|---|---|---|---|
+| Traced, as under `--do` | 121.4 (133.3) | 129.8 (144.2) | 35.2 (40.5) | 217.4 (220.6) |
+| `RSUI_INSPECT=0`, as in a window | 114.8 (121.9) | 118.6 (123.4) | 31.9 (35.2) | 209.9 (211.5) |
+| Peak, traced | 123.5 (133.3) | 135.0 (146.1) | 35.2 (40.5) | 217.4 (220.6) |
+| A second after starting, traced | 118.3 (119.0) | 124.8 (137.6) | 27.6 (30.0) | |
+| Working set at the end, traced | 147.6 (157.7) | 156.5 (167.7) | 54.8 (59.4) | 232.4 (235.7) |
+
+Not done, and what it would take: `RSUI_GC_YOUNG_CAP=16` (megabytes made between small collections at most) has the long
+list end at 195 MB and `=8` at 186, and Mantine at 120 with `=8`, but it's 4-6% more CPU on shadcn's page and the long
+list, so it's left off. Below that, the floor is the elements' JavaScript: a `Styled` element as one object with its
+state in a few typed fields rather than a `PlacedLive`, a `PassedHere` for each context and two instances would be most
+of the long list's 120 MB of objects, and an object of 48 bytes rather than 64 (the JIT's code takes a handle shifted by
+6 to be an address) another 20 MB of it.
+
 ## How it's tested
 
 `--do` is how an agent uses a running app, in one shell command, with plain text coming back. There's no server to set up, and no state

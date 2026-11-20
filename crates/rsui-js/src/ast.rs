@@ -101,6 +101,7 @@ fn release_spares(spares: &mut Vec<Spare>) {
         // SAFETY: these are addresses `AstMemory::new` reserved, whole, that nothing is using.
         unsafe {
             system::VirtualFree(spare.base.cast(), 0, system::MEM_RELEASE);
+            rsui_alloc::regions::forget(spare.base.cast());
         }
     }
 }
@@ -261,6 +262,7 @@ impl Drop for AstMemory {
             // SAFETY: these are whole ranges `reserve` got, and everything borrowed from here has gone.
             unsafe {
                 system::VirtualFree(base.cast(), 0, system::MEM_RELEASE);
+                rsui_alloc::regions::forget(base.cast());
             }
         }
         let base = self.base.get();
@@ -268,6 +270,7 @@ impl Drop for AstMemory {
             // SAFETY: as above.
             unsafe {
                 system::VirtualFree(base.cast(), 0, system::MEM_RELEASE);
+                rsui_alloc::regions::forget(base.cast());
             }
             return;
         }
@@ -298,6 +301,7 @@ impl Drop for AstMemory {
             // SAFETY: these are the addresses `new` got, whole, and everything borrowed from here has gone.
             unsafe {
                 system::VirtualFree(base.cast(), 0, system::MEM_RELEASE);
+                rsui_alloc::regions::forget(base.cast());
             }
         }
     }
@@ -316,6 +320,7 @@ fn reserve(size: usize) -> *mut u8 {
         )
     };
     assert!(!base.is_null(), "there are no addresses left to reserve");
+    rsui_alloc::regions::note(base.cast(), "js parse trees");
     base.cast()
 }
 

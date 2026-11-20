@@ -495,6 +495,17 @@ thread_local! {
     static FULL_FOLDERS: std::cell::RefCell<HashMap<PathBuf, PathBuf, FixedState>> = std::cell::RefCell::default();
 }
 
+/// Forgets what's been read of each folder on this thread (see [`crate::forget_folder_listings`]), if anything has been.
+pub(crate) fn forget_listings() {
+    FOLDERS.with(|folders| {
+        if let Ok(mut folders) = folders.try_borrow_mut()
+            && !folders.is_empty()
+        {
+            *folders = HashMap::default();
+        }
+    });
+}
+
 /// What's in `folder`, from the first look at it.
 fn listing(folder: &Path) -> Option<std::rc::Rc<Listing>> {
     let key = folder.to_string_lossy().to_lowercase();

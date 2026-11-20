@@ -94,6 +94,14 @@ pub fn read_packed_files_ahead() {
     }
 }
 
+/// Has collections make strings with the same text share it, in every engine of the process (see "What it keeps that it
+/// needn't" in `DESIGN.md`). It's off unless this turns it on: an app's strings are mostly class names, styles and labels
+/// made again and again, but a program working through text, as js-bench's `json` does, spent a fifth more time
+/// collecting for it. `RSUI_SHARE_TEXT=0` or `1` says otherwise.
+pub fn share_same_text(on: bool) {
+    text::set_sharing_same_text(on);
+}
+
 /// Says what modules the program is going to give the engine with [`Engine::add_module`], before there's an engine, so that a
 /// packed app's can be read ahead along with its files.
 pub fn know_modules(modules: &[(&'static str, &'static str)]) {
@@ -253,6 +261,52 @@ impl Engine {
     /// A main module that waits at its top is waited for, with whatever else is going on running as it would anyway,
     /// so that what it exports is there when this returns, as an app's window needs. It gives up waiting when nothing
     /// is left that could finish it.
+    /// Lets go of what's only kept to make loading code quicker, once a program's started and done loading most of what it
+    /// will: what finding modules has read of each folder it looked in (a package with thousands of files is a megabyte
+    /// of names), which constants are already in the list of them (a megabyte for shadcn's page), and the memory kept for
+    /// parsing. Code loaded after this works as before: a module found reads its folder again, and a constant it uses that's
+    /// there already is put in the list again. It's cheap when there's nothing to let go of, so it's done between frames.
+    /// For measuring: the live strings with text of their own (past what fits in the place), how many bytes they hold, and
+    /// how many of those bytes are text another live string has too.
+    #[doc(hidden)]
+    pub fn duplicate_strings(&self) -> (usize, usize, usize) {
+        let strings = &self.vm.strings;
+        let mut seen: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        let (mut count, mut bytes, mut again) = (0, 0, 0);
+        // A buffer that strings share counts once, with the first of them.
+        let tally = text::Tally::new();
+        for (index, data) in strings.items.iter().enumerate() {
+            if strings.free.is_free(index) {
+                continue;
+            }
+            let size = data.text.heap_bytes_in(tally);
+            if size == 0 {
+                continue;
+            }
+            count += 1;
+            bytes += size;
+            let key = match (data.text.ascii(), data.text.wide()) {
+                (Some(ascii), _) => ascii.to_vec(),
+                (None, Some(wide)) => wide.iter().flat_map(|unit| unit.to_le_bytes()).collect(),
+                _ => continue,
+            };
+            let times = seen.entry(key).or_insert(0);
+            if *times > 0 {
+                again += size;
+            }
+            *times += 1;
+        }
+        (count, bytes, again)
+    }
+
+    pub fn let_go_of_loading_caches(&mut self) {
+        modules::forget_listings();
+        if !self.vm.const_map.is_empty() {
+            self.vm.const_map = Default::default();
+        }
+        ast::release_spare_memory();
+    }
+
     pub fn run_file(&mut self, path: &Path) -> Result<Value, JsError> {
         self.enter();
         let result = self.vm.run_main(path);

@@ -194,6 +194,38 @@ What fixed both, with strings and cells still aging as objects do (t3/tune-gc-be
   or between the keys of one step, had shadcn's 40 keys 111 ms rather than 89. `RSUI_FRAME_GC=0` turns it off;
   `RSUI_GC_LOG` says which collections were done between frames.
 
+## What it keeps that it needn't
+
+Measured on 2026-11-20 on rsui-tsx's page apps (see "Where the memory goes" in its `DESIGN.md`):
+
+- **Text that's the same**, of 32 bytes to 1 KB (longer is text a program is working on), in an engine that's asked to (`share_same_text`, which rsui-tsx does for an app; it's off
+  otherwise, as js-bench's `json`, which parses tens of thousands of strings of that length, took a fifth more CPU for it).
+  When a collection keeps such a string for the first time (a small one, one
+  that's young now; a full one, one that wasn't old before it), it looks for the last string kept with the same hash and
+  length (`text::share_text`, a place for each text in a thread's `SAME_TEXT`, not in `Vm`, whose layout js-bench's
+  interpreter is sensitive to), and if the text is the same, both use one
+  buffer, as the steps of text built a piece at a time do (`Growing`). Only settled text is shared: a buffer that's being
+  added to is left as it is, as sharing it would have each addition copy all of it, and a buffer of shared text is never
+  added to (`Buffer::same_text`), so adding to one of those strings copies it, as it does a string that isn't in a buffer,
+  and a short string never keeps what was built from it alive. What's noted is let go of past 64K places (about a
+  megabyte); letting go of it at each full collection too had shadcn's page 2.6 MB higher.
+  Apps make the same text again and again: the long list's rows each join the same classes for their `className`, 1.6 MB
+  of its 1.8 MB of strings' own text, which is 0.2 MB now; Mantine's page 2.3 MB rather than 3.4, shadcn's 1.5 rather
+  than 2.2.
+- **The list of shapes** doubled as a `Vec` does, and Mantine's page, with 46,000 shapes of 72 bytes, had room for
+  131,072: 9 MB committed for 3.3 MB. It doubles while it's under a megabyte and grows by a quarter after
+  (`Shapes::room_for_one`). As an arena of its own, as the list of objects is, it was 40-120 KB more for a program with
+  few shapes, which a `Vec` in the process heap has room for already, and js-bench's small benches (2.7-3.3 MB) were 2%
+  higher.
+- **What loading leaves.** `Engine::let_go_of_loading_caches`, which rsui-tsx calls between frames, lets go of what
+  finding modules read of each folder (a package with thousands of files is a megabyte of names; shadcn's page had 3 MB of
+  them), the map from each constant to its place in the list of constants (1.1 MB on shadcn's page), which only saves a
+  constant being put in twice by code compiled later, and the memory kept for parsing. A module found after it reads its
+  folder again.
+- **Room between small collections** is three-eighths of what's alive, with no limit: the long list makes 34 MB between
+  two, and that's the 40% of free places in the list of objects after a collection. `RSUI_GC_YOUNG` (eighths, 1-8) and
+  `RSUI_GC_YOUNG_CAP` (megabytes) change it, for measuring what that trades.
+
 ## What made it fast
 
 Two of the biggest wins aren't what you'd guess, and are easy to lose by accident. They were found by measuring on a

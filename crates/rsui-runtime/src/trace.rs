@@ -39,8 +39,9 @@ pub struct Rendered {
     pub changed: bool,
     /// What it's called, if it said with [`Cx::trace_name`](crate::Cx::trace_name).
     pub name: Option<Text>,
-    /// Why it rendered, in sentences, if it said with [`Cx::trace_why`](crate::Cx::trace_why).
-    pub why: Vec<String>,
+    /// Why it rendered, in sentences, if it said with [`Cx::trace_why`](crate::Cx::trace_why). They're `Text` so that the
+    /// same sentence, which comes up for every render of a component that renders for the same reason, can be one string.
+    pub why: Vec<Text>,
     /// Where its output is in the tree, as [`Runtime::take_trace`](crate::Runtime::take_trace) found it, unless it was
     /// gone by then.
     pub path: Option<Vec<u32>>,

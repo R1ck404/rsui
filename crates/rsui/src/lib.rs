@@ -96,6 +96,8 @@ pub use rsui_text as text;
 pub use rsui_alloc::UiAlloc;
 #[doc(hidden)]
 pub use rsui_alloc::owners as alloc_owners;
+#[doc(hidden)]
+pub use rsui_alloc::regions as alloc_regions;
 pub use rsui_alloc::split;
 
 /// Everything most programs need.
