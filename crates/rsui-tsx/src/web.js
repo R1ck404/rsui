@@ -858,6 +858,9 @@ function contentVisibility(look, live, children, auto = false) {
     }
     if (live.skippedKids !== (auto ? children : undefined)) {
         // What's in it is still the page's, for code to find, though it isn't drawn: see `skippedParts`.
+        if (live.skippedKids !== (auto ? children : undefined)) {
+            skippedChanges += 1;
+        }
         live.skippedKids = auto ? children : undefined;
         pageNow = null;
     }
@@ -1126,6 +1129,9 @@ function forgetSkippedParts(live) {
         if (pageLives.get(one.domKey) === one.weak) {
             pageLives.delete(one.domKey);
         }
+    }
+    if (live.skippedKids !== undefined) {
+        skippedChanges += 1;
     }
     live.skippedKids = undefined;
     live.skippedParts = undefined;
@@ -4388,7 +4394,9 @@ function recheckHas(lives, always = false) {
                 }
                 if (!reuseTopology) break;
             }
-            reuseTopology &&= rsuiHostMethods.pageTreeContentKept?.() === true;
+            // Only where elements are and which have text is read from the tree for this (see `ownOf`), so a field's value
+            // changing as it's typed into keeps it: see `pageTreeContentKept` in `geometry.rs`.
+            reuseTopology &&= rsuiHostMethods.pageTreeContentKept?.(true) === true;
         }
         for (const live of lives) {
             if (live?.hasDrawn === undefined || (!always && version !== undefined && live.hasCheckedIn === version)) {
@@ -6449,7 +6457,8 @@ function drawnChildren(handle) {
 function drawnElementsOf(handle) {
     const key = handle.__domKey;
     if (key === undefined) return [];
-    const tree = pageNow !== null && rsuiHostMethods.pageTreeContentKept?.() === true ? pageNow : pageTree();
+    // Only which elements are in it, and in what order, is read from these (their `live`), which a field's value changing keeps.
+    const tree = pageNow !== null && rsuiHostMethods.pageTreeContentKept?.(true) === true ? pageNow : pageTree();
     return tree?.byKey.get(key)?.children ?? [];
 }
 
@@ -7527,6 +7536,12 @@ function madePlan(index, rules, own, classes) {
         apart: [itemsApart(items.slice(0, split)), itemsApart(items.slice(split))],
         from,
         checkedAt: version,
+        // What's worked out for it later, there from the start so that every plan has one shape.
+        lastSelf: undefined,
+        selfLasts: undefined,
+        together: undefined,
+        togetherAsked: undefined,
+        rustMatch: undefined,
     };
 }
 
@@ -7627,6 +7642,12 @@ function madePlanInRust(index, rules, own, classes) {
         apart: [(shape & 2) !== 0, (shape & 1) !== 0],
         from,
         checkedAt: version,
+        // What's worked out for it later, there from the start so that every plan has one shape.
+        lastSelf: undefined,
+        selfLasts: undefined,
+        together: undefined,
+        togetherAsked: undefined,
+        rustMatch: undefined,
     };
 }
 /// What `madePlanInRust` hands over, and where it's told each item came from, made again only when a plan has more items, and
@@ -7893,7 +7914,28 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
     if (extraCodes !== null && !STYLED_ENV.check) {
         needs |= matchedNeeds;
     }
-    const order = orderWith(plan, extra);
+    // `RSUI_CASCADE_CHECK` always works the order out, and puts them on as the first element with these has them too, first,
+    // kept and put back, to compare with (what states they care about isn't, as Rust's said those for both: see `matchedNeeds`).
+    let firstWay = null;
+    if (STYLED_ENV.check && plan.together?.has(orderKey(extra)) !== true) {
+        const before = { ...look };
+        const partsBefore = { ...parts };
+        cascadeOn(plan, self, codes, extra, extraCodes, owner, own, look, parts, between);
+        firstWay = [{ ...look }, { ...parts }];
+        putBack(look, before);
+        putBack(parts, partsBefore);
+    }
+    const order = orderWith(plan, extra, STYLED_ENV.check);
+    if (order === null) {
+        // The first element with these, which is put on one at a time with the order found as it goes, as working out how to put
+        // them on together for one element took longer than that: a focus makes new plans, for an element or two each.
+        needs |= cascadeOn(plan, self, codes, extra, extraCodes, owner, own, look, parts, between);
+        giveCodesBack(codes);
+        if (extraCodes !== null) {
+            extraCodesKept = extraCodes;
+        }
+        return needs;
+    }
     const together = self === null ? NOT_TOGETHER : order.together;
     if (STYLED_ENV.check && (together[0] || together[1])) {
         // `RSUI_CASCADE_CHECK`: each of what's about it alone put on in turn, as it was, against all of it together. What's
@@ -7910,6 +7952,9 @@ function indexedRulesOn(index, rules, owner, own, look, parts, classes, between)
         needs = all;
     } else {
         needs |= inOrderOn(plan, self, together, self === null ? order.all : order.rest, codes, extra, extraCodes, owner, own, look, parts, between);
+    }
+    if (firstWay !== null) {
+        togetherCheck(firstWay[0], look, firstWay[1], parts, needs, needs, own);
     }
     giveCodesBack(codes);
     if (extraCodes !== null) {
@@ -7999,59 +8044,134 @@ function inOrderOn(plan, self, together, order, codes, extra, extraCodes, owner,
 /// without those (`rest`). It can where, as `itemsApart` says of a plan alone, nothing else in that half (the plan's rules about
 /// more than the element, and these) says what one about it alone after it says (see `selfLasts`). Kept on the plan for each
 /// list of rules found by an attribute, as which an element has depends only on the names of what it's given.
-function orderWith(plan, extra) {
+/// It's null the first time it's asked for a plan and list, as working it out for one element takes longer than putting each on
+/// in turn (see `cascadeOn`), unless `now` says otherwise.
+function orderWith(plan, extra, now) {
     let key = '';
     for (const one of extra) {
         key += one.at + ',';
     }
-    const kept = (plan.together ??= new Map());
-    let found = kept.get(key);
-    if (found === undefined) {
-        const lasts = selfLasts(plan);
-        const together = [lasts.together[0], lasts.together[1]];
-        // Each of `extra` goes in before the first of the plan's slots that isn't before it in the cascade's order.
-        const at = new Int32Array(extra.length);
-        let slot = 0;
-        extra.forEach((one, more) => {
-            while (slot < plan.items.length && cascadeBefore(plan, slot, one)) {
-                slot += 1;
-            }
-            at[more] = slot;
-            const half = one.weight > 100 ? 1 : 0;
-            if (together[half] && saidAgain(saysOf(one.rule), lasts, half, slot)) {
-                together[half] = false;
-            }
-        });
-        const all = [];
-        const rest = [];
-        let betweenDone = false;
-        for (let next = 0, more = 0; next < plan.items.length || more < extra.length;) {
-            const takeExtra = more < extra.length && at[more] <= next;
-            const weight = takeExtra ? extra[more].weight : plan.columns[next * PLAN_COLUMNS + PLAN_WEIGHT];
-            if (!betweenDone && weight > 100) {
-                betweenDone = true;
-                all.push(BETWEEN);
-                rest.push(BETWEEN);
-            }
-            if (takeExtra) {
-                all.push(-1 - more);
-                rest.push(-1 - more);
-                more += 1;
-            } else {
-                all.push(next);
-                if (!(plan.columns[next * PLAN_COLUMNS + PLAN_SELF] && together[next < plan.split ? 0 : 1])) {
-                    rest.push(next);
-                }
-                next += 1;
-            }
+    let kept = plan.together;
+    if (kept !== undefined) {
+        const found = kept.get(key);
+        if (found !== undefined) {
+            return found;
         }
-        found = { together, all: Int32Array.from(all), rest: Int32Array.from(rest) };
-        if (kept.size >= 256) {
-            kept.clear();
-        }
-        kept.set(key, found);
+    } else if (!now && plan.togetherAsked !== key) {
+        // Only the last list asked about is remembered, and no map is made until then, as most plans are for an element or two.
+        // A plan that has one worked out has the next at once.
+        plan.togetherAsked = key;
+        return null;
+    } else {
+        kept = plan.together = new Map();
     }
+    const found = madeOrder(plan, extra);
+    if (kept.size >= 256) {
+        kept.clear();
+    }
+    kept.set(key, found);
     return found;
+}
+
+/// What a list of rules found by an attribute is kept by on a plan, for `orderWith`: where each is among the page's.
+function orderKey(extra) {
+    let key = '';
+    for (const one of extra) {
+        key += one.at + ',';
+    }
+    return key;
+}
+
+/// What `orderWith` keeps, worked out.
+function madeOrder(plan, extra) {
+    const lasts = selfLasts(plan);
+    const together = [lasts.together[0], lasts.together[1]];
+    // Each of `extra` goes in before the first of the plan's slots that isn't before it in the cascade's order.
+    const at = new Int32Array(extra.length);
+    let slot = 0;
+    extra.forEach((one, more) => {
+        while (slot < plan.items.length && cascadeBefore(plan, slot, one)) {
+            slot += 1;
+        }
+        at[more] = slot;
+        const half = one.weight > 100 ? 1 : 0;
+        if (together[half] && saidAgain(saysOf(one.rule), lasts, half, slot)) {
+            together[half] = false;
+        }
+    });
+    const all = [];
+    const rest = [];
+    let betweenDone = false;
+    for (let next = 0, more = 0; next < plan.items.length || more < extra.length;) {
+        const takeExtra = more < extra.length && at[more] <= next;
+        const weight = takeExtra ? extra[more].weight : plan.columns[next * PLAN_COLUMNS + PLAN_WEIGHT];
+        if (!betweenDone && weight > 100) {
+            betweenDone = true;
+            all.push(BETWEEN);
+            rest.push(BETWEEN);
+        }
+        if (takeExtra) {
+            all.push(-1 - more);
+            rest.push(-1 - more);
+            more += 1;
+        } else {
+            all.push(next);
+            if (!(plan.columns[next * PLAN_COLUMNS + PLAN_SELF] && together[next < plan.split ? 0 : 1])) {
+                rest.push(next);
+            }
+            next += 1;
+        }
+    }
+    return { together, all: Int32Array.from(all), rest: Int32Array.from(rest) };
+}
+
+/// A plan's rules and those found by an attribute, put on one at a time in the cascade's order, found as it goes, as `inOrderOn`
+/// puts them on with nothing together: what the first element with them has, before `orderWith` keeps an order for them.
+function cascadeOn(plan, self, codes, extra, extraCodes, owner, own, look, parts, between) {
+    let needs = 0;
+    let slot = 0;
+    let more = 0;
+    let betweenDone = false;
+    mergeInOrder = true;
+    while (slot < plan.items.length || more < extra.length) {
+        const takeItem = more >= extra.length || (slot < plan.items.length && cascadeBefore(plan, slot, extra[more]));
+        const weight = takeItem ? plan.columns[slot * PLAN_COLUMNS + PLAN_WEIGHT] : extra[more].weight;
+        if (!betweenDone && weight > 100) {
+            betweenDone = true;
+            between?.();
+        }
+        if (takeItem) {
+            const item = plan.items[slot];
+            if (plan.columns[slot * PLAN_COLUMNS + PLAN_SELF]) {
+                if (self.fits[slot]) {
+                    mergeWeight = plan.columns[slot * PLAN_COLUMNS + PLAN_WEIGHT];
+                    putOn(item, look, parts);
+                    mergeWeight = Infinity;
+                }
+            } else if (codes === null) {
+                needs |= ruleOn(item, owner, own, look, parts);
+            } else if (codes[slot] === 1) {
+                saidOn(item, look, parts);
+            } else if (codes[slot] === 3) {
+                needs |= ruleOn(item, owner, own, look, parts);
+            }
+            slot += 1;
+        } else {
+            if (extraCodes === null) {
+                needs |= ruleOn(extra[more].rule, owner, own, look, parts);
+            } else if (extraCodes[more] === 1) {
+                saidOn(extra[more].rule, look, parts);
+            } else if (extraCodes[more] === 3) {
+                needs |= ruleOn(extra[more].rule, owner, own, look, parts);
+            }
+            more += 1;
+        }
+    }
+    mergeInOrder = false;
+    if (!betweenDone) {
+        between?.();
+    }
+    return needs;
 }
 
 /// For each half of a plan, the last slot about the element alone that says each prop (and each that's `!important`), and
@@ -8574,6 +8694,7 @@ function keptPlan(index, rules, own, kind) {
         byKind.delete(kind);
         // What's kept for elements with rules found by an attribute is by where those are in the page's rules.
         plan.together = undefined;
+        plan.togetherAsked = undefined;
         plan.checkedAt = -1;
         return plan;
     }
@@ -15349,13 +15470,163 @@ let pageNow = null;
 function pageTree() {
     // What's laid out is kept from now on, for what code asks about the page, as it asks again.
     rsuiHostMethods.keepLaidOut();
-    const said = rsuiHostMethods.pageTree(pageNow === null);
+    let always = pageNow === null;
+    if (pageNow !== null && PAGE_TREE_PATCH) {
+        if (rsuiHostMethods.pageTreeKept()) {
+            // What `pageTree` would say by giving nothing.
+            return pageNow;
+        }
+    }
+    if (pageNow !== null && PAGE_TREE_PATCH && pageNotTreeSame(pageNow)) {
+        // Where the tree has the shape it had, only what's different in it is said, and put in: see `pageTreePatch`.
+        const patch = rsuiHostMethods.pageTreePatch();
+        if (patch !== undefined) {
+            if (patchedPage(pageNow, patch)) {
+                if (PAGE_TREE_PATCH_CHECK) {
+                    pageTreePatchCheck(pageNow);
+                }
+                return pageNow;
+            }
+            // Rust has given what's different, so the whole of it is asked for.
+            always = true;
+        }
+    }
+    const said = rsuiHostMethods.pageTree(always);
     if (said === undefined) {
         return pageNow;
     }
     if (said.length < 2) {
         return null;
     }
+    const tree = madePageTree(said);
+    for (const [key, weak] of pageLives) {
+        if (weak.deref() === undefined) {
+            pageLives.delete(key);
+        }
+    }
+    pageNow = tree;
+    return pageNow;
+}
+
+/// Whether `pageTree` can put what Rust says is different into the page's tree, rather than make it again: not with
+/// `RSUI_PAGE_TREE_PATCH=0`. `RSUI_PAGE_TREE_CHECK=1` makes it again after each time, and says where that's different.
+const PAGE_TREE_PATCH = (() => {
+    try { return globalThis.process?.env?.RSUI_PAGE_TREE_PATCH !== '0'; }
+    catch { return true; }
+})();
+const PAGE_TREE_PATCH_CHECK = (() => {
+    try { return globalThis.process?.env?.RSUI_PAGE_TREE_CHECK === '1'; }
+    catch { return false; }
+})();
+
+/// What the page's tree has that isn't from Rust's (what isn't shown, a `<select>`'s parts, what a long list's rows skip), as
+/// it was when it was made, said as one string, and what changes what a long list's rows skip, counted.
+function pageNotTreeSaid() {
+    let said = String(skippedChanges);
+    for (const kept of notShownLives.values()) {
+        const given = kept.given ?? {};
+        said += '\u0000' + kept.domKey + '\u0001' + kept.parentKey + '\u0001' + kept.listPart + '\u0001' + kept.text + '\u0001'
+            + (typeof given.className === 'string' ? given.className : '') + '\u0001' + (typeof given.id === 'string' ? given.id : '');
+    }
+    return said;
+}
+
+/// Whether what's in the page's tree that isn't from Rust's is as it was when it was made, and each of its elements is still
+/// what the page has for its key: what makes it again would make the same of those.
+function pageNotTreeSame(tree) {
+    if (pageNotTreeSaid() !== tree.notTreeSaid) {
+        return false;
+    }
+    for (const node of tree.fromTree) {
+        if (pageLives.get(node.key) !== node.weak) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Changes to what a long list's rows skip, which the page's tree has in them: see `pageNotTreeSaid`.
+let skippedChanges = 0;
+
+/// Puts what `pageTreePatch` says into the page's tree: each entry that's different, and the text it has. False where that
+/// isn't what making it again would make (what's text of the page isn't the same), when it's made again.
+function patchedPage(tree, patch) {
+    for (let at = 1; at < patch.length; at += 2) {
+        const place = patch[at];
+        const entry = patch[at + 1];
+        if (place === 0) {
+            tree.root.entry = entry;
+            continue;
+        }
+        const node = tree.entryNodes[place];
+        if (node !== undefined) {
+            node.entry = entry;
+        }
+        const text = tree.textAt.get(place);
+        if (text !== undefined) {
+            const live = entry[0] === undefined ? undefined : pageLives.get(entry[0])?.deref();
+            const said = pageTextOf(entry, live);
+            if ((said === undefined) !== (text < 0)) {
+                return false;
+            }
+            if (said !== undefined) {
+                tree.texts[text] = said;
+                tree.shown[text] = entry[5];
+            }
+        }
+    }
+    // What's worked out of each element for a selector is from what it was given, which is worked out again, as it is for a
+    // tree made again.
+    for (const node of tree.byKey.values()) {
+        node.own = null;
+    }
+    tree.selectorContentVersion = patch[0];
+    return true;
+}
+
+/// The text a text entry in the tree is of the page's, as `madePageTree` has it, or undefined if it isn't (it's an element's
+/// of the page that was given nothing to say).
+function pageTextOf(entry, live) {
+    const given = live?.children;
+    if (live !== undefined && (given === undefined || given === null || given === false || given === '')) {
+        return undefined;
+    }
+    const uncased = live?.uncased;
+    return uncased !== undefined && uncased.shown === entry[5] ? uncased.said : entry[5];
+}
+
+/// `RSUI_PAGE_TREE_CHECK`: the page's tree made again, against the one patched, said where they're different.
+function pageTreePatchCheck(patched) {
+    const made = madePageTree(rsuiHostMethods.pageTree(true));
+    const differs = [];
+    const keysOf = (list) => list.map((node) => String(node.key)).join(' ');
+    if (keysOf(made.order) !== keysOf(patched.order)) {
+        differs.push('order');
+    }
+    if (made.texts.join('\u0000') !== patched.texts.join('\u0000') || made.shown.join('\u0000') !== patched.shown.join('\u0000')) {
+        differs.push('texts');
+    }
+    if (made.selectorContentVersion !== patched.selectorContentVersion) {
+        differs.push('version ' + made.selectorContentVersion + ' vs ' + patched.selectorContentVersion);
+    }
+    if (JSON.stringify(made.root.entry) !== JSON.stringify(patched.root.entry)) {
+        differs.push('root');
+    }
+    for (let at = 0; at < made.order.length && at < patched.order.length && differs.length < 8; at += 1) {
+        const one = made.order[at];
+        const other = patched.order[at];
+        if (JSON.stringify(one.entry) !== JSON.stringify(other.entry) || one.textFrom !== other.textFrom || one.textTo !== other.textTo
+            || one.index !== other.index || one.children.length !== other.children.length || String(one.parent?.key) !== String(other.parent?.key)) {
+            differs.push('node ' + one.key);
+        }
+    }
+    if (differs.length > 0) {
+        console.error('rsui page tree check: patched tree differs in ' + differs.join(', '));
+    }
+}
+
+/// The page's tree, from all of what `pageTree` says.
+function madePageTree(said) {
     const root = { entry: said[0], key: undefined, live: null, parent: null, children: NO_PAGE_KIDS, index: 0, own: null, textFrom: 0, textTo: 0 };
     const byKey = new Map();
     const order = [];
@@ -15372,6 +15643,12 @@ function pageTree() {
     // A `<select>`'s options and optgroups, which aren't drawn, by what they're in: they're put in it in their place, with their
     // text, so that its `textContent` and `options` have them, rather than at the end with the rest of what isn't shown.
     let listParts = null;
+    // Each element made from an entry, by the entry's place among them (as `pageTreePatch` says it), and where each text
+    // that could be the page's is among `texts` (-1 where it isn't), for putting what's different in later.
+    const entryNodes = [];
+    const textAt = new Map();
+    const fromTree = [];
+    const notTreeSaid = pageNotTreeSaid();
     for (const kept of notShownLives.values()) {
         if (kept.listPart === true && kept.parentKey !== undefined) {
             listParts ??= new Map();
@@ -15406,6 +15683,7 @@ function pageTree() {
     const visit = (parent) => {
         const entry = said[at];
         const count = said[at + 1];
+        const place = at / 2;
         at += 2;
         let node = parent;
         const key = entry[0];
@@ -15437,10 +15715,12 @@ function pageTree() {
         const live = key === undefined ? undefined : pageLives.get(key)?.deref();
         // Only what's an element of the page is one: the rest is only there to lay out what's in it.
         if (live !== undefined && !byKey.has(key)) {
-            node = { entry, key, live, parent, children: NO_PAGE_KIDS, index: parent.children.length, own: null, textFrom: texts.length, textTo: texts.length };
+            node = { entry, key, live, weak: pageLives.get(key), parent, children: NO_PAGE_KIDS, index: parent.children.length, own: null, textFrom: texts.length, textTo: texts.length };
             withPageKid(parent, node);
             byKey.set(key, node);
             ordered.push(node);
+            entryNodes[place] = node;
+            fromTree.push(node);
         }
         // A page's element that was given nothing to say, as a slider's thumb, is named by its `aria-label`, which isn't its text.
         const given = live?.children;
@@ -15448,11 +15728,13 @@ function pageTree() {
         if (ownDrawing) {
             drawnOnly += 1;
         }
-        if (entry[1] === 'text' && count === 0 && typeof entry[5] === 'string' && drawnOnly === 0
-            && !(live !== undefined && (given === undefined || given === null || given === false || given === ''))) {
-            const uncased = live?.uncased;
-            texts.push(uncased !== undefined && uncased.shown === entry[5] ? uncased.said : entry[5]);
-            shown.push(entry[5]);
+        if (entry[1] === 'text' && count === 0 && typeof entry[5] === 'string' && drawnOnly === 0) {
+            const text = pageTextOf(entry, live);
+            textAt.set(place, text === undefined ? -1 : texts.length);
+            if (text !== undefined) {
+                texts.push(text);
+                shown.push(entry[5]);
+            }
         }
         for (let one = 0; one < count; one += 1) {
             visit(node);
@@ -15483,13 +15765,7 @@ function pageTree() {
         order.push(...portal.order);
     }
     root.textTo = texts.length;
-    for (const [key, weak] of pageLives) {
-        if (weak.deref() === undefined) {
-            pageLives.delete(key);
-        }
-    }
-    pageNow = withNotShown({ root, byKey, order, texts, shown, selectorContentVersion: said[0]?.[13] });
-    return pageNow;
+    return withNotShown({ root, byKey, order, texts, shown, selectorContentVersion: said[0]?.[13], entryNodes, textAt, fromTree, notTreeSaid });
 }
 
 /// What an element of the page is, for checking a selector against, as what's drawn is described for CSS (see `describe`), with

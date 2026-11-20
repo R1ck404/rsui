@@ -15,7 +15,7 @@ use rsui_js::{Args, HostFunction, Value, Vm};
 
 use crate::bridge::node_value;
 
-pub(crate) const FUNCTIONS: [(&str, HostFunction); 24] = [
+pub(crate) const FUNCTIONS: [(&str, HostFunction); 25] = [
     ("treeNow", host_tree_now),
     ("stillNow", host_still_now),
     ("chainsNow", host_chains_now),
@@ -32,6 +32,7 @@ pub(crate) const FUNCTIONS: [(&str, HostFunction); 24] = [
     ("chainsOf", host_chains_of),
     ("pageTree", host_page_tree),
     ("pageTreeKept", host_page_tree_kept),
+    ("pageTreePatch", host_page_tree_patch),
     ("pageTreeContentKept", host_page_tree_content_kept),
     ("pageTreeContentVersion", host_page_tree_content_version),
     ("captureSelectorInputs", crate::selector_receipt::capture),
@@ -765,6 +766,9 @@ thread_local! {
     // No extra tree: the serialization anchor above owns the only reference.
     // Saturation disables certification rather than aliasing f64 generations.
     static CONTENT_VERSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Where each element of the tree `pageTree` last gave was as it said that, one after another as they're written, for
+    /// `pageTreePatch` to tell which it says again.
+    static RECTS: RefCell<Vec<[f32; 4]>> = const { RefCell::new(Vec::new()) };
 }
 
 fn add_elements(
@@ -773,17 +777,129 @@ fn add_elements(
     layout: Option<&Layout>,
     path: &mut Vec<u32>,
     out: &mut Vec<Value>,
+    rects: &mut Vec<[f32; 4]>,
 ) {
     let rect = layout
         .and_then(|layout| layout.rect(path))
         .map_or([0.0; 4], |rect| [rect.x, rect.y, rect.width, rect.height]);
+    rects.push(rect);
     out.push(node_value(vm, node, rect));
     out.push(Value::number(node.children.len() as f64));
     for (index, child) in node.children.iter().enumerate() {
         path.push(index as u32);
-        add_elements(vm, child, layout, path, out);
+        add_elements(vm, child, layout, path, out, rects);
         path.pop();
     }
+}
+
+/// What `pageTreePatch` says again of an element: whatever it says of itself, if anything's different.
+fn same_entry(one: &Element, other: &Element) -> bool {
+    std::ptr::eq(one, other)
+        || (one.role == other.role && one.key == other.key && one.name == other.name && one.props == other.props)
+}
+
+/// Each element of `now`, which has the shape of `before`, that's different from what it was or somewhere else, as its place
+/// one after another as they're written and as `pageTree` says it, with where each was kept in `rects`.
+#[allow(clippy::too_many_arguments)]
+fn patch_elements(
+    vm: &mut Vm,
+    before: &Element,
+    now: &Element,
+    layout: Option<&Layout>,
+    path: &mut Vec<u32>,
+    at: &mut usize,
+    rects: &mut Vec<[f32; 4]>,
+    out: &mut Vec<Value>,
+) {
+    let rect = layout
+        .and_then(|layout| layout.rect(path))
+        .map_or([0.0; 4], |rect| [rect.x, rect.y, rect.width, rect.height]);
+    let place = *at;
+    *at += 1;
+    if rects.len() <= place {
+        rects.resize(place + 1, [f32::NAN; 4]);
+    }
+    if rects[place] != rect || !same_entry(before, now) {
+        rects[place] = rect;
+        out.push(Value::number(place as f64));
+        out.push(node_value(vm, now, rect));
+    }
+    for (index, (one, other)) in before.children.iter().zip(&now.children).enumerate() {
+        path.push(index as u32);
+        patch_elements(vm, one, other, layout, path, at, rects, out);
+        path.pop();
+    }
+}
+
+/// `pageTreePatch()`: what's different in the tree now from what `pageTree` last gave, if it has the same shape (see
+/// `same_page_shape`), as `[contentVersion, place, entry, place, entry, ...]`, each element that says anything different of
+/// itself or is somewhere else as its place among all of them one after another as they're written (the root first, at 0)
+/// and as `pageTree` says it; from then on that's what `pageTree` gave. Undefined if it's nothing it can say that way, when
+/// `pageTree` is to be asked. The page's tree in web.js is made again from what's different rather than all of it: a class
+/// put on Mantine's heading was its whole tree made again, 4,500 elements, for the `querySelector()` after it.
+fn host_page_tree_patch(vm: &mut Vm, _: Args) -> Result<Value, Value> {
+    let Some(tree) = tree_now() else {
+        return Ok(Value::UNDEFINED);
+    };
+    let Some(before) = GIVEN.with(|given| given.borrow().as_ref().map(|(before, laid)| (before.clone(), *laid))) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let (before, was_laid_out) = before;
+    if same(&before, &tree) || !same_page_shape(&before, &tree) {
+        // The same tree is `pageTree`'s to say (it gives nothing, or says where everything is now that it's been laid out).
+        return Ok(Value::UNDEFINED);
+    }
+    let split = rsui::split::enter(rsui::split::PAGE_TREE_BUILD);
+    let mut out = vec![Value::UNDEFINED];
+    let mut rects = RECTS.with(|rects| std::mem::take(&mut *rects.borrow_mut()));
+    // The root is always said again, as it says what the tree's content is up to (see `CONTENT_VERSION`).
+    if let Some(root) = rects.first_mut() {
+        *root = [f32::NAN; 4];
+    }
+    let mut at = 0;
+    let made = rsui::geometry::ask(|root, layout| {
+        same(root, &tree).then(|| patch_elements(vm, &before, root, Some(layout), &mut Vec::new(), &mut at, &mut rects, &mut out))
+    });
+    let made = made.or_else(|| {
+        rsui::geometry::ask_now(&tree, |root, layout| {
+            patch_elements(vm, &before, root, Some(layout), &mut Vec::new(), &mut at, &mut rects, &mut out);
+            Some(())
+        })
+    });
+    if made.is_none() {
+        if was_laid_out {
+            // What was said of where everything is isn't to be said again as nowhere.
+            RECTS.with(|kept| *kept.borrow_mut() = rects);
+            drop(split);
+            return Ok(Value::UNDEFINED);
+        }
+        patch_elements(vm, &before, &tree, None, &mut Vec::new(), &mut at, &mut rects, &mut out);
+    }
+    let changed_content = !same_page_content(&before, &tree);
+    let content_version = CONTENT_VERSION.with(|version| {
+        if changed_content {
+            version.set(version.get().saturating_add(1));
+        }
+        version.get()
+    });
+    GIVEN.with(|given| *given.borrow_mut() = Some((tree.clone(), made.is_some())));
+    RECTS.with(|kept| *kept.borrow_mut() = rects);
+    out[0] = if content_version < (1u64 << 53) { Value::number(content_version as f64) } else { Value::UNDEFINED };
+    // The root's entry carries the version too, as `pageTree` gives it.
+    if out.len() > 1
+        && out[1] == Value::number(0.0)
+        && content_version < (1u64 << 53)
+        && let Ok(mut fields) = vm.data_surface_array(out[2], 13)
+    {
+        fields.push(Value::number(content_version as f64));
+        out[2] = vm.new_array(fields);
+    }
+    if rsui::split::on() {
+        rsui::split::count(rsui::split::named("pageTree-patched"), (out.len() as u64 - 1) / 2);
+    }
+    let array = vm.new_array(out);
+    drop(split);
+    Ok(array)
 }
 
 /// `pageTree(always)`: every element in the tree as it is now, one after another as they're written, each as an event says
@@ -809,21 +925,23 @@ fn host_page_tree(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     }
     let split = rsui::split::enter(rsui::split::PAGE_TREE_BUILD);
     let mut out = Vec::new();
+    let mut rects = Vec::new();
     let made = rsui::geometry::ask(|root, layout| {
-        same(root, &tree).then(|| add_elements(vm, root, Some(layout), &mut Vec::new(), &mut out))
+        same(root, &tree).then(|| add_elements(vm, root, Some(layout), &mut Vec::new(), &mut out, &mut rects))
     });
     // A tree its window hasn't laid out, as one a `<style>` put in `<head>` has drawn again with nothing that looks different, so
     // that the window has no reason to, is laid out for this, as `chainOf` does: given with no boxes, every element found from it
     // said it had no size, and went on saying so as long as it was the same tree (a harness `click` after its first `eval`).
     let made = made.or_else(|| {
         rsui::geometry::ask_now(&tree, |root, layout| {
-            add_elements(vm, root, Some(layout), &mut Vec::new(), &mut out);
+            add_elements(vm, root, Some(layout), &mut Vec::new(), &mut out, &mut rects);
             Some(())
         })
     });
     if made.is_none() {
-        add_elements(vm, &tree, None, &mut Vec::new(), &mut out);
+        add_elements(vm, &tree, None, &mut Vec::new(), &mut out, &mut rects);
     }
+    RECTS.with(|kept| *kept.borrow_mut() = rects);
     let changed_content = GIVEN.with(|given| given.borrow().as_ref()
         .is_none_or(|(before, _)| !same_page_content(before, &tree)));
     let content_version = CONTENT_VERSION.with(|version| {
@@ -893,15 +1011,42 @@ fn same_page_content(one: &Node, other: &Node) -> bool {
         .all(|(one, other)| same_page_content(one, other))
 }
 
-fn host_page_tree_content_kept(_: &mut Vm, _: Args) -> Result<Value, Value> {
+/// Whether the page-tree serialization is the same as far as matching a selector against what `pageTree` made from it reads: the
+/// same elements, by their keys and kinds, in the same places, each with text or none just as before. What an element's given
+/// (its class, its value, its `data-*`) is read from what web.js keeps for it rather than from the tree, so typing into a field,
+/// which changes its `value` and its text, keeps it.
+fn same_page_shape(one: &Node, other: &Node) -> bool {
+    if same(one, other) {
+        return true;
+    }
+    if one.role != other.role
+        || one.key != other.key
+        || one.name.is_empty() != other.name.is_empty()
+        || one.props.is_empty() != other.props.is_empty()
+        || one.children.len() != other.children.len()
+        || one.props.get_symbol(symbol!("dom_key")) != other.props.get_symbol(symbol!("dom_key"))
+    {
+        return false;
+    }
+    one.children
+        .iter()
+        .zip(&other.children)
+        .all(|(one, other)| same_page_shape(one, other))
+}
+
+/// `pageTreeContentKept(shape)`: whether what `pageTree` gave last is still the page as it is now apart from where things are, or,
+/// with `shape`, as far as matching selectors against it goes (see `same_page_shape`), which is what `:has()` being checked again
+/// after each layout asks: on shadcn's page and Mantine's each key made the whole tree again for that, as the field's value had
+/// changed (1,231 elements and 1,453 lists, about half a megabyte, on shadcn's).
+fn host_page_tree_content_kept(vm: &mut Vm, args: Args) -> Result<Value, Value> {
+    let shape = args.get(vm, 0) == Value::TRUE;
     let Some(tree) = tree_now() else {
         return Ok(Value::FALSE);
     };
     Ok(Value::bool(GIVEN.with(|given| {
-        given
-            .borrow()
-            .as_ref()
-            .is_some_and(|(before, _)| same_page_content(before, &tree))
+        given.borrow().as_ref().is_some_and(|(before, _)| {
+            if shape { same_page_shape(before, &tree) } else { same_page_content(before, &tree) }
+        })
     })))
 }
 

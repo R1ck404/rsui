@@ -35,7 +35,9 @@ Heavy loops won't match V8's JIT, and aren't meant to. That work belongs in Rust
   numbers and constants go inside the instruction that uses them, a comparison and its jump are one instruction, and
   `for (...; i < n; i++)` ends in one instruction that does all of the loop's own work.
 - **Memory** is a mark and sweep collector that runs only at safe points, between instructions, and only after
-  enough has been allocated: 128 KB, or half of what's alive if that's more. It never runs on a timer. Objects don't
+  enough has been allocated: 128 KB, or half of what's alive if that's more. It never runs on a timer. Most
+  collections are small ones of what's young: an object is old once three in a row have kept it, and a string or a
+  closure's variable once two have, so what a function was working on when one came along still dies young. Objects don't
   move, and are named by 32-bit numbers. A native holding on to what it's made is safe, as everything made since the
   last safe point is kept. The big lists reserve addresses up front and take memory as they grow, so they never need
   two copies of themselves at once, and give memory back after a collection. `WeakMap`, `WeakSet`, `WeakRef` and
@@ -117,6 +119,52 @@ not in a field of `Vm` of its own: there, its 136 bytes moved the fields after i
 any of it, was 2% slower (prop_mono and prop_poly 7%, int_loop 6%, the same in two runs of ten rounds); as a box at the end of
 `Vm`, 14% (fib 40%). With `Vm`'s fields as they were, those benches are where they were. A field added to `Vm` is measured
 with js-bench for that reason.
+
+That goes for what's inside a field of `Vm` too. `Generations`, the collector's state, is one, and the 224 bytes that
+aging cells and strings added to it (below) had the interpreter 1.7% slower by geomean against 8c9786d3 (prop_mono 7.7%,
+int_loop and try_catch 5%, none of which collect). They're in a box now (`Aging`), with one field that was there before
+(`remembered_bytes`), so `Generations` is 464 bytes and `Vm` 5,488 as in 8c9786d3, with `generations` and
+`number_strings` where they were, and those benches are back (geomean 1.004, prop_mono 0.993, int_loop 0.975).
+string_ops stays 6-7% slower, which is the aging itself: its small collections take twice as long, as strings kept
+once are looked at again by the next. How little it takes: settling only the strings a small collection keeps for the
+first time, by reading two more lists of marks in the loop over them, had the interpreter 10.7% slower (int_loop and
+fib +33%), and reading it from `strings_surviving`, which the loop already has, put it back.
+
+## Full collections that leave the young young
+
+A full collection makes everything it keeps old, and what it keeps is what's alive *and* what's being worked on just
+then. The `json` bench is the plainest case: 0.8 MB stays alive between rounds, but every full collection lands while a
+round's text and parsed tree are still held and keeps 3.0 MB. All of that is old afterwards and dies old, and the
+budgets, which go by what the last full collection kept, are four times what they'd be. Since strings and closures'
+variables age as objects do (5fb3a79b), its full collections land a round later, so twice as much piles up, and its
+peak went from 10.2 MB to 11.8 MB. The file explorer's 1.3 MB more at its end is the same thing from the other side: it
+makes less old than it did, so its last full collection is the one during startup (keeping 7.2 MB, its working set
+with it), and the 1.5 MB made old while browsing stays short of what makes the next one due.
+
+`RSUI_GC_KEEP_YOUNG=1` has a full collection age what wasn't old as a small one would (`Young::reached` after marking,
+then the old objects and cells that were remembered are looked through again, as nothing else old can refer to what's
+still young), and `RSUI_GC_STRING_AGE=3` has strings age as objects do, three keeps rather than two. Both are off by
+default, as neither, nor anything tried with them, beat 5fb3a79b everywhere. Over eight lengths of the environment,
+against 5fb3a79b's rules in the same build (5fb3a79b, 9181f4e3):
+
+- Both on: js-bench's peaks are 2.3% lower by geomean (json 10.1 MB, string_build 7.7, async_await 17.6, map_set 12.9),
+  the explorer ends at 39.7 MB (40.9, 39.6), shadcn at 131.8 (132.4, 133.3) with no full collection in its keys, Mantine
+  147.9 (148.6, 155.3), long list 222.2 (223.3, 220.4). But collecting takes 14% longer over js-bench (alloc_churn 22 ms
+  rather than 16), 12% in shadcn and 27% in the explorer, as small collections look again at what a full one used to
+  make old, and the long list's 62 key presses took 435 ms rather than 329. js-bench's time is the same by geomean.
+- Only when the last small collection kept more young than the old budget (`=2`): json 10.0 MB, js-bench 0.7% lower,
+  shadcn 130.2, explorer 40.1, collecting 3-8% longer, but the long list ends 3 MB higher and Mantine peaks 1.3 MB higher.
+- A full collection that makes old whatever a small one had kept, and leaves only what's new young: json 10.1, map_set
+  11.1, but the long list's presses 25% slower.
+
+Triggers that leave full collections as they are can't fix `json` without luck: making the next collection full when
+the last small one kept more young than the old budget gave 10.3 MB on some lengths and 11.1 on others (it came down
+to 1.16 MB against 1.13), and its regex peak went from 7.3 MB to 8.2 by making a live 300 KB old; counting what the
+next small collection will make old as made old already, with strings at three keeps, gave 10.3 MB only because it
+happened to have no full collection once the payload was built. Leaving big strings young didn't help (what json makes
+old is fifteen thousand small strings), nor did counting a `Map`'s entries in what an object takes up, which made the
+budgets bigger and map_set's peak 1.8 MB higher. The allocator isn't where the explorer's memory is: its chunks hold
+2.0 MB more than their blocks in use in both builds; what's more is blocks in use and the engine's list of objects.
 
 ## What made it fast
 

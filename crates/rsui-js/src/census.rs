@@ -918,6 +918,14 @@ fn constructor_name(vm: &Vm, object: &Object, constructor: Atom) -> Option<Strin
     function_name(vm, &vm.objects[value.index()])
 }
 
+/// [`label`] with plain objects told apart by their properties' names, for `RSUI_GC_DIED_OLD`.
+pub(crate) fn label_by_keys(vm: &Vm, handle: u32, constructor: Atom) -> String {
+    BY_KEYS.with(|on| on.set(true));
+    let found = label(vm, handle, constructor);
+    BY_KEYS.with(|on| on.set(false));
+    found
+}
+
 /// What an object is counted as: a function by its name and where it's written, a prototype by whose it is, and
 /// anything else by its kind and what made it, as far as its prototype's `constructor` says.
 fn label(vm: &Vm, handle: u32, constructor: Atom) -> String {

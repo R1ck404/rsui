@@ -1173,6 +1173,112 @@ against 67f35351, had them 390.7 and 382.3 ms, its modal 84.1, 68.9, 81.0 ms aga
 Private memory at the end, the median over eight lengths of the environment, 67f35351 and this: shadcn's page 136.1 and 137.3
 MB, Mantine's 151.9 and 148.2 MB, the explorer 41.0 and 39.0 MB, the long list 228.6 and 228.8 MB.
 
+What the page's tree for matching selectors costs, found later the same day (t3/page-tune):
+
+- **`:has()` checked again after a key made the whole tree** (4502db0c). After each layout, what's drawn with what `:has()`
+  said is checked again against the page (`checkHasWatched` from `laidOut`), and on shadcn's page and Mantine's that made
+  `pageTree` again on every key, shadcn's 1,231 elements and 1,453 lists, half a megabyte: the tree was kept for it only if
+  nothing an element's given had changed (`pageTreeContentKept`), and a field's value changes as it's typed into. Matching
+  reads only where elements are and which have text from the tree (what each is given, its classes and state are read from
+  what web.js keeps for it, in `ownOf`), so `pageTreeContentKept(true)` says whether that much is the same (`same_page_shape`
+  in `geometry.rs`), which `recheckHas` and `drawnElementsOf` ask. Same exe, seven rounds, 40 keys: shadcn 183.6 -> 145.1
+  ms with 3 small collections rather than 6, Mantine 301.4 -> 220.2 ms, 3 rather than 7. `RSUI_RESTYLE_CHECK=1` compares
+  each answer with one from a tree made again (the `oracleTree` in `recheckHas`).
+- **The tree made again from what's different in it** (53700f3c). With that, what asked for the tree next made it instead:
+  Mantine's `document.querySelector('h1')` after a class went on it made all 4,500 elements, 4 ms, where it had been 0.06
+  as the frame before had made it. Where the tree has the shape it had, `pageTreePatch` says only each element that says
+  anything different of itself or is somewhere else, against where each was as it was last said (`RECTS`), and always the
+  root, which carries the content's version; web.js puts each into the element made from that entry (`entryNodes`) and
+  the text it gave (`textAt`), and works out what a selector reads of every element again. What isn't from Rust's tree
+  (what isn't shown, a `<select>`'s parts, what a long list's rows skip) is said as a string as the tree is made, and if
+  that or what the page has for any element's key is different the tree is made again (`pageNotTreeSame`). A tree that's
+  kept is given back without asking `pageTree`. A class put on Mantine's heading and taken off: 3.68 -> 1.56 ms (the
+  root and the heading said again), the class with the frame after it 6.5 -> 4.7 ms against t3/css-rust-finish, as the
+  frame no longer makes the tree; shadcn's 40 keys 134 -> 126 ms (7 patches and one tree made, its MutationObserver
+  reading `textContent`). `RSUI_PAGE_TREE_CHECK=1` makes the tree again after each patch and compares all of it;
+  `RSUI_PAGE_TREE_PATCH=0` makes it again each time.
+- **A focus made slower by putting what's about an element alone on together** (43f8c498). `orderWith` worked out, for
+  each plan and list of rules found by an attribute, the order and whether each half could go on together, which for a
+  plan used once, as most a focus makes are, was more than putting each on in turn. The first element with them now has
+  them put on in turn with the order found as it goes (`cascadeOn`), only the last list asked about is remembered
+  (`togetherAsked`, a string: a set for each plan was megabytes on Mantine's page), and the order is worked out the second
+  time. Plans have what's worked out for them later there from the start (`lastSelf`, `selfLasts`, `together`,
+  `togetherAsked`, `rustMatch`), as one shape. shadcn's focus on a field 15.1 -> 13.9 ms, its 40 keys 143.6 -> 139.9;
+  with `profMark`, that part of a focus 16.7 -> 14.8 µs an element and of the page starting 15.2 -> 9.6, below the 16.1 it
+  was before 6dd163a6. `RSUI_CASCADE_CHECK=1` works the order out at once, and puts the first element's on in turn too
+  to compare (a copy that put no rules found by an attribute on that way had 27 differences on shadcn's page).
+
+Mantine's "all steps" being 1,030 against 1,060 ms was settled with three builds of each (`__CARGO_DEFAULT_LIB_METADATA`),
+five rounds in a turning order: 41416697 1,064 ms, this 904, each of its three builds below each of the other's; the one
+step that was slower, the class put on its heading, is the one above, whose work had been in the `wait` after it, which
+"all steps" doesn't count. Mantine's memory at its start moved by 8 MB between two web.js files that do the same (one
+committed a step of pages more before a collection, with the same objects alive), and the other way in another build, so
+memory is compared over builds and lengths of the environment.
+
+The session, against the base before plans and matching were in Rust (9181f4e3), the commit before variables were worked
+out in Rust (41416697) and t3/css-rust-finish's head (7227facb), fastrel exes, three builds of this, three of 41416697
+and two of 7227facb, four rounds in a turning order on a busy machine, medians of steps (ms):
+
+| | 9181f4e3 | 41416697 | 7227facb | This |
+|---|---|---|---|---|
+| shadcn's page: dialog opened, closed, opened again | 250.1, 164.4, 211.7 | 245.6, 157.4, 174.9 | 224.4, 131.2, 180.3 | 225.3, 126.9, 148.6 |
+| shadcn's page: focus on a field, 40 keys | 18.1, 212.2 | 18.3, 234.8 | 23.1, 248.0 | 14.6, 132.2 |
+| shadcn's page, all steps | 1,066 | 1,005 | 969 | 796 |
+| Mantine's page: modal opened, closed, opened again | 134.8, 107.5, 123.5 | 125.7, 85.1, 97.1 | 95.1, 68.6, 84.3 | 81.4, 68.2, 81.5 |
+| Mantine's page: a class on its heading; 40 keys; a turn of the wheel | 0.26, 475, 23.3 | 0.27, 471, 20.4 | 0.27, 432, 20.6 | 1.49, 273, 20.3 |
+| Mantine's page, all steps | 1,434 | 1,326 | 1,175 | 1,028 |
+| The explorer on System32: Down, Page Down, a resize; all steps | 1.74, 3.22, 3.82; 438 | 1.78, 3.83, 4.02; 457 | 1.78, 3.76, 4.02; 450 | 1.67, 3.28, 3.71; 421 |
+| The long list, 5,000 rows, Down (eight rounds) | | 6.98 | 6.61 | 6.48 |
+
+Private memory at the end, the median over eight lengths of the environment (MB): shadcn's page 133.0, 136.2, 137.9 and
+131.6 (a second build of this 131.6); Mantine's 154.7, 153.0, 148.3 and 150.1, where 7227facb's builds are 146-148 at most
+lengths and 154-156 at the others and this one's 147-151 at all (its second and third builds 150.2 and 149.9, a second
+of 7227facb 148.1); the explorer 39.5, 40.4, 39.0 and 39.7, each within what lengths move it by (38.7-43.7); the long list
+220.3, 220.5, 228.5 and 228.7. The long list's 8 MB more since 41416697 is committed and never touched: its private working
+set is the same (226.0 against 225.7 MB), the process heap and the allocator's blocks are, and the engine has as many
+objects alive (1,234,713 places of objects rather than 1,226,014). That looks like one of the engine's lists growing to
+twice its room as it goes past a length, which 5fb3a79b on t3/gc-tune (asking for at most a megabyte ahead) is about; it
+wasn't looked into further here, as that's the collector's.
+
+What made the full collections, found later the same day: most of what full collections freed was made old by mistake.
+A closure's variables and strings were old the first time a small collection kept them, where an object waits for the
+third. `pageTree` in web.js makes the page's tree again on every key (1,231 nodes and 1,453 entries, about half a
+megabyte), and a small collection that came while it was building kept its variables, which were then old; once it had
+returned, they still held that tree, and an old variable that holds something young is looked at by every small
+collection until that's old too, so the tree became old and died old, at nearly every small collection while typing
+(`RSUI_GC_DIED_OLD=1` shows it, by what each small collection makes old and each full one finds dead). Variables and
+strings now stay young until two small collections have kept them (see `cells_surviving` in rsui-js's `gc.rs`). Over
+eight lengths of the environment, against the base before plans and matching were in Rust (9181f4e3) and the last
+commit before this (41416697): shadcn has no full collection in its 40 keys on any length (base 2, before 8), 14 full
+collections in the session rather than 15 and 16, 89 ms of them rather than 121, and small collections make 47.5 MB old
+rather than 64.6 and 57.6. Private memory at the end, medians: shadcn 131.8 MB (132.6, 134.7), Mantine 148.7 (154.1,
+152.8), the explorer 41.0 (39.4, 40.7) and `bench/long-list` 223.3 (220.5, 220.2), which is where its last small
+collection lands: 20 keys later it's 223.4 against 231.3 and 231.4. Lists of the engine also ask for at most a megabyte
+ahead of what they need, where an eighth of the long list's objects was 10 MB of private memory nothing had touched.
+
+Why the explorer ends 1.3 MB higher than the base, and the `json` bench peaks 1.6 MB higher, found after: it isn't the
+allocator (its chunks hold 2.0 MB more than their blocks in use in both builds), but when full collections land. With
+less made old, the explorer's last full collection is the one during startup, and what it keeps there is its working set
+too, all made old; the 1.5 MB that browsing makes old afterwards stays short of what makes the next one due. A full
+collection that leaves what's young young fixes both (39.7 MB, json 10.1) but makes collecting 12-27% slower in the apps
+and the long list's keys a third slower, so it's an experiment, off by default: rsui-js's `DESIGN.md` has what was
+tried and the numbers.
+
+Both together (t3/all-tuned, with `Vm` laid out as before again, see rsui-js's `DESIGN.md`), against 8c9786d3, fastrel,
+two builds a side, eight runs a side on a quiet machine: all of shadcn's steps 567 ms against 782, Mantine's 737
+against 1,111, the explorer's 366 against 413, the long list's 293 against 312; started and closed, Mantine 2,072 ms
+against 2,638 and shadcn 1,650 against 1,949; Mantine's class put on and taken off, with the frame after, 2.8 ms
+against 4.8. Two steps are slower. shadcn's focus on a field (14.3 against 11.3 ms): a small collection of 4-5 ms
+lands in it on every length of the environment tried, where without one it's 10 ms, and the session has 51 small
+collections rather than 71, 334 ms of collecting rather than 513. An `expect` step, 0.5-1 ms on both pages, which
+3d504951 found is the exe and not what it runs. Private memory at the
+end, medians over eight lengths: shadcn 131.2 MB (133.0), Mantine 146.0 (154.0), the long list 221.7 (220.4) and 20
+keys later 222.7 (231.2), so the 8 MB the plans had cost it are gone; the explorer 40.9 (40.2). After an `idle` step,
+as a window does when things go quiet, its JavaScript keeps the same 6.2 MB as page-tune's, and the 1.7 MB more than
+page-tune is the engine's list of objects (73,600 places rather than 69,400, 54 empty pages given back rather than
+116) and the allocator's chunks around it: with less made old, its dead old objects pile up higher before a full
+collection, and a list that's grown doesn't shrink past the pages still partly used.
+
 Boxes are laid out as a browser lays them out, in `rsui-layout`, which knows nothing about CSS but has the same rules:
 
 - `body` is a box of its own in the window, which lays out what's in it as it says, so `body { display: flex; justify-content: center; align-items: center }` puts the page in the middle. What's in it then is the page's root element, as `#root` is, a block of its own. What `html` and `body` say about text and their background is the window's, as before.

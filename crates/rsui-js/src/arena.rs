@@ -20,8 +20,13 @@ unsafe extern "system" {
     fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
 }
 
-/// Real memory is asked for in steps of this, or an eighth of what there is if that's more.
+/// Real memory is asked for in steps of this, or an eighth of what there is if that's more, up to [`AHEAD`].
 const STEP: usize = 16 * 1024;
+/// The most that's asked for ahead of what's needed. Memory that's asked for counts against the process whether it's
+/// touched or not, and an eighth of the list of objects of `bench/long-list` (80 MB) was 10 MB of that, which a few more
+/// objects at the end of a run decided whether it had. Asking for it a megabyte at a time is 80 calls to the system
+/// over the whole of that list, and a page costs the same to zero whenever it's first written.
+const AHEAD: usize = 1024 * 1024;
 
 pub(crate) struct Arena<T> {
     base: *mut T,
@@ -112,7 +117,7 @@ impl<T> Arena<T> {
         let have = self.committed_bytes();
         let need = wanted * size_of::<T>() + self.offset;
         let bytes = need
-            .max(have + (have / 8).max(STEP))
+            .max(have + (have / 8).clamp(STEP, AHEAD))
             .next_multiple_of(STEP)
             .min(self.reserved * size_of::<T>() + self.offset);
         // SAFETY: the range is inside what `with_limit_at` reserved.

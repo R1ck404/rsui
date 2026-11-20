@@ -2,8 +2,10 @@
 //! point in the interpreter, and only after enough has been made since the last time, so an idle program has no
 //! collector running at all.
 //!
-//! It has two generations, and nothing moves. An object that two small collections in a row have kept is old, and so is
-//! a string or a cell once one has, and their marks stay set afterwards. Most collections are small: they start from
+//! It has two generations, and nothing moves. An object becomes old the third time in a row a small collection keeps it
+//! (the second, with [`age`] at 2), and a string or a cell the second time, and their marks stay set afterwards. Until
+//! then what's young and was kept is unmarked again after each small collection, with bits of its own to say how often.
+//! Most collections are small: they start from
 //! the roots, stop at anything already marked, and so only go through what's young, and free only what's young and
 //! wasn't reached. A young thing can also be reached from an old one, so every change to an old object or cell goes
 //! through a write barrier first, which remembers it, and a small collection looks through what's remembered as well.
@@ -42,7 +44,15 @@
 //!
 //! `RSUI_GC_STRESS=1` collects at every safe point, `RSUI_GC_VERIFY=1` checks around each small collection that nothing
 //! old refers to something young without being remembered, and that nothing held weakly has been freed, and
-//! `RSUI_GC_LOG=1` writes a line about each collection.
+//! `RSUI_GC_LOG=1` writes a line about each collection. `RSUI_GC_DIED_OLD=1` writes what each small collection made old
+//! and what each full one found dead of what small ones had made old since the last, by what it is, which is what a full
+//! collection is for: as little of that as there can be is what keeps full collections few. Each line of
+//! `RSUI_GC_LOG` ends with how much was made since the collection before.
+//!
+//! Two experiments are off by default (see "Full collections that leave the young young" in `DESIGN.md`):
+//! `RSUI_GC_KEEP_YOUNG=1` (or `2`, only when what's young outweighs the old budget) has a full collection age what's
+//! young as a small one would rather than make all it keeps old, and `RSUI_GC_STRING_AGE=3` has strings age as
+//! objects do.
 
 use crate::arena::Arena;
 use crate::object::*;
@@ -146,6 +156,60 @@ fn logging() -> bool {
         0 => {
             let on = std::env::var_os("RSUI_GC_LOG").is_some_and(|value| value != "0");
             LOG.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        known => known == 2,
+    }
+}
+
+/// What `RSUI_GC_KEEP_YOUNG` asks of a full collection that's due: `0` (the default) makes everything it keeps old,
+/// `1` leaves what was young young, aged as a small collection would have aged it, and `2` does that only when the
+/// last small collection kept more young than the old budget (see [`Generations::keeps_young`]). It's an
+/// experiment, off by default: see "Full collections that leave the young young" in `DESIGN.md`.
+fn keep_young_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    match MODE.load(Ordering::Relaxed) {
+        u8::MAX => {
+            let mode = match std::env::var("RSUI_GC_KEEP_YOUNG").ok().as_deref() {
+                Some("1") => 1,
+                Some("2") => 2,
+                _ => 0,
+            };
+            MODE.store(mode, Ordering::Relaxed);
+            mode
+        }
+        mode => mode,
+    }
+}
+
+/// How many small collections keep a young string before it's old: 2, or with `RSUI_GC_STRING_AGE=3`, what [`age`]
+/// says, as objects. Also an experiment, off by default (see `DESIGN.md`).
+fn string_age() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static AGE: AtomicU8 = AtomicU8::new(0);
+    match AGE.load(Ordering::Relaxed) {
+        0 => {
+            let age = match std::env::var("RSUI_GC_STRING_AGE").ok().as_deref() {
+                Some("3") => age(),
+                _ => 2,
+            };
+            AGE.store(age, Ordering::Relaxed);
+            age
+        }
+        age => age,
+    }
+}
+
+/// Whether `RSUI_GC_DIED_OLD` asks for each full collection to write what small collections made old that it found
+/// dead, by what it is.
+fn died_old_logging() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("RSUI_GC_DIED_OLD").is_some_and(|value| value != "0");
+            ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
         known => known == 2,
@@ -546,8 +610,6 @@ pub(crate) struct Generations {
     surviving_bytes: usize,
     /// What was old before the small collection that's running: everything marked when it started.
     old_before: Vec<u64>,
-    /// What the last collection looked through in old objects that were remembered, as the values it found there.
-    remembered_bytes: usize,
     /// The shapes whose prototypes were young after the last collection, which a small collection keeps (with the shapes
     /// made since, in `Shapes::touched`) until they're old.
     young_protos: Vec<u32>,
@@ -566,6 +628,41 @@ pub(crate) struct Generations {
     /// The atoms a full collection found in use, and the ones it freed.
     atom_marks: Vec<u64>,
     atoms_freed: Vec<u64>,
+    /// What cells and strings aging needs, with `remembered_bytes`, which was here before, kept in a box. `Generations`
+    /// is a field of `Vm`, and with these 224 bytes in it js-bench's interpreter ran 1.7% slower by geomean (prop_mono
+    /// 8%, string_ops 7%, int_loop and try_catch 5%), none of which collect. With the box in the place of one 8-byte
+    /// field, `Generations`, and so `Vm`, is laid out as before (bulk.rs's state is in `NumberStrings` for that too).
+    more: Box<Aging>,
+}
+
+/// The part of [`Generations`] kept in a box, so that `Vm` is laid out as it was before strings and cells aged.
+#[derive(Default)]
+pub(crate) struct Aging {
+    /// What was young and alive after it, which only a full collection that leaves the young young has.
+    full_young: usize,
+    /// The cells the last small collection kept for the first time, which are still young, one bit each: the next one
+    /// to keep them makes them old. A cell used to be old as soon as a collection kept it. Then the variables of a
+    /// function that was running when one came along were old, and once it had returned they still held what they
+    /// were last given, which a small collection can't tell is garbage: an old cell that refers to something young is
+    /// remembered until that's old, which takes three, so what it held became old and died old. The page's tree that
+    /// `pageTree` in web.js makes on every key, half a megabyte, did that at nearly every small collection while
+    /// typing in shadcn's page, and was most of what full collections found dead.
+    cells_surviving: Vec<u64>,
+    cells_spare: Vec<u64>,
+    /// The cells that were old when the small collection that's running started.
+    cells_old_before: Vec<u64>,
+    /// The strings kept once by the last small collection, which are still young, as cells are.
+    strings_surviving: Vec<u64>,
+    strings_spare: Vec<u64>,
+    /// Of those, the ones kept twice, with [`age`] at 3, which become old if they're kept again.
+    strings_twice: Vec<u64>,
+    strings_twice_spare: Vec<u64>,
+    /// What the last collection looked through in old objects that were remembered, as the values it found there.
+    remembered_bytes: usize,
+    /// With `RSUI_GC_DIED_OLD`, the objects that were old after the last full collection, and the ones old before
+    /// this one, to tell what small collections made old that died before it.
+    died_at_full: Vec<u64>,
+    died_before: Vec<u64>,
 }
 
 impl Generations {
@@ -574,7 +671,8 @@ impl Generations {
     /// half, with nothing old left over as garbage; a half here kept the peak a fifth higher on programs that keep a
     /// lot for a little while, such as parsing JSON, and three-eighths keeps it about where it was.
     fn old_budget(&self) -> usize {
-        (self.full_live / 8 * 3).max(MIN_THRESHOLD)
+        // What a full collection left young was alive too, and would have counted had it been made old.
+        ((self.full_live + self.more.full_young) / 8 * 3).max(MIN_THRESHOLD)
     }
 
     /// How much can be made between two small collections, before what's young and was kept is taken out: as much
@@ -611,6 +709,18 @@ impl Generations {
         }
     }
 
+    /// Whether a full collection that's due leaves what's young young (see `RSUI_GC_KEEP_YOUNG`): always, or when
+    /// the last small collection kept more young than the old budget, as a full collection then lands in the middle
+    /// of what's being worked on. Making that old had the `json` bench's full collections keep 3.0 MB where 0.8 MB was
+    /// alive between rounds, and so allow four times as much to be made and become old.
+    fn keeps_young(&self) -> bool {
+        match keep_young_mode() {
+            1 => true,
+            2 => stress() != Stress::Off || self.surviving_bytes > self.old_budget(),
+            _ => false,
+        }
+    }
+
     /// How much can be made before the next collection.
     fn threshold(&self) -> usize {
         if stress() != Stress::Off {
@@ -633,7 +743,7 @@ impl Generations {
         self.budget()
             .saturating_sub(taken)
             .max(self.least())
-            .max(self.remembered_bytes)
+            .max(self.more.remembered_bytes)
     }
 }
 
@@ -975,6 +1085,9 @@ struct Young<'a> {
     surviving_twice: &'a mut Vec<u64>,
     /// What was old when this collection started.
     old_before: &'a [u64],
+    /// The cells and strings that were old when it started.
+    old_cells: &'a [u64],
+    old_strings: &'a [u64],
     /// The ones kept for the first time.
     surviving: &'a mut Vec<u64>,
     /// What the ones kept for the first time take up, and the ones kept for the second.
@@ -1006,13 +1119,17 @@ impl Young<'_> {
         object.flags |= OLD;
         self.promoted += object_bytes(object);
         // What it refers to was all reached, and what wasn't old and wasn't kept before stays young. A BigInt is in the list
-        // of objects too, and ages the same way.
+        // of objects too, and ages the same way. A cell or a string that wasn't old may be young after this too, which
+        // this has to be remembered for until it isn't.
         let (old, before) = (self.old_before, self.promoting);
+        let (old_cells, old_strings) = (self.old_cells, self.old_strings);
         let mut young = false;
         each_child(object, &mut |child: Value| {
-            young |= (child.is_object() || child.is_bigint())
+            young |= ((child.is_object() || child.is_bigint())
                 && !is_marked(old, child.index())
-                && !is_marked(before, child.index())
+                && !is_marked(before, child.index()))
+                || (child.is_cell() && !is_marked(old_cells, child.index()))
+                || (child.is_string() && !is_marked(old_strings, child.index()))
         });
         if young {
             remember(self.remembered, object, handle);
@@ -1298,12 +1415,13 @@ impl Vm {
     pub(crate) fn collect_garbage(&mut self) {
         // Nothing's old before the first one, so it has to look at everything anyway.
         let full = self.gc_count == 0 || self.generations.full_due();
-        self.collect(full);
+        let keep_young = full && self.gc_count != 0 && self.generations.keeps_young();
+        self.collect(full, keep_young);
     }
 
     /// Frees everything that can't be reached, young or old.
     pub(crate) fn collect_all_garbage(&mut self) {
-        self.collect(true);
+        self.collect(true, false);
     }
 
     /// A small collection from outside any JavaScript, for tests of what generations do.
@@ -1312,14 +1430,14 @@ impl Vm {
         self.nursery.clear();
         self.run_mark = 0;
         self.top = 0;
-        self.collect(false);
+        self.collect(false, false);
     }
 
     /// What's reached can include a handle to something already freed: a register a function no longer reads can still
     /// hold what was in it when a smaller function it called was running, and only that function's registers were
     /// looked at then. Such a handle keeps whatever has its place now alive a little longer, which does no harm. A
     /// string's can even be past the end of the list, in the last word of marks, and is left alone.
-    fn collect(&mut self, full: bool) {
+    fn collect(&mut self, full: bool, keep_young: bool) {
         let _split = rsui_alloc::split::enter(rsui_alloc::split::GC);
         let _span = rsui_spans::span(rsui_spans::Kind::Gc).map(|mut span| {
             span.arg(u32::from(full));
@@ -1345,7 +1463,14 @@ impl Vm {
         self.wipe_above_top();
         // What's watched and young is seen as it is: see `Watch`.
         self.objects.watch.unfake(&mut self.objects.list);
-        if full {
+        if full && died_old_logging() {
+            self.generations.more.died_before.clear();
+            self.generations
+                .more
+                .died_before
+                .extend_from_slice(&self.object_marks);
+        }
+        if full && !keep_young {
             clear_marks(&mut self.object_marks, self.objects.len());
             clear_marks(&mut self.strings.marks, self.strings.items.len());
             clear_marks(&mut self.cells.marks, self.cells.list.len());
@@ -1357,10 +1482,11 @@ impl Vm {
             extend_marks(&mut self.strings.marks, self.strings.items.len());
             extend_marks(&mut self.cells.marks, self.cells.list.len());
             if verifying() {
-                self.verify_generations("before a small collection");
-                self.verify_weak("before a small collection", false);
-                self.verify_shapes("before a small collection");
-                self.verify_atoms("before a small collection");
+                let when = if full { "before a full collection" } else { "before a small collection" };
+                self.verify_generations(when);
+                self.verify_weak(when, false);
+                self.verify_shapes(when);
+                self.verify_atoms(when);
             }
             self.generations.strings_before.clear();
             self.generations
@@ -1370,6 +1496,22 @@ impl Vm {
             self.generations
                 .old_before
                 .extend_from_slice(&self.object_marks);
+            // The cells that are old: the marked ones, and the ones remembered since the last collection, which are
+            // unmarked until this one.
+            let cells_before = &mut self.generations.more.cells_old_before;
+            cells_before.clear();
+            cells_before.extend_from_slice(&self.cells.marks);
+            for &cell in &self.cells.remembered {
+                set_mark(cells_before, cell as usize);
+            }
+            if keep_young {
+                // A full collection marks everything again, and what's young after it is worked out from what was old
+                // before it. What's remembered isn't a root then, as it may have died: it's what's looked at afterwards
+                // for referring to what's still young, as nothing else old can (see `keeps_young`).
+                clear_marks(&mut self.object_marks, self.objects.len());
+                clear_marks(&mut self.strings.marks, self.strings.items.len());
+                clear_marks(&mut self.cells.marks, self.cells.list.len());
+            }
         }
 
         // Places on pages that were given back look reached, so nothing traces into them (see `giveback.rs`).
@@ -1391,8 +1533,15 @@ impl Vm {
         let mut surviving_twice = std::mem::take(&mut self.generations.spare_twice);
         let old_before = std::mem::take(&mut self.generations.old_before);
         let mut still_remembered = std::mem::take(&mut self.generations.spare_handles);
+        // A cell becomes old the second time a small collection keeps it, as an object does at [`age`] 2, and for the
+        // same reason: see [`Aging::cells_surviving`].
+        let cells_survived_before = std::mem::take(&mut self.generations.more.cells_surviving);
+        let mut cells_surviving = std::mem::take(&mut self.generations.more.cells_spare);
+        let cells_old_before = std::mem::take(&mut self.generations.more.cells_old_before);
+        cells_surviving.clear();
+        let strings_before = std::mem::take(&mut self.generations.strings_before);
         let three = age() == 3;
-        if full {
+        if full && !keep_young {
             survived_before.clear();
             surviving.clear();
             twice_before.clear();
@@ -1415,6 +1564,8 @@ impl Vm {
             survived_before: survived_once,
             surviving_twice: &mut surviving_twice,
             old_before: &old_before,
+            old_cells: &cells_old_before,
+            old_strings: &strings_before,
             surviving: &mut surviving,
             surviving_bytes: 0,
             twice_bytes: 0,
@@ -1551,19 +1702,21 @@ impl Vm {
             let objects = &mut self.objects.list;
             // The old objects and cells changed since the last collection can refer to young things.
             let mut looked_at = 0;
-            for handle in &remembered {
-                set_mark(marker.object_marks, *handle as usize);
-                let object = &mut objects[*handle as usize];
-                object.flags |= OLD;
-                each_child(object, &mut |_| looked_at += 1);
-                each_child(object, &mut marker);
+            if !full {
+                for handle in &remembered {
+                    set_mark(marker.object_marks, *handle as usize);
+                    let object = &mut objects[*handle as usize];
+                    object.flags |= OLD;
+                    each_child(object, &mut |_| looked_at += 1);
+                    each_child(object, &mut marker);
+                }
+                for cell in &remembered_cells {
+                    set_mark(marker.cell_marks, *cell as usize);
+                    let inner = marker.cells[*cell as usize];
+                    marker.value(inner);
+                }
             }
             remembered_bytes = looked_at * size_of::<Value>();
-            for cell in &remembered_cells {
-                set_mark(marker.cell_marks, *cell as usize);
-                let inner = marker.cells[*cell as usize];
-                marker.value(inner);
-            }
             // After a full collection everything reached is old, and its shape is in use. After a small one, see
             // below. Each has a loop of its own, as one loop with both in it had less room for either.
             if full {
@@ -1588,13 +1741,43 @@ impl Vm {
             new_cells = std::mem::take(&mut marker.new_cells);
             weak = std::mem::take(&mut marker.weak);
         }
+        if keep_young {
+            // What a full collection reached that wasn't old ages as a small collection would have aged it, rather than
+            // all being made old: see `keeps_young`. Marking made it old for the while, which is taken off again.
+            let objects = &mut self.objects.list;
+            let holes = self.free_objects.holes();
+            for (at, word) in object_marks.iter().enumerate() {
+                let mut word = *word & !old_before.get(at).copied().unwrap_or(0) & !holes.word(at);
+                while word != 0 {
+                    let handle = at * 64 + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let Some(object) = objects.get_mut(handle) else {
+                        break;
+                    };
+                    // A small collection makes a BigInt old the first time it keeps it.
+                    if matches!(object.kind, Kind::BigInt(_)) {
+                        continue;
+                    }
+                    object.flags &= !OLD;
+                    young.reached(object, handle);
+                }
+            }
+            live_bytes = live_bytes.saturating_sub(young.surviving_bytes + young.twice_bytes);
+        }
         self.clear_weak(&weak, &object_marks, free_atoms.then_some(&atom_marks[..]));
+        if full && died_old_logging() {
+            self.report_died_old(&object_marks);
+        }
+        if !full && died_old_logging() {
+            self.report_promoted(&object_marks, &old_before);
+        }
 
-        let promoted = young.promoted;
+        // What a full collection made old is in what it found alive.
+        let promoted = if full { 0 } else { young.promoted };
         // What was made since the last collection and kept, and all that's young and kept, which takes up room until
         // the next one.
         let kept_new_bytes = young.surviving_bytes;
-        let surviving_bytes = young.surviving_bytes + young.twice_bytes;
+        let mut surviving_bytes = young.surviving_bytes + young.twice_bytes;
         if !full {
             live_bytes = 0;
         }
@@ -1622,7 +1805,7 @@ impl Vm {
         // What handing on has share captured variables forgets what's gone, before its place is another's or given back.
         let free = &self.free_objects;
         self.reads.forget_freed_closures(|member| member as usize >= keep || free.is_free(member as usize));
-        if !full {
+        if !full || keep_young {
             trim_marks(&mut surviving, keep);
             for (mark, survived) in object_marks.iter_mut().zip(&surviving) {
                 *mark &= !survived;
@@ -1635,7 +1818,7 @@ impl Vm {
         // The prototypes of the shapes looked at that are still young are looked at again next time. After a full
         // collection every shape that's left has an old prototype.
         let mut young_protos = std::mem::take(&mut self.generations.young_protos);
-        if full {
+        if full && !keep_young {
             young_protos.clear();
         } else {
             let items = &self.shapes.items;
@@ -1666,6 +1849,9 @@ impl Vm {
             if self.shapes.sweep(&shape_marks, &mut freed) {
                 self.forget_freed_shapes(&freed);
             }
+            if keep_young {
+                self.generations.young_protos.retain(|&shape| !is_marked(&freed, shape as usize));
+            }
             self.generations.shapes_freed = freed;
             // A small collection frees no prototype and no shape that isn't a dictionary, which none of these keep.
             self.forget_shape_caches();
@@ -1687,42 +1873,96 @@ impl Vm {
             self.forget_freed_atoms(&atoms_freed);
         }
         self.generations.atom_marks = atom_marks;
+        // A string kept for the first time stays young, as a cell does, unless the last small collection kept it too:
+        // what an object kept once refers to would otherwise be old when the object dies young, and die old. These
+        // are unmarked after sweeping. Strings made old by small collections were as much again as the objects they
+        // made old in a shadcn session.
+        let strings_survived_before = std::mem::take(&mut self.generations.more.strings_surviving);
+        let strings_twice_before = std::mem::take(&mut self.generations.more.strings_twice);
+        let mut strings_surviving = std::mem::take(&mut self.generations.more.strings_spare);
+        let mut strings_twice = std::mem::take(&mut self.generations.more.strings_twice_spare);
+        strings_surviving.clear();
+        strings_twice.clear();
+        if !full || keep_young {
+            let holes = self.strings.free.holes();
+            let three = string_age() == 3;
+            for (at, word) in string_marks.iter().enumerate() {
+                let young = *word & !strings_before.get(at).copied().unwrap_or(0) & !holes.word(at);
+                let kept = strings_survived_before.get(at).copied().unwrap_or(0);
+                let twice = strings_twice_before.get(at).copied().unwrap_or(0);
+                if three {
+                    strings_surviving.push(young & !twice);
+                    strings_twice.push(young & kept & !twice);
+                } else {
+                    strings_surviving.push(young & !kept);
+                    strings_twice.push(0);
+                }
+            }
+        }
         // The strings that name atoms stay as long as the atoms. After a full collection they're marked again, and
-        // after a small one they're still marked, being old, apart from the ones made since the last collection.
+        // after a small one they're still marked, being old, apart from the ones made since the last collection,
+        // which become old now.
         if full {
             for handle in self.atoms.strings() {
                 set_mark(&mut string_marks, handle as usize);
+                if let Some(word) = strings_surviving.get_mut(handle as usize / 64) {
+                    *word &= !(1u64 << (handle % 64));
+                }
+                if let Some(word) = strings_twice.get_mut(handle as usize / 64) {
+                    *word &= !(1u64 << (handle % 64));
+                }
             }
         } else {
             for handle in self.atoms.added_strings() {
                 set_mark(&mut string_marks, handle as usize);
+                if let Some(word) = strings_surviving.get_mut(handle as usize / 64) {
+                    *word &= !(1u64 << (handle % 64));
+                }
+                if let Some(word) = strings_twice.get_mut(handle as usize / 64) {
+                    *word &= !(1u64 << (handle % 64));
+                }
             }
         }
         self.atoms.forget_added();
         let objects = &mut self.objects.list;
         let generations = &mut self.generations;
 
-        // Only the strings kept for the first time need looking at after a small collection. A buffer that several of
-        // them share counts once (see `Tally`).
-        let before: &[u64] = if full {
-            &[]
-        } else {
-            &generations.strings_before
-        };
+        // Only the strings kept for the first time need looking at after a small collection, and only the ones that
+        // become old count, which are the ones the last one kept too, and atoms' (see `strings_surviving`). A buffer
+        // that several of them share counts once (see `Tally`).
+        let before: &[u64] = if full { &[] } else { &strings_before };
         let items = &mut self.strings.items;
         let tally = crate::text::Tally::new();
         let string_holes = self.strings.free.holes();
         for (word_index, word) in string_marks.iter().enumerate() {
-            let mut word = *word
+            let first = *word
                 & !before.get(word_index).copied().unwrap_or(0)
                 & !string_holes.word(word_index);
+            let young = strings_surviving.get(word_index).copied().unwrap_or(0);
+            let mut word = first;
             while word != 0 {
-                let Some(string) = items.get_mut(word_index * 64 + word.trailing_zeros() as usize)
+                let bit = word & word.wrapping_neg();
+                let Some(string) = items.get_mut(word_index * 64 + bit.trailing_zeros() as usize)
                 else {
                     break;
                 };
-                string.text.settle();
-                live_bytes += string.text.heap_bytes_in(tally) + 32;
+                // Only a string kept for the first time is settled (after a small collection, one that stays young).
+                // One kept by the last small collection too is unmarked, as it was young, and settling it again gave
+                // a string that's being added to its own exact copy between additions, so each one copied all of it:
+                // with RSUI_GC_STRESS, the 2,000 steps of a text built a piece at a time came to 2 GB where they
+                // share 2 MB (`text_built_a_piece_at_a_time_counts_once_however_many_steps_are_kept`).
+                if full || young & bit != 0 {
+                    string.text.settle();
+                }
+                let bytes = string.text.heap_bytes_in(tally) + 32;
+                if young & bit == 0 {
+                    live_bytes += bytes;
+                } else {
+                    // Kept for the first time, it takes up room until the next small collection as a young object does,
+                    // which comes out of what can be made before then. Leaving it out had the `json` bench's peak a
+                    // third higher, as what strings were kept used to count as made old.
+                    surviving_bytes += bytes;
+                }
                 word &= word - 1;
             }
         }
@@ -1757,6 +1997,11 @@ impl Vm {
             });
         items.truncate(keep);
         trim_marks(&mut string_marks, keep);
+        trim_marks(&mut strings_surviving, keep);
+        trim_marks(&mut strings_twice, keep);
+        for (mark, young) in string_marks.iter_mut().zip(&strings_surviving) {
+            *mark &= !young;
+        }
 
         // A free cell is always written before it's read, so there's nothing to do to one that died.
         let keep = self
@@ -1764,16 +2009,38 @@ impl Vm {
             .sweep(&cell_marks, self.cells.list.len(), |_| {});
         self.cells.list.truncate(keep);
         trim_marks(&mut cell_marks, keep);
+        // A cell kept for the first time stays young, unmarked, unless the last small collection kept it too. The ones
+        // reached that weren't marked are `new_cells`, which has the old ones that were remembered as well, if they were
+        // reached before the remembered ones were looked at.
+        if !full || keep_young {
+            clear_marks(&mut cells_surviving, keep);
+            for &cell in &new_cells {
+                let index = cell as usize;
+                if index < keep
+                    && !is_marked(&cells_old_before, index)
+                    && !is_marked(&cells_survived_before, index)
+                {
+                    set_mark(&mut cells_surviving, index);
+                    cell_marks[index / 64] &= !(1u64 << (index % 64));
+                }
+            }
+        }
 
-        // What's old now and refers to a young object has to be remembered, as nothing else leads a small collection
-        // there. Strings and cells are old as soon as they're kept, so only an object can be young, or a BigInt, which
-        // is in the list of objects. The objects that have just become old were looked at above.
+        // What's old now and refers to something young has to be remembered, as nothing else leads a small collection
+        // there: an object, or a BigInt, which is in the list of objects, a string or a cell. The objects that have
+        // just become old were looked at above.
         let mut still_remembered_cells = Vec::new();
-        if !full {
+        if !full || keep_young {
             let is_young = |value: Value| {
-                (value.is_object() || value.is_bigint()) && !is_marked(&object_marks, value.index())
+                ((value.is_object() || value.is_bigint()) && !is_marked(&object_marks, value.index()))
+                    || (value.is_cell() && !is_marked(&cell_marks, value.index()))
+                    || (value.is_string() && !is_marked(&string_marks, value.index()))
             };
             for handle in &remembered {
+                // After a full collection what was remembered may have died.
+                if full && (*handle as usize >= objects.len() || !is_marked(&object_marks, *handle as usize)) {
+                    continue;
+                }
                 let object = &mut objects[*handle as usize];
                 if object.flags & OLD == 0 {
                     continue;
@@ -1784,12 +2051,20 @@ impl Vm {
                     remember(&mut still_remembered, object, *handle as usize);
                 }
             }
+            // Only the old ones: a young cell is reached through what has it, and remembering one would keep it whether
+            // that's alive or not.
             for cell in remembered_cells.iter().chain(&new_cells) {
                 let index = *cell as usize;
-                if index < self.cells.list.len() && is_young(self.cells.list[index]) {
-                    cell_marks[index / 64] &= !(1u64 << (index % 64));
+                if index < self.cells.list.len()
+                    && is_marked(&cell_marks, index)
+                    && is_young(self.cells.list[index])
+                {
                     still_remembered_cells.push(*cell);
                 }
+            }
+            for &cell in &still_remembered_cells {
+                let index = cell as usize;
+                cell_marks[index / 64] &= !(1u64 << (index % 64));
             }
         }
 
@@ -1801,6 +2076,10 @@ impl Vm {
         weak.clear();
         shrink_if_oversized(&mut weak);
         // The marks stay, as they say what's old.
+        if full && died_old_logging() {
+            self.generations.more.died_at_full.clear();
+            self.generations.more.died_at_full.extend_from_slice(&object_marks);
+        }
         self.object_marks = object_marks;
         self.strings.marks = string_marks;
         self.cells.marks = cell_marks;
@@ -1812,6 +2091,14 @@ impl Vm {
         generations.spare_handles = remembered;
         generations.new_cells = new_cells;
         generations.weak = weak;
+        generations.more.cells_surviving = cells_surviving;
+        generations.more.cells_spare = cells_survived_before;
+        generations.more.cells_old_before = cells_old_before;
+        generations.more.strings_surviving = strings_surviving;
+        generations.more.strings_spare = strings_survived_before;
+        generations.more.strings_twice = strings_twice;
+        generations.more.strings_twice_spare = strings_twice_before;
+        generations.strings_before = strings_before;
         if verifying() {
             self.verify_generations("after a collection");
             self.verify_weak("after a collection", full);
@@ -1823,7 +2110,7 @@ impl Vm {
 
         if let Some(started) = started {
             eprintln!(
-                "gc {}: {}, {:.1} us, {} bytes {}, {} young kept, {} remembered, {} objects, {} shapes, {} atoms",
+                "gc {}: {}, {:.1} us, {} bytes {}, {} young kept, {} remembered, {} objects, {} shapes, {} atoms, {} made",
                 self.gc_count,
                 if full { "full" } else { "small" },
                 started.elapsed().as_secs_f64() * 1e6,
@@ -1834,6 +2121,7 @@ impl Vm {
                 self.objects.len(),
                 self.shapes.live(),
                 self.atoms.live(),
+                self.debt,
             );
         }
         let generations = &mut self.generations;
@@ -1842,6 +2130,7 @@ impl Vm {
             !full && (live_bytes + promoted + kept_new_bytes) * 2 > self.debt;
         if full {
             generations.full_live = live_bytes;
+            generations.more.full_young = surviving_bytes;
             generations.promoted = 0;
             generations.small_since_full = 0;
         } else {
@@ -1849,7 +2138,7 @@ impl Vm {
             generations.small_since_full += 1;
         }
         generations.surviving_bytes = surviving_bytes;
-        generations.remembered_bytes = remembered_bytes;
+        generations.more.remembered_bytes = remembered_bytes;
         self.debt = 0;
         self.threshold = generations.threshold();
         // What's past the end of each list goes back to the system, apart from as much as the list grew by since the
@@ -1878,6 +2167,72 @@ impl Vm {
         }
         if full && giveback::enabled() {
             self.give_back_pages();
+        }
+    }
+
+    /// Writes what small collections made old since the last full collection and this one found dead, by what it is,
+    /// the most bytes first. See `RSUI_GC_DIED_OLD`.
+    #[cold]
+    #[inline(never)]
+    fn report_died_old(&mut self, reached: &[u64]) {
+        let generations = &self.generations;
+        let mut groups: std::collections::HashMap<String, (usize, usize)> = Default::default();
+        let (mut count, mut bytes) = (0, 0);
+        for index in 0..self.objects.list.len() {
+            if self.free_objects.holes().has(index)
+                || !is_marked(&generations.more.died_before, index)
+                || is_marked(&generations.more.died_at_full, index)
+                || is_marked(reached, index)
+            {
+                continue;
+            }
+            let object = &self.objects.list[index];
+            if matches!(object.kind, Kind::Free) {
+                continue;
+            }
+            let size = object_bytes(object);
+            let label = crate::census::label_by_keys(self, index as u32, crate::text::CONSTRUCTOR);
+            let group = groups.entry(label).or_default();
+            group.0 += 1;
+            group.1 += size;
+            count += 1;
+            bytes += size;
+        }
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        eprintln!("gc {}: died old {count} objects, {bytes} bytes", self.gc_count);
+        for (label, (count, bytes)) in groups.iter().take(25) {
+            eprintln!("  died old {count:>7} {bytes:>9} B  {label}");
+        }
+    }
+
+    /// Writes what this small collection made old, by what it is, the most bytes first. See `RSUI_GC_DIED_OLD`.
+    #[cold]
+    #[inline(never)]
+    fn report_promoted(&self, reached: &[u64], old_before: &[u64]) {
+        let constructor = crate::text::CONSTRUCTOR;
+        let mut groups: std::collections::HashMap<String, (usize, usize)> = Default::default();
+        let (mut count, mut bytes) = (0, 0);
+        for index in 0..self.objects.list.len() {
+            if self.free_objects.holes().has(index) || is_marked(old_before, index) || !is_marked(reached, index) {
+                continue;
+            }
+            let object = &self.objects.list[index];
+            if object.flags & OLD == 0 || matches!(object.kind, Kind::Free) {
+                continue;
+            }
+            let size = object_bytes(object);
+            let group = groups.entry(crate::census::label_by_keys(self, index as u32, constructor)).or_default();
+            group.0 += 1;
+            group.1 += size;
+            count += 1;
+            bytes += size;
+        }
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        eprintln!("gc {}: promoted {count} objects, {bytes} bytes", self.gc_count);
+        for (label, (count, bytes)) in groups.iter().take(8) {
+            eprintln!("  promoted {count:>7} {bytes:>9} B  {label}");
         }
     }
 
@@ -2298,12 +2653,9 @@ impl Vm {
             }
             _ => false,
         };
-        let is_reached = |value: Value| match value.tag() {
-            Value::OBJECT_TAG => is_marked(&self.object_marks, value.index()),
-            Value::STRING_TAG => is_marked(&self.strings.marks, value.index()),
-            _ if value.is_bigint() => is_marked(&self.object_marks, value.index()),
-            _ => true,
-        };
+        // After sweeping, whatever wasn't reached has been freed. Its mark doesn't say, as a full collection leaves
+        // what's young unmarked (see `keeps_young`).
+        let is_reached = |value: Value| !is_free(value);
         for index in 0..objects.len() {
             if holes.has(index) {
                 continue;

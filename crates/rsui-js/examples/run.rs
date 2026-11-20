@@ -28,9 +28,11 @@ fn run(path: &str, expose_gc: bool) -> ExitCode {
     if std::env::var_os("RSUI_JS_MEMORY").is_some() {
         let memory = engine.memory();
         eprintln!(
-            "memory: {} bytes in all ({memory:?}), {} collections",
+            "memory: {} bytes in all ({memory:?}), {} collections; allocator: {} B in chunks, {} B of blocks in use",
             memory.total(),
-            engine.collections()
+            engine.collections(),
+            ALLOCATOR.retained_bytes(),
+            ALLOCATOR.live_bytes()
         );
     }
     match finished {

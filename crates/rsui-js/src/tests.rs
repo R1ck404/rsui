@@ -3236,6 +3236,58 @@ fn a_long_lived_weak_map_does_not_keep_short_lived_keys() {
     assert_eq!(output.borrow().as_str(), "4999950000\n14999950000\ntrue\n");
 }
 
+/// A function's variables that a small collection kept while it was running stay young, so once it's gone, what they
+/// held dies young too. They used to be old as soon as they were kept, and an old variable that holds something young is
+/// looked at by every small collection until that's old, whether anything still has the variable or not.
+#[test]
+fn what_a_finished_function_s_variables_held_dies_young() {
+    let (mut engine, output) = engine_with_gc();
+    let turn = |engine: &mut Engine, source: &str| {
+        engine.eval(source, "test.js").unwrap();
+        engine.run_jobs().unwrap();
+    };
+    turn(&mut engine, "var ref; var it;");
+    engine.collect_garbage();
+    // The generator waits with `held` in a variable a closure has, which the small collection keeps.
+    turn(
+        &mut engine,
+        "function* work() { let held = { big: 'x'.repeat(100) + 'y' }; ref = new WeakRef(held); const touch = () => held; yield touch; }
+         it = work(); it.next();",
+    );
+    engine.vm.collect_young_garbage();
+    turn(&mut engine, "it = null;");
+    engine.vm.collect_young_garbage();
+    engine.vm.collect_young_garbage();
+    // With a collection at every safe point, what it held may well have become old already.
+    if std::env::var_os("RSUI_GC_STRESS").is_some() {
+        engine.collect_garbage();
+    }
+    turn(&mut engine, "console.log(ref.deref() === undefined);");
+    assert_eq!(output.borrow().as_str(), "true\n");
+}
+
+/// A string kept once by a small collection stays young, so one that only a young object had dies with it at the next.
+#[test]
+fn a_string_kept_once_by_a_small_collection_is_still_young() {
+    let (mut engine, _output) = engine_with_gc();
+    engine.eval("var holder = null;", "test.js").unwrap();
+    engine.collect_garbage();
+    engine
+        .eval("holder = Array.from({ length: 100 }, (_, at) => 'kept for a while, number ' + at);", "test.js")
+        .unwrap();
+    let strings = |engine: &mut Engine| {
+        let strings = &engine.vm.strings;
+        (0..strings.items.len()).filter(|&at| !strings.free.is_free(at)).count()
+    };
+    engine.vm.collect_young_garbage();
+    let kept = strings(&mut engine);
+    engine.eval("holder = null;", "test.js").unwrap();
+    engine.vm.collect_young_garbage();
+    if std::env::var_os("RSUI_GC_STRESS").is_none() {
+        assert!(strings(&mut engine) + 100 <= kept, "{} strings, {kept} before", strings(&mut engine));
+    }
+}
+
 #[test]
 fn weak_holders_that_are_old_let_go_of_young_things_in_small_collections() {
     let (mut engine, output) = engine_with_gc();
