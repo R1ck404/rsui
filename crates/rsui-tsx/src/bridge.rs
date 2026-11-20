@@ -4433,6 +4433,10 @@ fn idle_collect() -> IdleCollect {
 /// What a quiet window does as well, as [`idle_collect`] says: collects all of the engine's garbage, gives back empty pages
 /// and shrinks storage (`Engine::collect_garbage_when_quiet`), unless JavaScript is running. Says whether it did.
 fn collect_when_quiet(quiet: rsui::Quiet) -> bool {
+    if quiet == rsui::Quiet::Frame {
+        between_frames();
+        return false;
+    }
     let mode = idle_collect();
     let now = match (mode, quiet) {
         (IdleCollect::Moment | IdleCollect::Plain, rsui::Quiet::Moment) => true,
@@ -4455,6 +4459,24 @@ fn collect_when_quiet(quiet: rsui::Quiet) -> bool {
         }
         false
     })
+}
+
+/// What's done between frames, once one is up and nothing else is waiting ([`rsui::Quiet::Frame`]): the collection that's
+/// about to be due is done now, if what the next few things made would bring it on, rather than in the middle of one of
+/// them (`Engine::collect_if_due_soon`). `RSUI_FRAME_GC=0` turns it off. Steps do this after each one is timed, as a window
+/// does between what someone does.
+pub fn between_frames() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("RSUI_FRAME_GC").as_deref() != Ok("0")) {
+        return;
+    }
+    HOST.with(|host| {
+        if let Ok(mut engine) = host.engine.try_borrow_mut()
+            && let Some(engine) = engine.as_mut()
+        {
+            engine.collect_if_due_soon();
+        }
+    });
 }
 
 /// Collects all of the engine's garbage on this thread, as `collect` in steps asks.

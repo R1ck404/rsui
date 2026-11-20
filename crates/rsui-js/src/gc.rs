@@ -659,6 +659,17 @@ pub(crate) struct Aging {
     strings_twice_spare: Vec<u64>,
     /// What the last collection looked through in old objects that were remembered, as the values it found there.
     remembered_bytes: usize,
+    /// What was made between two frames, the most of the last few (an eighth less each time, unless what was made is more), what had
+    /// been made since the last collection when that was last asked, and how many collections there had been then
+    /// (see [`Vm::due_soon`]).
+    between_frames: usize,
+    made_between_frames: usize,
+    collections_between_frames: u32,
+    /// What the last full collection kept that was young before it, and what small collections have made old since.
+    young_at_full: usize,
+    promoted_since_full: usize,
+    /// How long the last full collection took, in microseconds.
+    last_full_micros: u32,
     /// With `RSUI_GC_DIED_OLD`, the objects that were old after the last full collection, and the ones old before
     /// this one, to tell what small collections made old that died before it.
     died_at_full: Vec<u64>,
@@ -822,9 +833,29 @@ impl FreeSlots {
     }
 }
 
+/// What [`Vm::due_soon`] says to do between frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Soon {
+    No,
+    /// The collection that's next, full or small.
+    Next,
+    /// A full collection, which is cheap.
+    Full,
+}
+
+/// A full collection that took no longer than this is cheap enough to do between frames before it's due (see
+/// [`Vm::due_soon`]): a frame's spare time, with room to spare. The explorer's take about a millisecond, shadcn's page's 5-15.
+const CHEAP_FULL_MICROS: u32 = 4_000;
+
+/// How big a list can stay however short it's become, in bytes. Shrinking the engine's list of what natives have made since
+/// the last safe point, which in `string_ops` grew to 6,144 values between collections, had it asked for again by every
+/// collection's end, and the system's heap handed back and took its pages again: on some lengths of the environment that
+/// was 16 page faults a collection, 3,500 in the run, and 6% of its time. 16K items of each list had zlib's peak 0.3 MB higher.
+const SHRINK_FLOOR: usize = 64 * 1024;
+
 /// Gives memory back from a list that's much bigger than it needs to be.
 pub(crate) fn shrink_if_oversized<T>(list: &mut Vec<T>) {
-    if list.capacity() > 1024 && list.len() * 4 < list.capacity() {
+    if list.capacity() > 1024 && list.capacity() * size_of::<T>() > SHRINK_FLOOR && list.len() * 4 < list.capacity() {
         list.shrink_to(list.len() * 2);
     }
 }
@@ -1141,6 +1172,8 @@ struct Marker<'a> {
     work: Vec<u32>,
     /// What the objects reached take up, worked out as each is traced, while it's at hand.
     live_bytes: usize,
+    /// Of that, in a full collection, what the objects that weren't old before it take up.
+    young_bytes: usize,
     object_marks: &'a mut Vec<u64>,
     string_marks: &'a mut Vec<u64>,
     cell_marks: &'a mut Vec<u64>,
@@ -1343,6 +1376,7 @@ impl Marker<'_> {
             // in the cache, so it needn't be written back to memory once it's pushed out by the rest of the heap.
             if object.flags & OLD == 0 {
                 object.flags |= OLD;
+                self.young_bytes += object_bytes(object);
             }
             self.shape(object.shape);
             self.trace(object);
@@ -1419,6 +1453,67 @@ impl Vm {
         self.collect(full, keep_young);
     }
 
+    /// Whether the next collection is likely to come before this is asked again, between frames, as what's made between
+    /// two of them, the most of the last few, would bring it on. It also notes what was made since
+    /// it was asked last.
+    pub(crate) fn due_soon(&mut self) -> Soon {
+        let more = &mut self.generations.more;
+        let made = if self.gc_count == more.collections_between_frames {
+            self.debt.saturating_sub(more.made_between_frames)
+        } else {
+            self.debt
+        };
+        more.between_frames = made.max(more.between_frames - more.between_frames / 8);
+        more.made_between_frames = self.debt;
+        more.collections_between_frames = self.gc_count;
+        if stress() != Stress::Off || self.gc_count == 0 {
+            return Soon::No;
+        }
+        // The next one is due, or full and so due anyway: what's become old has had time to die, and a full one's mark of
+        // everything is best done where nobody's waiting for it.
+        if self.debt + more.between_frames >= self.threshold || self.generations.full_due() {
+            return Soon::Next;
+        }
+        // A full collection that's cheap, as it is for a small heap, is done once it's a third of the way to being due: what's
+        // become old since the last one may have died, and finding that out between frames costs nobody anything. The
+        // explorer's last full collection was otherwise as it started, keeping what starting was working on, and it
+        // ended 1 MB higher.
+        let old = self.generations.old_budget();
+        if self.generations.more.last_full_micros <= CHEAP_FULL_MICROS && self.generations.promoted * 4 > old {
+            return Soon::Full;
+        }
+        Soon::No
+    }
+
+    /// Collects as [`Vm::due_soon`] said, from outside any JavaScript.
+    pub(crate) fn collect_between_frames(&mut self, soon: Soon) {
+        self.nursery.clear();
+        self.run_mark = 0;
+        self.top = 0;
+        if soon != Soon::No && logging() {
+            eprintln!(
+                "gc {}: between frames ({}), {} made of {}",
+                self.gc_count + 1,
+                if soon == Soon::Full { "a cheap full one" } else { "the next" },
+                self.debt,
+                self.threshold
+            );
+        }
+        match soon {
+            Soon::No => return,
+            Soon::Next => self.collect_garbage(),
+            Soon::Full => self.collect_all_garbage(),
+        }
+        self.note_between_frames();
+    }
+
+    /// Notes that a collection was done between frames.
+    pub(crate) fn note_between_frames(&mut self) {
+        let more = &mut self.generations.more;
+        more.made_between_frames = self.debt;
+        more.collections_between_frames = self.gc_count;
+    }
+
     /// Frees everything that can't be reached, young or old.
     pub(crate) fn collect_all_garbage(&mut self) {
         self.collect(true, false);
@@ -1449,7 +1544,7 @@ impl Vm {
             self.strings.items.len(),
             self.cells.list.len(),
         );
-        let started = logging().then(std::time::Instant::now);
+        let started = std::time::Instant::now();
         // Handles can be used again after this, and a big string's units shouldn't stay around.
         self.regexp_input = (NONE, Vec::new());
         // What the numbers' strings name may be freed now, and their places given to others.
@@ -1471,6 +1566,11 @@ impl Vm {
                 .extend_from_slice(&self.object_marks);
         }
         if full && !keep_young {
+            // Which strings were old, to tell what this keeps that was young.
+            self.generations.strings_before.clear();
+            self.generations
+                .strings_before
+                .extend_from_slice(&self.strings.marks);
             clear_marks(&mut self.object_marks, self.objects.len());
             clear_marks(&mut self.strings.marks, self.strings.items.len());
             clear_marks(&mut self.cells.marks, self.cells.list.len());
@@ -1575,6 +1675,7 @@ impl Vm {
         let remembered_count = remembered.len() + remembered_cells.len();
         let mut new_cells;
         let mut live_bytes;
+        let full_young_bytes;
         let remembered_bytes;
         let mut weak;
         let mut shape_marks = std::mem::take(&mut self.generations.shape_marks);
@@ -1599,6 +1700,7 @@ impl Vm {
             let mut marker = Marker {
                 work: Vec::with_capacity(256),
                 live_bytes: 0,
+                young_bytes: 0,
                 object_marks: &mut object_marks,
                 string_marks: &mut string_marks,
                 cell_marks: &mut cell_marks,
@@ -1738,6 +1840,7 @@ impl Vm {
                 );
             }
             live_bytes = marker.live_bytes;
+            full_young_bytes = marker.young_bytes;
             new_cells = std::mem::take(&mut marker.new_cells);
             weak = std::mem::take(&mut marker.weak);
         }
@@ -1934,6 +2037,7 @@ impl Vm {
         let items = &mut self.strings.items;
         let tally = crate::text::Tally::new();
         let string_holes = self.strings.free.holes();
+        let mut young_string_bytes = 0usize;
         for (word_index, word) in string_marks.iter().enumerate() {
             let first = *word
                 & !before.get(word_index).copied().unwrap_or(0)
@@ -1955,6 +2059,9 @@ impl Vm {
                     string.text.settle();
                 }
                 let bytes = string.text.heap_bytes_in(tally) + 32;
+                if full && strings_before.get(word_index).copied().unwrap_or(0) & bit == 0 {
+                    young_string_bytes += bytes;
+                }
                 if young & bit == 0 {
                     live_bytes += bytes;
                 } else {
@@ -2108,14 +2215,15 @@ impl Vm {
         }
         self.objects.watch.refake(&mut self.objects.list);
 
-        if let Some(started) = started {
+        if logging() {
             eprintln!(
-                "gc {}: {}, {:.1} us, {} bytes {}, {} young kept, {} remembered, {} objects, {} shapes, {} atoms, {} made",
+                "gc {}: {}, {:.1} us, {} bytes {}{}, {} young kept, {} remembered, {} objects, {} shapes, {} atoms, {} made",
                 self.gc_count,
                 if full { "full" } else { "small" },
                 started.elapsed().as_secs_f64() * 1e6,
                 live_bytes + promoted,
                 if full { "kept" } else { "made old" },
+                if full { format!(" ({full_young_bytes} of objects and {young_string_bytes} of strings young before)") } else { String::new() },
                 surviving_bytes,
                 remembered_count,
                 self.objects.len(),
@@ -2129,12 +2237,39 @@ impl Vm {
         generations.mostly_kept =
             !full && (live_bytes + promoted + kept_new_bytes) * 2 > self.debt;
         if full {
+            // What this one kept that was young before it is old now, as what small collections make old is, and much
+            // of it is what was being worked on just then, which dies soon after. It counts as made old since this one,
+            // as much of it as died of what was made old that way the last time (what was old before this collection and
+            // isn't now), and half of that, as some is what's being built. With none of it counted, the `json` bench's full
+            // collections, which each keep a round's text and tree, came every third collection rather than every
+            // second, and it peaked 1.4 MB higher; the explorer's last full one was as it started, and it ended 1 MB higher.
+            let young_now = full_young_bytes + young_string_bytes;
+            let old_before = generations.full_live + generations.more.promoted_since_full;
+            let dead = old_before.saturating_sub(live_bytes.saturating_sub(young_now));
+            let suspect = generations.more.young_at_full + generations.more.promoted_since_full;
+            // Only when most of it died, as full collections are worth it then: counting less of it had builtin_misc's
+            // full collections land elsewhere, one of them in the middle of a sort, and its peak 1 MB higher.
+            let seed = if suspect == 0 || dead * 2 < suspect {
+                0
+            } else {
+                (young_now as u128 * dead.min(suspect) as u128 / suspect as u128 / 2) as usize
+            };
+            if logging() {
+                eprintln!(
+                    "gc {}: {dead} bytes died old of {suspect} made old since the last full one; {young_now} kept that was young, {seed} counted as made old",
+                    self.gc_count
+                );
+            }
             generations.full_live = live_bytes;
             generations.more.full_young = surviving_bytes;
-            generations.promoted = 0;
+            generations.more.young_at_full = young_now;
+            generations.more.last_full_micros = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            generations.more.promoted_since_full = 0;
+            generations.promoted = seed;
             generations.small_since_full = 0;
         } else {
             generations.promoted += live_bytes + promoted;
+            generations.more.promoted_since_full += live_bytes + promoted;
             generations.small_since_full += 1;
         }
         generations.surviving_bytes = surviving_bytes;

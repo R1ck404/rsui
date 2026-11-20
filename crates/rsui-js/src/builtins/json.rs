@@ -372,12 +372,17 @@ fn read_document<U: Unit>(vm: &mut Vm, units: &[U]) -> Run<Value> {
 fn parse(vm: &mut Vm, args: Args) -> Run<Value> {
     let source = vm.arg(&args, 0);
     let source = vm.to_js_string(source)?;
-    let text = vm.text_of(source).clone();
-    let value = match (text.ascii(), text.wide()) {
-        (Some(bytes), _) => read_document(vm, bytes)?,
-        (_, units) => read_document(vm, units.unwrap_or(&[]))?,
+    // The text is read where it is, taken out of its string for the while rather than copied, which for a megabyte of
+    // JSON was another megabyte or two in use at once. Nothing reading it runs JavaScript or looks at that string: keys
+    // are made from the units being read, and none can be the whole document.
+    let slot = source.index();
+    let text = std::mem::replace(&mut vm.strings.items[slot].text, crate::text::Text::empty());
+    let read = match (text.ascii(), text.wide()) {
+        (Some(bytes), _) => read_document(vm, bytes),
+        (_, units) => read_document(vm, units.unwrap_or(&[])),
     };
-    drop(text);
+    vm.strings.items[slot].text = text;
+    let value = read?;
     let reviver = vm.arg(&args, 1);
     if vm.is_callable(reviver) {
         let root = vm.new_plain();
@@ -415,7 +420,21 @@ pub(super) struct Out {
     is_wide: bool,
     /// Whether some was taken off after it went wide, which could have taken off all that wasn't ASCII.
     cut_since_widening: bool,
+    /// How long it's likely to get, which the wide units have room for when they're first made.
+    expected: usize,
 }
+
+thread_local! {
+    /// What `JSON.stringify` wrote last, and how long that was, which is how long it's likely to be if it's written again,
+    /// as a program that saves its state does. Starting with that much room saves the copies and the doubled room of
+    /// growing a step at a time, which for a megabyte of text had three megabytes in use at once. It's only for the same
+    /// object: going by whatever was written last had every small thing written after a big one ask for the big one's
+    /// room, which Mantine's page did as it started, 3 MB higher at its peak.
+    static LAST_WRITTEN: std::cell::Cell<(Value, usize)> = const { std::cell::Cell::new((Value::UNDEFINED, 0)) };
+}
+
+/// The most room asked for at first, however long what was written last time was.
+const MOST_EXPECTED: usize = 64 << 20;
 
 impl Out {
     pub(super) fn with_capacity(capacity: usize) -> Self {
@@ -447,7 +466,9 @@ impl Out {
 
     #[cold]
     fn widen(&mut self) {
-        self.wide = self.ascii.iter().map(|byte| u16::from(*byte)).collect();
+        let mut wide = Vec::with_capacity(self.expected.max(self.ascii.len() + 1));
+        wide.extend(self.ascii.iter().map(|byte| u16::from(*byte)));
+        self.wide = wide;
         self.ascii = Vec::new();
         self.is_wide = true;
     }
@@ -910,8 +931,16 @@ fn stringify(vm: &mut Vm, args: Args) -> Run<Value> {
         } else {
             None
         };
+    let expected = match LAST_WRITTEN.with(std::cell::Cell::get) {
+        (last, length) if value.is_object() && last == value => length.min(MOST_EXPECTED),
+        _ => 0,
+    };
     let mut writer = Writer {
-        out: Out::default(),
+        out: Out {
+            ascii: Vec::with_capacity(expected),
+            expected,
+            ..Out::default()
+        },
         no_to_json: [(NONE, 0, 0); 8],
         plans: HashMap::new(),
         generation: vm.shapes.generation,
@@ -927,6 +956,9 @@ fn stringify(vm: &mut Vm, args: Args) -> Run<Value> {
     vm.define(holder.handle(), empty_atom, value, PLAIN);
     if !writer.value(vm, holder, Key::Made(empty_key), value)? {
         return Ok(Value::UNDEFINED);
+    }
+    if value.is_object() {
+        LAST_WRITTEN.with(|last| last.set((value, writer.out.len())));
     }
     Ok(vm.new_text(writer.out.into_text()))
 }

@@ -2369,6 +2369,8 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
             println!("  took {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
         }
         print_split();
+        // Between one thing someone does and the next, as a window is once its frame is up (`rsui::Quiet::Frame`).
+        crate::bridge::between_frames();
         if let Err(reason) = done {
             if keep_going {
                 println!("  FAILED step {}: {reason}", number + 1);

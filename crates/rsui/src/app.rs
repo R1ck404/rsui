@@ -6219,6 +6219,9 @@ thread_local! {
 /// How quiet things have gone, for [`on_quiet`]'s hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quiet {
+    /// A frame is up, and nothing else has come since: no input, and nothing moving. Someone using the app is usually
+    /// between two things they do, so a little work done now isn't in the way of either, as it would be in the next.
+    Frame,
     /// Nothing has happened for a few seconds: in a window, at least five since the last frame (and a caret stops blinking
     /// ten seconds after the last key), after it's let go of its caches. Coming back then costs a moment anyway, as the
     /// window has given its memory back to the system and has to get it again.

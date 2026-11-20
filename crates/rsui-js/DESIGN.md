@@ -166,6 +166,34 @@ old is fifteen thousand small strings), nor did counting a `Map`'s entries in wh
 budgets bigger and map_set's peak 1.8 MB higher. The allocator isn't where the explorer's memory is: its chunks hold
 2.0 MB more than their blocks in use in both builds; what's more is blocks in use and the engine's list of objects.
 
+What fixed both, with strings and cells still aging as objects do (t3/tune-gc-benchmarks):
+
+- **What a full collection kept that was young counts as made old.** It's old once the full collection's done, as what a
+  small collection makes old is, and much of it is what was being worked on then. Half of it counts towards the next
+  full collection, times the share of what was made old that way the last time that died (what was old before a full
+  collection and isn't after), and only when that's more than half: counting it whenever any of it died moved
+  builtin_misc's full collections so one landed in a sort, 1 MB higher at its peak. json's full collections come every
+  other collection again, as in 8c9786d3.
+- **JSON reads and writes without copies.** `JSON.parse` cloned its source text, a megabyte or two of units, before reading
+  it; it reads it in place, taken out of its string for the while. `JSON.stringify` grew its output by doubling, three
+  times the text in use at once for a megabyte; writing the same object again starts with the room it took last time
+  (only the same object: going by the last write of anything had small writes after a big one ask for its room, and
+  Mantine's page peaked 3 MB higher as it started). json's peak, over eight lengths of the environment: 10.2 MB, against
+  10.4 for 8c9786d3 and 11.8 for 5125199e.
+- **Lists aren't shrunk below 64 KB.** string_ops' slowness was page faults, not collecting: the list of what natives made
+  since the last safe point grew to 6,144 values between collections and was shrunk by each, and the system's heap gave
+  its pages back and faulted them in again, 16 faults a collection on some lengths of the environment, 6,600 faults in
+  the run rather than 3,200. Now 2,650 on every length.
+- **Collections between frames** (`Engine::collect_if_due_soon`, `rsui::Quiet::Frame`). A window runs the quiet hook 20 ms
+  after a frame when nothing's waiting, and steps do after each step. The collection that's next is done then if what the
+  most of the last few frames made would bring it on, or if it's a full one that's due; a full collection is also done then
+  once it's a third of the way to due, if the last one took under 4 ms (the explorer's take about one, shadcn's 5-15).
+  shadcn's focus on a field had a small collection in it on every length (14.5 ms, 10.8 now), and `expect` steps one too
+  (5.6 ms, 4.8 now, 4.8 in 8c9786d3); the explorer's last full collection was as it started, keeping what starting was
+  working on (40.8 MB at its end, 39.1 now). Collecting earlier than that, when twice what a frame made would bring it on,
+  or between the keys of one step, had shadcn's 40 keys 111 ms rather than 89. `RSUI_FRAME_GC=0` turns it off;
+  `RSUI_GC_LOG` says which collections were done between frames.
+
 ## What made it fast
 
 Two of the biggest wins aren't what you'd guess, and are easy to lose by accident. They were found by measuring on a

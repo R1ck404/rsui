@@ -114,6 +114,12 @@ const COVERED_TIMER: usize = 6;
 const QUIET_WORK_TIMER: usize = 7;
 /// A timer for looking where the pointer is while it goes through a transparent window, which hears nothing from it then.
 const PASS_THROUGH_TIMER: usize = 8;
+/// A timer for the app's work between frames ([`crate::Quiet::Frame`]), once a frame is up and nothing else has come for
+/// [`FRAME_QUIET`]. A timer's message only comes when nothing else is waiting, so it's after any input and painting.
+const FRAME_QUIET_TIMER: usize = 9;
+/// How long after a frame nothing else must have happened. Someone typing or clicking is between two of them for a tenth of
+/// a second or more, and an animation draws a frame sooner than this, which puts it off.
+const FRAME_QUIET: Duration = Duration::from_millis(20);
 /// How long things must be quiet before the app's own quiet work, which rsui-tsx uses to collect all of its JavaScript's
 /// garbage. That takes about 30 ms for an editor with 10,000 paragraphs, and someone who's paused for a second is likely to
 /// carry on; past a few seconds they're less so, and their coming back costs a moment anyway, for the memory given back.
@@ -931,6 +937,10 @@ impl WindowState {
         match result {
             Ok(()) => {
                 self.place_embedded(window);
+                // SAFETY: `window` is the window this is running in.
+                unsafe {
+                    SetTimer(Some(window), FRAME_QUIET_TIMER, millis(FRAME_QUIET), None);
+                }
                 true
             }
             Err(error) => {
@@ -2623,6 +2633,18 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     }
                 }
             });
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == FRAME_QUIET_TIMER => {
+            // SAFETY: `window` is valid for a message sent to it.
+            unsafe {
+                let _ = KillTimer(Some(window), FRAME_QUIET_TIMER);
+            }
+            if !input_waiting() {
+                let logged = crate::input_log::now();
+                crate::app::run_quiet_hook(crate::app::Quiet::Frame);
+                crate::input_log::note("frame-quiet", logged, format_args!(""));
+            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == QUIET_WORK_TIMER => {

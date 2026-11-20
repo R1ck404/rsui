@@ -565,6 +565,14 @@ impl Engine {
         self.vm.collect_all_garbage();
     }
 
+    /// What an app does between frames, when nothing's waiting: the collection that's next is done now if what was made
+    /// between the last few times this was asked would bring it on before the next (see `gc.rs`). Says whether it collected.
+    pub fn collect_if_due_soon(&mut self) -> bool {
+        let soon = self.vm.due_soon();
+        self.vm.collect_between_frames(soon);
+        soon != gc::Soon::No
+    }
+
     /// What an app does once it's been quiet a while: frees everything nothing can reach, then gives back
     /// the pages of the engine's lists with nothing left on them and shrinks objects' storage to fit, which costs time later
     /// if the app gets busy again, so ordinary collections don't.
