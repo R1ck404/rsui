@@ -667,10 +667,10 @@ fn a_handler_made_again_before_something_on_a_page_doesnt_move_it() {
     ui.click(&key("other")).unwrap();
     assert!(line_with(&ui, "text \"other").contains("other 2"));
     assert_eq!(line_with(&ui, "label renders"), label);
-    // Each time the app, the button, which says something else, and two providers around them that aren't the app's, with the
-    // `<div>` drawn in place in the app's output (see `placeElement` in web.js): but not the label's `<span>`, which a new place
-    // would draw again, nor what tells the label where it is, which says the same about what does the same.
-    assert_eq!(ui.runtime().renders() - before, 8);
+    // Each time the app, the button, which says something else, and the provider around the line they're on, which isn't the
+    // app's, with the `<div>` drawn in place in the app's output (see `placeElement` in web.js): but not the label's `<span>`,
+    // which a new place would draw again.
+    assert_eq!(ui.runtime().renders() - before, 6);
 }
 
 /// Panes each given the whole session, as the file explorer's were before it gave them only what they use: the session's

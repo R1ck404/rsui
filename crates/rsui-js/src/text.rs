@@ -561,8 +561,9 @@ const MOST_NOTED: usize = 64 * 1024;
 /// join the same classes for their `className`, which was 1.6 MB of its 1.8 MB of text), and what's kept of it is then one
 /// buffer. A place that's been used again since it was noted is told apart by its text, which is compared. What's noted is
 /// let go of past [`MOST_NOTED`] places. (Letting go of it at each full collection too had shadcn's page 2.6 MB higher, as
-/// it makes the same text again across them.)
-pub(crate) fn share_text(items: &mut [StringData], at: usize) {
+/// it makes the same text again across them.) A place noted that's on a page given back since (`holes`, see `giveback.rs`)
+/// has no memory to read, and is let be.
+pub(crate) fn share_text(items: &mut [StringData], at: usize, holes: &crate::gc::giveback::Holes) {
     if !sharing_same_text() {
         return;
     }
@@ -588,7 +589,7 @@ pub(crate) fn share_text(items: &mut [StringData], at: usize) {
         return;
     };
     let other = other as usize;
-    if other == at || other >= items.len() || items[other].text != items[at].text {
+    if other == at || other >= items.len() || holes.has(other) || items[other].text != items[at].text {
         return;
     }
     let (first, second) = if other < at {

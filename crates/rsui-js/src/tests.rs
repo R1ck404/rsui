@@ -2841,6 +2841,44 @@ fn strings_kept_with_the_same_text_share_it_and_stay_as_they_were() {
     );
 }
 
+/// What's noted of a string's text for another with the same to share can be on a page given back since, which has no memory
+/// to read: shadcn's page stopped with an access violation as it started, under `RSUI_GIVE_BACK=1`, and a window's quiet
+/// collection gives pages back too.
+#[test]
+fn a_string_noted_for_its_text_on_a_page_given_back_since_is_let_be() {
+    crate::gc::giveback::FORCE.with(|on| on.set(true));
+    crate::share_same_text(true);
+    let (mut engine, output) = engine_with_gc();
+    engine
+        .eval(
+            "globalThis.same = [];
+             for (let i = 0; i < 20000; i++) same.push('the same text, long enough for a buffer of its own ' + (i % 1));
+             // More than a page of strings that go with them, so the page of the last one noted has nothing else on it.
+             for (let i = 0; i < 300; i++) same.push('spacer ' + i);
+             gc();
+             // What's after them stays, so their pages are in the middle of the list, rather than cut off its end.
+             globalThis.after = [];
+             for (let i = 0; i < 2000; i++) after.push('kept after them ' + i);",
+            "noted.js",
+        )
+        .unwrap();
+    // In a script of its own, as what ran the loop above still has the list in one of its registers.
+    engine.eval("same = null; gc();", "dropped.js").unwrap();
+    let given = engine.footprint();
+    assert!(given.strings.given_back_pages > 0, "{given}");
+    engine
+        .eval(
+            "globalThis.again = [];
+             for (let i = 0; i < 10; i++) again.push('the same text, long enough for a buffer of its own ' + (i % 1));
+             gc();
+             console.log('kept', again.length, again[9].length, again[0] === again[9]);",
+            "again.js",
+        )
+        .unwrap();
+    assert!(output.borrow().contains("kept 10 52 true"), "{}", output.borrow());
+    crate::gc::giveback::FORCE.with(|on| on.set(false));
+}
+
 #[test]
 fn a_quiet_collection_gives_back_and_shrinks_and_an_ordinary_one_does_not() {
     let (mut engine, _) = engine_with_gc();

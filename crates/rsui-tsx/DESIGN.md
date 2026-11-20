@@ -1386,6 +1386,55 @@ state in a few typed fields rather than a `PlacedLive`, a `PassedHere` for each 
 of the long list's 120 MB of objects, and an object of 48 bytes rather than 64 (the JIT's code takes a handle shifted by
 6 to be an address) another 20 MB of it.
 
+The second round (t3/memory-to-the-floor) took what each of a page's elements keeps in JavaScript down, as the census
+(`census` in steps, with `--features alloc-owners`) found it on the long list's 25,000 elements:
+
+- **What's passed down is only passed where something could read it.** A `Styled` element whose children are only text
+  passes nothing down: no `PassedHere` for each of its seven contexts, no rules' chain worked out for what's in it. It
+  passes from the first render where something in it could read them (a component, a page's tag written as a string, a
+  host element given a function that isn't a handler, what a portal or code put in it, or anything a `styled(Component)`
+  renders), and on every render from then on, as `provideHere` needs (`holdsComponent` in `web.js`).
+- **One provider tells a line it's a line**, around the line's group, rather than a `FlowContext` provider, with its
+  instance, element and props, around each piece of it (`wholeLine`). Where a line goes through `Children.toArray` (a list
+  item's marker, what's beside a float) or is held before what's on it is known, it keeps one around each piece, and what
+  finds an element among what's beside it for code moving it looks past the line's provider (`justInside`).
+- **`PlacedLive` is made with ten properties**, not twenty-one that grew to fifty-eight: what few elements have (its ref,
+  whether it's mounted, what it passes down worked out, its handlers' functions) is added once there's something, its
+  `handlers` and `instance` are getters, and what `Styled` set each render to an empty default isn't written until it's
+  something.
+- **What an instance read of a context** is a list of each context and what was read, inside its own object, not a `Map`.
+- **A string prop's value** is shared with the last element given the same text (`shared_text` in `props.rs`), so each
+  row's class names are one `Arc<Text>` between them.
+
+Private memory at the end, the median over eight lengths of the environment, against 4ea83414, in MB:
+
+| | shadcn | Mantine | explorer | long list |
+|---|---|---|---|---|
+| Traced, as under `--do` | 120.7 (121.3) | 127.7 (129.7) | 35.4 (35.5) | 162.9 (217.6) |
+| `RSUI_INSPECT=0`, as in a window | 113.9 (115.1) | 115.4 (118.7) | 31.9 (32.1) | 159.4 (209.8) |
+| Peak, `RSUI_INSPECT=0` | 118.2 (118.9) | 120.1 (122.7) | 32.6 (32.6) | 159.4 (209.8) |
+| A second after starting, `RSUI_INSPECT=0` | 111.6 (112.1) | 114.3 (116.2) | 27.2 (27.0) | |
+| Working set at the end, `RSUI_INSPECT=0` | 139.9 (140.6) | 143.4 (146.1) | 52.1 (52.0) | 174.4 (223.3) |
+
+The long list's engine objects are 3.7 KB an element where they were 4.8 (91.6 MB where they were 120.7, with the room
+between collections), and rsui-alloc's blocks in use 63.0 MB where they were 86.8. The page apps' memory is mostly
+elsewhere: on shadcn's page 17 MB of rsui-alloc's 54 MB of chunks is room between blocks, spread over every size class
+(`allocator classes` in `memory`; taking blocks from the fullest chunks first changed nothing), 9 MB of the list of objects
+is room between small collections, and the process heap keeps 8 MB more than it's using (`HeapOptimizeResources` gave
+none of it back).
+
+None of it is slower. Process CPU over a session with `RSUI_INSPECT=0`, medians of ten alternating runs: shadcn's page
+2898 ms (2883), Mantine's 3383 (3477); of six: the explorer 805 (844), the long list 2656 (2750). To start, of eight: the
+long list 1719 ms (1922), the others within a percent. js-bench's time and peaks are as they were (four salted builds a
+side: 0.989 of base's time over the interpreter's benches; peaks' geomean 5.148 MB against 5.139).
+
+Tried, and not kept: `RSUI_GC_YOUNG_CAP=8` takes the long list to 142 MB, Mantine to 109 and shadcn to 112, but with the
+collector's other costs cut (see rsui-js's `DESIGN.md`) it's still 5-7% more CPU on the explorer and the long list; a cap
+only while small collections find mostly garbage hardly ever applied by the end of a session. Compiling `node_modules`'
+functions when they're first called (`LazyCompile::NodeModules`) had shadcn's page 20 MB higher, as what's waiting keeps
+its parse tree. An object of 48 bytes needs three properties inside it rather than four and a `Kind` of 16 bytes with its
+tag in the object's header, which is every `match` on an object's kind, and the JIT's addressing (`handle << 6`) besides.
+
 ## How it's tested
 
 `--do` is how an agent uses a running app, in one shell command, with plain text coming back. There's no server to set up, and no state

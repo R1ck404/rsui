@@ -6534,7 +6534,9 @@ function moveDrawn(parent, child, before) {
             if (at === live.instance) {
                 return out.reverse();
             }
-            out.push(at);
+            if (at.props?.__wholeLine !== true) {
+                out.push(at);
+            }
         }
         return null;
     };
@@ -6659,7 +6661,7 @@ function drawnKeys(live, owner, keyOf) {
             continue;
         }
         let at = childLive.instance;
-        while (at !== null && at !== undefined && at.parent !== owner && at !== live.instance) {
+        while (at !== null && at !== undefined && !justInside(at, owner) && at !== live.instance) {
             at = at.parent;
         }
         if (at !== null && at !== undefined && at !== live.instance) {
@@ -9659,9 +9661,11 @@ function transformOriginIn(text, width, height) {
 function animationChanged(live, tag, plan) {
     const name = plan === null || plan.name === 'none' ? undefined : plan.name;
     const was = live.animationName;
-    live.animationName = name;
-    live.animationDuration = name === undefined ? undefined : plan.duration + 's';
-    live.animationTimes = name === undefined ? undefined : plan.times === 'inf' ? Infinity : Number(plan.times) || 1;
+    if (name !== undefined || was !== undefined) {
+        live.animationName = name;
+        live.animationDuration = name === undefined ? undefined : plan.duration + 's';
+        live.animationTimes = name === undefined ? undefined : plan.times === 'inf' ? Infinity : Number(plan.times) || 1;
+    }
     if (name === was || !hearsMotion(live)) {
         return;
     }
@@ -9889,7 +9893,7 @@ function withListMarker(children, said, index, font) {
     const inside = Children.toArray(children);
     const flowing = inside.length > 0 && (natives.cssChildren(layout, inside, TEXT_KINDS) & 2) !== 0;
     // What goes along a line is on one, which the marker is beside rather than on.
-    const content = flowing ? [make('text', { key: '__content' }, ...inside)] : Children.toArray(intoLines(inside, true, font));
+    const content = flowing ? [make('text', { key: '__content' }, ...inside)] : Children.toArray(intoLines(inside, true, font, false));
     const shape = markerShape(said.style, said.look, said.above);
     // Just before the item, as wide as it needs to be: a box that ends where the item starts, with the marker at its end.
     const drawn = shape ?? make('text', { key: '__marker', position: 'absolute', left: -MARKER_ROOM, width: MARKER_ROOM, top: 0, textAlign: 'right', noWrap: true, inert: true, whiteSpace: 'pre' }, marker.replace(/ $/, ' '));
@@ -10088,6 +10092,10 @@ function placeElement(description, owner, parent, place) {
 /// and what sets its state and draws it again, which are its own methods rather than functions made for each element, as there can
 /// be thousands. It's the handlers Rust's told about its state with too (see `StateHandlers`), each made the first time it's asked
 /// for.
+///
+/// Only what every element has is made with it. What few have (whether it's on the page or gone, its ref, what it passes down
+/// worked out, its handlers' functions) is added once there's something to keep, and what isn't is undefined: each property is 8
+/// bytes of every element, of which a long list has tens of thousands.
 class PlacedLive {
     constructor(type, place) {
         this.current = null;
@@ -10100,17 +10108,16 @@ class PlacedLive {
         this.placedDirty = false;
         this.placedState = 0;
         this.everything = -1;
-        this.mounted = false;
-        this.left = false;
-        this.refWanted = null;
-        this.refHeld = null;
-        this.refDetach = undefined;
-        this.refHandle = undefined;
-        this.innerDeps = undefined;
-        this.inner = undefined;
-        this.nthRef = undefined;
-        this.handlers = this;
-        this.made = null;
+    }
+
+    /// What its handlers are, which is itself (see `StateHandlers`).
+    get handlers() {
+        return this;
+    }
+
+    /// What stands for it among the components, which is what renders it.
+    get instance() {
+        return this.frame;
     }
 
     /// Its state, set as `useState`'s setter would.
@@ -10178,7 +10185,7 @@ function placedMemo(record, make, deps) {
 function placedDomRef(record, ref, had) {
     const key = (record.pageKey ??= had ?? '__dom' + nextDomKey++);
     const wanted = ref === undefined ? null : ref;
-    if (record.refWanted !== wanted) {
+    if ((record.refWanted ?? null) !== wanted) {
         record.refWanted = wanted;
         placedRefs.push(record);
     }
@@ -10262,7 +10269,9 @@ function placedLeft(record) {
         liveGone(record);
     }
     placedLetGo(record);
-    record.refHeld = null;
+    if (record.refHeld != null) {
+        record.refHeld = null;
+    }
     rsui.__forgetFrame(record.frame);
 }
 
@@ -10270,6 +10279,9 @@ function placedLeft(record) {
 function placedLetGo(record) {
     const detach = record.refDetach;
     const handle = record.refHandle;
+    if (detach === undefined && handle === undefined) {
+        return;
+    }
     record.refDetach = undefined;
     record.refHandle = undefined;
     if (handle !== undefined && handles.get(record.pageKey) === handle) {
@@ -10411,14 +10423,18 @@ function makeStyled(target, settings = {}) {
             const live = placed ?? useRef(null);
             // The page's variables it reads from here on, which it's drawn again for when one changes.
             variableReader = live;
-            live.pageVarsRead = null;
+            if (live.pageVarsRead != null) {
+                live.pageVarsRead = null;
+            }
             if (placed === null) {
                 useLayoutEffect(() => liveMounted(live), []);
             }
             live.seen = seen;
             live.flowSeen = flowVersion;
             // Drawn again once for however many times it's asked before it is, as asking twice would flip it back.
-            live.redrawing = false;
+            if (live.redrawing === true) {
+                live.redrawing = false;
+            }
             live.redraw ??= () => {
                 if (live.redrawing !== true) {
                     live.redrawing = true;
@@ -10455,9 +10471,8 @@ function makeStyled(target, settings = {}) {
             // What sets its state from what Rust says, made once, as `setState` is the same for as long as it's there.
             const handlers = (live.handlers ??= makeHandlers(setState));
             // Where each thing in this was last time, for it to be told the same as long as it's the same.
-            const nthKept = placed === null ? useRef(null) : (placed.nthRef ??= { current: null });
             // What finds which of what's in it an element is, once code moves one of them: see `slotOf`.
-            live.nthKept = nthKept;
+            const nthKept = placed === null ? (live.nthKept = useRef(null)) : (placed.nthKept ??= { current: null });
             // It's about the component it's in, and this is what that component made.
             if (given_nth !== null && given_nth.owner !== Styled && typeof given_nth.owner === 'function' && given_nth.owner.__webTag === undefined) {
                 given_nth.learn?.(typeof (given.as ?? target) === 'string' ? given.as ?? target : Styled.__webTag ?? null, nthKept, given.className);
@@ -10481,14 +10496,20 @@ function makeStyled(target, settings = {}) {
                 madeAt = version;
             }
             const text = textOf(strings, values, props);
-            live.viewportUnits = usesViewportUnits(text);
+            const viewportSaid = usesViewportUnits(text);
+            if (viewportSaid || live.viewportUnits !== undefined) {
+                live.viewportUnits = viewportSaid;
+            }
             let compiled = made.get(text);
             if (compiled === undefined) {
                 compiled = compile(readCss(text));
                 made.set(text, compiled);
             }
             // The variables what it says itself uses, which it's drawn again for when one changes.
-            live.ownVars = compiled.varNames ??= text.includes('var(') ? namesIn(text) : null;
+            const ownVars = (compiled.varNames ??= text.includes('var(') ? namesIn(text) : null);
+            if (ownVars !== null || live.ownVars != null) {
+                live.ownVars = ownVars;
+            }
             // `as` on something made from another styled component goes on to that one, so that what both say is kept.
             const passesAs = typeof target === 'function' && target.__webClass !== undefined;
             const tag = passesAs ? target : props.as ?? target;
@@ -10615,7 +10636,10 @@ function makeStyled(target, settings = {}) {
             }
             if (isHost) {
                 // What React's `style` says, which `element.style` reads, from the first time it's drawn.
-                live.styleProp = props.style !== null && typeof props.style === 'object' ? props.style : null;
+                const styleProp = props.style !== null && typeof props.style === 'object' ? props.style : null;
+                if (styleProp !== null || live.styleProp != null) {
+                    live.styleProp = styleProp;
+                }
             }
             let written = isHost && props.style !== null && typeof props.style === 'object' ? props.style : null;
             if (isHost && kept?.cssom != null) {
@@ -10624,8 +10648,13 @@ function makeStyled(target, settings = {}) {
                     delete written[name];
                 }
             }
-            live.inlineVars = written === null ? null : inlineVarNames(written);
-            live.viewportUnits ||= written !== null && Object.values(written).some(usesViewportUnits);
+            const inlineVars = written === null ? null : inlineVarNames(written);
+            if (inlineVars !== null || live.inlineVars != null) {
+                live.inlineVars = inlineVars;
+            }
+            if (written !== null && live.viewportUnits !== true && Object.values(written).some(usesViewportUnits)) {
+                live.viewportUnits = true;
+            }
             if (written !== null) {
                 // What CSS gives it to play apart from what's written on it, for `getComputedStyle()` to say once code takes back an
                 // `animation-name` it wrote, before it's drawn again (see `computedAnimationName`).
@@ -10665,8 +10694,12 @@ function makeStyled(target, settings = {}) {
                 textareaLook(look, props.cols);
             }
             } else {
-                live.styleProp = null;
-                live.inlineVars = null;
+                if (live.styleProp != null) {
+                    live.styleProp = null;
+                }
+                if (live.inlineVars != null) {
+                    live.inlineVars = null;
+                }
                 if (live.cssAnimationName !== undefined) {
                     live.cssAnimationName = undefined;
                 }
@@ -10717,7 +10750,9 @@ function makeStyled(target, settings = {}) {
             }
             // What its look was worked out from, while anything's drawn by what `:has()` says, for `getComputedStyle()` to work it
             // out again if that's different now (see `freshLook`).
-            live.cascade = started === null ? undefined : { owners, me, isHost, passedOn, started, written: writtenLook, cascaded, epoch: hasEpoch };
+            if (started !== null || live.cascade !== undefined) {
+                live.cascade = started === null ? undefined : { owners, me, isHost, passedOn, started, written: writtenLook, cascaded, epoch: hasEpoch };
+            }
             // What this writes in is what it's been given, unless it says otherwise. What's passed on to another component is only what
             // this says itself, as that component gets the rest from where it is.
             const own_look = isHost ? look : { ...look };
@@ -10728,7 +10763,9 @@ function makeStyled(target, settings = {}) {
             if (shared === undefined) {
             varsNote = { names: [], own: null, live };
             variablesInside = isHost ? keptVariablesDown(live, withElementVariables(look, variablesAbove, false, varsNote)) : null;
-            live.varsRead = varsNote.names.length > 0 ? varsNote.names : null;
+            if (varsNote.names.length > 0 || live.varsRead != null) {
+                live.varsRead = varsNote.names.length > 0 ? varsNote.names : null;
+            }
             if (isHost) {
                 // `::before` and `::after` use its variables too, as Radix's checkbox's `::before { width: var(--checkbox-size) }`
                 // uses what the checkbox sets.
@@ -10820,8 +10857,12 @@ function makeStyled(target, settings = {}) {
                 look = { ...shared.look };
                 varsNote = { names: shared.varNames, own: shared.varsOwn, live };
                 variablesInside = keptVariablesDown(live, shared.variablesInside);
-                live.varsRead = shared.varNames.length > 0 ? shared.varNames : null;
-                live.pageVarsRead = shared.pageVarsRead;
+                if (shared.varNames.length > 0 || live.varsRead != null) {
+                    live.varsRead = shared.varNames.length > 0 ? shared.varNames : null;
+                }
+                if (shared.pageVarsRead != null || live.pageVarsRead != null) {
+                    live.pageVarsRead = shared.pageVarsRead;
+                }
                 if (shared.saidTranslate) live.saidTranslate = true;
                 if (shared.saidRotate) live.saidRotate = true;
                 if (shared.saidScale) live.saidScale = true;
@@ -10940,10 +10981,24 @@ function makeStyled(target, settings = {}) {
             // what's in it until then, and what's in it from then on: see `contentVisibility`.
             // A long list's row that's far from being seen is skipped the same way where that changes nothing (see `LongRun`).
             const skipping = isHost ? contentVisibility(look, live, children, runAbove !== null && (skipsGiven || skipsByItself(live, look, given, children))) : null;
+            // What's in it is only told what this passes down once something in it could read it, which is a component: a span with
+            // only text in it, as most of a page's are, keeps none of it. From the first time it's told, it's told on every render,
+            // as `provideHere` needs (what reads it keeps reading the same place).
+            const passer = rsui.__instanceNow();
+            let passed = false;
+            // Another component, which is what a styled component made from one draws, is given what's in it to render as it does,
+            // and what a portal or code puts in it isn't in what it's given.
+            const passIfHeld = (now) => {
+                if (!passed && (!isHost || passer.provides !== null || live.portalKids !== undefined || live.handle?.__kids !== undefined
+                    || holdsComponent(now))) {
+                    passed = true;
+                    passAllDown();
+                }
+            };
             if (skipping !== null) {
                 children = skipping;
             } else {
-                passAllDown();
+                passIfHeld(children);
             }
             if (isHost && (look.__flex === true || look.display === 'grid') && !keepsSpaces(look.__whiteSpace)) {
                 // Text in a flex box or a grid is a box of its own, with no spaces at its ends, and only spaces is nothing.
@@ -11080,13 +11135,14 @@ function makeStyled(target, settings = {}) {
                 if (isValidElement(single) && typeof single.type === 'function' && (nthKept.heldLine === true || unknown(single))) {
                     unlike = true;
                     nthKept.heldLine = true;
-                    const lined = known(single) ? intoLines(children, true, lookFont()) : children;
+                    // With a provider around each piece of the line, as what's held there has before it's known: see `intoLines`.
+                    const lined = known(single) ? intoLines(children, true, lookFont(), false) : children;
                     children = lined !== children ? lined : [make('group', { key: '__line0', display: 'contents' }, ...eachWithin(FlowContext, 'block', all))];
                 } else if (nthKept.heldLine === true && all !== null) {
                     unlike = true;
                     // What was by itself in what's to be its line stays there once more comes beside it, rather than being put
                     // somewhere else and starting again, as react-select's control would when its menu appears beside it.
-                    const lined = intoLines(children, onlyElements, lookFont());
+                    const lined = intoLines(children, onlyElements, lookFont(), false);
                     children = lined !== children ? lined : [make('group', { key: '__line0', display: 'contents' }, ...eachWithin(FlowContext, 'block', all))];
                 } else {
                     const lined = intoLines(children, onlyElements, lookFont());
@@ -11113,7 +11169,9 @@ function makeStyled(target, settings = {}) {
             const instance = rsui.__instanceNow?.();
             if (instance !== null && instance !== undefined) {
                 instance.__pageLive = live;
-                live.instance = instance;
+                if (placed === null) {
+                    live.instance = instance;
+                }
             }
             if (renderListeners.size > 0) {
                 pageRendered();
@@ -11191,8 +11249,12 @@ function makeStyled(target, settings = {}) {
                 withInput(host, rest);
             }
             live.current = field ? { value: props.value, set: props.__setValue, setChecked: props.__setChecked } : null;
-            live.pendingValue = undefined;
-            live.pendingChecked = undefined;
+            if (live.pendingValue !== undefined) {
+                live.pendingValue = undefined;
+            }
+            if (live.pendingChecked !== undefined) {
+                live.pendingChecked = undefined;
+            }
             if (given.__handle !== undefined) {
                 // What it is was made before it was drawn, as a dialog's is, which is there while it's closed.
                 live.handle = given.__handle;
@@ -11203,7 +11265,9 @@ function makeStyled(target, settings = {}) {
                 : placedDomRef(placed, props.ref, given.__handle?.__own === true ? given.__handle.__domKey : undefined);
             live.domKey = domKey;
             // Where it's drawn from, for what it's in before it's drawn (see `parentElement`).
-            live.instance = rsui.__instanceNow?.() ?? undefined;
+            if (placed === null) {
+                live.instance = rsui.__instanceNow?.() ?? undefined;
+            }
             if (notShownNow) {
                 keepNotShown(live);
                 // Which is said to be `display: block`, as a browser says of its options.
@@ -11311,7 +11375,9 @@ function makeStyled(target, settings = {}) {
             }
             const scroll = look.__scroll;
             // What its `overflow` says each way, for `getComputedStyle()` (see `overflowOf`), which nothing draws.
-            live.overflow = look.__overflowX === undefined && look.__overflowY === undefined ? undefined : [look.__overflowX, look.__overflowY];
+            if (look.__overflowX !== undefined || look.__overflowY !== undefined || live.overflow !== undefined) {
+                live.overflow = look.__overflowX === undefined && look.__overflowY === undefined ? undefined : [look.__overflowX, look.__overflowY];
+            }
             delete look.__overflowX;
             delete look.__overflowY;
             if (look.display === undefined && look.direction === undefined && along) {
@@ -11346,7 +11412,7 @@ function makeStyled(target, settings = {}) {
                 } else {
                     // The variables its shapes use, as they're drawn, which is after this.
                     const names = [];
-                    shapeParts = shapePartsOf(inner, variablesHere, names);
+                    shapeParts = shapePartsOf(innerNow(), variablesHere, names);
                     live.shapeParts = { inner, variables: variablesHere, parts: shapeParts, names };
                 }
                 // It's drawn again when a variable it or its shapes use changes, and not for one that nothing in it uses. Its shapes
@@ -11407,7 +11473,9 @@ function makeStyled(target, settings = {}) {
                 : natives.cssPlace(layout, look, tag, flow, onLine, along, blockInside, fontAbove?.textAlign, current, placing, host, transitions, animation, em, shapeParts);
             // What it's drawn with and what moves it, for what code stops with its `style` before it's drawn again (see `stillForReads`).
             live.placedOut = out;
-            live.placedAnimation = animation;
+            if (animation !== undefined || live.placedAnimation !== undefined) {
+                live.placedAnimation = animation;
+            }
             if (starting !== undefined) {
                 out.starting = starting;
             }
@@ -11441,7 +11509,10 @@ function makeStyled(target, settings = {}) {
             // What's in it is told, from this rather than from providers around each of them, which would be there only while it's
             // different from what this was told, and make what's in it start again when that changes: see `provideHere`.
             if (skipping === null) {
-                rsui.__provideHere(FlowContext, inside);
+                passIfHeld(children);
+                if (passed) {
+                    rsui.__provideHere(FlowContext, inside);
+                }
             }
             for (const name of ['before', 'after']) {
                 if (parts[name] !== undefined) {
@@ -11557,6 +11628,11 @@ function makeStyled(target, settings = {}) {
                     value: props.value,
                 }) : null);
             }
+            if (skipping === null && !passed && (holdsComponent(children) || Object.keys(parts).length > 0 || props.__modal === true || tag === 'fieldset')) {
+                // What's been put in it since is a component, or could be.
+                passIfHeld(true);
+                rsui.__provideHere(FlowContext, inside);
+            }
             let shown = makeHost(tag, out, children, scroll, parts, keptNow ? type : undefined);
             if (tag === 'fieldset') {
                 live.legendClaim ??= { legend: null };
@@ -11632,6 +11708,36 @@ const NATIVE_FROM_ENV = (() => {
     }
 })();
 const nativeOn = () => NATIVE_FROM_ENV && globalThis.__rsuiNativeElements !== false;
+/// Whether anything in `children`, through the host elements in it, is a component, which is what could read what a `Styled` passes
+/// down to what's in it. Anything that isn't an element, text or nothing could be, and so could a host element given a function
+/// that isn't a handler, as a `<list>`'s `renderRow` renders its rows. A page's tag written as a string, as JSX outside a
+/// `PageWindow` has it, is drawn by a `Styled` of its own.
+function holdsComponent(children) {
+    if (children === null || children === undefined || typeof children !== 'object') {
+        return children === true;
+    }
+    if (Array.isArray(children)) {
+        for (const one of children) {
+            if (holdsComponent(one)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (!isValidElement(children) || typeof children.type !== 'string' || DOM_TAGS.has(children.type)) {
+        return true;
+    }
+    const props = children.props;
+    if (props !== null && props !== undefined) {
+        for (const name in props) {
+            if (typeof props[name] === 'function' && !(name.length > 2 && name.startsWith('on') && name[2] >= 'A' && name[2] <= 'Z') && name !== 'ref') {
+                return true;
+            }
+        }
+    }
+    return holdsComponent(children.kids) || holdsComponent(props?.children);
+}
+
 /// What's drawn this way, by its own component: blocks of text, and what holds blocks.
 const NATIVE_BLOCKS = new Set(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'li', 'div']);
 /// What's drawn this way inside one of those as a host element with no component of its own, or by its own component.
@@ -20130,7 +20236,7 @@ function withFloats(children, font, inner = null) {
         // its item's floated `::before` is.
         const between = beside.length === 0
             ? [make('group', { key: '__beside' + out.length, grow: 1 })]
-            : [make('group', { key: '__beside' + out.length, grow: 1, shrink: 1, minWidth: 0, minAuto: true }, ...Children.toArray(intoLines(beside, true, font)))];
+            : [make('group', { key: '__beside' + out.length, grow: 1, shrink: 1, minWidth: 0, minAuto: true }, ...Children.toArray(intoLines(beside, true, font, false)))];
         // What floats is in a box of its own on each side, which is never less than nothing across: what's beside a float pulled
         // into the padding by a negative margin starts where the block's content does, not before it, as Bootstrap's `.form-check`
         // has its checkbox, as CSS has it.
@@ -20325,7 +20431,21 @@ function floatRoom(floats) {
 
 /// What's in a block, with each run of what goes along a line, between what doesn't, as a line of its own, as a page lays them out.
 /// It's only that when there's some of each, unless `always` says a run is a line by itself too.
-function intoLines(children, always = false, font = null) {
+/// The provider around a whole line of what `intoLines` put on it, which what finds an element among what's beside it looks past,
+/// as it's around all of them rather than one (see `aroundOne`).
+function wholeLine(group, key) {
+    const made = wrappedIn(FlowContext, 'line', group, key);
+    made.props.__wholeLine = true;
+    return made;
+}
+
+/// Whether `instance` is what's just inside the element whose own is `owner`, or in the provider around a whole line just inside it.
+function justInside(instance, owner) {
+    const above = instance.parent;
+    return above === owner || (above !== null && above !== undefined && above.props?.__wholeLine === true && above.parent === owner);
+}
+
+function intoLines(children, always = false, font = null, oneProvider = true) {
     // Which go along a line, which don't, and which are placed by themselves (`null`), which take no part in lines and don't end one
     // either, from `layout.rs`: a picture's left where it is by itself, but one next to another, or to text, goes along a line with
     // it, as on a page. It's nothing when there's nothing to put on lines.
@@ -20353,7 +20473,10 @@ function intoLines(children, always = false, font = null) {
                 line.textDirection = 'rtl';
             }
 
-            out.push(make('group', line, ...eachWithin(FlowContext, 'line', pieces)));
+            // What's on it is told it's on a line by one provider around the line, rather than one around each piece of it: a
+            // component for each, with what it provides and its element, was most of what a row of a long list kept. Not where
+            // what this gives back is put through `Children.toArray`, which keys it again, as a list item's marker has it.
+            out.push(oneProvider ? wholeLine(make('group', line, ...pieces), line.key) : make('group', line, ...eachWithin(FlowContext, 'line', pieces)));
         }
         run = [];
     };

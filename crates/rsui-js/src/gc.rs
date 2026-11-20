@@ -375,10 +375,11 @@ impl Watch {
         false
     }
 
-    /// Takes `OLD` off every faked object, so the collector sees each as it is, which comes before every collection.
+    /// Takes `OLD` off every faked object, so the collector sees each as it is, which comes before every collection. Which
+    /// they were stays marked, for [`Watch::refake`] after a small collection.
     fn unfake(&mut self, objects: &mut [Object]) {
-        for (word_at, word) in self.faked.iter_mut().enumerate() {
-            let mut bits = std::mem::take(word);
+        for (word_at, word) in self.faked.iter().enumerate() {
+            let mut bits = *word;
             while bits != 0 {
                 let handle = word_at * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
@@ -391,10 +392,42 @@ impl Watch {
 
     /// After a collection: what was watched and has been freed isn't any more, and what's watched without `OLD` is given it,
     /// as a young object kept, or an old one remembered again, has it cleared.
-    fn refake(&mut self, objects: &mut [Object]) {
+    ///
+    /// After a small one, that's only what was faked before it: an old object that's watched is neither freed nor changed by
+    /// one, nor is one remembered, as changing it stops it being watched. What was faked and is old now stops being faked.
+    /// Going through everything watched after each small collection was 2.5 ms of each of Mantine's page's, which watches
+    /// what the results its components keep were worked out from (see `keeping.rs`).
+    fn refake(&mut self, objects: &mut [Object], full: bool) {
         if !self.any {
             return;
         }
+        if !full {
+            for word_at in 0..self.faked.len() {
+                let mut bits = self.faked[word_at];
+                while bits != 0 {
+                    let handle = word_at * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    match objects.get_mut(handle) {
+                        Some(object) if !matches!(object.kind, Kind::Free) => {
+                            if object.flags & OLD == 0 {
+                                object.flags |= OLD;
+                            } else {
+                                self.faked[word_at] &= !(1u64 << (handle % 64));
+                            }
+                        }
+                        _ => {
+                            self.faked[word_at] &= !(1u64 << (handle % 64));
+                            if is_marked(&self.watched, handle) {
+                                self.watched[word_at] &= !(1u64 << (handle % 64));
+                                self.count -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        self.faked.iter_mut().for_each(|word| *word = 0);
         extend_marks(&mut self.faked, self.watched.len() * 64);
         for word_at in 0..self.watched.len() {
             let mut bits = self.watched[word_at];
@@ -2091,7 +2124,7 @@ impl Vm {
                     let first_time = young & bit != 0
                         || (full && strings_before.get(word_index).copied().unwrap_or(0) & bit == 0);
                     if first_time {
-                        crate::text::share_text(items, at);
+                        crate::text::share_text(items, at, string_holes);
                     }
                 }
                 let string = &items[at];
@@ -2250,7 +2283,7 @@ impl Vm {
             self.verify_atoms("after a collection");
             self.verify_code("after a collection");
         }
-        self.objects.watch.refake(&mut self.objects.list);
+        self.objects.watch.refake(&mut self.objects.list, full);
 
         if logging() {
             eprintln!(

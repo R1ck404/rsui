@@ -336,6 +336,16 @@ impl UiAlloc {
             .sum()
     }
 
+    /// Each class's block size, how many chunks it has, and how many of its blocks are in use, for measuring how much of
+    /// the chunks is room between blocks.
+    pub fn classes(&self) -> Vec<(usize, usize, usize)> {
+        CLASSES
+            .iter()
+            .zip(CLASS_SIZES)
+            .map(|(c, size)| c.with(|s| (size, s.chunks, s.blocks)))
+            .collect()
+    }
+
     pub fn retained_bytes(&self) -> usize {
         CLASSES
             .iter()

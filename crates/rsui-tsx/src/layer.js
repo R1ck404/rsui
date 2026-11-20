@@ -1377,7 +1377,7 @@ function toldChanged(provider, before, after) {
         if ((watcher.flags & DEAD) !== 0) {
             continue;
         }
-        const note = passedOn === undefined || watcher.reads === null ? undefined : watcher.reads.get(provider.context);
+        const note = passedOn === undefined || watcher.reads === null ? undefined : readOf(watcher.reads, provider.context);
         if (note !== undefined && note !== null) {
             let own = watcher.provides;
             while (own !== null && !(own.context === provider.context && own.here === true)) {
@@ -1402,15 +1402,35 @@ function toldChanged(provider, before, after) {
 
 /// Says what the component rendering now read of a context that has `passedOn`, for [`toldChanged`]: what `passedOn` is given to
 /// say whether something it read is different. `null` says it can't be known, and it renders again whenever it changes.
+///
+/// They're kept as a list of each context and what was read of it, rather than a `Map`, as it's one or two of them for each element
+/// of a page, which a list of four keeps inside itself, where a `Map` of two was three times as big.
 function readsHere(context, note) {
     const instance = current;
-    if (instance.reads === null) {
-        if (note === null) {
+    const reads = instance.reads;
+    if (reads === null) {
+        if (note !== null) {
+            instance.reads = [context, note];
+        }
+        return;
+    }
+    for (let at = 0; at < reads.length; at += 2) {
+        if (reads[at] === context) {
+            reads[at + 1] = note;
             return;
         }
-        instance.reads = new Map();
     }
-    instance.reads.set(context, note);
+    reads.push(context, note);
+}
+
+/// What `readsHere` was last told was read of `context`, if anything.
+function readOf(reads, context) {
+    for (let at = 0; at < reads.length; at += 2) {
+        if (reads[at] === context) {
+            return reads[at + 1];
+        }
+    }
+    return undefined;
 }
 
 const isThenable = (value) => value !== null && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function';

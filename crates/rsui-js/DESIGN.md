@@ -225,6 +225,16 @@ Measured on 2026-11-20 on rsui-tsx's page apps (see "Where the memory goes" in i
 - **Room between small collections** is three-eighths of what's alive, with no limit: the long list makes 34 MB between
   two, and that's the 40% of free places in the list of objects after a collection. `RSUI_GC_YOUNG` (eighths, 1-8) and
   `RSUI_GC_YOUNG_CAP` (megabytes) change it, for measuring what that trades.
+- **Going through everything watched after a collection.** What a component keeps of a call (`keeping.rs`) watches what
+  it was worked out from, faking young objects old so the write barrier sees a change to them, and every collection went
+  through all of those afterwards to fake again what was young: 2.5 ms of each small collection on Mantine's page. A small
+  collection neither frees nor changes an old object that's watched (changing one stops it being watched), so after one
+  only what was faked is looked at (`Watch::refake`); a full one still goes through all. With it, Mantine's session took
+  3383 ms of CPU where it took 3461, and a smaller young budget costs Mantine nothing more, though it still costs the
+  explorer and the long list 5-7% at 8 MB.
+- **A string noted for its text on a page given back.** `share_text` read the last string noted with the same hash,
+  which could have died and had its page given back (`RSUI_GIVE_BACK=1`, or a window's quiet collection): shadcn's page
+  ended in an access violation as it started. A noted place that's a hole is let be.
 
 ## What made it fast
 

@@ -377,8 +377,61 @@ pub(crate) fn plain_value(vm: &Vm, value: Value) -> Option<PropValue> {
     if value.is_number() {
         return Some(PropValue::Float(value.as_number()));
     }
-    vm.string_text(value)
-        .map(|text| PropValue::from(text.as_ref()))
+    vm.string_text(value).map(|text| shared_text(text.as_ref()))
+}
+
+/// A string prop's value, as one shared with the last element given the same text while it's short: each row of a long list
+/// is given the same class names, which were a block for each and the text of them again (2-3 MB of the long list's).
+fn shared_text(text: &str) -> PropValue {
+    /// What's kept of texts given before: as many as this, after which it starts again, so a text given once (an element's
+    /// key) is only kept until then.
+    const MOST: usize = 8192;
+    /// Longer text is rarely given again, and isn't kept.
+    const LONGEST: usize = 256;
+    struct Shared(PropValue);
+    impl Shared {
+        fn text(&self) -> &str {
+            match &self.0 {
+                PropValue::Str(text) => text.as_str(),
+                _ => "",
+            }
+        }
+    }
+    impl std::hash::Hash for Shared {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.text().hash(state);
+        }
+    }
+    impl PartialEq for Shared {
+        fn eq(&self, other: &Self) -> bool {
+            self.text() == other.text()
+        }
+    }
+    impl Eq for Shared {}
+    impl std::borrow::Borrow<str> for Shared {
+        fn borrow(&self) -> &str {
+            self.text()
+        }
+    }
+    thread_local! {
+        static SHARED: std::cell::RefCell<std::collections::HashSet<Shared, foldhash::fast::FixedState>> =
+            std::cell::RefCell::new(std::collections::HashSet::with_hasher(foldhash::fast::FixedState::default()));
+    }
+    if text.len() > LONGEST {
+        return PropValue::from(text);
+    }
+    SHARED.with(|shared| {
+        let mut shared = shared.borrow_mut();
+        if let Some(found) = shared.get(text) {
+            return found.0.clone();
+        }
+        if shared.len() >= MOST {
+            shared.clear();
+        }
+        let value = PropValue::from(text);
+        shared.insert(Shared(value.clone()));
+        value
+    })
 }
 
 #[cfg(test)]

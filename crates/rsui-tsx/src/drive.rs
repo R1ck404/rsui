@@ -1196,6 +1196,15 @@ impl Desk {
                     rsui::UiAlloc.live_bytes(),
                     rsui::UiAlloc.empty_bytes()
                 );
+                // Each class's chunks against what's in use in them, where that's more than a chunk's worth of room.
+                let mut classes = String::new();
+                for (size, chunks, blocks) in rsui::UiAlloc.classes() {
+                    let room = (chunks * 65536).saturating_sub(blocks * size);
+                    if room > 65536 {
+                        classes += &format!(" {size}: {chunks} chunks, {} KB in use, {} KB room;", blocks * size / 1024, room / 1024);
+                    }
+                }
+                println!("  allocator classes:{classes}");
                 let (spans, room) = rsui_spans::footprint();
                 println!("  spans: {spans} kept in {room} B");
                 for one in &self.windows {
