@@ -47,6 +47,7 @@ pub mod desktop;
 #[path = "desktop_none.rs"]
 pub mod desktop;
 pub mod dialogs;
+pub mod popups;
 mod dock;
 #[cfg(windows)]
 mod drop;
