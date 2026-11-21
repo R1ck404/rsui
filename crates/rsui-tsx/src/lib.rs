@@ -36,6 +36,7 @@ mod logpoint;
 mod looks;
 mod matching;
 mod native;
+mod native_look;
 mod native_more;
 mod new;
 mod pack;
@@ -147,19 +148,21 @@ fn run_here(path: &Path, options: Options) -> Result<(), Error> {
     native::allow_real_effects();
     // Windows knows it as this app, and not only as the program running it, before it has a window: see `set_app_id`.
     // That's the id its `rsui.config.ts` gives, which a packed app has written in; one that isn't packed has its config
-    // read on a thread of its own while its scripts load, as it's only wanted once there's a window.
+    // read on a thread of its own while its scripts load, as it's only wanted once there's a window. Which look `native`
+    // draws in comes with it, which is wanted by then too, as nothing's drawn before.
     let config_id = if rsui_js::running_packed() || config::find(path).is_none() {
-        Ok(config::app_id(path))
+        Ok(config::running(path))
     } else {
         let path = path.to_owned();
-        Err(std::thread::spawn(move || config::app_id(&path)))
+        Err(std::thread::spawn(move || config::running(&path)))
     };
-    let tell_app_id = move |config_id: Result<Option<String>, std::thread::JoinHandle<Option<String>>>, path: &Path| {
-        let id = match config_id {
-            Ok(id) => id,
-            Err(reading) => reading.join().ok().flatten(),
+    let tell_app_id = move |config_id: Result<config::Running, std::thread::JoinHandle<config::Running>>, path: &Path| {
+        let running = match config_id {
+            Ok(running) => running,
+            Err(reading) => reading.join().unwrap_or_default(),
         };
-        let id = id.unwrap_or_else(|| format!("rsui.{}", bridge::name_of_app(path)));
+        rsui::native_look::choose_theme(running.theme.as_deref().unwrap_or("system"));
+        let id = running.id.unwrap_or_else(|| format!("rsui.{}", bridge::name_of_app(path)));
         if let Err(error) = rsui::desktop::set_app_id(&id) {
             eprintln!("rsui-tsx: Windows wasn't told which app this is: {error}");
         }
