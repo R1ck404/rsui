@@ -116,9 +116,9 @@ struct Settings {
 thread_local! {
     static SETTINGS: Cell<Settings> = const { Cell::new(Settings { theme: None, dark: None, used: false }) };
     /// The parts of controls made so far, as their props are the same for every control in the same state.
-    static PARTS: RefCell<Vec<(u32, Props)>> = const { RefCell::new(Vec::new()) };
+    static PARTS: RefCell<Vec<(u64, Props)>> = const { RefCell::new(Vec::new()) };
     /// What each look says of a control in each state, as [`restyle`] puts it on.
-    static STYLES: RefCell<Vec<(u32, Vec<(Symbol, PropValue)>)>> = const { RefCell::new(Vec::new()) };
+    static STYLES: RefCell<Vec<(u64, Vec<(Symbol, PropValue)>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn settings() -> Settings {
@@ -316,15 +316,15 @@ pub fn restyle(control: Control, variant: Option<&str>, entries: &mut Vec<(Symbo
     native
 }
 
-/// A number for a control's state, and which of its parts, for what's kept of how it looks.
-fn state_key(native: &NativeControl, part: u32) -> u32 {
-    (native.control as u32) << 24
-        | u32::from(native.variant) << 18
-        | u32::from(native.theme != Theme::Material) << 17
-        | u32::from(native.disabled) << 16
-        | u32::from(native.checked) << 15
-        | u32::from(native.dark) << 14
-        | part
+/// A number for a control's state, and which of its parts, for what's kept of how it looks: the part in the low 16 bits, and
+/// the state above them.
+fn state_key(native: &NativeControl, part: u32) -> u64 {
+    let state = (native.control as u64) << 8
+        | u64::from(native.variant) << 3
+        | u64::from(native.theme != Theme::Material) << 2
+        | u64::from(native.disabled) << 1
+        | u64::from(native.checked);
+    (state << 1 | u64::from(native.dark)) << 16 | u64::from(part & 0xFFFF)
 }
 
 /// Puts in the parts of a control that has them, as a checkbox's box, before what's in it, with a label from its name if
@@ -498,6 +498,20 @@ mod tests {
         assert_eq!(props.get("corner_radius"), Some(&PropValue::Float(20.0)));
         assert!(props.get("native").is_none());
         assert_eq!(native.theme, Theme::Material);
+    }
+
+    #[test]
+    fn what_is_kept_of_a_look_is_kept_apart_for_light_and_dark() {
+        choose_theme("material");
+        let background = |dark: bool| {
+            set_dark(dark);
+            let mut entries = Vec::new();
+            restyle(Control::Button, None, &mut entries, |_| {});
+            entries.into_iter().find(|(name, _)| *name == symbol!("background")).map(|(_, value)| value)
+        };
+        let light = background(false);
+        assert_ne!(background(true), light);
+        assert_eq!(background(false), light);
     }
 
     #[test]

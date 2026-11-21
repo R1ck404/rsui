@@ -262,3 +262,20 @@ fn the_look_comes_from_the_apps_config_and_what_is_left_out_is_said_once() {
         assert!(said.contains("button \"Two\""), "{said}");
     }
 }
+
+#[test]
+fn native_controls_go_dark_with_the_system() {
+    let mut ui = open("dark", "material", BUTTON);
+    assert_eq!(prop(&ui, "save", "background"), color(0x6750A4));
+    // What the window was told last may be the system's own: it's told light first, as what's drawn is.
+    ui.app.set_dark_mode(false);
+    ui.settle();
+    ui.app.set_dark_mode(true);
+    ui.settle();
+    // Material's dark scheme: its primary is lighter, and what's on it darker.
+    assert_eq!(prop(&ui, "save", "background"), color(0xD0BCFF));
+    assert_eq!(prop(&ui, "save", "text_color"), color(0x381E72));
+    ui.app.set_dark_mode(false);
+    ui.settle();
+    assert_eq!(prop(&ui, "save", "background"), color(0x6750A4));
+}
