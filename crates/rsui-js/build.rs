@@ -17,6 +17,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
+    // Where the JIT has a backend (src/jit/mod.rs).
+    println!("cargo:rustc-check-cfg=cfg(jit_backend)");
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if arch == "x86_64" {
+        println!("cargo:rustc-cfg=jit_backend");
+    }
+
     let mut files = Vec::new();
     list_files(&here.join("src"), &mut files);
     files.push(here.join("build.rs"));
