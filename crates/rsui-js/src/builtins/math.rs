@@ -242,8 +242,19 @@ pub(crate) fn quick_name(which: u16) -> &'static str {
 /// What `Math` function `which` in [`QUICK`] works out from numbers, for compiled code, which has checked it's the
 /// built-in one and has numbers (`y` is ignored by the ones that take one). The answer is what `math_quick` makes a
 /// `Value::number` of.
-#[cfg(feature = "jit")]
+/// On x86-64 compiled code calls with Windows' convention on every system; elsewhere with the system's own.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn quick_apply(which: u64, x: f64, y: f64) -> f64 {
+    quick_work(which, x, y)
+}
+#[cfg(all(feature = "jit", not(target_arch = "x86_64")))]
+pub(crate) extern "C" fn quick_apply(which: u64, x: f64, y: f64) -> f64 {
+    quick_work(which, x, y)
+}
+
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn quick_work(which: u64, x: f64, y: f64) -> f64 {
     match QUICK[which as usize].2 {
         Quick::One(function) => function(x),
         Quick::Two(function) => function(x, y),

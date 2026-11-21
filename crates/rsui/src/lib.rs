@@ -86,11 +86,14 @@ mod window;
 #[path = "window_none.rs"]
 mod window;
 
-/// What an app's library on Android uses: setting up the activity Android made, from `ANativeActivity_onCreate`, and the
-/// app's own folder and files.
+/// What an app's library on Android uses: starting the app when rsui's activity is made, handing on what the activity
+/// hears, and the app's own folder and files.
 #[cfg(target_os = "android")]
 pub mod android {
-    pub use crate::window::{ANativeActivity, copy_assets, data_folder, finish, on_create, show_keyboard};
+    pub use crate::window::{
+        commit, compose, configuration, copy_assets, data_folder, delete, destroy, finish_composing, focus, key, low_memory, redraw, shown,
+        start, surface, touch,
+    };
 }
 mod windows;
 

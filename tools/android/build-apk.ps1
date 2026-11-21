@@ -1,12 +1,12 @@
 <#
 Makes an APK of an rsui app, for arm64 phones, with no Gradle: the rsui-android library cross-compiled with the NDK, the
-app's files as assets with a list of them, a manifest for Android's NativeActivity, then aapt2, zipalign and apksigner
-from the Android SDK. Install it with -Install, on the phone adb sees.
+app's files as assets with a list of them, rsui's own activity (crates/rsui-android/java) compiled with javac and d8,
+and a manifest, then aapt2, zipalign and apksigner from the Android SDK. Install it with -Install, on the phone adb sees.
 
     tools/android/build-apk.ps1 -App demos/mobile-hello [-Install] [-Release]
 
 What it needs: the Android SDK (ANDROID_HOME, or %LOCALAPPDATA%\Android\Sdk) with an NDK, build-tools and a platform, a
-JDK for apksigner and keytool (JAVA_HOME, or Android Studio's), and Rust's aarch64-linux-android target. The build
+JDK for javac, apksigner and keytool (JAVA_HOME, or Android Studio's), and Rust's aarch64-linux-android target. The build
 runs at low priority, two jobs at a time.
 #>
 param(
@@ -65,6 +65,17 @@ try {
 } finally { Pop-Location }
 Copy-Item "$root\target\aarch64-linux-android\$buildProfile\librsui_app.so" "$work\stage\lib\arm64-v8a\librsui_app.so"
 
+# rsui's activity, as Android's own code: Java's classes, then d8's dex of them.
+$classes = "$work\classes"
+Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $classes | Out-Null
+$sources = @(Get-ChildItem "$root\crates\rsui-android\java" -Recurse -Filter *.java | ForEach-Object FullName)
+& "$java\bin\javac.exe" -nowarn --release 11 -classpath "$($platform.FullName)\android.jar" -d $classes $sources
+if ($LASTEXITCODE -ne 0) { throw 'javac failed' }
+$compiled = @(Get-ChildItem $classes -Recurse -Filter *.class | ForEach-Object FullName)
+& "$($tools.FullName)\d8.bat" --release --min-api 29 --lib "$($platform.FullName)\android.jar" --output $work $compiled
+if ($LASTEXITCODE -ne 0) { throw 'd8 failed' }
+
 # The app's files, and the list of them, which is what the library copies out on the phone.
 $files = Get-ChildItem $appPath -Recurse -File | Where-Object {
     $_.FullName -notmatch '\\(\.git|screenshots|target)\\' -and $_.Extension -notin '.rsuitrace', '.exe', '.png' -or $_.FullName -match '\\(assets|public)\\'
@@ -82,11 +93,10 @@ $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="$Package" android:versionCode="1" android:versionName="0.1">
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
-    <application android:label="$Label" android:hasCode="false" android:extractNativeLibs="false">
-        <activity android:name="android.app.NativeActivity" android:exported="true" android:launchMode="singleTask"
+    <application android:label="$Label" android:hasCode="true" android:extractNativeLibs="false">
+        <activity android:name="dev.rsui.RsuiActivity" android:exported="true" android:launchMode="singleTask"
                   android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode|density|fontScale"
                   android:windowSoftInputMode="adjustResize" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-            <meta-data android:name="android.app.lib_name" android:value="rsui_app" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -100,12 +110,13 @@ $manifest = @"
 $bin = $tools.FullName
 & "$bin\aapt2.exe" link -o "$work\base.apk" --manifest "$work\AndroidManifest.xml" -I "$($platform.FullName)\android.jar" -A "$work\stage\assets"
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 failed' }
-# The library goes in uncompressed, so Android can map it from the APK as it is.
+# The library goes in uncompressed, so Android can map it from the APK as it is; the activity's dex beside it.
 python -c @"
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], 'a') as apk:
     apk.write(sys.argv[2], 'lib/arm64-v8a/librsui_app.so', compress_type=zipfile.ZIP_STORED)
-"@ "$work\base.apk" "$work\stage\lib\arm64-v8a\librsui_app.so"
+    apk.write(sys.argv[3], 'classes.dex', compress_type=zipfile.ZIP_DEFLATED)
+"@ "$work\base.apk" "$work\stage\lib\arm64-v8a\librsui_app.so" "$work\classes.dex"
 if ($LASTEXITCODE -ne 0) { throw 'adding the library failed' }
 & "$bin\zipalign.exe" -f -P 16 4 "$work\base.apk" "$work\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw 'zipalign failed' }
@@ -123,5 +134,5 @@ if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
 
 if ($Install) {
     & "$sdk\platform-tools\adb.exe" install -r $Out
-    & "$sdk\platform-tools\adb.exe" shell am start -n "$Package/android.app.NativeActivity"
+    & "$sdk\platform-tools\adb.exe" shell am start -n "$Package/dev.rsui.RsuiActivity"
 }
