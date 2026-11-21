@@ -46,6 +46,8 @@ mod scene;
 mod shape;
 mod svg_image;
 mod transform;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod vulkan;
 
 pub use gpu::{RenderError, Renderer, WorkingSetLimit, give_back_memory, start_gpu_early};
 pub use images::{ImageUpload, Images, image_size, register_image, set_files_from};
