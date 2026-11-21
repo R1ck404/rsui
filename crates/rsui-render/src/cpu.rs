@@ -619,23 +619,26 @@ impl Renderer {
         }
         for upload in scene.image_uploads.drain(..) {
             let ImageUpload { id, width, height, pixels, changes } = upload;
-            let known = self.images.contains_key(&id);
+            // An image with no pixels, or fewer than it says, is turned down, as a GPU turns down such a texture, and
+            // whatever had this number stays as it was.
+            if width == 0 || height == 0 || pixels.len() < width as usize * height as usize * 4 {
+                continue;
+            }
             if let (Some((x, y)), Some(image)) = (changes, self.images.get_mut(&id)) {
-                if pixels.len() >= width as usize * height as usize * 4 {
-                    for row in 0..height {
-                        let (to_y, to_x) = ((y + row) as usize, x as usize);
-                        if to_y >= image.height as usize || to_x + width as usize > image.width as usize {
-                            continue;
-                        }
-                        let from = row as usize * width as usize * 4;
-                        let to = (to_y * image.width as usize + to_x) * 4;
-                        image.pixels[to..to + width as usize * 4].copy_from_slice(&pixels[from..from + width as usize * 4]);
+                for row in 0..height {
+                    let (to_y, to_x) = ((y + row) as usize, x as usize);
+                    if to_y >= image.height as usize || to_x + width as usize > image.width as usize {
+                        continue;
                     }
+                    let from = row as usize * width as usize * 4;
+                    let to = (to_y * image.width as usize + to_x) * 4;
+                    image.pixels[to..to + width as usize * 4].copy_from_slice(&pixels[from..from + width as usize * 4]);
                 }
-            } else if pixels.len() >= width as usize * height as usize * 4 {
+            } else {
                 self.images.insert(id, Image { width, height, pixels });
             }
-            changed |= known && referenced(&self.last.batches, id) && referenced(&scene.batches, id);
+            // What was drawn without it, as one that hadn't come yet, changes as much as one that's replaced.
+            changed |= referenced(&self.last.batches, id) && referenced(&scene.batches, id);
         }
         changed
     }

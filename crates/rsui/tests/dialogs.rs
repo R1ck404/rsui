@@ -1,4 +1,6 @@
 //! The file dialogs, on a desktop of their own that nobody can see, so that testing them doesn't get in anyone's way.
+// Real Win32 windows and dialogs, which only Windows has.
+#![cfg(windows)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

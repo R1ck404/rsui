@@ -294,19 +294,20 @@ unsafe extern "C" fn closing(context: *mut c_void, socket: c_int) -> c_int {
 
 /// Makes a request, says what came back once the headers are in, and then hands over its answer a part at a time, each
 /// when it's asked for, until it ends, fails, or is cancelled.
-fn exchange(asked: Asked, head: Later, events: Receiver<Event>, stop: Arc<Stop>) {
+/// Runs the request. What's left of how it ended, for a read that comes later, is given back.
+fn exchange(asked: Asked, head: Later, events: &Receiver<Event>, stop: Arc<Stop>) -> Option<Outcome> {
     let Some(curl) = curl() else {
         head.settle(Outcome::RequestFailed("libcurl isn't on this system".to_owned()));
-        return;
+        return None;
     };
     let lower = asked.url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         head.settle(Outcome::RequestFailed(format!("{} isn't an http or https URL", asked.url)));
-        return;
+        return None;
     }
     let (Ok(url), Ok(method)) = (CString::new(asked.url.clone()), CString::new(asked.method.clone())) else {
         head.settle(Outcome::RequestFailed("the address has a zero in it".to_owned()));
-        return;
+        return None;
     };
     // SAFETY: the handle and the list of headers are made and freed here; everything curl's given lasts through
     // `perform`, which is when it uses them.
@@ -314,7 +315,7 @@ fn exchange(asked: Asked, head: Later, events: Receiver<Event>, stop: Arc<Stop>)
         let handle = (curl.easy_init)();
         if handle.is_null() {
             head.settle(Outcome::RequestFailed("curl couldn't start".to_owned()));
-            return;
+            return None;
         }
         let mut list: *mut c_void = std::ptr::null_mut();
         let lines: Vec<CString> = asked
@@ -330,7 +331,7 @@ fn exchange(asked: Asked, head: Later, events: Receiver<Event>, stop: Arc<Stop>)
             handle,
             head: Some(head),
             lines: Vec::new(),
-            events: &events,
+            events,
             stop: &stop,
         };
         let set = curl.easy_setopt;
@@ -405,6 +406,7 @@ fn exchange(asked: Asked, head: Later, events: Receiver<Event>, stop: Arc<Stop>)
         {
             later.settle(ended.take().unwrap_or(Outcome::Null));
         }
+        ended
     }
 }
 
@@ -450,9 +452,17 @@ fn http_start(vm: &mut Vm, args: Args) -> Run<Value> {
         all.insert(number, (sender, stop.clone()));
     }
     let started = std::thread::Builder::new().name("rsui request".into()).stack_size(REQUEST_STACK).spawn(move || {
-        exchange(asked, head, events, stop);
+        let mut ended = exchange(asked, head, &events, stop);
+        // A read sends while it holds the list (see `http_read`), so once the request's off it, under the same lock,
+        // whatever was sent before is here to be told, and whatever comes after finds no request, which is the end.
+        // Without this a read sent just as the request ended was dropped with the channel, and failed.
         if let Ok(mut all) = exchanges().lock() {
             all.remove(&number);
+            while let Ok(event) = events.try_recv() {
+                if let Event::Read(later) = event {
+                    later.settle(ended.take().unwrap_or(Outcome::Null));
+                }
+            }
         }
     });
     if started.is_err()
@@ -469,14 +479,17 @@ fn http_read(vm: &mut Vm, args: Args) -> Run<Value> {
     let number = vm.to_number(number)? as u32;
     // This only waits to hear something, as a stream of events can stay open for good.
     let (promise, later) = vm.promise_for_later(true);
-    let sender = exchanges().lock().ok().and_then(|all| all.get(&number).map(|(sender, _)| sender.clone()));
-    match sender {
-        Some(sender) => {
-            if let Err(std::sync::mpsc::SendError(Event::Read(later))) = sender.send(Event::Read(later)) {
-                later.settle(Outcome::Null);
-            }
-        }
-        None => later.settle(Outcome::Null),
+    // Sent while the list is held, so the request can't end between finding it and sending to it.
+    let mut later = Some(later);
+    if let Ok(all) = exchanges().lock()
+        && let Some((sender, _)) = all.get(&number)
+        && let Some(asked) = later.take()
+        && let Err(std::sync::mpsc::SendError(Event::Read(back))) = sender.send(Event::Read(asked))
+    {
+        later = Some(back);
+    }
+    if let Some(later) = later {
+        later.settle(Outcome::Null);
     }
     Ok(promise)
 }

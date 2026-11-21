@@ -1,5 +1,7 @@
 //! Real windows and the real message loop, on a desktop of their own that nobody can see, so that testing them
 //! doesn't bring anything up on screen or take the keyboard.
+// Real Win32 windows and dialogs, which only Windows has.
+#![cfg(windows)]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
