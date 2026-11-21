@@ -1357,6 +1357,7 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
         .chain(crate::why::FUNCTIONS)
         .chain(crate::webview::FUNCTIONS)
         .chain(crate::popups::FUNCTIONS)
+        .chain(crate::native_look::FUNCTIONS)
     {
         let function = vm.host_function(name, 0, function);
         let atom = vm.atom(name);
@@ -2751,6 +2752,8 @@ enum Described {
         /// A list of children long enough to be looked at for what's the same in it as last time, with where they are, in place of
         /// `kids`: see [`KeptKids`].
         long: Option<(Value, Place)>,
+        /// What it is in the platform's look, if it says `native`: see `native_look.rs`.
+        native: Option<rsui::native_look::NativeControl>,
     },
     Scroll(Root, u64),
     List(Root, u64),
@@ -2903,6 +2906,7 @@ fn native_tag(tag: &str) -> Option<NativeTag> {
         "link" => tag!("link", Link, false, true, false),
         "input" => tag!("input", TextInput, false, false, true),
         "checkbox" => tag!("checkbox", Checkbox, false, true, false),
+        "switch" => tag!("switch", Checkbox, false, true, false),
         "item" => tag!("item", ListItem, false, true, false),
         "image" => tag!("image", Image, false, false, false),
         "dialog" => tag!("dialog", Dialog, false, false, true),
@@ -3156,7 +3160,13 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
             }
         }
     };
-    let gathered = gather_props(vm, props)?;
+    let mut gathered = gather_props(vm, props)?;
+    let native = if gathered.native {
+        let tag = vm.string_text(kind).map(|tag| tag.into_owned()).unwrap_or_default();
+        crate::native_look::restyle(vm, &tag, props, &mut gathered)?
+    } else {
+        None
+    };
     let kids_value = vm.get_property(description, names.kids_name)?;
     // Ordinary labels have one string child. Read it straight into the name rather
     // than allocate a Kid vector, walk it, join it and immediately clear it. Keep
@@ -3174,6 +3184,7 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
                     kids: Vec::new(),
                     own_text: Some(Text::from(text.as_ref())),
                     long: None,
+                    native,
                 });
             }
         }
@@ -3196,6 +3207,7 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
             kids: Vec::new(),
             own_text: None,
             long: Some((list, inside)),
+            native,
         });
     }
     let mut kids = Vec::new();
@@ -3214,6 +3226,7 @@ fn describe(vm: &mut Vm, at: Kid) -> Result<Described, Value> {
         kids,
         own_text,
         long: None,
+        native,
     })
 }
 
@@ -3418,11 +3431,22 @@ fn is_page_element(vm: &mut Vm, kind: Value, props: Value) -> Result<bool, Value
     if !props.is_object() {
         return Ok(false);
     }
-    let (class, kind) = with_internals(|internals| (internals.class_name, internals.type_name));
-    if !vm.get_property(props, class)?.is_nullish() {
-        return Ok(true);
+    let (class, type_name) = with_internals(|internals| (internals.class_name, internals.type_name));
+    let classed = !vm.get_property(props, class)?.is_nullish();
+    let page = classed || (!span && !vm.get_property(props, type_name)?.is_nullish());
+    // One in the platform's look stays rsui's own, whatever's said of it for a page.
+    if page {
+        let native = vm.atom("native");
+        if vm.get_property(props, native)? == Value::TRUE {
+            if classed {
+                if let Some(tag) = vm.string_text(kind).map(|tag| tag.into_owned()) {
+                    crate::native_look::class_name_left_out(&tag);
+                }
+            }
+            return Ok(false);
+        }
     }
-    Ok(!span && !vm.get_property(props, kind)?.is_nullish())
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -3660,6 +3684,7 @@ fn build_node(
             kids,
             own_text,
             long,
+            native,
         }) => finish_node(
             build_host(
                 cx,
@@ -3672,6 +3697,7 @@ fn build_node(
                 keyed_root,
                 auto,
                 previous,
+                native,
             ),
             previous,
         ),
@@ -3698,12 +3724,14 @@ fn build_host(
     keyed_root: bool,
     auto: &mut AutoKeys,
     previous: Option<PreviousNode<'_>>,
+    native: Option<rsui::native_look::NativeControl>,
 ) -> Element {
     let Gathered {
         mut entries,
         name,
-        handlers,
+        mut handlers,
         events: _,
+        native: _,
     } = gathered;
     if is_row {
         static DIRECTION: LazyLock<Symbol> = LazyLock::new(|| Symbol::new("direction"));
@@ -3755,8 +3783,12 @@ fn build_host(
         }
     }
     element.key = key;
-    if element.key.is_none() && !handlers.is_empty() && !keyed_root {
+    if element.key.is_none() && (!handlers.is_empty() || native.is_some()) && !keyed_root {
         element.key = Some(auto.next());
+    }
+    if let Some(native) = native {
+        let has_children = !kids.kids.is_empty() || kids.long.is_some();
+        element = crate::native_look::finish(cx, &native, element, &mut handlers, has_children);
     }
     match kids.long {
         Some((list, scope)) => {
@@ -3770,6 +3802,21 @@ fn build_host(
         }
     }
     wire_handlers(cx, element, handlers)
+}
+
+/// Calls an app's function with one value, as a handler, for what's wired up in Rust rather than through
+/// [`wire_handlers`], as a native slider's `onChange` is.
+pub(crate) fn call_with(updates: &mut Updates<'_>, function: &Root, value: Value) {
+    let failed = with_vm_letting_go(|vm| {
+        vm.call_function(function.get(), Value::UNDEFINED, &[value])
+            .err()
+            .map(|error| vm.error_text(error))
+    });
+    if let Some(message) = failed {
+        report(message);
+    }
+    pass_on_what_was_said(updates);
+    pump(updates);
 }
 
 /// `element` with each of `handlers` called when what it's for happens to it.
@@ -4266,6 +4313,7 @@ fn scroll_component(cx: &mut Cx<'_>, props: &Deferred) -> Element {
             None,
             false,
             &mut auto,
+            None,
             None,
         );
         if let Some(only) = only {

@@ -90,7 +90,8 @@ globalThis.__jsxMemo = jsxMemo;
 // What JSX calls in a file written for a page, which has a tag rsui has too, as a `<button>` beside a `<div>`: each of a page's tags
 // is the page's, drawn as its CSS says, and anything else is as `__jsx` has it. `rsui/web` is loaded the first time.
 globalThis.__jsxPage = function (type, props, kids, mayHaveKey) {
-    if (typeof type === 'string') {
+    // One that says `native` is rsui's own, in the platform's look, in a page's file too.
+    if (typeof type === 'string' && (props == null || props.native !== true)) {
         pageElement ??= require('rsui/web').__pageElement;
         type = pageElement(type) ?? type;
     }
@@ -98,7 +99,8 @@ globalThis.__jsxPage = function (type, props, kids, mayHaveKey) {
 };
 
 globalThis.__jsxPageMemo = function (type, props, kids, mayHaveKey) {
-    if (typeof type === 'string') {
+    // One that says `native` is rsui's own, in the platform's look, in a page's file too.
+    if (typeof type === 'string' && (props == null || props.native !== true)) {
         pageElement ??= require('rsui/web').__pageElement;
         type = pageElement(type) ?? type;
     }
@@ -3003,6 +3005,11 @@ const colorSchemeHeard = new Set();
 
 function colorSchemeChanged(dark) {
     colorScheme = dark ? 'dark' : 'light';
+    // Controls in the platform's look (`native`) have its light or dark colors in them, and are made again, if there are any.
+    if (host.nativeLookDark(dark)) {
+        everything += 1;
+        host.dirtyAll('The system went from light to dark, or back, which native controls follow.');
+    }
     for (const heard of colorSchemeHeard) {
         heard(colorScheme);
     }

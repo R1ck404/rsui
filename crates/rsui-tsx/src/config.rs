@@ -408,20 +408,25 @@ pub(crate) fn included_files(folder: &Path, include: &[String], exclude: &[Strin
         .collect()
 }
 
-/// The app's id from its config, for Windows to know it by, as cheaply as it can be had: a packed app has it written in
-/// (see `pack::packed_config`), and one that isn't packed has its config read, if it has one.
-pub(crate) fn app_id(app: &Path) -> Option<String> {
-    if rsui_js::running_packed() {
-        return crate::pack::packed_config().and_then(|config| config.get("id")?.as_str().map(str::to_owned));
-    }
-    find(app)?;
-    match load(app, this_platform()) {
-        Ok(config) => config.get("id").and_then(Value::as_str).map(str::to_owned),
-        Err(error) => {
-            eprintln!("rsui-tsx: {error}");
-            None
-        }
-    }
+/// What a running app needs of its config: its id, for Windows to know it by, and which look `native` draws in (`theme`).
+#[derive(Default)]
+pub(crate) struct Running {
+    pub(crate) id: Option<String>,
+    pub(crate) theme: Option<String>,
+}
+
+/// What a running app needs of its config, as cheaply as it can be had: a packed app has it written in (see
+/// `pack::packed_config`), and one that isn't packed has its config read, if it has one.
+pub(crate) fn running(app: &Path) -> Running {
+    let config = if rsui_js::running_packed() {
+        crate::pack::packed_config()
+    } else if find(app).is_some() {
+        load(app, this_platform()).map_err(|error| eprintln!("rsui-tsx: {error}")).ok()
+    } else {
+        None
+    };
+    let said = |key: &str| config.as_ref().and_then(|config| config.get(key)?.as_str().map(str::to_owned));
+    Running { id: said("id"), theme: said("theme") }
 }
 
 #[cfg(test)]

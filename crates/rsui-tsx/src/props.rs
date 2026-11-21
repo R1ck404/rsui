@@ -31,6 +31,8 @@ pub(crate) enum Meaning {
     Flex,
     Color(Symbol),
     Plain(Symbol),
+    /// Drawn in the platform's look: see `native_look.rs`.
+    Native,
 }
 
 /// `fontSize` as `font_size`, which is how rsui's own props are written.
@@ -52,6 +54,7 @@ fn meaning_of(name: &str) -> Meaning {
     match name {
         "key" | "children" | "ref" | "tag" => Meaning::Skip,
         "style" => Meaning::Style,
+        "native" => Meaning::Native,
         "name" => Meaning::Name,
         "onClick" => Meaning::Handler(ActionKind::Click),
         "onFocus" => Meaning::Handler(ActionKind::Focus),
@@ -61,6 +64,8 @@ fn meaning_of(name: &str) -> Meaning {
         "onFocusRingChange" => Meaning::Handler(ActionKind::Custom(Symbol::new("focus_ring"))),
         "onToggle" => Meaning::Handler(ActionKind::Toggle),
         "onChange" => Meaning::Handler(ActionKind::SetValue),
+        // What a field's typed into, as a page's `onInput` is, which rsui's own fields say with `onChange`.
+        "onInput" => Meaning::Handler(ActionKind::SetValue),
         "onScroll" => Meaning::Handler(ActionKind::Scroll),
         "onKeyPress" => Meaning::Handler(ActionKind::KeyPress),
         "onResize" => Meaning::Handler(ActionKind::Resize),
@@ -236,6 +241,8 @@ pub(crate) struct Gathered {
     pub(crate) handlers: Vec<(ActionKind, Root)>,
     /// Whether there's a handler for an event as the web has it, which the layer is asked to turn into rsui's.
     pub(crate) events: bool,
+    /// Whether it says `native`, for the platform's look.
+    pub(crate) native: bool,
 }
 
 fn number_of(value: Value) -> Option<f64> {
@@ -269,6 +276,7 @@ pub(crate) fn gather(
             }
         }
         Meaning::Event => out.events |= vm.is_function(value),
+        Meaning::Native => out.native |= value == Value::TRUE,
         Meaning::Number(name) => {
             if let Some(number) = number_of(value) {
                 out.entries.push((name, PropValue::Float(number)));

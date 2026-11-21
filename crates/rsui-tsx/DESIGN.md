@@ -42,6 +42,21 @@ what's wrong in a message if it can't start, and `--icon app.ico` gives it an ic
 `menuitem`, `scroll` and `list`. Anything else becomes a custom role. Text inside `text`, `button`, `link`, `menuitem`, `item`
 or `checkbox` is its name, which is what agents and screen readers see. `name` sets that directly.
 
+**The platform's look:** `native` on a `button`, `input`, `checkbox`, `switch`, `slider`, `progress` or `window` draws it as
+the platform's own: Material 3 on Android and Fluent on Windows (and on Linux, for now), or what `theme` in `rsui.config.ts`
+forces, with `RSUI_THEME` over that. It's rsui's element, styled by `rsui::native_look` with props any element has, so it costs
+what one styled by hand does (`bench/native-look`: a thousand of either made again in 6.6 ms). What the app says of how it looks,
+`className` included, is left out, and said once in a dev build; where it goes stays. `android={{ variant: 'tonal' }}` and
+`windows={{ variant: 'accent' }}` are read for that look only. What changes as it's used is drawn from props too: Material's ripple
+(`ripple`, kept by `App` from where it was pressed), a field's line while it's typed in (`focus_line`), and the platform's focus
+ring (`focus_ring`). Dark or light follows the system, and native controls are made again when it changes.
+
+```tsx
+<button native onClick={save}>Save</button>
+<input native value={name} onChange={setName} placeholder="Name" />
+<switch native checked={on} onChange={setOn}>Wi-Fi</switch>
+```
+
 **Color** goes down: text with no `color` of its own takes it from what it's in, and so does a shape's `currentColor`, and the
 thumbs of what scrolls. Nothing else does, and neither do fonts, unless it's parts of a paragraph.
 

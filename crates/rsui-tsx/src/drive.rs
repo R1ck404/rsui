@@ -231,6 +231,8 @@ impl Desk {
         bridge::keep_state_across_reloads();
         // What comes in is kept, with the clock and where random numbers start, so it can be replayed as a window's is.
         crate::replay::begin()?;
+        // Which look `native` draws in, from the app's config, as a window has it.
+        rsui::native_look::choose_theme(crate::config::running(path).theme.as_deref().unwrap_or("system"));
         let entry = crate::load(path, stack_limit)?;
         let text = rsui::default_text_engine().map_err(|error| error.to_string())?;
         // As big as it would be in a window, if it says.
