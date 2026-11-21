@@ -579,6 +579,66 @@ declare module 'rsui/web' {
 }
 
 /**
+ * An app's `rsui.config.ts`, beside its `package.json`: who the app is and how it's packed. It's read when the app's packed,
+ * and by `rsui-tsx config`, never while a packed app runs. What a window is like (`title`, `size`, `frameless`) stays as
+ * exports of the main file. Whatever's left out comes from `package.json` or the folder's name.
+ *
+ * ```ts
+ * import { defineConfig } from 'rsui/config';
+ * export default defineConfig(({ platform }) => ({
+ *     id: 'com.example.todo',
+ *     name: 'To-do',
+ *     icon: 'icon.png',
+ *     permissions: platform === 'android' ? ['network'] : [],
+ * }));
+ * ```
+ */
+declare module 'rsui/config' {
+    export type Platform = 'windows' | 'android' | 'macos' | 'linux';
+    /** What an app may ask the system for. Android is told in its manifest; elsewhere it's asked for when it's first used. */
+    export type Permission = 'network' | 'notifications' | 'camera' | 'microphone' | 'location' | 'vibrate';
+    export interface AppConfig {
+        /**
+         * Who the app is, written the other way round from a web address, as `com.example.todo`: Android's package name,
+         * Apple's bundle id, the app id Linux and Windows know it by. Two apps with the same one replace each other.
+         * Otherwise `dev.rsui.<its name>`.
+         */
+        id?: string;
+        /** What the launcher, the taskbar and the title of its store page show. Otherwise `package.json`'s name. */
+        name?: string;
+        /** As `1.2.3`. Otherwise `package.json`'s. */
+        version?: string;
+        /** A .png (256 by 256 is best) or a .ico, from this file's folder. */
+        icon?: string;
+        /** Files to pack beside what the app loads, as `assets/**`, and what to leave out of them, as `**\/*.psd`. */
+        files?: { include?: string[]; exclude?: string[] };
+        permissions?: Permission[];
+        /**
+         * What rsui's own elements with `native` look like: `system` is the platform's own (Material on Android, Fluent on
+         * Windows, macOS's on a Mac); the others are that one everywhere.
+         */
+        theme?: 'system' | 'material' | 'fluent' | 'mac';
+        android?: {
+            /** 29 (Android 10) or later. */
+            minSdk?: number;
+            targetSdk?: number;
+            orientation?: 'any' | 'portrait' | 'landscape';
+            /** Otherwise made from `version`: 1.2.3 is 10203. Each one installed has to be bigger than the one before. */
+            versionCode?: number;
+        };
+        macos?: { category?: string; minimumSystemVersion?: string };
+        windows?: {};
+        linux?: { categories?: string[] };
+    }
+    export interface ConfigContext {
+        /** Which system it's being packed for. */
+        platform: Platform;
+        mode: 'development' | 'production';
+    }
+    export function defineConfig(config: AppConfig | ((context: ConfigContext) => AppConfig)): typeof config;
+}
+
+/**
  * What `<webview>` says and is given: a web page from elsewhere, in the system's browser view (WebView2). It's a window of its
  * own over the app's, cut to what shows of its element, its corners and to what's drawn on top of it, such as a menu. Under
  * something see-through, as a dimmed backdrop, it shows a still picture of the page instead, which that's drawn over. Nothing of

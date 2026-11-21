@@ -22,6 +22,88 @@ unsafe extern "system" {
         size: u32,
     ) -> i32;
     fn EndUpdateResourceW(update: *mut c_void, discard: i32) -> i32;
+    fn FindResourceW(module: *mut c_void, name: *const u16, kind: *const u16) -> *mut c_void;
+    fn LoadResource(module: *mut c_void, found: *mut c_void) -> *mut c_void;
+    fn LockResource(loaded: *mut c_void) -> *const c_void;
+    fn SizeofResource(module: *mut c_void, found: *mut c_void) -> u32;
+}
+
+/// The kind of resource that's bytes of the program's own, and the name the app's config has among them.
+#[cfg(windows)]
+const RAW_DATA: usize = 10;
+#[cfg(windows)]
+const CONFIG_NAME: &str = "RSUICONFIG";
+
+/// Writes the app's config (`config.rs`), as JSON, into the program, where [`packed_config`] finds it.
+#[cfg(windows)]
+pub(crate) fn set_config(program: &Path, config: &serde_json::Value) -> Result<(), String> {
+    let text = config.to_string();
+    let (path, name) = (wide(program), wide(CONFIG_NAME));
+    // SAFETY: both strings end in a terminator; the data lasts until the update has ended, which is what it's copied by.
+    unsafe {
+        let update = BeginUpdateResourceW(path.as_ptr(), 0);
+        if update.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let worked = UpdateResourceW(update, RAW_DATA as *const u16, name.as_ptr(), 0, text.as_ptr().cast(), text.len() as u32) != 0;
+        if EndUpdateResourceW(update, i32::from(!worked)) == 0 || !worked {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Elsewhere a packed program carries no config yet: what it says goes into what the system reads, as an APK's manifest.
+#[cfg(not(windows))]
+pub(crate) fn set_config(_program: &Path, _config: &serde_json::Value) -> Result<(), String> {
+    Ok(())
+}
+
+/// The config written into this program when it was packed, if it was. It's in the program's image, which is mapped
+/// already, so this reads no file.
+#[cfg(windows)]
+pub(crate) fn packed_config() -> Option<serde_json::Value> {
+    let name = wide(CONFIG_NAME);
+    // SAFETY: a null module is this program; the resource stays mapped for as long as it runs, and is `size` bytes.
+    unsafe {
+        let found = FindResourceW(std::ptr::null_mut(), name.as_ptr(), RAW_DATA as *const u16);
+        if found.is_null() {
+            return None;
+        }
+        let size = SizeofResource(std::ptr::null_mut(), found) as usize;
+        let bytes = LockResource(LoadResource(std::ptr::null_mut(), found));
+        if bytes.is_null() {
+            return None;
+        }
+        serde_json::from_slice(std::slice::from_raw_parts(bytes.cast::<u8>(), size)).ok()
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn packed_config() -> Option<serde_json::Value> {
+    None
+}
+
+/// A `.ico` holding one PNG picture, as Windows has taken since Vista, for an app whose icon is a `.png`.
+pub(crate) fn ico_from_png(png: &[u8]) -> Result<Vec<u8>, String> {
+    if png.get(..8) != Some(b"\x89PNG\r\n\x1a\n".as_slice()) || png.get(12..16) != Some(b"IHDR".as_slice()) {
+        return Err("that isn't a .png file".to_owned());
+    }
+    let side = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().expect("four bytes"));
+    let (width, height) = (side(16), side(20));
+    if width > 256 || height > 256 {
+        return Err(format!(
+            "the icon is {width} by {height}, and a Windows icon is at most 256 by 256: give a .ico, or a 256 by 256 .png"
+        ));
+    }
+    // 256 is written as 0.
+    let byte = |side: u32| (side % 256) as u8;
+    let mut ico = vec![0, 0, 1, 0, 1, 0];
+    ico.extend_from_slice(&[byte(width), byte(height), 0, 0, 1, 0, 32, 0]);
+    ico.extend_from_slice(&(png.len() as u32).to_le_bytes());
+    ico.extend_from_slice(&22u32.to_le_bytes());
+    ico.extend_from_slice(png);
+    Ok(ico)
 }
 
 #[cfg(windows)]
@@ -384,7 +466,24 @@ pub(crate) fn pack(
 ) -> Result<(), String> {
     let describe = |what: &str, error: &dyn std::fmt::Display| format!("{what}: {error}");
     let this = std::env::current_exe().map_err(|error| describe("finding this program", &error))?;
-    let files = files_to_pack(app, loaded, also, graph)
+    // Who the app is, from its `rsui.config.ts`, which is checked now, before anything's made.
+    // An app without one packs as it always did, whatever its `package.json` is like.
+    let config = match crate::config::find(app) {
+        Some(_) => crate::config::load(app, crate::config::this_platform())?,
+        None => crate::config::load(app, crate::config::this_platform()).unwrap_or(serde_json::Value::Null),
+    };
+    let mut also = also.to_vec();
+    if let Some(folder) = crate::config::find(app).and_then(|file| file.parent().map(Path::to_owned)) {
+        let list = |key: &str| -> Vec<String> {
+            config["files"][key].as_array().into_iter().flatten().filter_map(|item| item.as_str().map(str::to_owned)).collect()
+        };
+        for file in crate::config::included_files(&folder, &list("include"), &list("exclude")) {
+            if !also.contains(&file) {
+                also.push(file);
+            }
+        }
+    }
+    let files = files_to_pack(app, loaded, &also, graph)
         .map_err(|error| describe("reading the app", &error))?;
     let entry = std::fs::canonicalize(app).map_err(|error| describe("finding the app", &error))?;
     let entry = plain_path(&entry);
@@ -394,10 +493,21 @@ pub(crate) fn pack(
     around.extend(links.iter().map(|(link, _)| link.clone()));
     let root = folder_around(&around).ok_or("the app didn't load anything")?;
     links.retain(|(_, target)| target.starts_with(&root));
-    let icon = icon
-        .map(std::fs::read)
-        .transpose()
-        .map_err(|error| describe("reading the icon", &error))?;
+    // `--icon` first, then the config's, which can be a .png.
+    let icon = match icon {
+        Some(icon) => Some(std::fs::read(icon).map_err(|error| describe("reading the icon", &error))?),
+        None => match config["icon"].as_str() {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|error| describe("reading the icon", &error))?;
+                Some(if path.to_ascii_lowercase().ends_with(".png") {
+                    ico_from_png(&bytes).map_err(|error| describe("the icon", &error))?
+                } else {
+                    bytes
+                })
+            }
+            None => None,
+        },
+    };
     // Publish only a completed program. A failed rebuild preserves an existing
     // output, rather than truncating it and then deleting it during rollback.
     let staged = out.with_file_name(format!(
@@ -419,6 +529,10 @@ pub(crate) fn pack(
         }
         if let Some(icon) = icon {
             set_icon(&staged, &icon).map_err(|error| describe("adding the icon", &error))?;
+        }
+        // An app with no config of its own is known as it always was (`rsui.<name>`), so nothing it's pinned as changes.
+        if crate::config::find(app).is_some() {
+            set_config(&staged, &config).map_err(|error| describe("adding the config", &error))?;
         }
         // This goes last, as adding an icon rewrites the file, and would lose what's on its end.
         let mut file = opened().map_err(|error| describe("opening what was made", &error))?;

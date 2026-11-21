@@ -352,6 +352,69 @@ fn a_program_can_have_an_icon_and_still_run() {
     );
 }
 
+/// A 2 by 2 PNG, which is all a `.png` icon needs to be to be wrapped as a `.ico`.
+fn tiny_png() -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png.extend_from_slice(&2u32.to_be_bytes());
+    png.extend_from_slice(&2u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    png
+}
+
+#[test]
+fn a_config_gives_the_program_its_icon_its_files_and_who_it_is_and_a_wrong_one_stops_it() {
+    let source = folder("config");
+    let main = source.join("main.tsx");
+    write(
+        main.clone(),
+        "import fs from 'fs'; import { fileURLToPath } from 'url';\n\
+         const said = fs.readFileSync(fileURLToPath(new URL('./assets/words.txt', import.meta.url)), 'utf8');\n\
+         export default function App() { return <window><text>{said}</text></window>; }",
+    );
+    write(source.join("assets").join("words.txt"), "from an included file");
+    std::fs::write(source.join("icon.png"), tiny_png()).unwrap();
+    let pack = |program: &Path| Command::new(TOOL).arg("--pack").arg(program).arg(&main).output().unwrap();
+
+    write(source.join("rsui.config.ts"), "export default { id: 'not an id' };");
+    let program = source.join("configured.exe");
+    let refused = pack(&program);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("isn't one"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(!program.exists(), "nothing's made of a wrong config");
+
+    write(
+        source.join("rsui.config.ts"),
+        "import { defineConfig } from 'rsui/config';\n\
+         export default defineConfig({ id: 'nl.example.packed', icon: 'icon.png', files: { include: ['assets/**'] } });",
+    );
+    let made = pack(&program);
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    let wide: Vec<u16> = program.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = "RSUICONFIG".encode_utf16().chain([0]).collect();
+    const AS_DATA: u32 = 2;
+    const ICON_GROUP: usize = 14;
+    const RAW_DATA: usize = 10;
+    // SAFETY: the names end in a terminator, and a small number can stand for a name or kind.
+    unsafe {
+        let module = LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), AS_DATA);
+        assert!(!module.is_null());
+        assert!(!FindResourceW(module, std::ptr::without_provenance(1), ICON_GROUP as *const u16).is_null(), "the .png is its icon");
+        assert!(!FindResourceW(module, name.as_ptr(), RAW_DATA as *const u16).is_null(), "it knows who it is");
+        FreeLibrary(module);
+    }
+    let picture = source.join("out.png");
+    let elsewhere = folder("config-elsewhere");
+    let moved = elsewhere.join("configured.exe");
+    std::fs::copy(&program, &moved).unwrap();
+    let ran = Command::new(&moved).arg("--png").arg(&picture).current_dir(&elsewhere).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains("from an included file"),
+        "what the config includes is in the program: {}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}
+
 #[test]
 fn a_picture_of_an_app_with_more_windows_has_a_picture_of_each() {
     let source = folder("pictures");

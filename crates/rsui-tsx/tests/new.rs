@@ -110,6 +110,13 @@ fn everything_an_editor_and_a_client_read_is_as_it_should_be() {
         std::fs::read_to_string(place.join("CLAUDE.md")).unwrap(),
         "@AGENTS.md\n"
     );
+    // Its config is one `rsui-tsx config` reads, with a name that has a quote in it, and an id made of letters only.
+    let config = tool(&["config", "--platform", "android", place.to_str().unwrap()]);
+    assert!(config.status.success(), "{}", complained(&config));
+    let config: serde_json::Value = serde_json::from_str(&said(&config)).unwrap();
+    assert_eq!(config["id"], "com.example.dontpanic");
+    assert_eq!(config["name"], "Don't Panic!");
+    assert_eq!(config["version"], "0.1.0");
     // A title with a quote in it still has to be code that runs.
     let app = place.join("app.tsx");
     let used = tool(&["--do", "expect \"Don't Panic!\"", app.to_str().unwrap()]);

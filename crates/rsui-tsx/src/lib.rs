@@ -23,6 +23,7 @@
 mod agent;
 mod bridge;
 mod canvas;
+mod config;
 mod css;
 mod css_build;
 mod debugger;
@@ -145,9 +146,31 @@ fn run_here(path: &Path, options: Options) -> Result<(), Error> {
     // This is a program that's really running, and what it asks for at the top of its main file really happens.
     native::allow_real_effects();
     // Windows knows it as this app, and not only as the program running it, before it has a window: see `set_app_id`.
-    if let Err(error) = rsui::desktop::set_app_id(&format!("rsui.{}", bridge::name_of_app(path))) {
-        eprintln!("rsui-tsx: Windows wasn't told which app this is: {error}");
-    }
+    // That's the id its `rsui.config.ts` gives, which a packed app has written in; one that isn't packed has its config
+    // read on a thread of its own while its scripts load, as it's only wanted once there's a window.
+    let config_id = if rsui_js::running_packed() || config::find(path).is_none() {
+        Ok(config::app_id(path))
+    } else {
+        let path = path.to_owned();
+        Err(std::thread::spawn(move || config::app_id(&path)))
+    };
+    let tell_app_id = move |config_id: Result<Option<String>, std::thread::JoinHandle<Option<String>>>, path: &Path| {
+        let id = match config_id {
+            Ok(id) => id,
+            Err(reading) => reading.join().ok().flatten(),
+        };
+        let id = id.unwrap_or_else(|| format!("rsui.{}", bridge::name_of_app(path)));
+        if let Err(error) = rsui::desktop::set_app_id(&id) {
+            eprintln!("rsui-tsx: Windows wasn't told which app this is: {error}");
+        }
+    };
+    let config_id = match config_id {
+        Ok(id) => {
+            tell_app_id(Ok(id), path);
+            None
+        }
+        reading => Some(reading),
+    };
     // Someone working on it can see what renders and why, and save it. Someone it's been handed to has no use for that.
     let worked_on = !rsui_js::running_packed() || rsui_js::packed_diagnostics();
     // The viewer is a tool, not something being worked on: it has no inspector of its own, nor the pill.
@@ -166,6 +189,9 @@ fn run_here(path: &Path, options: Options) -> Result<(), Error> {
     }
     rsui::mark("thread");
     let entry = load(path, STACK / 8 * 7).map_err(Error::Script)?;
+    if let Some(reading) = config_id {
+        tell_app_id(reading, path);
+    }
     // A replay is given to the window's app when it first updates, which is once it's there and can be woken.
     if let Some(plan) = replay::take_plan() {
         rsui::inspect::run_in_app(Box::new(move |app| {
@@ -303,6 +329,13 @@ pub const STEPS: &str = drive::STEPS;
 
 /// Makes a new app in this folder, with what it takes to run it, check it, and have an agent work on it. The folder can't
 /// already have anything in it. It says what it made.
+/// The app's `rsui.config.ts` for `platform` (`windows`, `android`, `macos` or `linux`; this system's if it's `None`), as
+/// JSON with everything it leaves out filled in, or what's wrong with it. `app` is its main file or its folder.
+pub fn app_config(app: &Path, platform: Option<&str>) -> Result<String, Error> {
+    let config = config::load(app, platform.unwrap_or(config::this_platform())).map_err(Error::Script)?;
+    serde_json::to_string_pretty(&config).map_err(|error| Error::Script(error.to_string()))
+}
+
 pub fn new_project(place: &Path) -> Result<Vec<PathBuf>, Error> {
     new::new_project(place).map_err(Error::Script)
 }
@@ -441,6 +474,10 @@ pub fn pack_with_options(
     icon: Option<&Path>,
     options: &PackOptions,
 ) -> Result<(), Error> {
+    // A config that's wrong stops it before any of the app has run, with what's wrong with it.
+    if config::find(app).is_some() {
+        config::load(app, config::this_platform()).map_err(Error::Script)?;
+    }
     let code_cache = options.code_cache;
     let diagnostics = options.diagnostics;
     let mut build = options

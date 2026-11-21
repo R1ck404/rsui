@@ -1242,6 +1242,8 @@ pub(crate) const HOST_MODULES: &[(&str, &str)] = &[
     ("rsui/editing", EDITING),
     ("rsui/events", EVENTS),
     ("rsui/webview", WEBVIEW),
+    // Only `rsui.config.ts` has a use for it, but an app that imports it gets the same thing.
+    ("rsui/config", "exports.defineConfig = (config) => config;"),
     ("react", REACT),
     ("react-dom", REACT_DOM),
     ("react-dom/client", REACT_DOM),

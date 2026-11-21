@@ -62,8 +62,25 @@ pub(crate) fn new_project(place: &Path) -> Result<Vec<PathBuf>, String> {
         "{{\n  \"mcpServers\": {{\n    \"{server}\": {{\n      \"command\": \"rsui-tsx\",\n      \"args\": [\"--agent\", \"app.tsx\"]\n    }}\n  }}\n}}\n"
     );
 
-    let files: [(&str, String); 7] = [
+    // Who the app is, for packing it: an id that's only an example until it's changed to one of the app's own.
+    let part = crate::config::id_part(&name);
+    let config = [
+        "import { defineConfig } from 'rsui/config';".to_owned(),
+        String::new(),
+        "// Who the app is and how it's packed: see `rsui/config` in rsui.d.ts. `rsui-tsx config` prints what this comes to."
+            .to_owned(),
+        "export default defineConfig({".to_owned(),
+        format!("    // Change this to one of your own, as `com.yourname.{part}`: two apps with the same id replace each other."),
+        format!("    id: 'com.example.{part}',"),
+        format!("    name: '{in_code}',"),
+        "    version: '0.1.0',".to_owned(),
+        "});".to_owned(),
+        String::new(),
+    ]
+    .join("\n");
+    let files: [(&str, String); 8] = [
         ("app.tsx", APP.replace("{{TITLE}}", &in_code)),
+        ("rsui.config.ts", config),
         ("rsui.d.ts", TYPES.to_owned()),
         ("tsconfig.json", TSCONFIG.to_owned()),
         (".mcp.json", mcp),

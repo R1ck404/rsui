@@ -5,6 +5,10 @@ and a manifest, then aapt2, zipalign and apksigner from the Android SDK. Install
 
     tools/android/build-apk.ps1 -App demos/mobile-hello [-Install] [-Release]
 
+Who the app is comes from its rsui.config.ts (id, name, version, icon, permissions, android.minSdk/targetSdk/orientation,
+files.exclude), as `rsui-tsx config --platform android` prints it; -Package and -Label override the id and the name. That
+rsui-tsx is -Tsx, or this tree's target\release or target\debug one, or one built for it.
+
 What it needs: the Android SDK (ANDROID_HOME, or %LOCALAPPDATA%\Android\Sdk) with an NDK, build-tools and a platform, a
 JDK for javac, apksigner and keytool (JAVA_HOME, or Android Studio's), and Rust's aarch64-linux-android target. The build
 runs at low priority, two jobs at a time.
@@ -12,8 +16,9 @@ runs at low priority, two jobs at a time.
 param(
     [Parameter(Mandatory)] [string] $App,
     [string] $Out = '',
-    [string] $Package = 'dev.rsui.app',
+    [string] $Package = '',
     [string] $Label = '',
+    [string] $Tsx = '',
     [switch] $Install,
     [switch] $Release
 )
@@ -23,7 +28,6 @@ $ErrorActionPreference = 'Stop'
 $root = Resolve-Path "$PSScriptRoot\..\.."
 $appPath = (Resolve-Path $App).Path
 $name = Split-Path $appPath -Leaf
-if (-not $Label) { $Label = $name }
 $sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { "$env:LOCALAPPDATA\Android\Sdk" }
 $ndk = Get-ChildItem "$sdk\ndk" -Directory | Sort-Object Name | Select-Object -Last 1
 $tools = Get-ChildItem "$sdk\build-tools" -Directory | Sort-Object { [version]($_.Name -replace '-.*', '') } | Select-Object -Last 1
@@ -32,6 +36,45 @@ $java = if ($env:JAVA_HOME) { $env:JAVA_HOME } else { 'C:\Program Files\Android\
 if (-not $ndk -or -not $tools -or -not $platform) { throw "the Android SDK at $sdk needs an NDK, build-tools and a platform" }
 $env:JAVA_HOME = $java
 $env:PATH = "$java\bin;$env:PATH"
+
+# What the app's config says, for Android, from an rsui-tsx that runs here.
+if (-not $Tsx) {
+    $Tsx = @("$root\target\release\rsui-tsx.exe", "$root\target\debug\rsui-tsx.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $Tsx) {
+    Get-ChildItem env: | Where-Object Name -like 'CARGO_PROFILE_*' | ForEach-Object { Remove-Item "env:$($_.Name)" }
+    New-Item -ItemType Directory -Force "$root\target\android" | Out-Null
+    $p = Start-Process cargo -ArgumentList @('build', '-j', '2', '-p', 'rsui-tsx') -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput "$root\target\android\tsx.out" -RedirectStandardError "$root\target\android\tsx.err"
+    $null = $p.Handle
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { Get-Content "$root\target\android\tsx.err" -Tail 30; throw 'rsui-tsx didn''t build, for reading the config' }
+    $Tsx = "$root\target\debug\rsui-tsx.exe"
+}
+$said = & $Tsx config --platform android $appPath
+if ($LASTEXITCODE -ne 0) { throw "the app's rsui.config.ts isn't right (above)" }
+$config = ($said -join "`n") | ConvertFrom-Json
+if (-not $Package) { $Package = $config.id }
+if (-not $Label) { $Label = $config.name }
+# What's written into the manifest is XML.
+function ConvertTo-XmlText([string] $text) { [System.Security.SecurityElement]::Escape($text) }
+
+# A glob, as the config has them, as a regular expression on a path with `/` between its parts.
+function ConvertTo-Pattern([string] $glob) {
+    $glob = $glob -replace '^\./', ''
+    $out = '^'
+    for ($i = 0; $i -lt $glob.Length; $i++) {
+        $c = $glob[$i]
+        if ($c -eq '*' -and $i + 1 -lt $glob.Length -and $glob[$i + 1] -eq '*') {
+            $i++
+            if ($i + 1 -lt $glob.Length -and $glob[$i + 1] -eq '/') { $i++; $out += '(?:.*/)?' } else { $out += '.*' }
+        } elseif ($c -eq '*') { $out += '[^/]*' }
+        elseif ($c -eq '?') { $out += '[^/]' }
+        else { $out += [regex]::Escape([string]$c) }
+    }
+    $out + '$'
+}
+$excluded = @($config.files.exclude | ForEach-Object { ConvertTo-Pattern $_ })
 
 $work = "$root\target\android\$name"
 Remove-Item -Recurse -Force "$work\stage" -ErrorAction SilentlyContinue
@@ -82,6 +125,8 @@ $files = Get-ChildItem $appPath -Recurse -File | Where-Object {
 }
 $list = foreach ($file in $files) {
     $relative = $file.FullName.Substring($appPath.Length + 1)
+    $slashed = $relative -replace '\\', '/'
+    if ($excluded | Where-Object { $slashed -match $_ }) { continue }
     $to = "$work\stage\assets\$relative"
     New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
     Copy-Item $file.FullName $to
@@ -89,12 +134,31 @@ $list = foreach ($file in $files) {
 }
 [System.IO.File]::WriteAllLines("$work\stage\assets\rsui-assets.txt", [string[]]$list)
 
+# The launcher's icon, from the config's .png, as Android's own resource, which it scales for each screen.
+$resources = @()
+$iconAttribute = ''
+if ($config.icon) {
+    if ($config.icon -match '\.png$') {
+        Remove-Item -Recurse -Force "$work\res" -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force "$work\res\mipmap" | Out-Null
+        Copy-Item $config.icon "$work\res\mipmap\ic_launcher.png"
+        & "$($tools.FullName)\aapt2.exe" compile --dir "$work\res" -o "$work\res.zip"
+        if ($LASTEXITCODE -ne 0) { throw 'aapt2 couldn''t take the icon' }
+        $resources = @("$work\res.zip")
+        $iconAttribute = ' android:icon="@mipmap/ic_launcher"'
+    } else {
+        Write-Warning "the icon is $($config.icon); Android's launcher takes a .png, so the APK has none"
+    }
+}
+$orientation = @{ any = 'unspecified'; portrait = 'portrait'; landscape = 'landscape' }[$config.android.orientation]
+$permissions = ($config.android.permissions | ForEach-Object { "    <uses-permission android:name=`"$_`" />" }) -join "`n"
 $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="$Package" android:versionCode="1" android:versionName="0.1">
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
-    <application android:label="$Label" android:hasCode="true" android:extractNativeLibs="false">
-        <activity android:name="dev.rsui.RsuiActivity" android:exported="true" android:launchMode="singleTask"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="$Package" android:versionCode="$($config.android.versionCode)" android:versionName="$(ConvertTo-XmlText $config.version)">
+    <uses-sdk android:minSdkVersion="$($config.android.minSdk)" android:targetSdkVersion="$($config.android.targetSdk)" />
+$permissions
+    <application android:label="$(ConvertTo-XmlText $Label)"$iconAttribute android:hasCode="true" android:extractNativeLibs="false">
+        <activity android:name="dev.rsui.RsuiActivity" android:exported="true" android:launchMode="singleTask" android:screenOrientation="$orientation"
                   android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode|density|fontScale"
                   android:windowSoftInputMode="adjustResize" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
             <intent-filter>
@@ -108,15 +172,19 @@ $manifest = @"
 [System.IO.File]::WriteAllText("$work\AndroidManifest.xml", $manifest)
 
 $bin = $tools.FullName
-& "$bin\aapt2.exe" link -o "$work\base.apk" --manifest "$work\AndroidManifest.xml" -I "$($platform.FullName)\android.jar" -A "$work\stage\assets"
+& "$bin\aapt2.exe" link -o "$work\made.apk" --manifest "$work\AndroidManifest.xml" -I "$($platform.FullName)\android.jar" -A "$work\stage\assets" @resources
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 failed' }
 # The library goes in uncompressed, so Android can map it from the APK as it is; the activity's dex beside it.
+# A new zip of what aapt2 made, each entry as it was (resources.arsc has to stay uncompressed), and the two more: appending
+# to aapt2's own zip leaves headers zipalign won't take once there are resources.
 python -c @"
 import sys, zipfile
-with zipfile.ZipFile(sys.argv[1], 'a') as apk:
+with zipfile.ZipFile(sys.argv[1]) as made, zipfile.ZipFile(sys.argv[4], 'w') as apk:
+    for entry in made.infolist():
+        apk.writestr(entry.filename, made.read(entry), compress_type=entry.compress_type)
     apk.write(sys.argv[2], 'lib/arm64-v8a/librsui_app.so', compress_type=zipfile.ZIP_STORED)
     apk.write(sys.argv[3], 'classes.dex', compress_type=zipfile.ZIP_DEFLATED)
-"@ "$work\base.apk" "$work\stage\lib\arm64-v8a\librsui_app.so" "$work\classes.dex"
+"@ "$work\made.apk" "$work\stage\lib\arm64-v8a\librsui_app.so" "$work\classes.dex" "$work\base.apk"
 if ($LASTEXITCODE -ne 0) { throw 'adding the library failed' }
 & "$bin\zipalign.exe" -f -P 16 4 "$work\base.apk" "$work\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw 'zipalign failed' }
@@ -130,7 +198,7 @@ if (-not (Test-Path $keystore)) {
 if (-not $Out) { $Out = "$work\$name.apk" }
 & "$bin\apksigner.bat" sign --ks $keystore --ks-pass pass:android --key-pass pass:android --out $Out "$work\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
-"APK: $Out ($([math]::Round((Get-Item $Out).Length / 1MB, 2)) MB, library $([math]::Round((Get-Item "$work\stage\lib\arm64-v8a\librsui_app.so").Length / 1MB, 2)) MB)"
+"APK: $Out, $Package $($config.version) ($([math]::Round((Get-Item $Out).Length / 1MB, 2)) MB, library $([math]::Round((Get-Item "$work\stage\lib\arm64-v8a\librsui_app.so").Length / 1MB, 2)) MB)"
 
 if ($Install) {
     & "$sdk\platform-tools\adb.exe" install -r $Out
