@@ -70,7 +70,7 @@ use std::path::Path;
 
 pub use bulk::Keys;
 pub use census::{Census, CensusGroup};
-pub use codecache::CompiledCode;
+pub use codecache::{CompiledCode, use_code_cache_file, write_code_cache_file};
 pub use embed::{DataProperty, DataSurfaceError, HostFunction, Root};
 pub use keeping::KeptCounts;
 pub use reads::NO_READS;

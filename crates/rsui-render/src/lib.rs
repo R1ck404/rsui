@@ -48,6 +48,8 @@ mod svg_image;
 mod transform;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod vulkan;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use vulkan::set_pipeline_cache_file;
 
 pub use gpu::{RenderError, Renderer, WorkingSetLimit, give_back_memory, start_gpu_early};
 pub use images::{ImageUpload, Images, image_size, register_image, set_files_from};
@@ -55,7 +57,8 @@ pub use paint::{Color, Paint, has_hover, has_pressed};
 pub use scene::{
     Batch, ContentBox, Editing, EditingLines, Filter, Interaction, Layer, Overlay, OverlayBox, OverlayText, Ripple,
     Painter, PixelRect, Quad, RoundClip, SCROLL_BAR_REACH, Scene, byte_from_mask, byte_in_mask, content_box,
-    input_indent, input_value, password_mask, scroll_for_thumb, scroll_thumb, text_line_count,
+    fade_scrollbars, input_indent, input_value, password_mask, scroll_for_thumb, scroll_thumb, scrollbars_fade,
+    text_line_count,
 };
 pub use shape::{LineCap, natural_shape_size, shape_layer};
 pub use transform::{Matrix, apply_matrix, invert_matrix, parse_transform, transform_of};

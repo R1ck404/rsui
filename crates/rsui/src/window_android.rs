@@ -117,6 +117,7 @@ fn send(event: Event, wait: bool) {
 /// `AAssetManager`), the screen's scale and whether it's set to dark colors, and what shows or hides the soft keyboard.
 /// This is what the app's library calls when the activity's made.
 pub fn start(main: fn(), data: PathBuf, assets: *mut c_void, scale: f32, night: bool, keyboard: fn(bool)) {
+    let _ = STARTED.set(Instant::now());
     send_output_to_the_log();
     let mut ends = [0; 2];
     // SAFETY: room for two descriptors.
@@ -140,6 +141,30 @@ pub fn start(main: fn(), data: PathBuf, assets: *mut c_void, scale: f32, night: 
         keyboard,
     });
     let _ = std::thread::Builder::new().name("rsui app".into()).stack_size(8 * 1024 * 1024).spawn(main);
+}
+
+/// What's told the colors at the top and bottom edges of what's drawn, as ARGB (0 for none that's solid), when they change,
+/// for the status and navigation bars: see [`on_bar_colors`].
+static BAR_COLORS: std::sync::OnceLock<fn(u32, u32)> = std::sync::OnceLock::new();
+
+/// Has `tell` hear the colors at the top and bottom edges of what's drawn, as ARGB, or 0 where nothing there is solid, each
+/// time they change, so the system's bars beside them can be the same. Said once, before the app starts.
+pub fn on_bar_colors(tell: fn(u32, u32)) {
+    let _ = BAR_COLORS.set(tell);
+}
+
+/// Tells [`on_bar_colors`]'s hearer the edges' colors, if they're not what they were.
+fn tell_bar_colors(app: &mut App, told: &mut Option<(u32, u32)>) {
+    let Some(tell) = BAR_COLORS.get() else { return };
+    let argb = |color: Option<rsui_render::Color>| {
+        color.map_or(0, |color| u32::from_be_bytes([color.a, color.r, color.g, color.b]))
+    };
+    let (top, bottom) = app.edge_colors();
+    let now = (argb(top), argb(bottom));
+    if *told != Some(now) {
+        *told = Some(now);
+        tell(now.0, now.1);
+    }
 }
 
 /// The window's surface, acquired by the caller, which the app's thread releases once it's done with it; or none, which
@@ -194,8 +219,8 @@ pub fn data_folder() -> Option<PathBuf> {
 }
 
 /// Copies what's in the app's package under `assets/`, as `rsui-assets.txt` there lists it, a path a line, to `into`.
-/// What's there already, at the same size, is left.
-pub fn copy_assets(into: &std::path::Path) -> Result<usize, String> {
+/// Unless it's `every` one, what's there already, at the same size, is left.
+pub fn copy_assets(into: &std::path::Path, every: bool) -> Result<usize, String> {
     let manager = lock().as_ref().ok_or("the app hasn't started")?.assets as *mut c_void;
     let read = |name: &str| -> Option<Vec<u8>> {
         let name = std::ffi::CString::new(name).ok()?;
@@ -224,7 +249,7 @@ pub fn copy_assets(into: &std::path::Path) -> Result<usize, String> {
     for name in list.lines().map(str::trim).filter(|name| !name.is_empty() && !name.contains("..")) {
         let Some(bytes) = read(name) else { continue };
         let to = into.join(name);
-        if std::fs::metadata(&to).is_ok_and(|found| found.len() == bytes.len() as u64) {
+        if !every && std::fs::metadata(&to).is_ok_and(|found| found.len() == bytes.len() as u64) {
             continue;
         }
         if let Some(parent) = to.parent() {
@@ -384,6 +409,8 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
         .map(|glue| (glue.read, glue.write, glue.scale, glue.night, glue.keyboard))
         .ok_or_else(|| RunError::Window("the app hasn't started".to_owned()))?;
     let text = crate::default_text_engine()?;
+    // A phone's scrollbars show only while something scrolls.
+    rsui_render::fade_scrollbars(true);
     let mut app = App::new(render, props, text, (1, 1), scale);
     // What another thread has for the app, as what a popup was answered with, wakes the loop as what the activity says does.
     app.set_waker(move || {
@@ -398,6 +425,7 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
     let mut composing = String::new();
     let mut keyboard_up = false;
     let mut finger = Finger::default();
+    let mut bars_told = None;
     loop {
         let now = Instant::now();
         let deadline = [wake_at, blink_at].into_iter().flatten().min();
@@ -427,8 +455,10 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
                 Event::Surface(window) => {
                     shown = None;
                     if !window.is_null() {
+                        crate::mark("surface");
                         let size = window_size(window);
                         if let Some((renderer, gpu)) = renderer_for(window, size) {
+                            crate::mark("renderer made");
                             app.resize(size, scale);
                             app.renderer_replaced();
                             shown = Some(Shown { renderer, gpu, size, window: Held(window) });
@@ -444,6 +474,7 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
                     if let Some(now) = shown.as_mut() {
                         refit(&mut app, now, scale);
                         draw(&mut app, now);
+                        tell_bar_colors(&mut app, &mut bars_told);
                         needs_draw = false;
                     }
                     false
@@ -561,6 +592,7 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
             needs_draw = false;
             refit(&mut app, shown, scale);
             draw(&mut app, shown);
+            tell_bar_colors(&mut app, &mut bars_told);
         }
         wake_at = app.next_wake().map(|wait| Instant::now() + wait);
         if app.caret_blinking() && blink_at.is_none() {
@@ -762,6 +794,21 @@ fn refit(app: &mut App, shown: &mut Shown, scale: f32) {
 
 /// Draws a frame with the CPU, and copies it into the window's buffer.
 fn draw(app: &mut App, shown: &mut Shown) {
+    draw_now(app, shown);
+    // How long the app took to show, from the activity being made, which the log says once.
+    static TOLD: std::sync::Once = std::sync::Once::new();
+    if let Some(started) = STARTED.get() {
+        TOLD.call_once(|| {
+            crate::mark("first frame");
+            eprintln!("rsui: first frame {} ms after the activity was made", started.elapsed().as_millis());
+        });
+    }
+}
+
+/// When the activity was made, for how long the first frame took.
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn draw_now(app: &mut App, shown: &mut Shown) {
     if shown.gpu {
         if let Err(error) = app.render(&mut shown.renderer) {
             // The GPU's gone, or can't draw here: the CPU draws from now on, once Vulkan's let go of the window.

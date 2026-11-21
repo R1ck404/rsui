@@ -16,3 +16,4 @@ name = "rsui_app"
 [target.'cfg(target_os = "android")'.dependencies]
 rsui = { path = "../rsui" }
 rsui-tsx = { path = "../rsui-tsx" }
+rsui-js = { path = "../rsui-js" }

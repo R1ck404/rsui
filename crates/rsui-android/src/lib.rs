@@ -63,6 +63,7 @@ mod app {
         finish: usize,
         popup: usize,
         toast: usize,
+        bar_colors: usize,
     }
 
     static ACTIVITY: OnceLock<Activity> = OnceLock::new();
@@ -190,6 +191,22 @@ mod app {
         });
     }
 
+    /// The colors at the top and bottom edges of what's drawn, as ARGB, or 0, for the system's bars beside them.
+    fn bar_colors(top: u32, bottom: u32) {
+        with_env(|env, found| {
+            // SAFETY: the environment is this thread's, and the method takes two ints.
+            unsafe {
+                let arguments = [u64::from(top), u64::from(bottom)];
+                jni::<unsafe extern "C" fn(Env, Object, usize, *const u64)>(env, CALL_VOID_METHOD_A)(
+                    env,
+                    found.activity as Object,
+                    found.bar_colors,
+                    arguments.as_ptr(),
+                );
+            }
+        });
+    }
+
     fn show_toast(text: &str, long: bool) {
         with_env(|env, found| {
             // SAFETY: as in `show_popup`, for a string and a boolean.
@@ -252,8 +269,10 @@ mod app {
                 let finish = method(c"finish", c"()V");
                 let popup = method(c"popup", c"(ILjava/lang/String;Ljava/lang/String;)V");
                 let toast = method(c"toast", c"(Ljava/lang/String;Z)V");
+                let bars = method(c"barColors", c"(II)V");
                 jni::<unsafe extern "C" fn(Env, Object)>(env, DELETE_LOCAL_REF)(env, class);
-                let _ = ACTIVITY.set(Activity { vm: vm as usize, activity: kept as usize, show_keyboard, finish, popup, toast });
+                let _ = ACTIVITY.set(Activity { vm: vm as usize, activity: kept as usize, show_keyboard, finish, popup, toast, bar_colors: bars });
+                rsui::android::on_bar_colors(bar_colors);
                 rsui::popups::android::set_activity(rsui::popups::android::Activity { show: show_popup, toast: show_toast });
             }
             let manager = AAssetManager_fromJava(env, assets);
@@ -349,6 +368,16 @@ mod app {
         rsui::android::delete(before, after);
     }
 
+    /// Which package is installed, as the APK the app's library is loaded from (it's mapped from inside it), its size and
+    /// when it was written, which an update changes. None if it can't be told, which has everything made again each time.
+    fn installed_package() -> Option<String> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        let apk = maps.lines().filter_map(|line| line.split_whitespace().nth(5)).find(|path| path.ends_with("/base.apk"))?;
+        let found = std::fs::metadata(apk).ok()?;
+        let written = found.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        Some(format!("{apk} {} {written}", found.len()))
+    }
+
     /// The app's thread: the files out of the APK, then the app. Once it's done, so is the activity, and the process, so
     /// that an app started again starts from nothing.
     fn run() {
@@ -364,10 +393,46 @@ mod app {
             std::env::set_var("TMPDIR", &temp);
             std::env::set_var("HOME", &data);
         }
+        // An app on Android is started with no environment of its own, so what rsui's switches would be set to
+        // (RSUI_JIT, RSUI_STARTUP_TIMES, ...) can be written, a `NAME=value` a line, to `env` in its folder:
+        // `adb shell run-as <id> sh -c 'echo RSUI_JIT=eager > files/env'`, in a build that's debuggable.
+        if let Ok(said) = std::fs::read_to_string(data.join("env")) {
+            for line in said.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+                if let Some((name, value)) = line.split_once('=') {
+                    eprintln!("rsui: {name}={value}, from {}", data.join("env").display());
+                    // SAFETY: as above.
+                    unsafe { std::env::set_var(name.trim(), value.trim()) };
+                }
+            }
+        }
+        rsui::mark("android thread");
         let folder = data.join("app");
-        match rsui::android::copy_assets(&folder) {
-            Ok(copied) => eprintln!("rsui: {copied} files copied to {}", folder.display()),
-            Err(error) => eprintln!("rsui: the app's files couldn't be copied: {error}"),
+        // What was copied out of the package, and what the app's code compiled to, are good for as long as the package
+        // that's installed is the one they came from: an update copies every file again, and makes the cache again.
+        let installed = installed_package();
+        let installed_file = data.join("installed");
+        let cache = data.join("code.cache");
+        let same = installed.is_some() && std::fs::read_to_string(&installed_file).ok() == installed && folder.is_dir();
+        if !same {
+            let _ = std::fs::remove_file(&cache);
+            match rsui::android::copy_assets(&folder, true) {
+                Ok(copied) => {
+                    eprintln!("rsui: {copied} files copied to {}", folder.display());
+                    if let Some(installed) = &installed {
+                        let _ = std::fs::write(&installed_file, installed);
+                    }
+                }
+                Err(error) => eprintln!("rsui: the app's files couldn't be copied: {error}"),
+            }
+        }
+        rsui::mark("files ready");
+        // What the GPU's driver compiled rsui's shaders to, which it checks is its own.
+        rsui::render::set_pipeline_cache_file(data.join("pipelines.cache"));
+        let mut options = rsui_tsx::Options::default();
+        if same && cache.is_file() {
+            rsui_js::use_code_cache_file(&cache, &folder);
+        } else if installed.is_some() {
+            options.write_code_cache = Some((cache, folder.clone()));
         }
         let entry = ["app.tsx", "app.jsx", "app.ts", "app.js", "main.tsx"]
             .into_iter()
@@ -377,7 +442,7 @@ mod app {
             if let Err(error) = std::env::set_current_dir(&folder) {
                 eprintln!("rsui: {error}");
             }
-            if let Err(error) = rsui_tsx::run(&entry, rsui_tsx::Options::default()) {
+            if let Err(error) = rsui_tsx::run(&entry, options) {
                 eprintln!("rsui: {error:?}");
             }
         } else {

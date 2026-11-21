@@ -127,6 +127,23 @@ pub struct Interaction<'a> {
     pub overlay: Option<&'a Overlay>,
     /// A press spreading out from where it landed, as Material's ripple does, on what says it has one (`ripple`).
     pub ripple: Option<Ripple<'a>>,
+    /// Where scrollbars only show while something scrolls ([`fade_scrollbars`]), what's scrolling, and how much its
+    /// scrollbar shows, from 0 to 1.
+    pub scrolling: Option<(&'a Element, f32)>,
+}
+
+static FADING_SCROLLBARS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Has rsui's own thin scrollbars show only while what they're on scrolls, and fade once it's stopped, as a phone's do,
+/// rather than always. Those whose size or colors are said (CSS's `scrollbar-width` and `scrollbar-color`) and the classic
+/// ones with arrows show as they always do.
+pub fn fade_scrollbars(on: bool) {
+    FADING_SCROLLBARS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether scrollbars fade: see [`fade_scrollbars`].
+pub fn scrollbars_fade() -> bool {
+    FADING_SCROLLBARS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A press spreading out from where it landed, on an element whose `ripple` prop is its color: what it's on, where it landed in
@@ -4866,13 +4883,23 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
             return;
         }
         let radius = if said.is_some() { 0.0 } else { thickness / 2.0 };
+        // On a phone, rsui's own only shows while it's scrolling, and as much as it still does.
+        let shows = match self.interaction.scrolling {
+            _ if said.is_some() || !scrollbars_fade() => 1.0,
+            Some((scrolling, shows)) if std::ptr::eq(scrolling, element) => shows,
+            _ => 0.0,
+        };
+        if shows <= 0.0 {
+            self.pop_clip();
+            return;
+        }
         // It goes with the text, so that it shows up on whatever's behind that.
         let thumb = element
             .props
             .get("scrollbar_thumb")
             .and_then(Color::from_prop)
             .unwrap_or(Color {
-                a: SCROLL_THUMB_OPACITY,
+                a: (f32::from(SCROLL_THUMB_OPACITY) * shows).round() as u8,
                 ..self.around_color()
             });
         let track = element

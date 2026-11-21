@@ -424,6 +424,15 @@ impl Early {
     }
 }
 
+/// Where what the driver compiled rsui's shaders to is kept between runs: see [`set_pipeline_cache_file`].
+static PIPELINE_CACHE_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Keeps what the GPU's driver compiles rsui's shaders to in `file`, so that the next time a window's drawn with Vulkan they
+/// needn't be compiled again, which is most of the time a phone's GPU takes to start. Said once, before the first window.
+pub fn set_pipeline_cache_file(file: std::path::PathBuf) {
+    let _ = PIPELINE_CACHE_FILE.set(file);
+}
+
 /// Loads Vulkan and makes an instance with what drawing on `window` needs, and the validation layers if
 /// `RSUI_VULKAN_VALIDATE=1` asks for them and they're installed.
 fn make_instance(window: Option<Window>) -> Result<Early, RenderError> {
@@ -859,8 +868,32 @@ impl Vulkan {
             .render_pass(self.clearing)
             .subpass(0);
         let infos = [info.stages(&quad_stages), info.stages(&image_stages)];
+        // What the driver compiled the shaders to, kept from the last time, where there's a file for it: compiling them is
+        // most of the time a GPU takes to start on a phone (~50 ms of ~65 on an Adreno 740). The driver checks the file is
+        // its own, for this GPU and this version of itself, and compiles them again if it isn't.
+        let file = PIPELINE_CACHE_FILE.get();
+        let kept = file.and_then(|file| std::fs::read(file).ok()).unwrap_or_default();
+        // SAFETY: the description lives through the call; data that isn't the driver's is what it checks for.
+        let cache = unsafe { self.device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&kept), None) }
+            .unwrap_or(vk::PipelineCache::null());
         // SAFETY: the descriptions are complete and live through the call.
-        let made = unsafe { self.device.create_graphics_pipelines(vk::PipelineCache::null(), &infos, None) };
+        let made = unsafe { self.device.create_graphics_pipelines(cache, &infos, None) };
+        if cache != vk::PipelineCache::null() {
+            // SAFETY: the cache is this device's, and nothing else is using it.
+            unsafe {
+                if let (Some(file), Ok(data)) = (file, self.device.get_pipeline_cache_data(cache))
+                    && !data.is_empty()
+                    && data != kept
+                {
+                    let mut staged = file.as_os_str().to_owned();
+                    staged.push(".new");
+                    if std::fs::write(&staged, &data).is_ok() {
+                        let _ = std::fs::rename(&staged, file);
+                    }
+                }
+                self.device.destroy_pipeline_cache(cache, None);
+            }
+        }
         match made {
             Ok(pipelines) => Ok((pipelines[0], pipelines[1])),
             Err((pipelines, error)) => {

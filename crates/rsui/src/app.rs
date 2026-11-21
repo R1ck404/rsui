@@ -73,6 +73,10 @@ const REVEAL_MARGIN: f32 = 8.0;
 const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 /// How long a hover color takes to come and go.
 const HOVER_FADE: Duration = Duration::from_millis(100);
+/// Where scrollbars only show while something scrolls (a phone's: see `rsui_render::fade_scrollbars`), how long one stays
+/// after it last moved, and how long it takes to fade, as Android's own do.
+const SCROLLBAR_STAYS: Duration = Duration::from_millis(300);
+const SCROLLBAR_FADE: Duration = Duration::from_millis(250);
 /// How long scrolling takes to get where it's going.
 const SCROLL_GLIDE: Duration = Duration::from_millis(120);
 
@@ -564,6 +568,8 @@ pub struct App {
     animations: bool,
     /// When the pointer got to what it's on, while that's still fading in.
     hover_since: Option<Instant>,
+    /// Where scrollbars fade, what last scrolled and when, whose scrollbar shows until it's faded.
+    scrolled: Option<(Vec<u32>, Instant)>,
     hover_amount: f32,
     /// What the pointer's left, while that's still fading out: since when, and how much it started with.
     leaving: Option<(Vec<u32>, Instant, f32)>,
@@ -774,6 +780,7 @@ impl App {
             hovered: None,
             animations: false,
             hover_since: None,
+            scrolled: None,
             hover_amount: 1.0,
             leaving: None,
             leaving_amount: 0.0,
@@ -1140,6 +1147,7 @@ impl App {
     fn app_animating(&self) -> bool {
         self.runtime.moves_every_frame_in_view(|path, node| self.motion_might_show(path, node))
             || self.hover_since.is_some()
+            || self.scrolled.is_some()
             || self.leaving.is_some()
             || self.ripple.is_some()
             || self.glide.is_some()
@@ -1257,6 +1265,13 @@ impl App {
                 self.hover_since = None;
                 self.hover_amount = 1.0;
             }
+        }
+        if let Some((_, since)) = &self.scrolled {
+            if now.saturating_duration_since(*since) >= SCROLLBAR_STAYS + SCROLLBAR_FADE {
+                self.scrolled = None;
+            }
+            self.invalidate_automatic();
+            self.repaint = true;
         }
         if let Some(ripple) = &mut self.ripple {
             if !ripple.step(now) {
@@ -1558,6 +1573,25 @@ impl App {
         } else {
             Frame::Needed
         }
+    }
+
+    /// The colors at the middle of the top and bottom edges of what's drawn, as the nearest solid background under each has
+    /// them: what a phone's status and navigation bars beside the window are given, so the app goes on under them. None
+    /// where there's no solid one.
+    pub fn edge_colors(&mut self) -> (Option<rsui_render::Color>, Option<rsui_render::Color>) {
+        let (width, height) = (self.size.0 as f32, self.size.1 as f32);
+        let mut at = |y: f32| {
+            let path = self.path_at(width / 2.0, y)?;
+            let root = self.runtime.root();
+            (0..=path.len()).rev().find_map(|depth| {
+                let Some(PropValue::Int(color)) = find(root, &path[..depth])?.props.get("background") else {
+                    return None;
+                };
+                let [r, g, b, a] = u32::try_from(*color).ok()?.to_be_bytes();
+                (a == 255).then_some(rsui_render::Color { r, g, b, a })
+            })
+        };
+        (at(1.0), at(height - 1.0))
     }
 
     /// How big the window is, in physical pixels.
@@ -2091,6 +2125,11 @@ impl App {
                 .as_ref()
                 .and_then(|(path, scroll)| Some((at(path)?, *scroll))),
             pressed: self.pressed.as_ref().and_then(|press| at(&press.path)),
+            scrolling: self.scrolled.as_ref().and_then(|(path, since)| {
+                let gone = Instant::now().saturating_duration_since(*since).saturating_sub(SCROLLBAR_STAYS);
+                let shows = 1.0 - (gone.as_secs_f32() / SCROLLBAR_FADE.as_secs_f32()).min(1.0);
+                Some((at(path)?, shows))
+            }),
             ripple: self.ripple.as_ref().and_then(|ripple| {
                 Some(rsui_render::Ripple {
                     element: at(&ripple.path)?,
@@ -5049,6 +5088,10 @@ impl App {
             if node.actions.contains(ActionKind::Scroll)
                 && self.move_scroller(&path, step, sideways)?
             {
+                if rsui_render::scrollbars_fade() {
+                    self.scrolled = Some((path, Instant::now()));
+                    self.repaint = true;
+                }
                 return Ok(());
             }
             // What's underneath something on top doesn't scroll because of it.
@@ -5346,6 +5389,10 @@ impl App {
 
     /// on the thumb grabs it where it is. Anywhere else on the track brings the thumb there first.
     fn scrollbar_at(&mut self, x: f32, y: f32) -> Option<ScrollDrag> {
+        // A phone's scrollbars only show what's scrolling, and aren't taken hold of: a finger by the edge moves what's there.
+        if rsui_render::scrollbars_fade() {
+            return None;
+        }
         let mut path = self.path_at(x, y)?;
         let (x, y) = (x / self.scale, y / self.scale);
         loop {

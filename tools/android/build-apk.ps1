@@ -156,12 +156,15 @@ if ($config.icon) {
 }
 $orientation = @{ any = 'unspecified'; portrait = 'portrait'; landscape = 'landscape' }[$config.android.orientation]
 $permissions = ($config.android.permissions | ForEach-Object { "    <uses-permission android:name=`"$_`" />" }) -join "`n"
+# A build that isn't -Release can be looked into, as Gradle's debug builds can: `adb shell run-as <id>` reaches its folder,
+# where an `env` file sets rsui's switches (see rsui-android).
+$debuggable = if ($Release) { '' } else { ' android:debuggable="true"' }
 $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="$Package" android:versionCode="$($config.android.versionCode)" android:versionName="$(ConvertTo-XmlText $config.version)">
     <uses-sdk android:minSdkVersion="$($config.android.minSdk)" android:targetSdkVersion="$($config.android.targetSdk)" />
 $permissions
-    <application android:label="$(ConvertTo-XmlText $Label)"$iconAttribute android:hasCode="true" android:extractNativeLibs="false">
+    <application android:label="$(ConvertTo-XmlText $Label)"$iconAttribute android:hasCode="true" android:extractNativeLibs="false"$debuggable>
         <activity android:name="dev.rsui.RsuiActivity" android:exported="true" android:launchMode="singleTask" android:screenOrientation="$orientation"
                   android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode|density|fontScale"
                   android:windowSoftInputMode="adjustResize" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">

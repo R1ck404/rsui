@@ -95,6 +95,10 @@ pub struct Options {
     pub title: Option<String>,
     /// Swaps in changes to the app's files as they're saved, keeping its state.
     pub watch: bool,
+    /// Writes what the app's files and rsui's own compiled to as it started into this file, for its files inside this
+    /// folder, for `rsui_js::use_code_cache_file` to load the next time: an app on a phone, which isn't packed, makes its
+    /// own code cache this way the first time it starts. It's written on a thread of its own, once the app's loaded.
+    pub write_code_cache: Option<(PathBuf, PathBuf)>,
 }
 
 /// Why an app didn't run.
@@ -192,7 +196,19 @@ fn run_here(path: &Path, options: Options) -> Result<(), Error> {
         replay::begin().map_err(Error::Script)?;
     }
     rsui::mark("thread");
+    if options.write_code_cache.is_some() {
+        bridge::keep_compiled_code();
+    }
     let entry = load(path, STACK / 8 * 7).map_err(Error::Script)?;
+    if let Some((file, root)) = options.write_code_cache.clone()
+        && let Some(code) = bridge::take_compiled_code()
+    {
+        let _ = std::thread::Builder::new().name("rsui code cache".into()).spawn(move || {
+            if let Err(error) = rsui_js::write_code_cache_file(&code, &root, &file) {
+                eprintln!("rsui-tsx: the code cache couldn't be written to {}: {error}", file.display());
+            }
+        });
+    }
     if let Some(reading) = config_id {
         tell_app_id(reading, path);
     }

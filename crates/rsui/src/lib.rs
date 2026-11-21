@@ -93,8 +93,8 @@ mod window;
 #[cfg(target_os = "android")]
 pub mod android {
     pub use crate::window::{
-        commit, compose, configuration, copy_assets, data_folder, delete, destroy, finish_composing, focus, key, low_memory, redraw, shown,
-        start, surface, touch,
+        commit, compose, configuration, copy_assets, data_folder, delete, destroy, finish_composing, focus, key, low_memory, on_bar_colors,
+        redraw, shown, start, surface, touch,
     };
 }
 mod windows;

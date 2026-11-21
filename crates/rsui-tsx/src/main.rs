@@ -343,6 +343,7 @@ fn main() -> ExitCode {
             rsui_tsx::Options {
                 title: None,
                 watch: watch && !is_packed,
+                write_code_cache: None,
             },
         ),
     };

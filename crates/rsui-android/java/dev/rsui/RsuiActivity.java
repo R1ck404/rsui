@@ -10,9 +10,15 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorFilter;
 import android.graphics.Insets;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
@@ -94,6 +100,12 @@ public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
                 return insets;
             }
         });
+        holder.setBackground(bars);
+        if (Build.VERSION.SDK_INT >= 29) {
+            // The bars are the app's own colors, as they're given, without a scrim the system would put over them.
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
         setContentView(holder);
         barColors(getResources().getConfiguration());
         view.requestFocus();
@@ -105,21 +117,98 @@ public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
         return (configuration.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
     }
 
-    /** What's behind the system's bars, light or dark as the phone is, with their icons dark on light and light on dark. */
+    /** What's behind the status bar and the navigation bar: the colors at the top and bottom of what rsui draws. */
+    private final BarsBehind bars = new BarsBehind();
+    /** Those colors, as rsui last said them, as ARGB, or 0 where what it draws there isn't one solid color. */
+    private int appTop, appBottom;
+
+    /**
+     * Called by the app's thread when the colors at the top and bottom edges of what's drawn change, so the bars beside them
+     * are the same, and the app goes on under them, as a phone's own apps do.
+     */
+    public void barColors(final int top, final int bottom) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                appTop = top;
+                appBottom = bottom;
+                barColors(getResources().getConfiguration());
+            }
+        });
+    }
+
+    /**
+     * Has the bars the app's colors, or where it has none, light or dark as the phone is, with their icons dark on a light
+     * color and light on a dark one.
+     */
     private void barColors(Configuration configuration) {
         boolean night = isNight(configuration);
+        int otherwise = night ? Color.BLACK : Color.WHITE;
+        int top = appTop != 0 ? appTop : otherwise;
+        int bottom = appBottom != 0 ? appBottom : otherwise;
+        bars.set(top, bottom);
         Window window = getWindow();
-        window.setBackgroundDrawable(new ColorDrawable(night ? Color.BLACK : Color.WHITE));
+        window.setBackgroundDrawable(new ColorDrawable(otherwise));
+        boolean lightTop = isLight(top);
+        boolean lightBottom = isLight(bottom);
         if (Build.VERSION.SDK_INT >= 30) {
-            int light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
-            WindowInsetsController bars = window.getInsetsController();
-            if (bars != null) {
-                bars.setSystemBarsAppearance(night ? 0 : light, light);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                int wanted = (lightTop ? WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS : 0)
+                        | (lightBottom ? WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS : 0);
+                controller.setSystemBarsAppearance(wanted,
+                        WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
             }
         } else {
             View decor = window.getDecorView();
-            int light = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
-            decor.setSystemUiVisibility(night ? decor.getSystemUiVisibility() & ~light : decor.getSystemUiVisibility() | light);
+            int flags = decor.getSystemUiVisibility() & ~(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+            flags |= (lightTop ? View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR : 0) | (lightBottom ? View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR : 0);
+            decor.setSystemUiVisibility(flags);
+        }
+    }
+
+    /** Whether a color is light enough that dark icons show on it better than light ones. */
+    private static boolean isLight(int color) {
+        double luminance = (0.2126 * Color.red(color) + 0.7152 * Color.green(color) + 0.0722 * Color.blue(color)) / 255.0;
+        return luminance > 0.6;
+    }
+
+    /**
+     * Paints the strip under the status bar in the top color, and everything else in the bottom one: the navigation bar, and
+     * the keyboard's room while it comes and goes. Where rsui's surface is, it's what shows.
+     */
+    final class BarsBehind extends Drawable {
+        private final Paint paint = new Paint();
+        private int top = Color.BLACK, bottom = Color.BLACK;
+
+        void set(int top, int bottom) {
+            if (top != this.top || bottom != this.bottom) {
+                this.top = top;
+                this.bottom = bottom;
+                invalidateSelf();
+            }
+        }
+
+        @Override
+        public void draw(Canvas canvas) {
+            Rect bounds = getBounds();
+            View holder = view == null ? null : (View) view.getParent();
+            int strip = holder == null ? 0 : holder.getPaddingTop();
+            paint.setColor(bottom);
+            canvas.drawRect(bounds, paint);
+            paint.setColor(top);
+            canvas.drawRect(bounds.left, bounds.top, bounds.right, bounds.top + strip, paint);
+        }
+
+        @Override
+        public void setAlpha(int alpha) {}
+
+        @Override
+        public void setColorFilter(ColorFilter filter) {}
+
+        @Override
+        public int getOpacity() {
+            return PixelFormat.OPAQUE;
         }
     }
 
