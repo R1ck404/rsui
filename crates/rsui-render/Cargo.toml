@@ -35,6 +35,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Vulkan, loaded from the system when the first window is drawn, so nothing is linked at build time.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+
 [dev-dependencies]
 proptest = "1"
 

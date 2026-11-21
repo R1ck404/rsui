@@ -10,8 +10,13 @@
 //! Most of a frame is rectangles of one color and glyphs that line up with whole pixels, and those don't go through the
 //! whole of the shader's arithmetic. Everything is drawn every frame that's different from the last, and nothing at all
 //! for one that's the same.
+//!
+//! On Linux and Android, a renderer made for a window draws with Vulkan instead (`vulkan.rs`), through this same
+//! interface, and only what tells one frame from the next is kept here.
 
 use std::collections::HashMap;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::ffi::c_void;
 use std::fmt;
 
 use rsui_text::Upload;
@@ -107,6 +112,9 @@ pub struct Renderer {
     see_through: bool,
     #[cfg(feature = "retained-frame")]
     frame_token: u64,
+    /// What draws instead, on a GPU, for a window.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    vulkan: Option<crate::vulkan::Vulkan>,
 }
 
 impl Renderer {
@@ -114,9 +122,16 @@ impl Renderer {
     /// the same pixels on each, which is what tests need.
     pub fn offscreen(size: (u32, u32)) -> Result<Self, RenderError> {
         let size = (size.0.max(1), size.1.max(1));
-        Ok(Self {
+        let mut renderer = Self::empty(size);
+        renderer.pixels = vec![[0; 4]; size.0 as usize * size.1 as usize];
+        Ok(renderer)
+    }
+
+    /// A renderer with nothing drawn on yet.
+    fn empty(size: (u32, u32)) -> Self {
+        Self {
             size,
-            pixels: vec![[0; 4]; size.0 as usize * size.1 as usize],
+            pixels: Vec::new(),
             atlas: Vec::new(),
             atlas_size: 0,
             images: HashMap::new(),
@@ -130,7 +145,71 @@ impl Renderer {
             see_through: false,
             #[cfg(feature = "retained-frame")]
             frame_token: 0,
-        })
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            vulkan: None,
+        }
+    }
+
+    /// Draws to a Wayland surface with Vulkan. This fails when there's no Vulkan, no GPU that can draw on the surface, or
+    /// only a GPU that's really the CPU, which is slower than [`offscreen`](Self::offscreen) drawing by itself; then the
+    /// caller draws with that instead. `RSUI_VULKAN=1` takes a software GPU anyway, and `RSUI_VULKAN=0` never tries.
+    ///
+    /// The caller asks for the surface's frame callbacks, as Wayland has it, and what's drawn can't be read back with
+    /// [`read_pixels`](Self::read_pixels).
+    ///
+    /// # Safety
+    ///
+    /// `display` is a libwayland `wl_display` and `surface` a `wl_surface` of it, and both outlive the renderer.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn for_wayland(display: *mut c_void, surface: *mut c_void, size: (u32, u32)) -> Result<Self, RenderError> {
+        Self::for_window(crate::vulkan::Window::Wayland { display, surface }, size)
+    }
+
+    /// Draws to an Android window (`ANativeWindow`) with Vulkan, as [`for_wayland`](Self::for_wayland) does.
+    ///
+    /// # Safety
+    ///
+    /// `window` is an `ANativeWindow` that outlives the renderer.
+    #[cfg(target_os = "android")]
+    pub unsafe fn for_android(window: *mut c_void, size: (u32, u32)) -> Result<Self, RenderError> {
+        Self::for_window(crate::vulkan::Window::Android { window }, size)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn for_window(window: crate::vulkan::Window, size: (u32, u32)) -> Result<Self, RenderError> {
+        let wanted = std::env::var("RSUI_VULKAN").unwrap_or_default();
+        if wanted == "0" {
+            return Err(RenderError::Graphics("RSUI_VULKAN=0 says not to use Vulkan".to_owned()));
+        }
+        let size = (size.0.max(1), size.1.max(1));
+        let vulkan = crate::vulkan::Vulkan::new(Some(window), size, wanted == "1")?;
+        Ok(Self { vulkan: Some(vulkan), ..Self::empty(size) })
+    }
+
+    /// Draws to memory with Vulkan, on whatever GPU there is, software ones included, for checking what Vulkan draws
+    /// against what [`offscreen`](Self::offscreen) does.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[doc(hidden)]
+    pub fn offscreen_vulkan(size: (u32, u32)) -> Result<Self, RenderError> {
+        let size = (size.0.max(1), size.1.max(1));
+        let vulkan = crate::vulkan::Vulkan::new(None, size, true)?;
+        Ok(Self { vulkan: Some(vulkan), ..Self::empty(size) })
+    }
+
+    /// How many errors Vulkan's validation layers (`RSUI_VULKAN_VALIDATE=1`) have reported in this process.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[doc(hidden)]
+    pub fn vulkan_validation_errors() -> u32 {
+        crate::vulkan::validation_errors()
+    }
+
+    /// Whether this draws on a window itself, with the GPU, rather than into memory for the caller to show.
+    pub fn draws_to_window(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &self.vulkan {
+            return vulkan.draws_to_window();
+        }
+        false
     }
 
     /// The same as [`offscreen`](Self::offscreen): there's no other hardware to draw on here.
@@ -149,9 +228,14 @@ impl Renderer {
         self.see_through
     }
 
-    /// Memory has alpha anyway, so this only remembers it.
+    /// Memory has alpha anyway, so this only remembers it. A window drawn with Vulkan is seen through from its next frame.
     pub fn set_see_through(&mut self, on: bool) -> Result<(), RenderError> {
         self.see_through = on;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &mut self.vulkan {
+            vulkan.set_see_through(on);
+            self.known = false;
+        }
         Ok(())
     }
 
@@ -167,6 +251,17 @@ impl Renderer {
 
     /// Shows what's been drawn, which in memory is nothing to do.
     pub fn present(&mut self) -> Result<(), RenderError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &mut self.vulkan {
+            let shown = vulkan.present();
+            if shown.is_err() {
+                self.known = false;
+            }
+            // A window that had nothing to draw on showed nothing, which the caller mustn't wait to see.
+            if !shown? && vulkan.draws_to_window() {
+                self.nothing_to_show = true;
+            }
+        }
         Ok(())
     }
 
@@ -212,11 +307,53 @@ impl Renderer {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             self.frame_token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.vulkan.is_some() {
+            return self.draw_with_vulkan(scene, clear, false);
+        }
         self.prepare_atlas(scene.atlas_size);
         self.upload_glyphs(&scene.uploads);
         scene.uploads.clear();
         let images_changed = self.upload_images(scene);
-        let same = self.known
+        let same = self.same_as_last(scene, clear, images_changed);
+        self.text_look = scene.text_look;
+        self.nothing_to_show = same;
+        if !same {
+            self.draw_all(scene, clear);
+        }
+        self.keep_for_next_frame(scene, clear);
+        Ok(())
+    }
+
+    /// [`draw`](Self::draw), with Vulkan, on the window or, if `to_memory` says so, into memory.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn draw_with_vulkan(&mut self, scene: &mut Scene, clear: Color, to_memory: bool) -> Result<(), RenderError> {
+        let vulkan = self.vulkan.as_mut().expect("drawing with Vulkan");
+        let images_changed = vulkan.take_uploads(scene, &self.last.batches);
+        if vulkan.needs_whole_frame() || to_memory {
+            self.known = false;
+        }
+        let same = self.same_as_last(scene, clear, images_changed);
+        self.text_look = scene.text_look;
+        self.nothing_to_show = same;
+        if !same {
+            let vulkan = self.vulkan.as_mut().expect("drawing with Vulkan");
+            if let Err(error) = vulkan.draw(scene, clear, self.text_look, to_memory) {
+                self.known = false;
+                return Err(error);
+            }
+        }
+        self.keep_for_next_frame(scene, clear);
+        // What's in memory isn't what's on the window, so the window's next frame is drawn whatever it is.
+        if to_memory && self.draws_to_window() {
+            self.known = false;
+        }
+        Ok(())
+    }
+
+    /// Whether a scene is the same as the last frame, so there's nothing to draw.
+    fn same_as_last(&self, scene: &Scene, clear: Color, images_changed: bool) -> bool {
+        self.known
             && !self.always_redraw
             && !images_changed
             && self.last.clear == Some(clear)
@@ -227,14 +364,7 @@ impl Renderer {
             && self.last.transforms == scene.transforms
             && self.last.filters == scene.filters
             && self.last.round_clips == scene.round_clips
-            && self.last.layers == scene.layers;
-        self.text_look = scene.text_look;
-        self.nothing_to_show = same;
-        if !same {
-            self.draw_all(scene, clear);
-        }
-        self.keep_for_next_frame(scene, clear);
-        Ok(())
+            && self.last.layers == scene.layers
     }
 
     fn keep_for_next_frame(&mut self, scene: &mut Scene, clear: Color) {
@@ -347,6 +477,15 @@ impl Renderer {
     /// Draws a scene, and returns the pixels, as blue, green, red and how opaque each is, in rows from the top, with
     /// colors multiplied by that. This is for keeping the picture some other way.
     pub fn draw_to_memory(&mut self, scene: &mut Scene, clear: Color) -> Result<Vec<u8>, RenderError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.vulkan.is_some() {
+            self.draw_with_vulkan(scene, clear, true)?;
+            let mut out = self.vulkan.as_ref().expect("drawing with Vulkan").read_pixels()?;
+            for pixel in out.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            return Ok(out);
+        }
         self.known = false;
         self.draw(scene, clear)?;
         let mut out = Vec::with_capacity(self.pixels.len() * 4);
@@ -358,6 +497,12 @@ impl Renderer {
 
     /// Gives back most of what this holds, for when it isn't showing.
     pub fn hide(&mut self) -> Result<(), RenderError> {
+        // A window drawn with Vulkan keeps its swapchain, which is what the compositor shows; the rest is let go of.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.vulkan.is_some() {
+            self.trim();
+            return Ok(());
+        }
         self.resize((1, 1))?;
         self.trim();
         Ok(())
@@ -375,6 +520,12 @@ impl Renderer {
             return Ok(());
         }
         self.size = size;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &mut self.vulkan {
+            vulkan.resize(size);
+            self.known = false;
+            return Ok(());
+        }
         self.pixels = vec![[0; 4]; size.0 as usize * size.1 as usize];
         self.layer = Vec::new();
         self.layer_size = (0, 0);
@@ -391,8 +542,14 @@ impl Renderer {
     /// Lets go of images that are gone.
     pub fn release_images(&mut self, dropped: &mut Vec<u32>) {
         for id in dropped.drain(..) {
-            if self.images.remove(&id).is_some() && self.last.batches.iter().any(|batch| batch.image == id && batch.count != 0)
-            {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let had = match &mut self.vulkan {
+                Some(vulkan) => vulkan.drop_picture(id),
+                None => self.images.remove(&id).is_some(),
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let had = self.images.remove(&id).is_some();
+            if had && self.last.batches.iter().any(|batch| batch.image == id && batch.count != 0) {
                 self.known = false;
             }
         }
@@ -400,6 +557,10 @@ impl Renderer {
 
     /// Lets go of what the last frame was, and the layer, which are made again when they're next needed.
     pub fn trim_storage(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &mut self.vulkan {
+            vulkan.trim();
+        }
         self.layer = Vec::new();
         self.layer_size = (0, 0);
         self.last = Last::default();
@@ -408,6 +569,10 @@ impl Renderer {
 
     /// The pixels drawn so far, as red, green, blue and alpha for each, in rows from the top.
     pub fn read_pixels(&self) -> Result<Vec<u8>, RenderError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &self.vulkan {
+            return vulkan.read_pixels();
+        }
         Ok(self.pixels.iter().flatten().copied().collect())
     }
 
