@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn QueryPerformanceCounter(count: *mut i64) -> i32;
@@ -50,7 +51,17 @@ impl Drop for Span {
     }
 }
 
+/// The time now, in nanoseconds of the monotonic clock, which every process on the machine shares too.
+#[cfg(unix)]
+pub(crate) fn now() -> i64 {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `now` is a valid place for the time.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    now.tv_sec as i64 * 1_000_000_000 + now.tv_nsec as i64
+}
+
 /// The time now, in performance counter ticks.
+#[cfg(windows)]
 pub(crate) fn now() -> i64 {
     let mut ticks = 0;
     // SAFETY: `ticks` is a valid place for the count, and this can't fail on Windows XP and later.

@@ -51,7 +51,29 @@ pub(crate) fn now() -> ProcessMemory {
     }
 }
 
-#[cfg(not(windows))]
+/// The same, from what Linux and Android say in `/proc/self/status`: the resident set for the working set, and the part
+/// of it that isn't a file's, which no other process shares, for what's this process's own.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn now() -> ProcessMemory {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
+            .map_or(0, |kb| kb * 1024)
+    };
+    let own = field("RssAnon:");
+    ProcessMemory {
+        working_set: field("VmRSS:"),
+        peak_working_set: field("VmHWM:"),
+        private_working_set: own,
+        private: own,
+        peak_private: field("VmHWM:"),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 pub(crate) fn now() -> ProcessMemory {
     ProcessMemory::default()
 }
