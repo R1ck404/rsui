@@ -34,14 +34,17 @@ fn room_left() -> Option<usize> {
     (low != 0 && here > low).then(|| here - low)
 }
 
+/// Elsewhere the stack's bounds are asked for once a thread, and a new stack is one of rsui-os's.
 #[cfg(not(windows))]
+#[inline]
 fn room_left() -> Option<usize> {
-    None
+    rsui_os::stack::room_left()
 }
 
 #[cfg(not(windows))]
+#[inline(never)]
 fn on_new_stack<R>(run: impl FnOnce() -> R) -> R {
-    run()
+    rsui_os::stack::on_new_stack(SIZE, run)
 }
 
 /// Runs `run` on a fiber of its own, which is a stack of its own on this same thread, and comes back to this one when it's

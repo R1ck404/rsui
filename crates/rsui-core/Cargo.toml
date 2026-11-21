@@ -17,6 +17,9 @@ serde_json = "1"
 thin-vec = { version = "0.2.21", features = ["serde"] }
 triomphe = "0.1.17"
 
+[target.'cfg(not(windows))'.dependencies]
+rsui-os = { path = "../rsui-os" }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1"

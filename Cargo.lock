@@ -604,6 +604,9 @@ dependencies = [
 [[package]]
 name = "rsui-alloc"
 version = "0.1.0"
+dependencies = [
+ "rsui-os",
+]
 
 [[package]]
 name = "rsui-core"
@@ -614,6 +617,7 @@ dependencies = [
  "foldhash",
  "itoa",
  "proptest",
+ "rsui-os",
  "serde",
  "serde_json",
  "thin-vec",
@@ -642,7 +646,9 @@ name = "rsui-js"
 version = "0.1.0"
 dependencies = [
  "foldhash",
+ "libc",
  "rsui-alloc",
+ "rsui-os",
  "rsui-spans",
 ]
 
@@ -658,6 +664,13 @@ dependencies = [
  "rsui-runtime",
  "thin-vec",
  "triomphe",
+]
+
+[[package]]
+name = "rsui-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -702,6 +715,7 @@ dependencies = [
  "rsui-core",
  "rsui-image",
  "rsui-layout",
+ "rsui-os",
  "rsui-spans",
 ]
 
@@ -710,6 +724,7 @@ name = "rsui-tsx"
 version = "0.1.0"
 dependencies = [
  "foldhash",
+ "libc",
  "rsui",
  "rsui-agent",
  "rsui-headless",

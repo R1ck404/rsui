@@ -100,7 +100,20 @@ mod backing {
         }
     }
 }
-#[cfg(not(windows))]
+/// Elsewhere each chunk is a mapping of its own, as on Windows. The C library's `malloc` would serve an aligned 64 KiB
+/// from its heap, wasting up to as much again in padding, and what's freed there seldom goes back to the system.
+#[cfg(unix)]
+mod backing {
+    use super::CHUNK_SIZE;
+    pub unsafe fn alloc() -> *mut u8 {
+        rsui_os::vm::alloc_aligned(CHUNK_SIZE, CHUNK_SIZE).unwrap_or(std::ptr::null_mut())
+    }
+    pub unsafe fn free(p: *mut u8) {
+        // SAFETY: caller owns the detached chunk, which `alloc` mapped.
+        unsafe { rsui_os::vm::release_aligned(p, CHUNK_SIZE) }
+    }
+}
+#[cfg(not(any(windows, unix)))]
 mod backing {
     use super::*;
     const LAYOUT: Layout = match Layout::from_size_align(CHUNK_SIZE, CHUNK_SIZE) {

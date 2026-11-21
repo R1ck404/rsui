@@ -9,6 +9,7 @@ members = [
     "crates/rsui-image",
     "crates/rsui-js",
     "crates/rsui-layout",
+    "crates/rsui-os",
     "crates/rsui-render",
     "crates/rsui-runtime",
     "crates/rsui-spans",
