@@ -2,12 +2,17 @@
 //!
 //! Run with `cargo run -p rsui-render --example compile_shaders`.
 
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
+#[cfg(windows)]
 use windows::core::{PCSTR, s};
 
+#[cfg(windows)]
 const SOURCE: &str = include_str!("../src/quad.hlsl");
 
+#[cfg(windows)]
 fn compile(entry: PCSTR, target: PCSTR) -> Vec<u8> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -43,6 +48,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> Vec<u8> {
     }
 }
 
+#[cfg(windows)]
 fn main() {
     let folder = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
     let vertex = compile(s!("vs"), s!("vs_4_0"));
@@ -54,4 +60,10 @@ fn main() {
     println!("vertex shader: {} bytes", vertex.len());
     println!("pixel shader: {} bytes", pixel.len());
     println!("image shader: {} bytes", image.len());
+}
+
+/// The shaders are compiled with Windows' own compiler, so this only does anything there.
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("compile_shaders runs on Windows, which has the shader compiler");
 }

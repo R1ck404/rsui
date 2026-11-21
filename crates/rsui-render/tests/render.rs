@@ -791,6 +791,7 @@ fn trimming_does_not_stop_drawing() {
 
 /// The program ships compiled shaders, which must match their source.
 #[test]
+#[cfg(windows)]
 fn the_compiled_shaders_match_their_source() {
     use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
     use windows::Win32::Graphics::Direct3D::ID3DBlob;

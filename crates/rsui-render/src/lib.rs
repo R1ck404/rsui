@@ -26,8 +26,18 @@
 #[cfg(feature = "render-diagnostics")]
 pub mod diagnostics;
 
+mod area;
 pub mod canvas;
+#[cfg(windows)]
 mod dwrite;
+#[cfg(not(windows))]
+#[path = "own_glyphs.rs"]
+mod dwrite;
+#[cfg(windows)]
+mod gpu;
+// Elsewhere, until each system has a GPU renderer of its own, scenes are drawn with the CPU, through the same interface.
+#[cfg(not(windows))]
+#[path = "cpu.rs"]
 mod gpu;
 mod gradient;
 mod images;
