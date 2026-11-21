@@ -73,11 +73,22 @@ mod widgets;
 mod shell_layer;
 #[cfg(windows)]
 mod window;
-// The window system of each other system comes in here as it's written: Wayland and X11 on Linux, AppKit on macOS, and
-// an activity of its own on Android. Until then, what runs headless works, and opening a window says it can't.
-#[cfg(not(windows))]
+// Android's window is the activity's (see `rsui::android`).
+#[cfg(target_os = "android")]
+#[path = "window_android.rs"]
+mod window;
+// The window system of each other system comes in here as it's written: Wayland and X11 on Linux and AppKit on macOS.
+// Until then, what runs headless works, and opening a window says it can't.
+#[cfg(not(any(windows, target_os = "android")))]
 #[path = "window_none.rs"]
 mod window;
+
+/// What an app's library on Android uses: setting up the activity Android made, from `ANativeActivity_onCreate`, and the
+/// app's own folder and files.
+#[cfg(target_os = "android")]
+pub mod android {
+    pub use crate::window::{ANativeActivity, copy_assets, data_folder, finish, on_create, show_keyboard};
+}
 mod windows;
 
 pub use app::{

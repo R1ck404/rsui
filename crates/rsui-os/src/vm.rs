@@ -376,7 +376,27 @@ mod tests {
         unsafe {
             assert!(commit(at, size));
             std::ptr::write_bytes(at, 0xab, size);
-            // Not on a page boundary at either end, as the callers' 4 KB steps can be on bigger pages.
+            decommit(at.add(65536), 3 * 65536);
+            assert!(commit(at, size));
+            let all = std::slice::from_raw_parts(at, size);
+            assert!(all[..65536].iter().all(|&b| b == 0xab));
+            assert!(all[65536..4 * 65536].iter().all(|&b| b == 0));
+            assert!(all[4 * 65536..].iter().all(|&b| b == 0xab));
+            release(at, size);
+        }
+    }
+
+    /// What's given back can start and end partway through a page, as the callers' 4 KB steps can on bigger pages. Only
+    /// that range reads as zeros after. Windows always gives back whole pages, so this is for the others.
+    #[test]
+    #[cfg(unix)]
+    fn part_of_a_page_given_back_reads_as_zeros_and_the_rest_stays() {
+        let size = 1 << 20;
+        let at = reserve(size).expect("addresses");
+        // SAFETY: inside the reservation, which nothing else uses.
+        unsafe {
+            assert!(commit(at, size));
+            std::ptr::write_bytes(at, 0xab, size);
             decommit(at.add(4096 + 100), 3 * 65536);
             assert!(commit(at, size));
             let all = std::slice::from_raw_parts(at, size);

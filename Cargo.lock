@@ -577,6 +577,7 @@ name = "rsui"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "proptest",
  "rsui-alloc",
  "rsui-core",
@@ -606,6 +607,14 @@ name = "rsui-alloc"
 version = "0.1.0"
 dependencies = [
  "rsui-os",
+]
+
+[[package]]
+name = "rsui-android"
+version = "0.1.0"
+dependencies = [
+ "rsui",
+ "rsui-tsx",
 ]
 
 [[package]]

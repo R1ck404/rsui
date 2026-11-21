@@ -4,6 +4,7 @@ members = [
     "crates/rsui",
     "crates/rsui-agent",
     "crates/rsui-alloc",
+    "crates/rsui-android",
     "crates/rsui-core",
     "crates/rsui-headless",
     "crates/rsui-image",

@@ -294,21 +294,15 @@ fn stop_wanting_a_console(file: &mut std::fs::File) -> std::io::Result<()> {
     file.write_all(&WINDOWS_GUI.to_le_bytes())
 }
 
-/// A program elsewhere has no icon of its own: the desktop file that starts it says what its icon is.
+/// A program elsewhere has no icon of its own: the desktop file that starts it says what its icon is. The icon's still
+/// checked, so a bad one is said to be bad on every system.
 #[cfg(not(windows))]
 fn set_icon(_program: &Path, icon: &[u8]) -> Result<(), String> {
-    if icon.get(..4) != Some(&[0, 0, 1, 0]) {
-        return Err("that isn't an .ico file".to_owned());
-    }
-    Ok(())
+    read_icon(icon).map(|_| ())
 }
 
-/// Gives a program an icon, from the bytes of a `.ico` file. In a program, each picture in one is a
-/// resource of its own, and the list of them is another with a slightly different form.
-#[cfg(windows)]
-fn set_icon(program: &Path, icon: &[u8]) -> Result<(), String> {
-    const ICON: usize = 3;
-    const ICON_GROUP: usize = 14;
+/// The pictures in a `.ico` file, and the list of them as a program's resources have it.
+fn read_icon(icon: &[u8]) -> Result<(Vec<u8>, Vec<&[u8]>), String> {
     let bad = || "that isn't an .ico file".to_owned();
     let (Some(&[0, 0, 1, 0]), Some(&[low, high])) = (
         icon.get(..4)
@@ -331,6 +325,16 @@ fn set_icon(program: &Path, icon: &[u8]) -> Result<(), String> {
         group.extend_from_slice(&entry[..12]);
         group.extend_from_slice(&((index + 1) as u16).to_le_bytes());
     }
+    Ok((group, pictures))
+}
+
+/// Gives a program an icon, from the bytes of a `.ico` file. In a program, each picture in one is a
+/// resource of its own, and the list of them is another with a slightly different form.
+#[cfg(windows)]
+fn set_icon(program: &Path, icon: &[u8]) -> Result<(), String> {
+    const ICON: usize = 3;
+    const ICON_GROUP: usize = 14;
+    let (group, pictures) = read_icon(icon)?;
     let path = wide(program);
     // SAFETY: the path ends in a terminator. A kind and a name can be a small number, in place of a pointer,
     // and the data lasts until the update has ended, which is what it's copied by.
@@ -496,6 +500,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn a_package_is_the_folder_after_the_last_node_modules() {
         let of = |path: &str| package_folder(Path::new(path));
         assert_eq!(
@@ -569,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn the_folder_around_files_is_the_nearest_one() {
         let files = [
             PathBuf::from(r"C:\a\b\c\one.tsx"),
