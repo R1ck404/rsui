@@ -28,14 +28,18 @@ mod material;
 pub enum Theme {
     /// Material 3, Android's.
     Material,
-    /// Fluent, Windows 11's.
+    /// Fluent, Windows 11's, which an Android build doesn't have.
+    #[cfg(not(target_os = "android"))]
     Fluent,
 }
 
 impl Theme {
     /// What `system` means here.
     pub fn of_system() -> Self {
-        if cfg!(target_os = "android") { Self::Material } else { Self::Fluent }
+        #[cfg(target_os = "android")]
+        return Self::Material;
+        #[cfg(not(target_os = "android"))]
+        Self::Fluent
     }
 
     /// The look a config's `theme` names: `system`, `material`, `fluent` or `mac`. One that isn't built in here, as Fluent on
@@ -53,6 +57,7 @@ impl Theme {
     pub fn name(self) -> &'static str {
         match self {
             Self::Material => "material",
+            #[cfg(not(target_os = "android"))]
             Self::Fluent => "fluent",
         }
     }
@@ -315,7 +320,7 @@ pub fn restyle(control: Control, variant: Option<&str>, entries: &mut Vec<(Symbo
 fn state_key(native: &NativeControl, part: u32) -> u32 {
     (native.control as u32) << 24
         | u32::from(native.variant) << 18
-        | u32::from(native.theme == Theme::Fluent) << 17
+        | u32::from(native.theme != Theme::Material) << 17
         | u32::from(native.disabled) << 16
         | u32::from(native.checked) << 15
         | u32::from(native.dark) << 14
@@ -428,7 +433,8 @@ impl Out<'_> {
     }
 }
 
-/// A color as `#AARRGGBB` is written, as Fluent's and Android's tokens are.
+/// A color as `#AARRGGBB` is written, as Fluent's tokens are.
+#[cfg(not(target_os = "android"))]
 pub(crate) const fn argb(value: u32) -> Color {
     Color::rgba((value >> 16) as u8, (value >> 8) as u8, value as u8, (value >> 24) as u8)
 }

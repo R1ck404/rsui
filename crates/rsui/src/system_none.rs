@@ -7,6 +7,7 @@ pub fn system_is_dark() -> bool {
 }
 
 /// The shades of the accent color the user's chosen, which only Windows says yet (see `system.rs`).
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub(crate) fn accent_palette() -> Option<[[u8; 4]; 8]> {
     None
 }

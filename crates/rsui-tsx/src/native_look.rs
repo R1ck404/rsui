@@ -41,6 +41,7 @@ fn warn(tag: &'static str, what: &'static str) {
 fn extras_name(theme: Theme) -> &'static str {
     match theme {
         Theme::Material => "android",
+        #[cfg(not(target_os = "android"))]
         Theme::Fluent => "windows",
     }
 }
@@ -126,9 +127,8 @@ fn slider(cx: &mut Cx<'_>, native: &NativeControl, element: Element, changed: Op
         let stepped = if step > 0.0 { ((next - min) / step).round() * step + min } else { next };
         stepped.clamp(min.min(max), max.max(min))
     };
-    let thumb = match look::theme() {
-        Theme::Material | Theme::Fluent => 20.0,
-    };
+    // Both looks' thumbs are 20 across.
+    let thumb = 20.0;
     let dragged = changed.clone();
     let element = cx.on(element, ActionKind::Custom(symbol!("drag")), move |updates, input| {
         let Some(PropValue::Str(said)) = input else { return };
