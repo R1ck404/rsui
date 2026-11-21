@@ -113,8 +113,12 @@ $classes = "$work\classes"
 Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $classes | Out-Null
 $sources = @(Get-ChildItem "$root\crates\rsui-android\java" -Recurse -Filter *.java | ForEach-Object FullName)
-& "$java\bin\javac.exe" -nowarn --release 11 -classpath "$($platform.FullName)\android.jar" -d $classes $sources
-if ($LASTEXITCODE -ne 0) { throw 'javac failed' }
+# javac's notes come on stderr, which PowerShell 5.1 would stop at; only how it ends says whether it failed.
+$ErrorActionPreference = 'Continue'
+& "$java\bin\javac.exe" -nowarn --release 11 -classpath "$($platform.FullName)\android.jar" -d $classes $sources 2>&1 | ForEach-Object { "$_" }
+$compiledOk = $LASTEXITCODE -eq 0
+$ErrorActionPreference = 'Stop'
+if (-not $compiledOk) { throw 'javac failed' }
 $compiled = @(Get-ChildItem $classes -Recurse -Filter *.class | ForEach-Object FullName)
 & "$($tools.FullName)\d8.bat" --release --min-api 29 --lib "$($platform.FullName)\android.jar" --output $work $compiled
 if ($LASTEXITCODE -ne 0) { throw 'd8 failed' }

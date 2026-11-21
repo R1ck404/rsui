@@ -1165,13 +1165,17 @@ impl Vulkan {
         unsafe { self.device.device_wait_idle()? };
         // SAFETY: a plain query on a live surface.
         let capabilities = unsafe { surfaces.get_physical_device_surface_capabilities(self.physical, self.surface)? };
-        let extent = if capabilities.current_extent.width != u32::MAX {
-            capabilities.current_extent
-        } else {
+        // Android's driver says the size the window had a moment ago: a SurfaceView made shorter by the soft keyboard is still
+        // its old height there, and a swapchain made that size is squashed into the window. Android takes any size and scales
+        // it, so there the window's own size is used, as `ANativeWindow_getHeight` says it now.
+        let ours = cfg!(target_os = "android") || capabilities.current_extent.width == u32::MAX;
+        let extent = if ours {
             vk::Extent2D {
                 width: self.size.0.clamp(capabilities.min_image_extent.width, capabilities.max_image_extent.width.max(1)),
                 height: self.size.1.clamp(capabilities.min_image_extent.height, capabilities.max_image_extent.height.max(1)),
             }
+        } else {
+            capabilities.current_extent
         };
         let old = self.swapchain.take();
         if extent.width == 0 || extent.height == 0 {

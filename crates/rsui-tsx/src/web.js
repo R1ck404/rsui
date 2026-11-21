@@ -16676,12 +16676,15 @@ function setAttributeOn(live, name, value) {
 const PAGE_SCROLL = '__dompage';
 /// How wide the page's own scrollbars are: classic ones, as a browser on Windows draws.
 const PAGE_SCROLLBAR = 17;
+/// Whether scrollbars are thin and over what scrolls, taking no room, as Chrome draws them on a phone: rsui's own, rather than
+/// the classic ones with arrows.
+const OVERLAY_SCROLLBARS = rsuiHostMethods.overlayScrollbars?.() === true;
 /// What `html` says of the window's scrollbars: `scrollbar-width` and `scrollbar-color` (see `standardScrollbars`).
 const PAGE_SCROLLBAR_SAID = ['__scrollbarWidth', '__scrollbarColor', '__scrollbarThumb', '__scrollbarTrack'];
 /// How much room the window's scrollbar takes: none with `scrollbar-width: none`, less when it's thin.
 function pageScrollbarRoom() {
     const width = pageLook().__scrollbarWidth;
-    return width === 'none' ? 0 : width === 'thin' ? 11 : PAGE_SCROLLBAR;
+    return width === 'none' || OVERLAY_SCROLLBARS ? 0 : width === 'thin' ? 11 : PAGE_SCROLLBAR;
 }
 /// What's asked of the page's own scrolling area, as an element's are kept on what it keeps: see `scrollTo`.
 const pageScrolling = { domKey: PAGE_SCROLL, ask: 0, listeners: new Set(), told: null };
@@ -20851,6 +20854,9 @@ function makeHost(tag, props, children, scroll, parts = {}, known = undefined) {
             if (own.textDirection === 'rtl' && scrollbars.scrollbarRoom > 0) {
                 outer.scrollbarLeft = true;
             }
+        } else if (bar === undefined && OVERLAY_SCROLLBARS) {
+            // A phone's: rsui's own thin one, over what scrolls.
+            outer.fillAcross = true;
         } else if (bar === undefined) {
             // A browser's own scrollbar, which takes room when there's more than shows.
             outer.scrollbarStyle = 'classic';
@@ -22065,7 +22071,7 @@ function PageWindow({ children, ...rest }) {
     if (pageScroll !== 'none') {
         // The page scrolls when there's more of it than the window, with the scrollbars a browser has.
         // What's placed by itself with nothing positioned around it is placed from the page, as from a page's first box.
-        inner = make('scroll', { axis: pageScroll, flex: 1, collapseMargins: true, scrollbarStyle: 'classic', scrollbarRoom: PAGE_SCROLLBAR, fillAcross: true, domKey: PAGE_SCROLL, staticBox: false, focusable: false, ...scrollProps(pageScrolling), ...pageScrollbars, ...(pagePointerEvents === 'none' ? { inert: true } : null) }, inner);
+        inner = make('scroll', { axis: pageScroll, flex: 1, collapseMargins: true, ...(OVERLAY_SCROLLBARS ? null : { scrollbarStyle: 'classic', scrollbarRoom: PAGE_SCROLLBAR }), fillAcross: true, domKey: PAGE_SCROLL, staticBox: false, focusable: false, ...scrollProps(pageScrolling), ...pageScrollbars, ...(pagePointerEvents === 'none' ? { inert: true } : null) }, inner);
     } else if (pagePointerEvents === 'none') {
         inner = make('group', { flex: 1, collapseMargins: true, inert: true }, inner);
     }

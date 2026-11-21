@@ -178,5 +178,12 @@ fn host_native_look_dark(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     Ok(Value::bool(look::set_dark(dark)))
 }
 
-pub(crate) const FUNCTIONS: [(&str, HostFunction); 1] = [("nativeLookDark", host_native_look_dark)];
+/// `overlayScrollbars()`: whether a browser here draws its scrollbars thin, over what scrolls, taking no room, as Chrome does on
+/// a phone, rather than the classic ones beside it with arrows that it has on a desktop.
+fn host_overlay_scrollbars(_vm: &mut Vm, _args: Args) -> Result<Value, Value> {
+    Ok(Value::bool(cfg!(target_os = "android")))
+}
+
+pub(crate) const FUNCTIONS: [(&str, HostFunction); 2] =
+    [("nativeLookDark", host_native_look_dark), ("overlayScrollbars", host_overlay_scrollbars)];
 

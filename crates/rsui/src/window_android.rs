@@ -397,10 +397,11 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
     let mut blink_at: Option<Instant> = None;
     let mut composing = String::new();
     let mut keyboard_up = false;
+    let mut finger = Finger::default();
     loop {
         let now = Instant::now();
         let deadline = [wake_at, blink_at].into_iter().flatten().min();
-        let timeout = if app.animating() && shown.is_some() {
+        let timeout = if (app.animating() || finger.flinging()) && shown.is_some() {
             16
         } else {
             deadline.map_or(-1, |at| at.saturating_duration_since(now).as_millis().min(i32::MAX as u128) as c_int)
@@ -479,25 +480,7 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
                     app.set_input_time(now);
                     // The first finger is the pointer; others are left until rsui has more than one.
                     if pointer == 0 {
-                        match action {
-                            0 => {
-                                let _ = app.feed(&Input::Move { x, y });
-                                let _ = app.feed(&Input::Down { x, y, clicks: 1 });
-                            }
-                            2 => {
-                                let _ = app.feed(&Input::Move { x, y });
-                            }
-                            1 | 6 => {
-                                let _ = app.feed(&Input::Up { x, y });
-                                // A finger that's lifted isn't over anything any more.
-                                let _ = app.feed(&Input::Leave);
-                            }
-                            3 => {
-                                let _ = app.feed(&Input::CancelPress);
-                                let _ = app.feed(&Input::Leave);
-                            }
-                            _ => {}
-                        }
+                        finger.touched(&mut app, action, x, y, scale, now);
                     }
                     false
                 }
@@ -561,6 +544,7 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
             blink_at = None;
             app.blink();
         }
+        finger.fling_on(&mut app, Instant::now());
         if app.update() == Frame::Needed {
             needs_draw = true;
         }
@@ -582,6 +566,169 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
         if app.caret_blinking() && blink_at.is_none() {
             blink_at = Some(Instant::now() + Duration::from_millis(530));
         }
+    }
+}
+
+/// How far a finger goes before it moves what's under it rather than pressing it, in logical pixels: Android's touch slop.
+const TOUCH_SLOP: f32 = 8.0;
+/// How quickly a fling slows: its speed falls to 1/e in this many seconds, which takes it `speed * FLING_FADE` in all.
+const FLING_FADE: f32 = 0.5;
+/// The slowest a lifted finger can be going and still fling, the fastest a fling starts, and the speed it stops at, in logical
+/// pixels a second, as Android's 50 and 8,000 dp a second.
+const FLING_LEAST: f32 = 50.0;
+const FLING_MOST: f32 = 8000.0;
+const FLING_STOP: f32 = 20.0;
+/// How far back how fast a finger was going is worked out from.
+const FLING_TRAIL: Duration = Duration::from_millis(100);
+
+/// A finger on the screen, as a phone has them do: one that's put down and lifted where it was presses what's there; one that
+/// goes further than the touch slop moves what's under it, across or down as it went, with it, and is let go with a fling,
+/// which slows to a stop and which another finger stops without pressing anything.
+#[derive(Default)]
+struct Finger {
+    /// Where it went down, in the window's pixels: what's moved is what's under there.
+    down: Option<(f32, f32)>,
+    /// Whether it's pressing what it went down on, as a mouse button would.
+    pressing: bool,
+    /// Which way it's moving what's under it, once it's gone past the slop: across (true) or down.
+    panning: Option<bool>,
+    /// Where it was last, in the window's pixels.
+    last: (f32, f32),
+    /// Where it's been lately, along the way it's moving, in logical pixels.
+    trail: VecDeque<(Instant, f32)>,
+    fling: Option<Fling>,
+}
+
+struct Fling {
+    x: f32,
+    y: f32,
+    across: bool,
+    /// Logical pixels a second, further on (down or right) when it's more than 0.
+    speed: f32,
+    at: Instant,
+}
+
+impl Finger {
+    fn flinging(&self) -> bool {
+        self.fling.is_some()
+    }
+
+    fn touched(&mut self, app: &mut App, action: i32, x: f32, y: f32, scale: f32, now: Instant) {
+        match action {
+            // Down.
+            0 => {
+                let caught = self.fling.take().is_some();
+                self.down = Some((x, y));
+                self.last = (x, y);
+                self.panning = None;
+                self.trail.clear();
+                self.pressing = !caught;
+                if self.pressing {
+                    let _ = app.feed(&Input::Move { x, y });
+                    let _ = app.feed(&Input::Down { x, y, clicks: 1 });
+                }
+            }
+            // Moved.
+            2 => {
+                let Some((from_x, from_y)) = self.down else { return };
+                let across = match self.panning {
+                    Some(across) => across,
+                    None => {
+                        let (dx, dy) = (x - from_x, y - from_y);
+                        let slop = TOUCH_SLOP * scale;
+                        if dx.hypot(dy) < slop {
+                            if self.pressing {
+                                let _ = app.feed(&Input::Move { x, y });
+                            }
+                            return;
+                        }
+                        let across = dx.abs() > dy.abs();
+                        self.panning = Some(across);
+                        if self.pressing {
+                            self.pressing = false;
+                            let _ = app.feed(&Input::CancelPress);
+                            let _ = app.feed(&Input::Leave);
+                        }
+                        // What it moves starts from where it went past the slop, as Android's own scrolling does, so nothing
+                        // jumps by the slop as it starts.
+                        self.last = if across {
+                            (from_x + slop.copysign(dx), y)
+                        } else {
+                            (x, from_y + slop.copysign(dy))
+                        };
+                        across
+                    }
+                };
+                let moved = if across { self.last.0 - x } else { self.last.1 - y };
+                self.last = (x, y);
+                self.trail_to(now, (if across { x } else { y }) / scale);
+                let _ = app.feed(&Input::ScrollPixels { x: from_x, y: from_y, pixels: moved / scale, across, precise: true });
+            }
+            // Lifted.
+            1 | 6 => {
+                if self.pressing {
+                    let _ = app.feed(&Input::Up { x, y });
+                    // A finger that's lifted isn't over anything any more.
+                    let _ = app.feed(&Input::Leave);
+                } else if let (Some(across), Some((from_x, from_y))) = (self.panning, self.down) {
+                    self.trail_to(now, (if across { x } else { y }) / scale);
+                    if let (Some(&(first_at, first)), Some(&(last_at, last))) = (self.trail.front(), self.trail.back()) {
+                        let took = last_at.saturating_duration_since(first_at).as_secs_f32();
+                        // Moving up or left is moving further on.
+                        let speed = if took > 0.004 { (first - last) / took } else { 0.0 };
+                        if speed.abs() >= FLING_LEAST {
+                            self.fling = Some(Fling {
+                                x: from_x,
+                                y: from_y,
+                                across,
+                                speed: speed.clamp(-FLING_MOST, FLING_MOST),
+                                at: now,
+                            });
+                        }
+                    }
+                }
+                self.down = None;
+                self.pressing = false;
+                self.panning = None;
+            }
+            // Taken away, as when a system gesture has it.
+            3 => {
+                if self.pressing {
+                    let _ = app.feed(&Input::CancelPress);
+                    let _ = app.feed(&Input::Leave);
+                }
+                self.down = None;
+                self.pressing = false;
+                self.panning = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn trail_to(&mut self, now: Instant, along: f32) {
+        self.trail.push_back((now, along));
+        while self.trail.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > FLING_TRAIL) {
+            self.trail.pop_front();
+        }
+    }
+
+    /// Moves what's being flung on by as far as it's gone since it last was, slowing.
+    fn fling_on(&mut self, app: &mut App, now: Instant) {
+        let Some(fling) = self.fling.as_mut() else { return };
+        let took = now.saturating_duration_since(fling.at).as_secs_f32();
+        if took <= 0.0 {
+            return;
+        }
+        fling.at = now;
+        // How far something going at `speed`, slowing as e^(-t/FLING_FADE), goes in `took`.
+        let fade = (-took / FLING_FADE).exp();
+        let pixels = fling.speed * FLING_FADE * (1.0 - fade);
+        fling.speed *= fade;
+        let (x, y, across) = (fling.x, fling.y, fling.across);
+        if fling.speed.abs() < FLING_STOP {
+            self.fling = None;
+        }
+        let _ = app.feed(&Input::ScrollPixels { x, y, pixels, across, precise: true });
     }
 }
 

@@ -11,6 +11,9 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.graphics.Insets;
+import android.graphics.drawable.ColorDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.text.format.DateFormat;
@@ -18,7 +21,13 @@ import android.view.ContextThemeWrapper;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -36,9 +45,9 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * The activity an rsui app runs in. It hands its window's surface to rsui, which draws it, and keeps one view of its own,
- * which is never drawn, for what comes in: touches, keys, and the soft keyboard's text through an InputConnection, which
- * Android's own NativeActivity has no way to give. Everything is passed to the native library as it comes, and the app's
+ * The activity an rsui app runs in. It has one view, a SurfaceView, whose surface rsui draws and which hears what comes in:
+ * touches, keys, and the soft keyboard's text through an InputConnection, which Android's own NativeActivity has no way to
+ * give. Everything is passed to the native library as it comes, and the app's
  * own thread there does the rest.
  */
 public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
@@ -51,9 +60,42 @@ public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
-        getWindow().takeSurface(this);
+        // rsui draws into a surface of its own that's kept clear of the status bar, the navigation bar, the camera's cutout and
+        // the soft keyboard, by padding what holds it by the insets the system gives. So where a finger is on the view is where
+        // it is in what's drawn, and the field being typed in is never under the keyboard.
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+        } else {
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        }
+        // The view takes text, so Android would bring the keyboard up as the app opens; it comes only for a field rsui has
+        // focused (showKeyboard).
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
         view = new RsuiView(this);
-        setContentView(view);
+        view.getHolder().addCallback(this);
+        FrameLayout holder = new FrameLayout(this);
+        holder.addView(view, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        holder.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public WindowInsets onApplyWindowInsets(View holder, WindowInsets insets) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    Insets clear = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
+                            | WindowInsets.Type.ime());
+                    holder.setPadding(clear.left, clear.top, clear.right, clear.bottom);
+                } else {
+                    holder.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                            insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+                }
+                return insets;
+            }
+        });
+        setContentView(holder);
+        barColors(getResources().getConfiguration());
         view.requestFocus();
         nativeCreate(this, getAssets(), getFilesDir().getPath(), getCacheDir().getPath(),
                 getResources().getDisplayMetrics().density, isNight(getResources().getConfiguration()));
@@ -63,9 +105,28 @@ public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
         return (configuration.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
     }
 
+    /** What's behind the system's bars, light or dark as the phone is, with their icons dark on light and light on dark. */
+    private void barColors(Configuration configuration) {
+        boolean night = isNight(configuration);
+        Window window = getWindow();
+        window.setBackgroundDrawable(new ColorDrawable(night ? Color.BLACK : Color.WHITE));
+        if (Build.VERSION.SDK_INT >= 30) {
+            int light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+            WindowInsetsController bars = window.getInsetsController();
+            if (bars != null) {
+                bars.setSystemBarsAppearance(night ? 0 : light, light);
+            }
+        } else {
+            View decor = window.getDecorView();
+            int light = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            decor.setSystemUiVisibility(night ? decor.getSystemUiVisibility() & ~light : decor.getSystemUiVisibility() | light);
+        }
+    }
+
     @Override
     public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
+        barColors(configuration);
         nativeConfiguration(getResources().getDisplayMetrics().density, isNight(configuration));
     }
 
@@ -341,8 +402,8 @@ public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
         }
     }
 
-    /** The view that's never drawn, which input comes to. */
-    static class RsuiView extends View {
+    /** The surface rsui draws, which input comes to, so a touch is where it is in what's drawn. */
+    static class RsuiView extends SurfaceView {
         RsuiView(Context context) {
             super(context);
             setFocusable(true);
