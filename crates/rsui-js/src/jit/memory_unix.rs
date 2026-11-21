@@ -116,7 +116,8 @@ impl CodeMemory {
     }
 
     /// Copies code in at [`next_offset`](Self::next_offset), and says where it went. x86-64 sees what's written through
-    /// one view in the other at once, so nothing more is needed for it to run.
+    /// one view in the other at once, so nothing more is needed for it to run; Arm's instruction cache doesn't, so it's
+    /// told (see [`sync_code`]).
     pub(crate) fn add(&mut self, code: &[u8]) -> Option<usize> {
         let at = self.next_offset();
         let end = at + code.len();
@@ -125,6 +126,11 @@ impl CodeMemory {
         }
         // SAFETY: inside the range both views map, past any code that's run.
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), self.writable.add(at), code.len()) };
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: both ranges are inside the views, and what's just been written.
+        unsafe {
+            sync_code(self.writable.add(at), self.base.add(at), code.len())
+        };
         self.committed = self.committed.max(end.next_multiple_of(CHUNK).min(self.reserved));
         self.used = end;
         Some(at)
@@ -132,7 +138,50 @@ impl CodeMemory {
 
     /// There's no feedback here yet.
     #[cfg(feature = "jit-opt")]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn feedback(&mut self, _size: usize) -> Option<usize> {
         None
+    }
+}
+
+/// Has the instruction cache see code just written at `written` (through the writable view), which runs at `run` (the
+/// executable view): the data cache's lines are cleaned out to where instructions are fetched from, then the
+/// instruction cache's lines for where it runs are thrown away, on every core (`ish`), as the Arm ARM has it for
+/// self-modifying code. The core that runs it then wants an `isb` (which this one has here, and others in
+/// `Vm::jit_collect`). The lines' sizes are what CTR_EL0 says, which Linux lets a program read.
+///
+/// # Safety
+///
+/// Both ranges have to be mapped.
+#[cfg(target_arch = "aarch64")]
+unsafe fn sync_code(written: *const u8, run: *const u8, length: usize) {
+    let ctr: u64;
+    // SAFETY: reading the cache type register, which the kernel allows (or emulates) at EL0.
+    unsafe { std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let data_line = 4usize << ((ctr >> 16) & 0xF);
+    let code_line = 4usize << (ctr & 0xF);
+    // IDC: the data cache needn't be cleaned for the instruction cache to see it. DIC: nor the instruction cache
+    // thrown away.
+    let idc = ctr & (1 << 28) != 0;
+    let dic = ctr & (1 << 29) != 0;
+    // SAFETY: cache maintenance by address on memory that's mapped, and barriers.
+    unsafe {
+        if !idc {
+            let mut at = written as usize & !(data_line - 1);
+            while at < written as usize + length {
+                std::arch::asm!("dc cvau, {}", in(reg) at, options(nostack, preserves_flags));
+                at += data_line;
+            }
+        }
+        std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        if !dic {
+            let mut at = run as usize & !(code_line - 1);
+            while at < run as usize + length {
+                std::arch::asm!("ic ivau, {}", in(reg) at, options(nostack, preserves_flags));
+                at += code_line;
+            }
+            std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+        std::arch::asm!("isb", options(nostack, preserves_flags));
     }
 }

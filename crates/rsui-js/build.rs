@@ -17,10 +17,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
-    // Where the JIT has a backend (src/jit/mod.rs).
+    // Where the JIT has a backend (src/jit/mod.rs): x86-64 everywhere, and 64-bit Arm on Linux and Android, whose
+    // code memory is a memfd mapped twice. (macOS wants MAP_JIT instead, which isn't there yet.)
     println!("cargo:rustc-check-cfg=cfg(jit_backend)");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if arch == "x86_64" {
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if arch == "x86_64" || (arch == "aarch64" && (os == "linux" || os == "android")) {
         println!("cargo:rustc-cfg=jit_backend");
     }
 

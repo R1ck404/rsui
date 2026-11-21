@@ -1561,6 +1561,7 @@ pub(crate) const READ_ONLY_LENGTH: u8 = 64;
 /// real objects, rather than written down.
 #[cfg(feature = "jit")]
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct ObjectLayout {
     pub(crate) size: usize,
     pub(crate) shape: usize,

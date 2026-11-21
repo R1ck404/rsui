@@ -549,13 +549,13 @@ impl Drop for Jit {
 }
 
 /// For tests: which instruction has the record at `at`.
-#[cfg(all(test, jit_backend, feature = "jit-opt"))]
+#[cfg(all(test, target_arch = "x86_64", feature = "jit-opt"))]
 fn at_of(layout: &feedback::Layout, at: u32) -> usize {
     layout.offsets.iter().position(|&offset| offset == at).expect("a record is an instruction's")
 }
 
 /// For tests: the records of the compiled function named `name`, each with the name of the instruction it's for.
-#[cfg(all(test, jit_backend, feature = "jit-opt"))]
+#[cfg(all(test, target_arch = "x86_64", feature = "jit-opt"))]
 #[allow(unsafe_code)]
 pub(crate) fn feedback_of(vm: &Vm, name: &str) -> Vec<(String, Vec<u8>)> {
     let Some(backend) = &vm.jit.backend else {
@@ -1170,6 +1170,7 @@ impl Vm {
     ///   meanwhile go the way that works for any callee, which is only slower.
     /// - Else (a call of callbacks, or of natives) the count starts again, longer each time.
     #[allow(unsafe_code)]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn jit_recompile(&mut self, proto: u32, pc: u32, counter: *mut u64) -> usize {
         #[cfg(jit_backend)]
         {

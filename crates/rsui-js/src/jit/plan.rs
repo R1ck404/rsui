@@ -3,6 +3,8 @@
 //! structures (`Layout`), and what comes of it (`Compiled`, `Done`). The backends (`x64.rs`, `arm64.rs`) turn a job
 //! into machine code; see `JIT.md`.
 #![allow(unsafe_code)]
+// arm64.rs doesn't use all of it yet.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 use std::mem::offset_of;
 use std::sync::Arc;

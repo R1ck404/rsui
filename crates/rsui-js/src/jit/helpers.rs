@@ -11,6 +11,8 @@
 //! [`THROW`] with the error in `vm.jit.value`, [`BAIL`] to have the interpreter carry on in that frame from where its
 //! `pc` now is, or for a jump, [`TAKEN`].
 #![allow(unsafe_code)]
+// arm64.rs doesn't call all of them yet.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 use crate::object::*;
 use crate::op::*;

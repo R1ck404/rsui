@@ -728,6 +728,7 @@ fn number_class(bits: u8) -> usize {
 
 /// What `RSUI_OPT` asks for, read once: whether compiled code records feedback (`0` or `off` turns it off, with the
 /// feature built in).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn on() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(0);
