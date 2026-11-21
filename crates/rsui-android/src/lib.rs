@@ -43,6 +43,7 @@ mod app {
     const GET_OBJECT_CLASS: usize = 31;
     const GET_METHOD_ID: usize = 33;
     const CALL_VOID_METHOD_A: usize = 63;
+    const NEW_STRING: usize = 163;
     const GET_STRING_LENGTH: usize = 164;
     const GET_STRING_CHARS: usize = 165;
     const RELEASE_STRING_CHARS: usize = 166;
@@ -50,6 +51,9 @@ mod app {
     const EXCEPTION_CHECK: usize = 228;
     // The VM's own table.
     const ATTACH_CURRENT_THREAD: usize = 4;
+    const DETACH_CURRENT_THREAD: usize = 5;
+    const GET_ENV: usize = 6;
+    const JNI_VERSION_1_6: i32 = 0x0001_0006;
 
     /// The activity, kept for calls back into it from the app's thread.
     struct Activity {
@@ -57,6 +61,8 @@ mod app {
         activity: usize,
         show_keyboard: usize,
         finish: usize,
+        popup: usize,
+        toast: usize,
     }
 
     static ACTIVITY: OnceLock<Activity> = OnceLock::new();
@@ -112,6 +118,106 @@ mod app {
         call_activity(|found| found.finish, None);
     }
 
+    // The system's popups, which the activity shows on Android's main thread, and answers through `nativePopupAnswered`.
+
+    /// Runs `call` with this thread's environment, attaching it to the VM for as long as that takes if it isn't already.
+    fn with_env(call: impl FnOnce(Env, &Activity)) {
+        let Some(found) = ACTIVITY.get() else { return };
+        let vm = found.vm as *mut *const *const c_void;
+        let mut env: Env = std::ptr::null_mut();
+        // SAFETY: the VM is the process's, which lasts; a thread attached here is detached before this returns, and
+        // what's thrown in Java is cleared, as nothing here can catch it.
+        unsafe {
+            let get_env: unsafe extern "C" fn(*mut *const *const c_void, *mut Env, i32) -> i32 =
+                std::mem::transmute_copy(&*(*vm).add(GET_ENV));
+            let attached_here = get_env(vm, &raw mut env, JNI_VERSION_1_6) != 0;
+            if attached_here {
+                let attach: unsafe extern "C" fn(*mut *const *const c_void, *mut Env, *mut c_void) -> i32 =
+                    std::mem::transmute_copy(&*(*vm).add(ATTACH_CURRENT_THREAD));
+                if attach(vm, &raw mut env, std::ptr::null_mut()) != 0 || env.is_null() {
+                    return;
+                }
+            }
+            call(env, found);
+            if jni::<unsafe extern "C" fn(Env) -> u8>(env, EXCEPTION_CHECK)(env) != 0 {
+                jni::<unsafe extern "C" fn(Env)>(env, EXCEPTION_CLEAR)(env);
+            }
+            if attached_here {
+                let detach: unsafe extern "C" fn(*mut *const *const c_void) -> i32 =
+                    std::mem::transmute_copy(&*(*vm).add(DETACH_CURRENT_THREAD));
+                detach(vm);
+            }
+        }
+    }
+
+    /// A new Java string, which the caller lets go of.
+    ///
+    /// # Safety
+    /// `env` is this thread's live environment.
+    unsafe fn java_string(env: Env, text: &str) -> Object {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        // SAFETY: as the caller promises; the characters last through the call.
+        unsafe { jni::<unsafe extern "C" fn(Env, *const u16, i32) -> Object>(env, NEW_STRING)(env, units.as_ptr(), units.len() as i32) }
+    }
+
+    /// Lets go of a local reference, as a thread that stays in native code never gets back to Java to have them let go of.
+    ///
+    /// # Safety
+    /// `env` is this thread's live environment, and `object` is a local reference in it, or null.
+    unsafe fn let_go(env: Env, object: Object) {
+        if !object.is_null() {
+            // SAFETY: as the caller promises.
+            unsafe { jni::<unsafe extern "C" fn(Env, Object)>(env, DELETE_LOCAL_REF)(env, object) };
+        }
+    }
+
+    fn show_popup(id: u32, kind: &str, json: &str) {
+        with_env(|env, found| {
+            // SAFETY: the environment is this thread's, the method takes an int and two strings, and the strings are let
+            // go of after.
+            unsafe {
+                let (kind, json) = (java_string(env, kind), java_string(env, json));
+                let arguments = [u64::from(id), kind as u64, json as u64];
+                jni::<unsafe extern "C" fn(Env, Object, usize, *const u64)>(env, CALL_VOID_METHOD_A)(
+                    env,
+                    found.activity as Object,
+                    found.popup,
+                    arguments.as_ptr(),
+                );
+                let_go(env, kind);
+                let_go(env, json);
+            }
+        });
+    }
+
+    fn show_toast(text: &str, long: bool) {
+        with_env(|env, found| {
+            // SAFETY: as in `show_popup`, for a string and a boolean.
+            unsafe {
+                let text = java_string(env, text);
+                let arguments = [text as u64, u64::from(long)];
+                jni::<unsafe extern "C" fn(Env, Object, usize, *const u64)>(env, CALL_VOID_METHOD_A)(
+                    env,
+                    found.activity as Object,
+                    found.toast,
+                    arguments.as_ptr(),
+                );
+                let_go(env, text);
+            }
+        });
+    }
+
+    /// A popup's been answered: see `rsui::popups::android::answered` for what it says.
+    ///
+    /// # Safety
+    /// Java calls this with the popup's number and its answer, or null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn Java_dev_rsui_RsuiActivity_nativePopupAnswered(env: Env, _class: Object, id: i32, answer: Object) {
+        // SAFETY: as Java promises.
+        let answer = (!answer.is_null()).then(|| unsafe { string(env, answer) });
+        rsui::popups::android::answered(id as u32, answer);
+    }
+
     /// The activity's been made.
     ///
     /// # Safety
@@ -144,8 +250,11 @@ mod app {
                 };
                 let show_keyboard = method(c"showKeyboard", c"(Z)V");
                 let finish = method(c"finish", c"()V");
+                let popup = method(c"popup", c"(ILjava/lang/String;Ljava/lang/String;)V");
+                let toast = method(c"toast", c"(Ljava/lang/String;Z)V");
                 jni::<unsafe extern "C" fn(Env, Object)>(env, DELETE_LOCAL_REF)(env, class);
-                let _ = ACTIVITY.set(Activity { vm: vm as usize, activity: kept as usize, show_keyboard, finish });
+                let _ = ACTIVITY.set(Activity { vm: vm as usize, activity: kept as usize, show_keyboard, finish, popup, toast });
+                rsui::popups::android::set_activity(rsui::popups::android::Activity { show: show_popup, toast: show_toast });
             }
             let manager = AAssetManager_fromJava(env, assets);
             let data = std::path::PathBuf::from(string(env, files));

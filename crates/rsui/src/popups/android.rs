@@ -1,7 +1,6 @@
 //! The popups on Android, which rsui's activity shows: the app's library (rsui-android) says how to reach it with
 //! [`set_activity`], and tells [`answered`] what each was answered with, from Android's main thread.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::{Answer, Answered, Popup};
@@ -17,10 +16,11 @@ pub struct Activity {
 struct Waiting {
     activity: Option<Activity>,
     next: u32,
-    asked: HashMap<u32, (Popup, Answered)>,
+    /// What's showing, which is rarely more than one.
+    asked: Vec<(u32, Popup, Answered)>,
 }
 
-static WAITING: Mutex<Waiting> = Mutex::new(Waiting { activity: None, next: 1, asked: HashMap::new() });
+static WAITING: Mutex<Waiting> = Mutex::new(Waiting { activity: None, next: 1, asked: Vec::new() });
 
 fn waiting() -> std::sync::MutexGuard<'static, Waiting> {
     WAITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -42,7 +42,7 @@ pub(super) fn ask(popup: Popup, answered: Answered) {
         };
         let id = waiting.next;
         waiting.next = waiting.next.wrapping_add(1).max(1);
-        waiting.asked.insert(id, (popup, answered));
+        waiting.asked.push((id, popup, answered));
         (activity, id)
     };
     (activity.show)(id, kind, &json);
@@ -57,7 +57,12 @@ pub(super) fn toast(text: &str, long: bool) -> Result<(), String> {
 /// What the popup `id` was answered with, as the activity says it: `true` or `false`, a place in a sheet's list, a day as
 /// `2026-11-21` or a time as `14:05`, nothing for none, or `!` and why it couldn't be shown.
 pub fn answered(id: u32, said: Option<String>) {
-    let Some((popup, answered)) = waiting().asked.remove(&id) else { return };
+    let found = {
+        let mut waiting = waiting();
+        let at = waiting.asked.iter().position(|(asked, _, _)| *asked == id);
+        at.map(|at| waiting.asked.swap_remove(at))
+    };
+    let Some((_, popup, answered)) = found else { return };
     let answer: Result<Answer, String> = match said.as_deref() {
         Some(failed) if failed.starts_with('!') => Err(failed[1..].to_owned()),
         said => super::answer_from(&popup, said),
