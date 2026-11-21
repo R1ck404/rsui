@@ -1,11 +1,15 @@
 //! Making one program out of an app, to hand to someone with nothing else to install.
 
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::fs::OpenOptions;
+#[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn BeginUpdateResourceW(file: *const u16, delete_existing: i32) -> *mut c_void;
@@ -20,16 +24,26 @@ unsafe extern "system" {
     fn EndUpdateResourceW(update: *mut c_void, discard: i32) -> i32;
 }
 
+#[cfg(windows)]
 #[link(name = "user32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
 unsafe extern "system" {
     fn MessageBoxW(window: *mut c_void, text: *const u16, title: *const u16, kind: u32) -> i32;
 }
 
+#[cfg(windows)]
 fn wide(text: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     text.as_ref().encode_wide().chain([0]).collect()
 }
 
+/// Shows that something went wrong. Elsewhere a program started from the desktop has its errors in the system's log, which
+/// is where this goes, until the desktop's own message boxes are written.
+#[cfg(not(windows))]
+pub(crate) fn show_error(message: &str) {
+    eprintln!("This app couldn't start: {message}");
+}
+
 /// Shows that something went wrong, for a program with no console to say so on.
+#[cfg(windows)]
 pub(crate) fn show_error(message: &str) {
     const ERROR_ICON: u32 = 0x10;
     let (text, title) = (wide(message), wide("This app couldn't start"));
@@ -268,6 +282,7 @@ fn folder_around(files: &[PathBuf]) -> Option<PathBuf> {
 
 /// Says that this doesn't want a console, so that none comes up with it. The field that says so is in the
 /// program's header, as Windows lays it out.
+#[cfg(windows)]
 fn stop_wanting_a_console(file: &mut std::fs::File) -> std::io::Result<()> {
     const WINDOWS_GUI: u16 = 2;
     const SUBSYSTEM_FROM_SIGNATURE: u64 = 4 + 20 + 68;
@@ -279,8 +294,18 @@ fn stop_wanting_a_console(file: &mut std::fs::File) -> std::io::Result<()> {
     file.write_all(&WINDOWS_GUI.to_le_bytes())
 }
 
+/// A program elsewhere has no icon of its own: the desktop file that starts it says what its icon is.
+#[cfg(not(windows))]
+fn set_icon(_program: &Path, icon: &[u8]) -> Result<(), String> {
+    if icon.get(..4) != Some(&[0, 0, 1, 0]) {
+        return Err("that isn't an .ico file".to_owned());
+    }
+    Ok(())
+}
+
 /// Gives a program an icon, from the bytes of a `.ico` file. In a program, each picture in one is a
 /// resource of its own, and the list of them is another with a slightly different form.
+#[cfg(windows)]
 fn set_icon(program: &Path, icon: &[u8]) -> Result<(), String> {
     const ICON: usize = 3;
     const ICON_GROUP: usize = 14;
@@ -383,9 +408,11 @@ pub(crate) fn pack(
     let result = (|| {
         std::fs::copy(&this, &staged).map_err(|error| describe("copying this program", &error))?;
         let opened = || OpenOptions::new().read(true).write(true).open(&staged);
-        let mut file = opened().map_err(|error| describe("opening what was made", &error))?;
-        stop_wanting_a_console(&mut file).map_err(|error| describe("writing it", &error))?;
-        drop(file);
+        #[cfg(windows)]
+        {
+            let mut file = opened().map_err(|error| describe("opening what was made", &error))?;
+            stop_wanting_a_console(&mut file).map_err(|error| describe("writing it", &error))?;
+        }
         if let Some(icon) = icon {
             set_icon(&staged, &icon).map_err(|error| describe("adding the icon", &error))?;
         }

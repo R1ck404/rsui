@@ -40,9 +40,15 @@ pub mod access;
 mod app;
 #[cfg(feature = "mutation-pilot")]
 pub use app::mutation_pilot::MutationPilot;
+#[cfg(windows)]
+pub mod desktop;
+// Each system's own desktop services come in as they're written; until then, the same names that do nothing.
+#[cfg(not(windows))]
+#[path = "desktop_none.rs"]
 pub mod desktop;
 pub mod dialogs;
 mod dock;
+#[cfg(windows)]
 mod drop;
 pub mod edit;
 pub mod embed;
@@ -55,10 +61,22 @@ mod marks;
 #[cfg(feature = "idle-probe")]
 mod native_cycles;
 pub mod replay;
+#[cfg(windows)]
 mod system;
+#[cfg(not(windows))]
+#[path = "system_none.rs"]
+mod system;
+#[cfg(windows)]
 mod uia;
 mod widgets;
+#[cfg(windows)]
 mod shell_layer;
+#[cfg(windows)]
+mod window;
+// The window system of each other system comes in here as it's written: Wayland and X11 on Linux, AppKit on macOS, and
+// an activity of its own on Android. Until then, what runs headless works, and opening a window says it can't.
+#[cfg(not(windows))]
+#[path = "window_none.rs"]
 mod window;
 mod windows;
 

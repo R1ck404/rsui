@@ -43,6 +43,7 @@ pub use events::DropPhase;
 use events::{Captured, Kind, follow_along, keys_along};
 
 const REGULAR_FONT: &str = "C:/Windows/Fonts/segoeui.ttf";
+#[cfg_attr(not(windows), allow(dead_code))]
 const BOLD_FONT: &str = "C:/Windows/Fonts/segoeuib.ttf";
 pub(crate) const BACKGROUND: Color = Color::hex(0xF6F8FA);
 
@@ -80,7 +81,11 @@ const SCROLL_GLIDE: Duration = Duration::from_millis(120);
 pub enum RunError {
     Font(FontError),
     Render(RenderError),
+    #[cfg(windows)]
     Window(windows::core::Error),
+    /// Elsewhere, what the system said, or that there's no window system to open one with yet.
+    #[cfg(not(windows))]
+    Window(String),
 }
 
 impl fmt::Display for RunError {
@@ -107,6 +112,7 @@ impl From<RenderError> for RunError {
     }
 }
 
+#[cfg(windows)]
 impl From<windows::core::Error> for RunError {
     fn from(error: windows::core::Error) -> Self {
         Self::Window(error)
@@ -125,8 +131,16 @@ pub fn window_scale() -> f32 {
 
 /// The system's UI font, in regular and bold.
 pub fn default_text_engine() -> Result<TextEngine, RunError> {
-    let mut engine = TextEngine::new(Font::open(REGULAR_FONT)?);
-    if let Ok(bold) = Font::open(BOLD_FONT) {
+    #[cfg(windows)]
+    let (regular, bold) = (REGULAR_FONT, Some(BOLD_FONT));
+    // Elsewhere it's whichever of the fonts the system's UI uses there is (see `rsui_text::system_ui_font_files`).
+    #[cfg(not(windows))]
+    let (regular, bold) = {
+        let (regular, bold) = rsui_text::system_ui_font_files();
+        (regular.unwrap_or(REGULAR_FONT), bold)
+    };
+    let mut engine = TextEngine::new(Font::open(regular)?);
+    if let Some(Ok(bold)) = bold.map(Font::open) {
         engine = engine.with_bold(bold);
     }
     Ok(engine.with_system_fallbacks())
@@ -217,6 +231,7 @@ impl Measure for Measuring<'_> {
 
 
 /// What says whether the tree assistive technology sees might have changed.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) type AccessFingerprint = (u64, Option<Vec<u32>>, (u32, u32), u32);
 
 /// What a window should do after an event.
@@ -5371,6 +5386,7 @@ impl App {
 
     /// Whether what [`access_tree`](Self::access_tree) would say could have changed since this was
     /// last this. Working the tree out takes time, so it's only done if it might be different.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn access_fingerprint(&self) -> AccessFingerprint {
         (
             self.tree_changes,

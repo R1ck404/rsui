@@ -1,14 +1,20 @@
 //! Notices when an app's files change, using no CPU until they do.
 
+#[cfg(windows)]
 use std::ffi::c_void;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(windows)]
 const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x10;
+#[cfg(windows)]
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
+#[cfg(windows)]
 const INFINITE: u32 = u32::MAX;
 
+#[cfg(windows)]
 #[allow(unsafe_code)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -37,6 +43,23 @@ pub(crate) fn start(path: &Path) {
     }
 }
 
+/// Elsewhere this looks at the folder's newest source file a few times a second, which is only done while developing
+/// with `--watch`. inotify and FSEvents, as `rsui-js`'s `fs.watch` uses, would let it wait instead.
+#[cfg(not(windows))]
+fn watch_folder(folder: &Path, main_file: &Path, notify: &crate::bridge::ReloadSender) {
+    let mut last = newest_change(folder);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = newest_change(folder);
+        if now > last {
+            std::thread::sleep(SETTLE);
+            last = newest_change(folder).max(now);
+            notify.send(main_file.to_owned());
+        }
+    }
+}
+
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn watch_folder(folder: &Path, main_file: &Path, notify: &crate::bridge::ReloadSender) {
     let wide: Vec<u16> = folder.as_os_str().encode_wide().chain([0]).collect();

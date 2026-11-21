@@ -47,10 +47,13 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -106,6 +109,7 @@ pub(crate) fn open_viewer(app: &mut App) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         // It has a window of its own, and no console.
@@ -118,14 +122,22 @@ pub(crate) fn open_viewer(app: &mut App) {
     }
 }
 
+#[cfg(windows)]
 const PIPE_ACCESS_DUPLEX: u32 = 3;
+#[cfg(windows)]
 const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+#[cfg(windows)]
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 8;
+#[cfg(windows)]
 const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+#[cfg(windows)]
 const PIPE_BUFFER: u32 = 64 * 1024;
+#[cfg(windows)]
 const ERROR_PIPE_CONNECTED: i32 = 535;
+#[cfg(windows)]
 const INVALID: isize = -1;
 
+#[cfg(windows)]
 #[allow(unsafe_code)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -145,7 +157,9 @@ unsafe extern "system" {
     fn GetExitCodeProcess(process: isize, code: *mut u32) -> i32;
 }
 
+#[cfg(windows)]
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+#[cfg(windows)]
 const STILL_ACTIVE: u32 = 259;
 
 /// What a viewer's told this app is, and the file that says it's there.
@@ -187,7 +201,11 @@ pub(crate) fn folder() -> PathBuf {
 /// is where what's said is heard.
 pub(crate) fn start(main_file: &Path, title: &str) {
     let pid = std::process::id();
+    #[cfg(windows)]
     let pipe = format!(r"\\.\pipe\rsui-live-{pid}");
+    // Elsewhere it's a Unix socket, which is what `net` connects to at a path, in the user's own folder for such things.
+    #[cfg(not(windows))]
+    let pipe = socket_path(pid);
     let file = folder().join(format!("{pid}.json"));
     let about = json!({
         "pid": pid,
@@ -246,7 +264,24 @@ pub(crate) fn forget_gone() {
     }
 }
 
+/// Where an app's socket for viewers is: in the user's runtime folder, which only they can get into, if there's one.
+#[cfg(not(windows))]
+fn socket_path(pid: u32) -> String {
+    let folder = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    folder.join(format!("rsui-live-{pid}.sock")).to_string_lossy().into_owned()
+}
+
+/// Whether a process is still running: one that's there, whether or not it's this user's.
+#[cfg(not(windows))]
+#[allow(unsafe_code)]
+fn running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    // SAFETY: signal 0 only asks whether there's such a process.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
 /// Whether a process is still running.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn running(pid: u32) -> bool {
     // SAFETY: the handle, if there is one, is closed before this returns, and `code` outlives the call.
@@ -276,6 +311,10 @@ pub(crate) fn named(title: &str) {
 pub(crate) fn stop() {
     if let Some(listening) = LISTENING.get() {
         let _ = std::fs::remove_file(&listening.file);
+        #[cfg(not(windows))]
+        if let Some(socket) = listening.about.lock().ok().and_then(|about| about["pipe"].as_str().map(str::to_owned)) {
+            let _ = std::fs::remove_file(socket);
+        }
     }
 }
 
@@ -301,6 +340,7 @@ pub(crate) fn heard(text: &str) {
     });
 }
 
+#[cfg(windows)]
 fn wide(text: &str) -> Vec<u16> {
     std::ffi::OsStr::new(text)
         .encode_wide()
@@ -308,7 +348,36 @@ fn wide(text: &str) -> Vec<u16> {
         .collect()
 }
 
+/// The socket viewers connect to. One left behind by a process that's gone is taken away first.
+#[cfg(not(windows))]
+fn make_pipe(name: &str, _first: bool) -> Option<std::os::unix::net::UnixListener> {
+    let _ = std::fs::remove_file(name);
+    std::os::unix::net::UnixListener::bind(name).ok()
+}
+
+#[cfg(not(windows))]
+fn close(listener: std::os::unix::net::UnixListener) {
+    drop(listener);
+}
+
+/// Waits for each viewer in turn, and serves each on a thread of its own.
+#[cfg(not(windows))]
+fn listen(_name: &str, listener: std::os::unix::net::UnixListener) {
+    for viewer in listener.incoming() {
+        let Ok(viewer) = viewer else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        let viewer = File::from(std::os::fd::OwnedFd::from(viewer));
+        let _ = std::thread::Builder::new()
+            .name("rsui-tsx viewer".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || serve(&viewer));
+    }
+}
+
 /// A new end of the pipe for the next viewer to connect to. The first is made only if nothing has the name already.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn make_pipe(name: &str, first: bool) -> Option<isize> {
     let name = wide(name);
@@ -334,6 +403,7 @@ fn make_pipe(name: &str, first: bool) -> Option<isize> {
     (pipe != INVALID).then_some(pipe)
 }
 
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn close(pipe: isize) {
     // SAFETY: it's a handle this made and nothing else has.
@@ -424,6 +494,7 @@ fn answer_paused(
 }
 
 /// Waits for each viewer in turn, and serves each on a thread of its own.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn listen(name: &str, first: isize) {
     let mut next = Some(first);
@@ -986,6 +1057,7 @@ export default function App() {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_viewer_looks_at_an_app_over_its_pipe_and_goes_back_through_its_state() {
         let folder = std::env::temp_dir().join(format!("rsui-live-test-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();

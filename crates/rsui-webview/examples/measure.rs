@@ -7,21 +7,33 @@
 //! It prints one line of JSON and closes once the page has loaded and settled for two seconds. What it keeps is in a
 //! folder of its own in the temporary folder, which it deletes after.
 
+#[cfg(windows)]
 use std::cell::RefCell;
+#[cfg(windows)]
 use std::rc::Rc;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use rsui_webview::{Bounds, Event, Settings, WebView};
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
+#[cfg(windows)]
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+#[cfg(windows)]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(windows)]
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+#[cfg(windows)]
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::*;
+#[cfg(windows)]
 use windows::core::w;
 
+#[cfg(windows)]
 unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_DESTROY {
         // SAFETY: ending this thread's message loop.
@@ -33,6 +45,7 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
 }
 
 /// The private bytes of `root` and every process under it, in MB.
+#[cfg(windows)]
 fn private_mb(root: u32) -> f64 {
     let mut total = 0usize;
     // SAFETY: a snapshot of the processes, read and closed here, and each process opened only to read its memory.
@@ -71,6 +84,7 @@ fn private_mb(root: u32) -> f64 {
     total as f64 / 1_048_576.0
 }
 
+#[cfg(windows)]
 fn main() {
     let url = std::env::args().nth(1).unwrap_or_else(|| "https://example.com/".to_owned());
     let found = Instant::now();
@@ -156,4 +170,10 @@ fn main() {
     // The browser lets go of its folder once its processes have gone.
     std::thread::sleep(Duration::from_secs(2));
     let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// WebView2 is only on Windows.
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("measure runs on Windows, which has WebView2");
 }

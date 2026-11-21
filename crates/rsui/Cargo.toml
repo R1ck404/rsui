@@ -29,6 +29,8 @@ rsui-layout = { path = "../rsui-layout" }
 rsui-render = { path = "../rsui-render" }
 rsui-runtime = { path = "../rsui-runtime" }
 rsui-text = { path = "../rsui-text" }
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
@@ -58,6 +60,8 @@ windows-core = "0.62"
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1"
+
+[target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_StationsAndDesktops",

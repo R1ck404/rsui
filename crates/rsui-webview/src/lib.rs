@@ -10,14 +10,26 @@
 //! What a page keeps, its cookies and storage, is in a folder of the app's, in a profile of its own for each name a view is
 //! given ([`profile_name`]), and never in the person's own Edge.
 
+#[cfg(windows)]
 mod ffi;
+#[cfg(windows)]
 mod handler;
+#[cfg(windows)]
 pub mod runtime;
+#[cfg(not(windows))]
+#[path = "runtime_none.rs"]
+pub mod runtime;
+mod types;
+#[cfg(windows)]
+mod view;
+#[cfg(not(windows))]
+#[path = "view_none.rs"]
 mod view;
 
 use std::path::{Path, PathBuf};
 
 /// Says what's being done, and what came of it, if `RSUI_WEBVIEW_LOG` is set, for finding out why a view doesn't show.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn log(said: impl FnOnce() -> String) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -64,6 +76,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn what_pages_keep_is_in_the_apps_own_folder() {
         assert_eq!(data_folder(Path::new(r"C:\Data\app")), PathBuf::from(r"C:\Data\app\WebView2"));
     }

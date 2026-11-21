@@ -1,19 +1,25 @@
 //! The system's dialogs for choosing files and folders. They wait for someone to answer, so these are for calling on a thread
 //! that can wait, and the window carries on drawing meanwhile. Nothing here is loaded until one's asked for.
 
+#[cfg(windows)]
 use std::sync::atomic::{AtomicIsize, Ordering};
 
+#[cfg(windows)]
 use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+#[cfg(windows)]
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
     CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
+#[cfg(windows)]
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::{
     FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog,
     IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName,
     SIGDN_FILESYSPATH,
 };
+#[cfg(windows)]
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 /// What to ask for.
@@ -34,17 +40,28 @@ pub struct DialogOptions {
     pub filters: Vec<(String, String)>,
 }
 
+/// Asks someone to choose a file or folder. The system's dialogs aren't written here yet (on Linux they'll come from the
+/// desktop's portal), so this says so.
+#[cfg(not(windows))]
+pub fn ask_for_path(_kind: DialogKind, _options: DialogOptions) -> Result<Option<String>, String> {
+    Err("the system's file dialogs aren't on this system yet".to_owned())
+}
+
+#[cfg(windows)]
 /// The window that's open, for dialogs to belong to.
 static CURRENT_WINDOW: AtomicIsize = AtomicIsize::new(0);
 
+#[cfg(windows)]
 pub(crate) fn set_current_window(window: HWND) {
     CURRENT_WINDOW.store(window.0 as isize, Ordering::Release);
 }
 
+#[cfg(windows)]
 pub(crate) fn current_window() -> HWND {
     HWND(CURRENT_WINDOW.load(Ordering::Acquire) as *mut _)
 }
 
+#[cfg(windows)]
 /// Asks someone to choose a file or folder, and says what they chose, if they did. It goes on a thread of its own, as these
 /// dialogs need a lot of stack for what the system loads into them, and the window it belongs to stays disabled until it's
 /// answered.
@@ -60,6 +77,7 @@ pub fn ask_for_path(kind: DialogKind, options: DialogOptions) -> Result<Option<S
         .unwrap_or_else(|_| Err("the dialog stopped working".to_owned()))
 }
 
+#[cfg(windows)]
 /// [`ask_for_path`], on this thread, with no thought for what else it's holding up.
 #[doc(hidden)]
 pub fn ask_on_this_thread(
@@ -78,6 +96,7 @@ pub fn ask_on_this_thread(
     result
 }
 
+#[cfg(windows)]
 fn show(
     kind: DialogKind,
     options: &DialogOptions,

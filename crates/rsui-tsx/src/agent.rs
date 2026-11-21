@@ -301,9 +301,12 @@ impl AppHost {
     }
 }
 
+#[cfg(windows)]
 const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+#[cfg(windows)]
 const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 
+#[cfg(windows)]
 #[allow(unsafe_code)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -312,7 +315,22 @@ unsafe extern "system" {
 }
 
 /// Takes the standard output for the protocol alone, and sends anything else that's written there to the standard error.
+/// Elsewhere that's a copy of descriptor 1 for the protocol, and descriptor 2 put in its place.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn take_standard_output() -> File {
+    use std::os::fd::FromRawFd;
+    // SAFETY: these only copy this process's own descriptors; the copy is this one's alone from here on.
+    unsafe {
+        let output = libc::dup(1);
+        libc::dup2(2, 1);
+        File::from_raw_fd(output)
+    }
+}
+
+/// Takes the standard output for the protocol alone, and sends anything else that's written there to the standard error.
 /// A single stray line would break the connection, and an app can write there in all sorts of ways.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn take_standard_output() -> File {
     use std::os::windows::io::FromRawHandle;
