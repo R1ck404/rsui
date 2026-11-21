@@ -125,6 +125,20 @@ pub struct Interaction<'a> {
     pub tooltip: Option<(&'a str, f32, f32)>,
     /// What a debugger draws over everything, if one is.
     pub overlay: Option<&'a Overlay>,
+    /// A press spreading out from where it landed, as Material's ripple does, on what says it has one (`ripple`).
+    pub ripple: Option<Ripple<'a>>,
+}
+
+/// A press spreading out from where it landed, on an element whose `ripple` prop is its color: what it's on, where it landed in
+/// logical pixels from the window's top left, how far it's spread from 0 (a dot) to 1 (all of it), and how strongly it shows,
+/// from 0 to 1, which falls once it's let go.
+#[derive(Debug, Clone, Copy)]
+pub struct Ripple<'a> {
+    pub element: &'a Element,
+    pub x: f32,
+    pub y: f32,
+    pub spread: f32,
+    pub strength: f32,
 }
 
 /// What a debugger draws on top of everything else, in physical pixels: boxes, and a little text.
@@ -2645,16 +2659,24 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                 self.paint_shadow_around(quad, edges, corners);
             }
         }
+        // A press that ripples shows as the ripple, over what's there otherwise, rather than as a pressed background.
+        let rippling = look.native && self.interaction.ripple.is_some_and(|ripple| std::ptr::eq(ripple.element, element));
+        let focused = look.native && self.has_keyboard(element);
         let pressed = look
             .pressed
-            .filter(|_| is(self.interaction.pressed, element));
-        let shade = if self.shading && pressed.is_none() {
+            .filter(|_| is(self.interaction.pressed, element) && !rippling);
+        let focus_background = if focused {
+            element.props.get("focus_background").and_then(Color::from_prop)
+        } else {
+            None
+        };
+        let shade = if self.shading && pressed.is_none() && focus_background.is_none() {
             self.hover_shade(element, &look)
         } else {
             None
         };
         let hovered = look.hover.filter(|_| is(self.interaction.hovered, element));
-        let background = pressed.or(shade).or(hovered).or(look.background);
+        let background = pressed.or(focus_background).or(shade).or(hovered).or(look.background);
         // Corners that aren't all one circle, or a shape it's cut to, are drawn as a picture, background and border together.
         let shape = if look.shaped {
             crate::gradient::BoxShape::of(element, area, self.scale)
@@ -2765,6 +2787,121 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
                     .quads
                     .push(outline_quad(around, outline.color, rounded, width)),
             }
+        }
+        if look.native {
+            self.paint_native(element, area, radius, focused, rippling);
+        }
+    }
+
+    /// Whether this has the keyboard: it's being typed in, or it shows the focus ring.
+    fn has_keyboard(&self, element: &Element) -> bool {
+        is(self.interaction.ring, element)
+            || self
+                .interaction
+                .editing
+                .is_some_and(|editing| std::ptr::eq(editing.element, element))
+    }
+
+    /// What a control in the platform's look draws over its background and border as it's used: the line a text field
+    /// has while it's typed in (`focus_line`, `"bottom COLOR WIDTH"` or `"all COLOR WIDTH"`, the color as `Color::to_prop` has
+    /// it), a ripple spreading from where it was pressed (`ripple`, its color at full strength), and its text's color while
+    /// it's pressed (`pressed_text_color`).
+    #[cold]
+    #[inline(never)]
+    fn paint_native(&mut self, element: &Element, area: [f32; 4], radius: f32, focused: bool, rippling: bool) {
+        if focused {
+            if let Some(PropValue::Str(line)) = element.props.get("focus_line") {
+                let mut words = line.split_whitespace();
+                let side = words.next().unwrap_or("all");
+                let color = words.next().and_then(color_word);
+                let width = words.next().and_then(|width| width.parse::<f32>().ok()).unwrap_or(2.0);
+                if let Some(color) = color {
+                    let width = (width * self.scale).round().max(1.0);
+                    if side == "bottom" {
+                        let strip = [area[0], area[1] + area[3] - width, area[2], width];
+                        self.border_strip(strip, color, area, radius);
+                    } else {
+                        self.quads.push(outline_quad(area, color, radius, width));
+                    }
+                }
+            }
+        }
+        if rippling {
+            if let (Some(ripple), Some(color)) = (self.interaction.ripple, element.props.get("ripple").and_then(Color::from_prop)) {
+                self.paint_ripple(element, area, ripple, color);
+            }
+        }
+        if is(self.interaction.pressed, element) {
+            if let Some(color) = element.props.get("pressed_text_color").and_then(Color::from_prop) {
+                self.look.text_color = Some(color);
+            }
+        }
+    }
+
+    /// Material's ripple: a circle that grows from where it was pressed to cover all of what was pressed, moving to its middle as
+    /// it does, cut off at its edges and round corners, as Compose draws it (`RippleAnimation`): it starts three tenths of the
+    /// longer side across and ends 10 pixels past the corners.
+    fn paint_ripple(&mut self, element: &Element, area: [f32; 4], ripple: Ripple<'_>, color: Color) {
+        let [left, top, across, down] = area;
+        if across <= 0.0 || down <= 0.0 {
+            return;
+        }
+        let spread = ripple.spread.clamp(0.0, 1.0);
+        let (pressed_x, pressed_y) = (ripple.x * self.scale, ripple.y * self.scale);
+        let (middle_x, middle_y) = (left + across / 2.0, top + down / 2.0);
+        let x = pressed_x + (middle_x - pressed_x) * spread;
+        let y = pressed_y + (middle_y - pressed_y) * spread;
+        let from = across.max(down) * 0.3 / 2.0;
+        let to = (across * across + down * down).sqrt() / 2.0 + 10.0 * self.scale;
+        let reach = from + (to - from) * spread;
+        let alpha = (f32::from(color.a) * ripple.strength.clamp(0.0, 1.0)).round() as u8;
+        if alpha == 0 {
+            return;
+        }
+        let circle = solid_quad([x - reach, y - reach, reach * 2.0, reach * 2.0], Color { a: alpha, ..color }, reach);
+        match self.corners(element, area) {
+            Some(corners) => {
+                self.push_round_clip([left, top, left + across, top + down], corners, false);
+                self.quads.push(circle);
+                self.finish_batch();
+                self.rounded.pop();
+            }
+            None => {
+                self.finish_batch();
+                let clip = self.clip().intersect(PixelRect {
+                    left: left.round() as i32,
+                    top: top.round() as i32,
+                    right: (left + across).round() as i32,
+                    bottom: (top + down).round() as i32,
+                });
+                self.clips.push(clip);
+                self.quads.push(circle);
+                self.finish_batch();
+                self.clips.pop();
+            }
+        }
+    }
+
+    /// A focus ring a control in the platform's look says it has (`focus_ring`): `"COLOR WIDTH OFFSET"`, a ring that far
+    /// outside its edge, and then, if it says, `INNER_COLOR INNER_WIDTH`, a ring just outside its edge, as Fluent's has.
+    #[cold]
+    #[inline(never)]
+    fn paint_native_ring(&mut self, said: &str, edges: [f32; 4]) {
+        let [left, top, right, bottom] = edges;
+        let area = [left, top, right - left, bottom - top];
+        let radius = fitting_radius(self.look.corner_radius * self.scale, area);
+        let words: Vec<&str> = said.split_whitespace().collect();
+        let number = |at: usize, otherwise: f32| words.get(at).and_then(|word| word.parse::<f32>().ok()).unwrap_or(otherwise);
+        let around = |out: f32| [area[0] - out, area[1] - out, area[2] + out * 2.0, area[3] + out * 2.0];
+        let rounded = |out: f32| if radius > 0.0 { radius + out } else { 0.0 };
+        if let Some(outer) = words.first().copied().and_then(color_word) {
+            let width = (number(1, 2.0) * self.scale).round().max(1.0);
+            let out = (number(2, 0.0) * self.scale).round() + width;
+            self.quads.push(outline_quad(around(out), outer, rounded(out), width));
+        }
+        if let Some(inner) = words.get(3).copied().and_then(color_word) {
+            let width = (number(4, 1.0) * self.scale).round().max(1.0);
+            self.quads.push(outline_quad(around(width), inner, rounded(width), width));
         }
     }
 
@@ -3295,6 +3432,10 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
     #[cold]
     #[inline(never)]
     fn paint_ring(&mut self, element: &Element, edges: [f32; 4]) {
+        if let Some(PropValue::Str(said)) = element.props.get("focus_ring") {
+            self.paint_native_ring(said, edges);
+            return;
+        }
         let [left, top, right, bottom] = edges;
         let radius = fitting_radius(
             self.look.corner_radius * self.scale,
@@ -4530,6 +4671,11 @@ fn selection_rect_outside(clip: PixelRect, [left, top, width, height]: [f32; 4])
 
 /// What a shadow inside something is marked with, in place of a glyph's width in the atlas, as the shader has it.
 const INSET_MARK: u16 = 65534;
+
+/// A color written in a prop's text as `Color::to_prop` has it, as a control in the platform's look writes them.
+fn color_word(word: &str) -> Option<Color> {
+    Color::from_prop(&PropValue::Int(word.parse().ok()?))
+}
 
 fn solid_quad(rect: [f32; 4], color: Color, radius: f32) -> Quad {
     Quad {

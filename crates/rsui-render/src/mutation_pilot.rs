@@ -49,6 +49,7 @@ pub(super) fn interaction_safe(e: &Element, i: Interaction<'_>) -> bool {
         && i.tooltip.is_none()
         && i.overlay.is_none()
         && i.resting_area.is_none()
+        && i.ripple.is_none()
 }
 
 impl Default for PilotPaint {

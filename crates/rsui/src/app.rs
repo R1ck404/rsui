@@ -366,6 +366,41 @@ fn eased(started: Instant, now: Instant, duration: Duration) -> f32 {
     1.0 - left * left * left
 }
 
+/// How long Material's ripple takes to spread across what was pressed, and to fade in and out, as Compose has them
+/// (`RippleAnimation`: `RadiusDuration`, `FadeInDuration`, `FadeOutDuration`).
+const RIPPLE_SPREAD: Duration = Duration::from_millis(225);
+const RIPPLE_FADE_IN: Duration = Duration::from_millis(75);
+const RIPPLE_FADE_OUT: Duration = Duration::from_millis(150);
+
+/// A press spreading out from where it landed, on something that says it ripples (`ripple`), as a control in Material's look
+/// does. It's only kept while animations are on.
+struct RippleNow {
+    path: Vec<u32>,
+    /// Where it landed, in logical pixels from the window's top left.
+    x: f32,
+    y: f32,
+    since: Instant,
+    let_go: Option<Instant>,
+    spread: f32,
+    strength: f32,
+}
+
+impl RippleNow {
+    /// Moves it along to `now`, saying whether it's still showing.
+    fn step(&mut self, now: Instant) -> bool {
+        let on = now.saturating_duration_since(self.since);
+        self.spread = eased(self.since, now, RIPPLE_SPREAD);
+        let fade_in = (on.as_secs_f32() / RIPPLE_FADE_IN.as_secs_f32()).min(1.0);
+        // It fades once it's let go, though not before it's spread all the way.
+        let fade_out = self.let_go.map_or(1.0, |let_go| {
+            let from = let_go.max(self.since + RIPPLE_SPREAD);
+            1.0 - now.saturating_duration_since(from).as_secs_f32() / RIPPLE_FADE_OUT.as_secs_f32()
+        });
+        self.strength = fade_in.min(fade_out).clamp(0.0, 1.0);
+        self.let_go.is_none() || self.strength > 0.0
+    }
+}
+
 /// A scrollbar being dragged.
 struct ScrollDrag {
     path: Vec<u32>,
@@ -548,6 +583,8 @@ pub struct App {
     pointer_keys: [Vec<Option<Key>>; 3],
     title_wanted: Option<rsui_core::Text>,
     pressed: Option<Press>,
+    /// The ripple a press set off, if what was pressed has one.
+    ripple: Option<RippleNow>,
     dragged: Option<Dragged>,
     /// Whether the pointer is dragging out a selection in the focused input.
     selecting: bool,
@@ -749,6 +786,7 @@ impl App {
             pointer_keys: [Vec::new(), Vec::new(), Vec::new()],
             title_wanted: None,
             pressed: None,
+            ripple: None,
             dragged: None,
             selecting: false,
             dark_mode: None,
@@ -1082,6 +1120,7 @@ impl App {
             self.hover_since = None;
             self.hover_amount = 1.0;
             self.leaving = None;
+            self.ripple = None;
             self.invalidate_automatic();
             self.repaint = true;
         }
@@ -1102,6 +1141,7 @@ impl App {
         self.runtime.moves_every_frame_in_view(|path, node| self.motion_might_show(path, node))
             || self.hover_since.is_some()
             || self.leaving.is_some()
+            || self.ripple.is_some()
             || self.glide.is_some()
             || self.runtime.scrolled_waiting()
     }
@@ -1217,6 +1257,13 @@ impl App {
                 self.hover_since = None;
                 self.hover_amount = 1.0;
             }
+        }
+        if let Some(ripple) = &mut self.ripple {
+            if !ripple.step(now) {
+                self.ripple = None;
+            }
+            self.invalidate_automatic();
+            self.repaint = true;
         }
         if let Some((_, since, start)) = &self.leaving {
             self.leaving_amount = start * (1.0 - eased(*since, now, HOVER_FADE));
@@ -2044,6 +2091,15 @@ impl App {
                 .as_ref()
                 .and_then(|(path, scroll)| Some((at(path)?, *scroll))),
             pressed: self.pressed.as_ref().and_then(|press| at(&press.path)),
+            ripple: self.ripple.as_ref().and_then(|ripple| {
+                Some(rsui_render::Ripple {
+                    element: at(&ripple.path)?,
+                    x: ripple.x,
+                    y: ripple.y,
+                    spread: ripple.spread,
+                    strength: ripple.strength,
+                })
+            }),
             ring: focused
                 .filter(|(focus, _)| focus.ring || focus.edit.is_some())
                 .map(|(_, element)| element),
@@ -3085,6 +3141,11 @@ impl App {
         }
         self.pressed = self.nearest_at(x, y, activates).map(|path| {
             let node = node_at(self.runtime.root(), &path);
+            // What ripples, as a control in Material's look does, spreads from here. With animations off it shows as pressed.
+            if self.animations && node.props.get("ripple").is_some() {
+                let now = Instant::now();
+                self.ripple = Some(RippleNow { path: path.clone(), x, y, since: now, let_go: None, spread: 0.0, strength: 0.0 });
+            }
             if has_pressed(node) {
                 #[cfg(feature = "automatic-render")]
                 if let Some(p) = &mut self.pilot {
@@ -3345,6 +3406,7 @@ impl App {
             }
             press
         });
+        self.let_go_of_ripple();
         if let Some(dragged) = self.dragged.take() {
             let (dx, dy) = (x - dragged.last.0, y - dragged.last.1);
             let _ = self.send_drag(&dragged.path, "end", x, y, dx, dy);
@@ -3616,6 +3678,14 @@ impl App {
         if self.pressed.take().is_some() {
             self.invalidate_automatic();
             self.repaint = true;
+        }
+        self.let_go_of_ripple();
+    }
+
+    /// A ripple fades once what set it off is let go.
+    fn let_go_of_ripple(&mut self) {
+        if let Some(ripple) = &mut self.ripple {
+            ripple.let_go.get_or_insert_with(Instant::now);
         }
     }
 
