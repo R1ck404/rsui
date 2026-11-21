@@ -58,6 +58,7 @@ mod input_log;
 pub mod inspect;
 mod pill;
 mod marks;
+pub mod native_look;
 #[cfg(feature = "idle-probe")]
 mod native_cycles;
 pub mod replay;

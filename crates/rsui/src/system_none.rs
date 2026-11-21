@@ -6,6 +6,11 @@ pub fn system_is_dark() -> bool {
     std::env::var("GTK_THEME").is_ok_and(|theme| theme.to_ascii_lowercase().contains("dark"))
 }
 
+/// The shades of the accent color the user's chosen, which only Windows says yet (see `system.rs`).
+pub(crate) fn accent_palette() -> Option<[[u8; 4]; 8]> {
+    None
+}
+
 /// Whether this is something it's safe to hand to whatever opens it. Text in a program can come from anywhere, and what
 /// opens `file:` or a program's own scheme can run anything.
 pub fn can_open_url(url: &str) -> bool {

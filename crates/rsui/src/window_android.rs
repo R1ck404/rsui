@@ -159,6 +159,10 @@ pub fn focus(on: bool) {
 pub fn configuration(scale: f32, night: bool) {
     send(Event::Configuration { scale, night }, false);
 }
+/// Whether the activity said the system was set to dark colors when it started, for what's drawn before the app hears it.
+pub(crate) fn night() -> bool {
+    lock().as_ref().is_some_and(|glue| glue.night)
+}
 pub fn low_memory() {
     send(Event::LowMemory, false);
 }
