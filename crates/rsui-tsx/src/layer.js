@@ -3407,6 +3407,13 @@ const PAGE_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
     }
 }
 
+// `native`, the system's own popups, is only loaded the first time it's used: see `native_popups.js`.
+const nativePopups = () => {
+    const { native } = require('rsui/native');
+    Object.defineProperty(module.exports, 'native', { value: native, enumerable: true, configurable: true, writable: false });
+    return native;
+};
+
 module.exports = {
     // For 'react', and nothing else.
     __adapt(render) {
@@ -3518,3 +3525,4 @@ module.exports = {
     Select,
     TextInput,
 };
+Object.defineProperty(module.exports, 'native', { get: nativePopups, enumerable: true, configurable: true });

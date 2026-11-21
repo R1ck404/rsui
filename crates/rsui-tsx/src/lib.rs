@@ -40,6 +40,7 @@ mod native_more;
 mod new;
 mod pack;
 mod plans;
+mod popups;
 mod png;
 mod process_memory;
 mod props;
