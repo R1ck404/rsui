@@ -7,7 +7,7 @@
 //! here in [`run_sized`] as it would in a window anywhere else: what comes in is fed to the app, and a frame is drawn when
 //! it says one's needed.
 //!
-//! Drawing is with the CPU renderer for now, straight into the window's buffer; Vulkan comes in its place (plan 058, §5.7).
+//! Drawing is with Vulkan, on the phone's GPU, or with the CPU renderer, straight into the window's buffer, where Vulkan can't.
 
 #![allow(unsafe_code)]
 
@@ -328,15 +328,42 @@ pub fn run<P: 'static, R: IntoNode + 'static>(title: &str, render: fn(&mut Cx<'_
 
 /// The window the app's drawing on, while there is one.
 struct Shown {
-    window: *mut c_void,
+    // The renderer goes first, as it may be drawing on the window.
     renderer: Renderer,
+    /// Whether the renderer draws on the window itself, with Vulkan, rather than the CPU into memory.
+    gpu: bool,
     size: (u32, u32),
+    window: Held,
 }
 
-impl Drop for Shown {
+/// A window acquired for drawing on, let go of once.
+struct Held(*mut c_void);
+
+impl Drop for Held {
     fn drop(&mut self) {
         // SAFETY: the window was acquired for this, and is let go of once.
-        unsafe { ANativeWindow_release(self.window) };
+        unsafe { ANativeWindow_release(self.0) };
+    }
+}
+
+/// What draws on `window`: the GPU, with Vulkan, if there's one that can, or else the CPU. `RSUI_VULKAN=0` says to draw
+/// with the CPU, and setting `RSUI_VULKAN` at all says which it is and why.
+fn renderer_for(window: *mut c_void, size: (u32, u32)) -> Option<(Renderer, bool)> {
+    let told = std::env::var_os("RSUI_VULKAN").is_some();
+    // SAFETY: the window is held for as long as the renderer is, as `Shown` drops the renderer first.
+    match unsafe { Renderer::for_android(window, size) } {
+        Ok(renderer) => {
+            if told {
+                eprintln!("rsui: drawing with Vulkan");
+            }
+            Some((renderer, true))
+        }
+        Err(error) => {
+            if told {
+                eprintln!("rsui: drawing with the CPU, as {error}");
+            }
+            Renderer::offscreen(size).ok().map(|renderer| (renderer, false))
+        }
     }
 }
 
@@ -381,7 +408,7 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
             let now = Instant::now();
             let stop = match event {
                 // The same window, as it is when it's only changed size, keeps its renderer.
-                Event::Surface(window) if shown.as_ref().is_some_and(|shown| shown.window == window) => {
+                Event::Surface(window) if shown.as_ref().is_some_and(|shown| shown.window.0 == window) => {
                     // SAFETY: acquired again by whoever sent it, and held already.
                     unsafe { ANativeWindow_release(window) };
                     needs_draw = true;
@@ -391,10 +418,10 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
                     shown = None;
                     if !window.is_null() {
                         let size = window_size(window);
-                        if let Ok(renderer) = Renderer::offscreen(size) {
+                        if let Some((renderer, gpu)) = renderer_for(window, size) {
                             app.resize(size, scale);
                             app.renderer_replaced();
-                            shown = Some(Shown { window, renderer, size });
+                            shown = Some(Shown { renderer, gpu, size, window: Held(window) });
                         } else {
                             // SAFETY: acquired by whoever sent it, and not kept.
                             unsafe { ANativeWindow_release(window) };
@@ -569,7 +596,7 @@ fn window_size(window: *mut c_void) -> (u32, u32) {
 
 /// Has the renderer and the app as big as the window is now.
 fn refit(app: &mut App, shown: &mut Shown, scale: f32) {
-    let size = window_size(shown.window);
+    let size = window_size(shown.window.0);
     if size != shown.size {
         shown.size = size;
         let _ = shown.renderer.resize(size);
@@ -579,6 +606,20 @@ fn refit(app: &mut App, shown: &mut Shown, scale: f32) {
 
 /// Draws a frame with the CPU, and copies it into the window's buffer.
 fn draw(app: &mut App, shown: &mut Shown) {
+    if shown.gpu {
+        if let Err(error) = app.render(&mut shown.renderer) {
+            // The GPU's gone, or can't draw here: the CPU draws from now on, once Vulkan's let go of the window.
+            if std::env::var_os("RSUI_VULKAN").is_some() {
+                eprintln!("rsui: Vulkan stopped drawing ({error}); drawing with the CPU");
+            }
+            let Ok(renderer) = Renderer::offscreen(shown.size) else { return };
+            shown.renderer = renderer;
+            shown.gpu = false;
+            app.renderer_replaced();
+        } else {
+            return;
+        }
+    }
     if app.render(&mut shown.renderer).is_err() {
         return;
     }
@@ -586,9 +627,9 @@ fn draw(app: &mut App, shown: &mut Shown) {
     let (width, height) = shown.size;
     // SAFETY: the window is held; the buffer it hands out is `stride` pixels a row, `height` rows, until it's posted.
     unsafe {
-        ANativeWindow_setBuffersGeometry(shown.window, width as i32, height as i32, FORMAT_RGBA_8888);
+        ANativeWindow_setBuffersGeometry(shown.window.0, width as i32, height as i32, FORMAT_RGBA_8888);
         let mut buffer: WindowBuffer = std::mem::zeroed();
-        if ANativeWindow_lock(shown.window, &raw mut buffer, std::ptr::null_mut()) != 0 {
+        if ANativeWindow_lock(shown.window.0, &raw mut buffer, std::ptr::null_mut()) != 0 {
             return;
         }
         let rows = (buffer.height.max(0) as usize).min(height as usize);
@@ -598,7 +639,7 @@ fn draw(app: &mut App, shown: &mut Shown) {
             let to = buffer.bits.cast::<u8>().add(row * buffer.stride as usize * 4);
             std::ptr::copy_nonoverlapping(from.as_ptr(), to, across);
         }
-        ANativeWindow_unlockAndPost(shown.window);
+        ANativeWindow_unlockAndPost(shown.window.0);
     }
 }
 
