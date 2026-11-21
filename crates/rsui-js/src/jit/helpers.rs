@@ -11,12 +11,27 @@
 //! [`THROW`] with the error in `vm.jit.value`, [`BAIL`] to have the interpreter carry on in that frame from where its
 //! `pc` now is, or for a jump, [`TAKEN`].
 #![allow(unsafe_code)]
+// arm64.rs doesn't call all of them yet.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 use crate::object::*;
 use crate::op::*;
 use crate::text::{self, Atom, AtomKind};
 use crate::value::Value;
 use crate::vm::{Args, Frame, Vm};
+
+/// Declares a function compiled code calls: with Windows' convention on x86-64, on every system (so that x64.rs has
+/// one convention), and with the system's own elsewhere (AAPCS64 on Arm, which arm64.rs calls with).
+macro_rules! jit_abi {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident($($params:tt)*) $(-> $ret:ty)? $body:block) => {
+        #[cfg(target_arch = "x86_64")]
+        $(#[$meta])*
+        $vis extern "win64" fn $name($($params)*) $(-> $ret)? $body
+        #[cfg(not(target_arch = "x86_64"))]
+        $(#[$meta])*
+        $vis extern "C" fn $name($($params)*) $(-> $ret)? $body
+    };
+}
 
 pub(crate) const OK: u32 = 0;
 pub(crate) const BAIL: u32 = 1;
@@ -409,9 +424,10 @@ fn forgiven(vm: &mut Vm, result: crate::vm::Run<()>) -> u32 {
     }
 }
 
+jit_abi! {
 /// Does the instruction at `pc`, in the frame on top, as the interpreter would, all of it. For CallMethod and
 /// CallMethodPoly it's only the read of the method, which [`call`] then calls.
-pub(crate) extern "win64" fn op(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn op(vm: &mut Vm, pc: u32) -> u32 {
     use crate::builtins::BigOp;
     #[cfg(feature = "jit-opt")]
     super::feedback::record(vm, pc);
@@ -1292,6 +1308,7 @@ pub(crate) extern "win64" fn op(vm: &mut Vm, pc: u32) -> u32 {
     }
     OK
 }
+}
 
 /// Has the interpreter carry on from the instruction at `pc`, which hasn't been started. Compiled code only comes here
 /// for an instruction the helpers don't do, which is a bug in what `Gen::op` sends them: it's counted, and with
@@ -1309,10 +1326,11 @@ fn bail_at(vm: &mut Vm, pc: u32) -> u32 {
     BAIL
 }
 
+jit_abi! {
 /// A call that compiled code doesn't make itself: to a function that isn't compiled, a native, anything else, a
 /// `new` or a `super(...)`. For CallMethod the method has been read already. A JavaScript function runs to its end
 /// before this returns, in the interpreter (which goes into compiled code again if it has some).
-pub(crate) extern "win64" fn call(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn call(vm: &mut Vm, pc: u32) -> u32 {
     #[cfg(feature = "jit-opt")]
     super::feedback::record(vm, pc);
     let op = vm.code[pc as usize];
@@ -1447,6 +1465,7 @@ pub(crate) extern "win64" fn call(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
 /// For `RSUI_JIT_LOG`: what a property read compiled code left to the generic helper read from.
 #[cold]
@@ -1514,7 +1533,7 @@ fn count_call(vm: &mut Vm, op: &Op) {
                     "a generator or async"
                 } else if slot == 0 {
                     "a function never compiled"
-                } else if slot < super::x64::CODE_MIN {
+                } else if slot < super::plan::CODE_MIN {
                     "a function not compiled yet"
                 } else {
                     "a compiled function"
@@ -1531,9 +1550,10 @@ fn count_call(vm: &mut Vm, op: &Op) {
     *vm.jit.generic.entry(format!("call: {name} of {what}")).or_default() += 1;
 }
 
+jit_abi! {
 /// The test of `IncLoopLt`, `IncLoopLtInt` or `IncLoopLtLength` at `pc`, once compiled code has stepped the
 /// counter itself: [`TAKEN`] if the loop goes round again.
-pub(crate) extern "win64" fn loop_test(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn loop_test(vm: &mut Vm, pc: u32) -> u32 {
     let op = vm.code[pc as usize];
     let frame = here(vm, pc);
     let base = frame.base as usize;
@@ -1564,16 +1584,20 @@ pub(crate) extern "win64" fn loop_test(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
-
-/// `===` of two values that could each be equal to something with other bits than theirs, and aren't both numbers:
-/// two strings or two bigints, by what they hold. 1 if they're equal. It can't fail or make anything.
-pub(crate) extern "win64" fn strict_equals(vm: &mut Vm, x: u64, y: u64) -> u32 {
-    u32::from(vm.strict_equals(Value(x), Value(y)))
 }
 
+jit_abi! {
+/// `===` of two values that could each be equal to something with other bits than theirs, and aren't both numbers:
+/// two strings or two bigints, by what they hold. 1 if they're equal. It can't fail or make anything.
+pub(crate) fn strict_equals(vm: &mut Vm, x: u64, y: u64) -> u32 {
+    u32::from(vm.strict_equals(Value(x), Value(y)))
+}
+}
+
+jit_abi! {
 /// The comparison at `pc` (`<`, `<=`, `>` or `>=`, as a value, a jump or a loop's test) of `x` and `y`, which aren't
 /// two numbers, as the interpreter's `less_than` and the rest work it out: [`TAKEN`] if it holds, OK if not.
-pub(crate) extern "win64" fn compare(vm: &mut Vm, pc: u32, x: u64, y: u64) -> u32 {
+pub(crate) fn compare(vm: &mut Vm, pc: u32, x: u64, y: u64) -> u32 {
     #[cfg(feature = "jit-opt")]
     super::feedback::record(vm, pc);
     let rel = match vm.code[pc as usize] {
@@ -1614,9 +1638,11 @@ pub(crate) extern "win64" fn compare(vm: &mut Vm, pc: u32, x: u64, y: u64) -> u3
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// Concat at `pc`: the strings of its registers joined, as the interpreter makes it.
-pub(crate) extern "win64" fn concat(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn concat(vm: &mut Vm, pc: u32) -> u32 {
     let Op::Concat { dst, start, count } = vm.code[pc as usize] else {
         unreachable!("only Concat comes here");
     };
@@ -1629,12 +1655,14 @@ pub(crate) extern "win64" fn concat(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
 // Helpers for instructions that are a call of one `Vm` function, which saves the generic helper's work of finding
 // which instruction it is: each finds its operands in the one instruction it's for, as `op` would.
 
+jit_abi! {
 /// InstanceOf at `pc`.
-pub(crate) extern "win64" fn instance_of(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn instance_of(vm: &mut Vm, pc: u32) -> u32 {
     let Op::InstanceOf { dst, a, b } = vm.code[pc as usize] else {
         return op(vm, pc);
     };
@@ -1648,9 +1676,11 @@ pub(crate) extern "win64" fn instance_of(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// SuperGet at `pc`.
-pub(crate) extern "win64" fn super_get(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn super_get(vm: &mut Vm, pc: u32) -> u32 {
     let Op::SuperGet { dst, key, this } = vm.code[pc as usize] else {
         return op(vm, pc);
     };
@@ -1665,9 +1695,11 @@ pub(crate) extern "win64" fn super_get(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// CreateArguments at `pc`, which can't fail.
-pub(crate) extern "win64" fn create_arguments(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn create_arguments(vm: &mut Vm, pc: u32) -> u32 {
     let Op::CreateArguments { dst } = vm.code[pc as usize] else {
         return op(vm, pc);
     };
@@ -1676,12 +1708,14 @@ pub(crate) extern "win64" fn create_arguments(vm: &mut Vm, pc: u32) -> u32 {
     vm.stack[base + dst as usize] = arguments;
     OK
 }
+}
 
+jit_abi! {
 /// SetHome at `pc`, which gives a method an object literal makes the literal as its home, as the interpreter does.
 /// Each method with a name of its own has one (which defines such a method as a field is), and chart.js
 /// runs about 275,000 of them in the canvas benchmark (whose line chart's update took 12.65 ms with them done the
 /// generic way, and 12.2-12.5 with this). It can't fail, allocate or call anything.
-pub(crate) extern "win64" fn set_home(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn set_home(vm: &mut Vm, pc: u32) -> u32 {
     let Op::SetHome { function, home } = vm.code[pc as usize] else {
         return op(vm, pc);
     };
@@ -1692,9 +1726,11 @@ pub(crate) extern "win64" fn set_home(vm: &mut Vm, pc: u32) -> u32 {
     }
     OK
 }
+}
 
+jit_abi! {
 /// ToNumber or ToNumeric at `pc` of what isn't a number.
-pub(crate) extern "win64" fn to_number(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn to_number(vm: &mut Vm, pc: u32) -> u32 {
     let (dst, src, numeric) = match vm.code[pc as usize] {
         Op::ToNumber { dst, src } => (dst, src, false),
         Op::ToNumeric { dst, src } => (dst, src, true),
@@ -1715,10 +1751,12 @@ pub(crate) extern "win64" fn to_number(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// SetElem at `pc` of what isn't an array's or a typed array's element (`o[key] = v` for a name), as the
 /// interpreter does it then.
-pub(crate) extern "win64" fn set_elem(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn set_elem(vm: &mut Vm, pc: u32) -> u32 {
     #[cfg(feature = "jit-opt")]
     super::feedback::record(vm, pc);
     // (SetElemTyped turns back into SetElem the generic way, as in the interpreter.)
@@ -1737,38 +1775,50 @@ pub(crate) extern "win64" fn set_elem(vm: &mut Vm, pc: u32) -> u32 {
     }
     op(vm, pc)
 }
+}
 
+jit_abi! {
 /// `x % y` of two doubles, as Rust's `%` (and the interpreter's `remainder!`) works it out.
-pub(crate) extern "win64" fn fmod(x: f64, y: f64) -> f64 {
+pub(crate) fn fmod(x: f64, y: f64) -> f64 {
     x % y
 }
+}
 
+jit_abi! {
 /// The write barrier for cell `index`, which compiled code has just stored `value` in, as `Cells::write_barrier`
 /// does after the interpreter's stores. Only called for what isn't a number.
-pub(crate) extern "win64" fn cell_barrier(vm: &mut Vm, index: u32, value: u64) {
+pub(crate) fn cell_barrier(vm: &mut Vm, index: u32, value: u64) {
     vm.cells.write_barrier(index as usize, Value(value));
 }
+}
 
+jit_abi! {
 /// The `TYPE_` number of what `typeof` says of `value`. It can't fail or make anything.
-pub(crate) extern "win64" fn type_kind(vm: &mut Vm, value: u64) -> u32 {
+pub(crate) fn type_kind(vm: &mut Vm, value: u64) -> u32 {
     u32::from(vm.type_kind(Value(value)))
 }
+}
 
+jit_abi! {
 /// Whether `value` is truthy, 1 if it is. It can't fail or make anything.
-pub(crate) extern "win64" fn truthy(vm: &mut Vm, value: u64) -> u32 {
+pub(crate) fn truthy(vm: &mut Vm, value: u64) -> u32 {
     u32::from(vm.to_boolean(Value(value)))
 }
-
-/// A string's length, as GetLength gives it. It can't fail or make anything.
-pub(crate) extern "win64" fn string_length(vm: &mut Vm, string: u64) -> u64 {
-    Value::int(vm.strings.items[Value(string).index()].text.len() as i32).0
 }
 
+jit_abi! {
+/// A string's length, as GetLength gives it. It can't fail or make anything.
+pub(crate) fn string_length(vm: &mut Vm, string: u64) -> u64 {
+    Value::int(vm.strings.items[Value(string).index()].text.len() as i32).0
+}
+}
+
+jit_abi! {
 /// A call from compiled code at `pc` to a native, whose function compiled code has found (`func`), and has said the
 /// frame is at that call, with the top of the stack where the native may use it. `operands` has the callee's
 /// register, how many arguments there are and where the result goes, in 16 bits each from the bottom, of the frame
 /// whose registers start at `base` on the stack.
-pub(crate) extern "win64" fn call_native(vm: &mut Vm, func: usize, base: u32, operands: u64) -> u32 {
+pub(crate) fn call_native(vm: &mut Vm, func: usize, base: u32, operands: u64) -> u32 {
     // SAFETY: compiled code read it from a native's `NativeData::func`.
     let func: NativeFn = unsafe { std::mem::transmute::<usize, NativeFn>(func) };
     let base = base as usize;
@@ -1804,14 +1854,18 @@ pub(crate) extern "win64" fn call_native(vm: &mut Vm, func: usize, base: u32, op
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// The `length` IncLoopLtLength compares with, for what isn't an array, when it's quick to find (`arguments`, a
 /// typed array whose getter is the built-in one, a string): the value, or `EMPTY` for the long way. It can't fail or
 /// run anything, so it needs no frame.
-pub(crate) extern "win64" fn quick_length(vm: &mut Vm, target: u64) -> u64 {
+pub(crate) fn quick_length(vm: &mut Vm, target: u64) -> u64 {
     vm.quick_loop_length(Value(target)).unwrap_or(Value::EMPTY).0
 }
+}
 
+jit_abi! {
 /// IterNext at `pc` when what it goes through isn't an array. Any iterator but a generator: its `next`, as
 /// `iterator_step` calls it.
 ///
@@ -1821,7 +1875,7 @@ pub(crate) extern "win64" fn quick_length(vm: &mut Vm, target: u64) -> u64 {
 /// interpreter carries this frame on from this instruction to the frame's end (marked [`crate::vm::INTERPRETED`],
 /// so that it doesn't come back into this code at the top of the loop), and this says the function has returned
 /// ([`RETURNED`], with its value) or thrown ([`THROWN`]). The functions it calls are compiled as ever.
-pub(crate) extern "win64" fn iter_next(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn iter_next(vm: &mut Vm, pc: u32) -> u32 {
     let Op::IterNext { value, iter, .. } = vm.code[pc as usize] else {
         unreachable!("only IterNext comes here");
     };
@@ -1872,12 +1926,14 @@ pub(crate) extern "win64" fn iter_next(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// ArraySpread at `pc`, `[...source]` into an array literal, as the interpreter does. This, Rest and GetIterator of
 /// what isn't an array have helpers of their own, rather than the generic one, whose start and end cost more than the
 /// interpreter's handler does: code that makes small trees of elements each frame (react_render) does them hundreds of
 /// thousands of times.
-pub(crate) extern "win64" fn array_spread(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn array_spread(vm: &mut Vm, pc: u32) -> u32 {
     let Op::ArraySpread { array, source } = vm.code[pc as usize] else {
         unreachable!("only ArraySpread comes here");
     };
@@ -1888,9 +1944,11 @@ pub(crate) extern "win64" fn array_spread(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// Rest at `pc`, a rest parameter, as the interpreter does (see `array_spread`).
-pub(crate) extern "win64" fn rest(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn rest(vm: &mut Vm, pc: u32) -> u32 {
     let Op::Rest { dst, start } = vm.code[pc as usize] else {
         unreachable!("only Rest comes here");
     };
@@ -1909,10 +1967,12 @@ pub(crate) extern "win64" fn rest(vm: &mut Vm, pc: u32) -> u32 {
     vm.stack[frame.base as usize + dst as usize] = array;
     OK
 }
+}
 
+jit_abi! {
 /// GetIterator at `pc` of what compiled code doesn't go through by a count itself, as the interpreter does (see
 /// `array_spread`).
-pub(crate) extern "win64" fn get_iterator(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn get_iterator(vm: &mut Vm, pc: u32) -> u32 {
     let Op::GetIterator { iter, source } = vm.code[pc as usize] else {
         unreachable!("only GetIterator comes here");
     };
@@ -1925,6 +1985,7 @@ pub(crate) extern "win64" fn get_iterator(vm: &mut Vm, pc: u32) -> u32 {
         }
         Err(error) => throw(vm, error),
     }
+}
 }
 
 /// For `iter_next`: if what a `for of` goes through is a suspended generator with the built-in `next` and compiled
@@ -1956,10 +2017,11 @@ fn resume_in_code(vm: &mut Vm, iterator: Value, next: Value, dst: u16) -> crate:
     Ok(Some(target))
 }
 
+jit_abi! {
 /// A read at a megamorphic place `cache` (its index in the list of caches) of the object `target`, from what reads
 /// remember, as GetPropPoly does: [`OK`] with the value in `vm.jit.value`, or [`BAIL`] for the generic way to do it.
 /// It can't fail or run anything, so it needs no frame.
-pub(crate) extern "win64" fn mega_get(vm: &mut Vm, target: u64, cache: u32) -> u32 {
+pub(crate) fn mega_get(vm: &mut Vm, target: u64, cache: u32) -> u32 {
     let target = Value(target);
     let cache = cache as usize;
     let (shape, flags) = {
@@ -1984,11 +2046,13 @@ pub(crate) extern "win64" fn mega_get(vm: &mut Vm, target: u64, cache: u32) -> u
     vm.jit.value = unsafe { vm.objects[holder as usize].read_slot(slot as usize) };
     OK
 }
+}
 
+jit_abi! {
 /// A write at a megamorphic place `cache` (its index in the list of caches) of `value` to the object `target`, from
 /// where writes to its shape went before, as SetPropPoly does: [`OK`] if it wrote, or [`BAIL`] for the generic way. It
 /// can't fail or run anything, so it needs no frame. Compiled code has checked the object isn't old.
-pub(crate) extern "win64" fn mega_set(vm: &mut Vm, target: u64, value: u64, cache: u32) -> u32 {
+pub(crate) fn mega_set(vm: &mut Vm, target: u64, value: u64, cache: u32) -> u32 {
     let (target, value) = (Value(target), Value(value));
     let atom = vm.caches[cache as usize].atom;
     let (shape, flags) = {
@@ -2016,9 +2080,11 @@ pub(crate) extern "win64" fn mega_set(vm: &mut Vm, target: u64, value: u64, cach
     vm.debt += 8;
     OK
 }
+}
 
+jit_abi! {
 /// The `+` at `pc` (Add, AddK or AddInt) of `x` and `y`, when they aren't two numbers, as `arithmetic!` does.
-pub(crate) extern "win64" fn add(vm: &mut Vm, pc: u32, x: u64, y: u64) -> u32 {
+pub(crate) fn add(vm: &mut Vm, pc: u32, x: u64, y: u64) -> u32 {
     #[cfg(feature = "jit-opt")]
     super::feedback::record(vm, pc);
     let dst = match vm.code[pc as usize] {
@@ -2034,10 +2100,12 @@ pub(crate) extern "win64" fn add(vm: &mut Vm, pc: u32, x: u64, y: u64) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// GetLength at `pc` of `target` when that isn't an array, as the interpreter does: a string's here, anything else
 /// through its cache.
-pub(crate) extern "win64" fn get_length(vm: &mut Vm, pc: u32, target: u64) -> u32 {
+pub(crate) fn get_length(vm: &mut Vm, pc: u32, target: u64) -> u32 {
     let Op::GetLength { dst, cache, .. } = vm.code[pc as usize] else {
         unreachable!("only GetLength comes here");
     };
@@ -2062,11 +2130,13 @@ pub(crate) extern "win64" fn get_length(vm: &mut Vm, pc: u32, target: u64) -> u3
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// GetElem of `target[key]` when that isn't an array's element, as the interpreter does: a typed array's the quick
 /// way, anything else `get_by_value`. `at` is the instruction's place, with the register the result goes in from bit
 /// 32.
-pub(crate) extern "win64" fn get_elem(vm: &mut Vm, at: u64, target: u64, key: u64) -> u32 {
+pub(crate) fn get_elem(vm: &mut Vm, at: u64, target: u64, key: u64) -> u32 {
     let (pc, dst) = (at as u32, (at >> 32) as usize);
     let (target, key) = (Value(target), Value(key));
     #[cfg(feature = "jit-opt")]
@@ -2095,9 +2165,11 @@ pub(crate) extern "win64" fn get_elem(vm: &mut Vm, at: u64, target: u64, key: u6
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// Writes a typed array's element, as SetElem's quick way does: [`OK`] if it did, or [`BAIL`] for the generic way.
-pub(crate) extern "win64" fn typed_set(vm: &mut Vm, target: u64, key: u64, value: u64) -> u32 {
+pub(crate) fn typed_set(vm: &mut Vm, target: u64, key: u64, value: u64) -> u32 {
     let (target, key) = (Value(target), Value(key));
     if target.is_object()
         && key.is_int()
@@ -2115,12 +2187,14 @@ pub(crate) extern "win64" fn typed_set(vm: &mut Vm, target: u64, key: u64, value
         BAIL
     }
 }
+}
 
+jit_abi! {
 /// An error was thrown in the compiled function whose frame is `frame`, or in compiled code it called, whose frames
 /// are still above it. As `Vm::unwind` does for that frame: if it has a `catch` or `finally` around where it is, the
 /// frames above it go, the error is put where the handler wants it, and this says which of the function's
 /// instructions the handler starts at; else `u32::MAX`, with the error in `vm.jit.value`.
-pub(crate) extern "win64" fn catch(vm: &mut Vm, error: u64, frame: *const Frame) -> u32 {
+pub(crate) fn catch(vm: &mut Vm, error: u64, frame: *const Frame) -> u32 {
     let error = Value(error);
     let index = (frame as usize - vm.frames.as_ptr() as usize) / size_of::<Frame>();
     while vm.frames.len() > index + 1 {
@@ -2149,18 +2223,22 @@ pub(crate) extern "win64" fn catch(vm: &mut Vm, error: u64, frame: *const Frame)
         }
     }
 }
+}
 
 // Small helpers for what the generic way would do the same as, taking what they need in registers. None of them can
 // fail, or collect garbage (that's only at safe points), so they need no frame.
 
+jit_abi! {
 /// NewObject's object.
-pub(crate) extern "win64" fn new_object(vm: &mut Vm, capacity: u32) -> u64 {
+pub(crate) fn new_object(vm: &mut Vm, capacity: u32) -> u64 {
     let shape = vm.realm.object_shape;
     vm.alloc_for_jit(shape, Kind::Plain, capacity as usize).0
 }
+}
 
+jit_abi! {
 /// NewArray's array.
-pub(crate) extern "win64" fn new_array(vm: &mut Vm, capacity: u32) -> u64 {
+pub(crate) fn new_array(vm: &mut Vm, capacity: u32) -> u64 {
     if capacity <= 4 {
         return vm.small_array(&[]).0;
     }
@@ -2169,60 +2247,76 @@ pub(crate) extern "win64" fn new_array(vm: &mut Vm, capacity: u32) -> u64 {
     let items = Vec::with_capacity(capacity as usize);
     vm.alloc_for_jit(shape, Kind::Array(items.into()), 0).0
 }
+}
 
+jit_abi! {
 /// ArrayPush, onto the array an array literal is making.
-pub(crate) extern "win64" fn array_push(vm: &mut Vm, array: u64, value: u64) {
+pub(crate) fn array_push(vm: &mut Vm, array: u64, value: u64) {
     if let Kind::Array(items) = &mut vm.objects[Value(array).index()].kind {
         items.push(Value(value));
     }
     vm.debt += 8;
 }
+}
 
+jit_abi! {
 /// Closure's function, made in the frame on top.
-pub(crate) extern "win64" fn closure(vm: &mut Vm, proto: u32) -> u64 {
+pub(crate) fn closure(vm: &mut Vm, proto: u32) -> u64 {
     let base = vm.frames.last().expect("compiled code runs in a frame").base as usize;
     vm.make_closure(proto, base).0
 }
+}
 
+jit_abi! {
 /// NewCell's and CopyCell's cell, holding `value`.
-pub(crate) extern "win64" fn new_cell(vm: &mut Vm, value: u64) -> u64 {
+pub(crate) fn new_cell(vm: &mut Vm, value: u64) -> u64 {
     vm.new_cell(Value(value)).0
 }
-
-/// TypeOf's string.
-pub(crate) extern "win64" fn type_of(vm: &mut Vm, value: u64) -> u64 {
-    vm.type_of(Value(value)).0
 }
 
+jit_abi! {
+/// TypeOf's string.
+pub(crate) fn type_of(vm: &mut Vm, value: u64) -> u64 {
+    vm.type_of(Value(value)).0
+}
+}
+
+jit_abi! {
 /// Gives the object `handle` a property at the end, moving it to `shape`, as SetProp does when its cache says how.
-pub(crate) extern "win64" fn add_slot(vm: &mut Vm, handle: u32, shape: u32, value: u64) {
+pub(crate) fn add_slot(vm: &mut Vm, handle: u32, shape: u32, value: u64) {
     // Not through `objects[..]`: compiled code has checked it isn't old.
     let found = unsafe { &mut *vm.objects.as_mut_ptr().add(handle as usize) };
     found.shape = shape;
     found.push_slot(Value(value));
     vm.debt += 8;
 }
+}
 
+jit_abi! {
 /// The same for DefineField, which doesn't count it as made.
-pub(crate) extern "win64" fn define_slot(vm: &mut Vm, handle: u32, shape: u32, value: u64) {
+pub(crate) fn define_slot(vm: &mut Vm, handle: u32, shape: u32, value: u64) {
     // As above.
     let found = unsafe { &mut *vm.objects.as_mut_ptr().add(handle as usize) };
     found.shape = shape;
     found.push_slot(Value(value));
 }
+}
 
+jit_abi! {
 /// Keeps the arguments of the frame compiled code has just made, for a function that keeps them, as
 /// `enter_function` does.
-pub(crate) extern "win64" fn keep_args(vm: &mut Vm, argc: u32) {
+pub(crate) fn keep_args(vm: &mut Vm, argc: u32) {
     let base = vm.frames.last().expect("a frame was just made").base as usize;
     let mut args = vm.spare_args.pop().unwrap_or_default();
     args.extend_from_slice(&vm.stack[base + 1..base + 1 + argc as usize]);
     vm.kept_args.push(args);
 }
+}
 
+jit_abi! {
 /// Makes the `this` of the `new` at `pc`, whose callee compiled code has found to be one it can call itself, or of
 /// the `super(...)` there, whose parent isn't derived: for its `new.target`, which is the frame's.
-pub(crate) extern "win64" fn this_for(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn this_for(vm: &mut Vm, pc: u32) -> u32 {
     #[cfg(feature = "jit-opt")]
     let site = super::feedback::site_of(vm, pc);
     let frame = here(vm, pc);
@@ -2242,34 +2336,42 @@ pub(crate) extern "win64" fn this_for(vm: &mut Vm, pc: u32) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// The calls at `pc` and the others like it that knew nothing of what they'd call have counted `counter` (the
 /// running code's) down: compiles the function again, or looks whether it has been (`Vm::jit_recompile`), and says
 /// where its new code for that instruction is, or 0 to go on in this.
-pub(crate) extern "win64" fn recompile(vm: &mut Vm, pc: u32, counter: *mut u64) -> u64 {
+pub(crate) fn recompile(vm: &mut Vm, pc: u32, counter: *mut u64) -> u64 {
     let frame = here(vm, pc);
     vm.jit_recompile(frame.proto, pc, counter) as u64
 }
+}
 
+jit_abi! {
 /// The count towards the optimizing tier of the compiled function on top has come to 0 (see `jit::feedback::due`).
 #[cfg(feature = "jit-opt")]
-pub(crate) extern "win64" fn opt_due(vm: &mut Vm) {
+pub(crate) fn opt_due(vm: &mut Vm) {
     let proto = vm.frames.last().expect("compiled code runs in a frame").proto;
     vm.opt_due(proto);
 }
+}
 
+jit_abi! {
 /// A safe point that's due: collects garbage, with the frame's `pc` saying it's at the instruction before `pc`.
-pub(crate) extern "win64" fn collect(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn collect(vm: &mut Vm, pc: u32) -> u32 {
     let frame = vm.frames.last_mut().expect("compiled code runs in a frame");
     frame.pc = pc;
     vm.top = frame.top as usize;
     vm.collect_garbage();
     OK
 }
+}
 
+jit_abi! {
 /// A compiled function's frame doesn't fit: makes room for it, as `enter_function` would, or says why not. The
 /// caller's frame is on top, and `needed` is how far the stack has to reach.
-pub(crate) extern "win64" fn grow(vm: &mut Vm, needed: u32) -> u32 {
+pub(crate) fn grow(vm: &mut Vm, needed: u32) -> u32 {
     let frame = *vm.frames.last().expect("compiled code runs in a frame");
     vm.top = frame.top as usize;
     if vm.frames.len() >= crate::vm::MAX_FRAMES {
@@ -2286,10 +2388,12 @@ pub(crate) extern "win64" fn grow(vm: &mut Vm, needed: u32) -> u32 {
     }
     OK
 }
+}
 
+jit_abi! {
 /// Finishes returning from a frame with flags (a `new`, or one that keeps its arguments), as `finish_return!` does
 /// before the frame goes. The value to hand back goes in `vm.jit.value`.
-pub(crate) extern "win64" fn finish_return(vm: &mut Vm, value: u64) -> u32 {
+pub(crate) fn finish_return(vm: &mut Vm, value: u64) -> u32 {
     match vm.finish_special_frame(Value(value)) {
         Ok(value) => {
             vm.jit.value = value;
@@ -2299,10 +2403,12 @@ pub(crate) extern "win64" fn finish_return(vm: &mut Vm, value: u64) -> u32 {
         Err(error) => throw(vm, error),
     }
 }
+}
 
+jit_abi! {
 /// InitialYield at `pc`, at the start of a generator: makes the generator, with the frame as it is, which then goes,
 /// as the interpreter's InitialYield does. The generator goes in `vm.jit.value`, for compiled code to return.
-pub(crate) extern "win64" fn initial_yield(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn initial_yield(vm: &mut Vm, pc: u32) -> u32 {
     let frame = here(vm, pc);
     let generator = vm.suspend_new_generator();
     vm.pop_frame();
@@ -2319,11 +2425,13 @@ pub(crate) extern "win64" fn initial_yield(vm: &mut Vm, pc: u32) -> u32 {
     vm.jit.value = generator;
     OK
 }
+}
 
+jit_abi! {
 /// Yield at `pc`: the generator stops, with its frame as it is, and the frame goes, as the interpreter's Yield does.
 /// What it yields goes in `vm.jit.value`, for compiled code to return: to `resume_generator`, or, for a generator a
 /// `for of` carried on in place, to whoever went into this code, which puts it where that loop wants it.
-pub(crate) extern "win64" fn yield_value(vm: &mut Vm, pc: u32) -> u32 {
+pub(crate) fn yield_value(vm: &mut Vm, pc: u32) -> u32 {
     let Op::Yield { dst, src } = vm.code[pc as usize] else {
         unreachable!("only Yield comes here");
     };
@@ -2338,4 +2446,5 @@ pub(crate) extern "win64" fn yield_value(vm: &mut Vm, pc: u32) -> u32 {
     }
     vm.jit.value = value;
     OK
+}
 }
