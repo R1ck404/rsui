@@ -235,7 +235,7 @@ impl Layout {
 
 /// The way into compiled code from Rust (see [`trampoline`]): the engine, the frame on top, and where in its function's
 /// code to start. It gives back how the code left, with what it handed back in `vm.jit.value`.
-pub(crate) type Trampoline = unsafe extern "C" fn(*mut Vm, *mut Frame, usize) -> u32;
+pub(crate) type Trampoline = unsafe extern "win64" fn(*mut Vm, *mut Frame, usize) -> u32;
 
 /// One compiled function, as the engine keeps it.
 pub(crate) struct Compiled {
@@ -1514,7 +1514,7 @@ impl<'a> Gen<'a> {
     }
 
     /// Calls `helper(vm, pc)` for instruction `i`, a helper for that one instruction, and leaves if it says to.
-    fn direct(&mut self, i: usize, helper: extern "C" fn(&mut Vm, u32) -> u32) {
+    fn direct(&mut self, i: usize, helper: extern "win64" fn(&mut Vm, u32) -> u32) {
         if let Some(deopt) = self.deopt() {
             self.a.jmp(deopt);
             return;
@@ -1527,7 +1527,7 @@ impl<'a> Gen<'a> {
     }
 
     /// A cold path that does instruction `i` by `helper`, a helper for that one instruction, and goes back to `done`.
-    fn cold_direct(&mut self, i: usize, at: Label, done: Label, helper: extern "C" fn(&mut Vm, u32) -> u32) {
+    fn cold_direct(&mut self, i: usize, at: Label, done: Label, helper: extern "win64" fn(&mut Vm, u32) -> u32) {
         let was = self.a.is_cold();
         self.a.set_cold(true);
         self.a.bind(at);
@@ -5367,7 +5367,7 @@ impl<'a> Gen<'a> {
 
     /// A generator stopping at instruction `i` by `helper`, which takes its frame away and leaves what's to be handed
     /// back in `vm.jit.value`: this returns it, as `ret` does.
-    fn stop_here(&mut self, i: usize, helper: extern "C" fn(&mut Vm, u32) -> u32) {
+    fn stop_here(&mut self, i: usize, helper: extern "win64" fn(&mut Vm, u32) -> u32) {
         self.direct(i, helper);
         self.a.load(RAX, m(VM, self.l.value));
         self.a.alu_rr32(Alu::Xor, RDX, RDX);

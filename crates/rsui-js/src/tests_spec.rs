@@ -168,11 +168,12 @@ fn import_meta_has_the_module_as_a_file_url_and_as_a_path() {
                 "a b#[x]~\u{e9}/main.mjs",
                 r#"
                 import { fileURLToPath, pathToFileURL } from 'url';
+                import { sep } from 'path';
                 import { other } from './other.mjs';
                 const r = (s) => { try { return import.meta.resolve(s); } catch (e) { return 'threw ' + e.code; } };
                 const up = new URL('..', import.meta.url).href;
                 console.log(import.meta.url.startsWith('file:///'), import.meta.url.slice(up.length - 1));
-                console.log(fileURLToPath(import.meta.url) === import.meta.filename, pathToFileURL(import.meta.filename).href === import.meta.url, import.meta.dirname + String.fromCharCode(92) + 'main.mjs' === import.meta.filename);
+                console.log(fileURLToPath(import.meta.url) === import.meta.filename, pathToFileURL(import.meta.filename).href === import.meta.url, import.meta.dirname + sep + 'main.mjs' === import.meta.filename);
                 console.log(Object.keys(import.meta).join(), Object.getPrototypeOf(import.meta), import.meta.main, other.main, other === import.meta);
                 console.log([r('./other.mjs'), r('./missing.js'), r('./other.mjs?q=1#h'), r('../x/y.js')].map((u) => u.startsWith(up) ? u.slice(up.length) : u).join(' '));
                 console.log(r('fs'), r('node:path'), r('nope-pkg'), r('https://a/b.js'), import.meta.resolve.name, import.meta.resolve.length);

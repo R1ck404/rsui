@@ -243,7 +243,7 @@ pub(crate) fn quick_name(which: u16) -> &'static str {
 /// built-in one and has numbers (`y` is ignored by the ones that take one). The answer is what `math_quick` makes a
 /// `Value::number` of.
 #[cfg(feature = "jit")]
-pub(crate) extern "C" fn quick_apply(which: u64, x: f64, y: f64) -> f64 {
+pub(crate) extern "win64" fn quick_apply(which: u64, x: f64, y: f64) -> f64 {
     match QUICK[which as usize].2 {
         Quick::One(function) => function(x),
         Quick::Two(function) => function(x, y),

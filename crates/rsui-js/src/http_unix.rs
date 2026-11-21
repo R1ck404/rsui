@@ -41,6 +41,10 @@ const CURLOPT_XFERINFODATA: c_int = 10057;
 const CURLOPT_NOSIGNAL: c_int = 99;
 const CURLOPT_CONNECTTIMEOUT_MS: c_int = 156;
 const CURLOPT_MAXREDIRS: c_int = 68;
+const CURLOPT_SOCKOPTFUNCTION: c_int = 20148;
+const CURLOPT_SOCKOPTDATA: c_int = 10149;
+const CURLOPT_CLOSESOCKETFUNCTION: c_int = 20208;
+const CURLOPT_CLOSESOCKETDATA: c_int = 10209;
 const CURLINFO_RESPONSE_CODE: c_int = 0x0020_0002;
 const CURLINFO_EFFECTIVE_URL: c_int = 0x0010_0001;
 const CURL_GLOBAL_DEFAULT: c_long = 3;
@@ -52,6 +56,34 @@ type SetOption = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
 type GetInfo = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
 type WriteFn = unsafe extern "C" fn(*const c_char, usize, usize, *mut c_void) -> usize;
 type ProgressFn = unsafe extern "C" fn(*mut c_void, i64, i64, i64, i64) -> c_int;
+type SocketFn = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
+type CloseFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+
+/// What stops a request: whether it's been cancelled, and the socket it's on now, which is shut down to stop it at once,
+/// wherever curl's got to.
+/// The socket's kept under a lock that curl closes it under too, so it's never shut down once its number could be
+/// something else's.
+struct Stop {
+    cancelled: AtomicBool,
+    socket: Mutex<c_int>,
+}
+
+impl Default for Stop {
+    fn default() -> Self {
+        Self { cancelled: AtomicBool::new(false), socket: Mutex::new(-1) }
+    }
+}
+
+impl Stop {
+    fn stop(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        let socket = self.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *socket >= 0 {
+            // SAFETY: the socket's open while it's here; shutting it down only ends what's on it, and curl still closes it.
+            unsafe { libc::shutdown(*socket, libc::SHUT_RDWR) };
+        }
+    }
+}
 
 /// libcurl's functions that are used here.
 struct Curl {
@@ -112,8 +144,12 @@ enum Event {
     Cancel,
 }
 
-fn exchanges() -> &'static Mutex<HashMap<u32, Sender<Event>>> {
-    static ALL: OnceLock<Mutex<HashMap<u32, Sender<Event>>>> = OnceLock::new();
+/// Each request that's running: where to tell it what JavaScript says, and whether it's been cancelled, which curl looks
+/// at however far it's got, as a request waiting for an answer isn't reading what it's told.
+type Running = (Sender<Event>, Arc<Stop>);
+
+fn exchanges() -> &'static Mutex<HashMap<u32, Running>> {
+    static ALL: OnceLock<Mutex<HashMap<u32, Running>>> = OnceLock::new();
     ALL.get_or_init(Mutex::default)
 }
 
@@ -134,7 +170,7 @@ struct Exchange<'a> {
     /// The header lines of the response that's coming, which a redirect starts again.
     lines: Vec<String>,
     events: &'a Receiver<Event>,
-    cancelled: &'a AtomicBool,
+    stop: &'a Stop,
 }
 
 impl Exchange<'_> {
@@ -173,7 +209,7 @@ impl Exchange<'_> {
                     return true;
                 }
                 Ok(Event::Cancel) | Err(_) => {
-                    self.cancelled.store(true, Ordering::Relaxed);
+                    self.stop.cancelled.store(true, Ordering::Relaxed);
                     return false;
                 }
             }
@@ -217,7 +253,7 @@ unsafe extern "C" fn heard_header(data: *const c_char, size: usize, count: usize
     } else {
         exchange.lines.push(line);
     }
-    if exchange.cancelled.load(Ordering::Relaxed) { 0 } else { length }
+    if exchange.stop.cancelled.load(Ordering::Relaxed) { 0 } else { length }
 }
 
 unsafe extern "C" fn heard_body(data: *const c_char, size: usize, count: usize, context: *mut c_void) -> usize {
@@ -231,15 +267,34 @@ unsafe extern "C" fn heard_body(data: *const c_char, size: usize, count: usize, 
 }
 
 unsafe extern "C" fn going(context: *mut c_void, _: i64, _: i64, _: i64, _: i64) -> c_int {
-    // SAFETY: the flag the request was given, which outlives it.
-    let cancelled = unsafe { &*context.cast::<AtomicBool>() };
-    // A request that's cancelled while nothing's coming stops at curl's next look, about once a second.
-    c_int::from(cancelled.load(Ordering::Relaxed))
+    // SAFETY: the request's `Stop`, which outlives it.
+    let stop = unsafe { &*context.cast::<Stop>() };
+    c_int::from(stop.cancelled.load(Ordering::Relaxed))
+}
+
+/// Notes each socket curl opens for the request, so that cancelling can shut it down.
+unsafe extern "C" fn opened(context: *mut c_void, socket: c_int, _purpose: c_int) -> c_int {
+    // SAFETY: as for `going`.
+    let stop = unsafe { &*context.cast::<Stop>() };
+    *stop.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = socket;
+    0
+}
+
+/// Closes a socket of the request's, as curl would, once it's no longer where cancelling can find it.
+unsafe extern "C" fn closing(context: *mut c_void, socket: c_int) -> c_int {
+    // SAFETY: as for `going`.
+    let stop = unsafe { &*context.cast::<Stop>() };
+    let mut kept = stop.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *kept == socket {
+        *kept = -1;
+    }
+    // SAFETY: curl hands over a socket it's done with, which is closed here as it asked.
+    unsafe { libc::close(socket) }
 }
 
 /// Makes a request, says what came back once the headers are in, and then hands over its answer a part at a time, each
 /// when it's asked for, until it ends, fails, or is cancelled.
-fn exchange(asked: Asked, head: Later, events: Receiver<Event>) {
+fn exchange(asked: Asked, head: Later, events: Receiver<Event>, stop: Arc<Stop>) {
     let Some(curl) = curl() else {
         head.settle(Outcome::RequestFailed("libcurl isn't on this system".to_owned()));
         return;
@@ -253,7 +308,6 @@ fn exchange(asked: Asked, head: Later, events: Receiver<Event>) {
         head.settle(Outcome::RequestFailed("the address has a zero in it".to_owned()));
         return;
     };
-    let cancelled = AtomicBool::new(false);
     // SAFETY: the handle and the list of headers are made and freed here; everything curl's given lasts through
     // `perform`, which is when it uses them.
     unsafe {
@@ -277,7 +331,7 @@ fn exchange(asked: Asked, head: Later, events: Receiver<Event>) {
             head: Some(head),
             lines: Vec::new(),
             events: &events,
-            cancelled: &cancelled,
+            stop: &stop,
         };
         let set = curl.easy_setopt;
         set(handle, CURLOPT_URL, url.as_ptr());
@@ -306,10 +360,16 @@ fn exchange(asked: Asked, head: Later, events: Receiver<Event>) {
         set(handle, CURLOPT_WRITEDATA, context);
         set(handle, CURLOPT_NOPROGRESS, 0 as c_long);
         set(handle, CURLOPT_XFERINFOFUNCTION, going as ProgressFn);
-        set(handle, CURLOPT_XFERINFODATA, (&raw const cancelled).cast::<c_void>());
+        set(handle, CURLOPT_XFERINFODATA, Arc::as_ptr(&stop).cast::<c_void>());
+        set(handle, CURLOPT_SOCKOPTFUNCTION, opened as SocketFn);
+        set(handle, CURLOPT_SOCKOPTDATA, Arc::as_ptr(&stop).cast::<c_void>());
+        set(handle, CURLOPT_CLOSESOCKETFUNCTION, closing as CloseFn);
+        set(handle, CURLOPT_CLOSESOCKETDATA, Arc::as_ptr(&stop).cast::<c_void>());
         let code = (curl.easy_perform)(handle);
         // Stopped by JavaScript, through a callback, which curl says as one of these.
-        let stopped = cancelled.load(Ordering::Relaxed) && matches!(code, CURLE_WRITE_ERROR | CURLE_ABORTED_BY_CALLBACK);
+        // A socket shut down from under it is one of curl's receive or send errors.
+        let stopped = stop.cancelled.load(Ordering::Relaxed)
+            && (matches!(code, CURLE_WRITE_ERROR | CURLE_ABORTED_BY_CALLBACK) || code == 55 || code == 56);
         let ended = if code == 0 || stopped {
             // What had a head and no body, as a `204` or `HEAD` has, says so now.
             exchange.tell_head();
@@ -385,11 +445,12 @@ fn http_start(vm: &mut Vm, args: Args) -> Run<Value> {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     let number = NEXT.fetch_add(1, Ordering::Relaxed);
     let (sender, events) = channel();
+    let stop = Arc::new(Stop::default());
     if let Ok(mut all) = exchanges().lock() {
-        all.insert(number, sender);
+        all.insert(number, (sender, stop.clone()));
     }
     let started = std::thread::Builder::new().name("rsui request".into()).stack_size(REQUEST_STACK).spawn(move || {
-        exchange(asked, head, events);
+        exchange(asked, head, events, stop);
         if let Ok(mut all) = exchanges().lock() {
             all.remove(&number);
         }
@@ -408,7 +469,7 @@ fn http_read(vm: &mut Vm, args: Args) -> Run<Value> {
     let number = vm.to_number(number)? as u32;
     // This only waits to hear something, as a stream of events can stay open for good.
     let (promise, later) = vm.promise_for_later(true);
-    let sender = exchanges().lock().ok().and_then(|all| all.get(&number).cloned());
+    let sender = exchanges().lock().ok().and_then(|all| all.get(&number).map(|(sender, _)| sender.clone()));
     match sender {
         Some(sender) => {
             if let Err(std::sync::mpsc::SendError(Event::Read(later))) = sender.send(Event::Read(later)) {
@@ -424,8 +485,9 @@ fn http_read(vm: &mut Vm, args: Args) -> Run<Value> {
 fn http_cancel(vm: &mut Vm, args: Args) -> Run<Value> {
     let number = vm.arg(&args, 0);
     let number = vm.to_number(number)? as u32;
-    let sender = exchanges().lock().ok().and_then(|mut all| all.remove(&number));
-    if let Some(sender) = sender {
+    let running = exchanges().lock().ok().and_then(|mut all| all.remove(&number));
+    if let Some((sender, stop)) = running {
+        stop.stop();
         let _ = sender.send(Event::Cancel);
     }
     Ok(Value::UNDEFINED)
