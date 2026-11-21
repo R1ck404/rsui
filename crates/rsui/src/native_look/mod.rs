@@ -112,6 +112,8 @@ thread_local! {
     static SETTINGS: Cell<Settings> = const { Cell::new(Settings { theme: None, dark: None, used: false }) };
     /// The parts of controls made so far, as their props are the same for every control in the same state.
     static PARTS: RefCell<Vec<(u32, Props)>> = const { RefCell::new(Vec::new()) };
+    /// What each look says of a control in each state, as [`restyle`] puts it on.
+    static STYLES: RefCell<Vec<(u32, Vec<(Symbol, PropValue)>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn settings() -> Settings {
@@ -279,22 +281,45 @@ pub fn restyle(control: Control, variant: Option<&str>, entries: &mut Vec<(Symbo
         !visual
     });
     let mut native = NativeControl { control, theme, variant: 0, disabled, checked, fraction, dark: dark() };
-    let mut own = Vec::with_capacity(24);
-    match theme {
-        Theme::Material => {
-            native.variant = material::variant(control, variant);
-            material::style(&native, &mut Out(&mut own));
-        }
+    native.variant = match theme {
+        Theme::Material => material::variant(control, variant),
         #[cfg(not(target_os = "android"))]
-        Theme::Fluent => {
-            native.variant = fluent::variant(control, variant);
-            fluent::style(&native, &mut Out(&mut own));
-        }
-    }
-    // The look's first, so what the app said of where it goes comes after it, and wins.
-    entries.splice(0..0, own);
+        Theme::Fluent => fluent::variant(control, variant),
+    };
+    // What the look says is the same for every control in the same state, and is made once: making it each time was
+    // a fifth of what a list of buttons took to make again.
+    let key = state_key(&native, 0xFFFF);
+    STYLES.with(|styles| {
+        let mut styles = styles.borrow_mut();
+        let at = match styles.iter().position(|(kept, _)| *kept == key) {
+            Some(at) => at,
+            None => {
+                let mut own = Vec::with_capacity(24);
+                match theme {
+                    Theme::Material => material::style(&native, &mut Out(&mut own)),
+                    #[cfg(not(target_os = "android"))]
+                    Theme::Fluent => fluent::style(&native, &mut Out(&mut own)),
+                }
+                styles.push((key, own));
+                styles.len() - 1
+            }
+        };
+        // The look's first, so what the app said of where it goes comes after it, and wins.
+        entries.splice(0..0, styles[at].1.iter().cloned());
+    });
     change(|settings| settings.used = true);
     native
+}
+
+/// A number for a control's state, and which of its parts, for what's kept of how it looks.
+fn state_key(native: &NativeControl, part: u32) -> u32 {
+    (native.control as u32) << 24
+        | u32::from(native.variant) << 18
+        | u32::from(native.theme == Theme::Fluent) << 17
+        | u32::from(native.disabled) << 16
+        | u32::from(native.checked) << 15
+        | u32::from(native.dark) << 14
+        | part
 }
 
 /// Puts in the parts of a control that has them, as a checkbox's box, before what's in it, with a label from its name if
@@ -328,12 +353,7 @@ pub fn finish(native: &NativeControl, mut element: Element, has_children: bool) 
 fn part_props(native: &NativeControl, part: u32, make: impl FnOnce() -> Vec<(Symbol, PropValue)>) -> Props {
     // Sliders and progress bars are as many states as there are places along them, which aren't kept.
     let along = matches!(native.control, Control::Slider | Control::Progress);
-    let key = (native.control as u32) << 24
-        | u32::from(native.variant) << 16
-        | u32::from(native.disabled) << 15
-        | u32::from(native.checked) << 14
-        | u32::from(native.dark) << 13
-        | part;
+    let key = state_key(native, part);
     if !along {
         if let Some(found) = PARTS.with(|parts| parts.borrow().iter().find(|(kept, _)| *kept == key).map(|(_, props)| props.clone())) {
             return found;

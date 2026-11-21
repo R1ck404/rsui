@@ -1,0 +1,33 @@
+wait 300
+memory
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+click #b0
+wheel 400 300 0 600
+wheel 400 300 0 600
+wheel 400 300 0 600
+wheel 400 300 0 600
+wheel 400 300 0 600
+wheel 400 300 0 -600
+wheel 400 300 0 -600
+wheel 400 300 0 -600
+wheel 400 300 0 -600
+wheel 400 300 0 -600
+memory
