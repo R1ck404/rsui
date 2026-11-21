@@ -497,6 +497,12 @@ impl Renderer {
 
     /// Gives back most of what this holds, for when it isn't showing.
     pub fn hide(&mut self) -> Result<(), RenderError> {
+        // A window drawn with Vulkan keeps its swapchain, which is what the compositor shows; the rest is let go of.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.vulkan.is_some() {
+            self.trim();
+            return Ok(());
+        }
         self.resize((1, 1))?;
         self.trim();
         Ok(())

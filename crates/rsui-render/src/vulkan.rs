@@ -365,6 +365,9 @@ fn constants_of(
     values
 }
 
+/// What writes the constants for what's drawn next, and has it read from there.
+type UseConstants<'a> = dyn FnMut(Option<Matrix>, Option<&Filter>, RoundSlots) + 'a;
+
 /// Where a layer's top left is, on what's drawn to.
 fn layer_origin(layer: &Layer, size: (u32, u32)) -> (i32, i32) {
     (layer.bounds.left.clamp(0, size.0 as i32), layer.bounds.top.clamp(0, size.1 as i32))
@@ -1910,7 +1913,7 @@ impl Vulkan {
         let mut in_layer: Option<usize> = None;
         let layer = self.layer.as_ref();
         // Puts down the layer that's been drawn on, at its opacity, with its quad, after the scene's own.
-        let put_down = |at: usize, use_constants: &mut dyn FnMut(Option<Matrix>, Option<&Filter>, RoundSlots)| {
+        let put_down = |at: usize, use_constants: &mut UseConstants<'_>| {
             let Some(canvas) = layer else { return };
             let layer = &scene.layers[at];
             // SAFETY: as the function says; the layer was drawn on in the pass that ends here.
