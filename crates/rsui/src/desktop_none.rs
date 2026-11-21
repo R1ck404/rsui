@@ -1,6 +1,6 @@
 //! The desktop's services on systems that don't have their own written yet: the same types and functions as on Windows
 //! (`desktop.rs`), each of which says it can't be done here, or gives what's least surprising, so that a program written
-//! for them still builds and runs, without them. This file is written by a script from the Windows ones, so that the two
+//! for them still builds and runs, without them. This file is written by tools/gen_desktop_none.py from the Windows ones, so that the two
 //! stay alike; each system's real ones replace these as they're written.
 #![allow(unused_variables, dead_code, clippy::all)]
 
@@ -155,9 +155,8 @@ pub fn pointer_on_screen() -> (i32, i32) {
     (0, 0)
 }
 
-/// Not on this system yet.
 pub fn set_app_id(id: &str) -> Result<(), String> {
-    Err(NOT_HERE.to_owned())
+    Ok(())
 }
 
 /// Not on this system yet.

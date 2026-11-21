@@ -77,9 +77,12 @@ mod window;
 #[cfg(target_os = "android")]
 #[path = "window_android.rs"]
 mod window;
-// The window system of each other system comes in here as it's written: Wayland and X11 on Linux and AppKit on macOS.
-// Until then, what runs headless works, and opening a window says it can't.
-#[cfg(not(any(windows, target_os = "android")))]
+// Linux's window is Wayland's (X11 comes later).
+#[cfg(target_os = "linux")]
+#[path = "window_wayland.rs"]
+mod window;
+// AppKit on macOS comes in here as it's written. Until then, what runs headless works, and opening a window says it can't.
+#[cfg(not(any(windows, target_os = "android", target_os = "linux")))]
 #[path = "window_none.rs"]
 mod window;
 

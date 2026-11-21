@@ -33,6 +33,11 @@ rsui-text = { path = "../rsui-text" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Wayland, spoken in Rust, with no libwayland to load; the protocols are generated at build time.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging", "unstable"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
