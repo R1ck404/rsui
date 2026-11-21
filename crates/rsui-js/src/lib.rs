@@ -681,6 +681,12 @@ impl Engine {
         self.vm.memory()
     }
 
+    /// For measuring: each file's functions, instructions and property caches, the biggest first.
+    #[doc(hidden)]
+    pub fn code_by_file(&self) -> Vec<(String, usize, usize, usize)> {
+        self.vm.code_by_file()
+    }
+
     /// Where the JIT's code for each function it has compiled is, for a native profile to say which function and
     /// instruction a sample in it was at.
     #[cfg(feature = "jit")]

@@ -471,7 +471,11 @@ impl Vm {
             code_room: Default::default(),
             uncompiled: HashMap::default(),
             debug_vars: HashMap::default(),
-            lazy_compile: crate::LazyCompile::Never,
+            lazy_compile: match std::env::var("RSUI_LAZY_COMPILE").as_deref() {
+                Ok("all") => crate::LazyCompile::Always,
+                Ok("packages") => crate::LazyCompile::NodeModules,
+                _ => crate::LazyCompile::Never,
+            },
             code_cache: None,
             sources: crate::source_text::Sources::default(),
             kept_memory: None,

@@ -4059,6 +4059,11 @@ fn native_props(mut entries: Vec<(Symbol, rsui::core::PropValue)>) -> Props {
         entries.reverse();
         entries.dedup_by_key(|(name, _)| *name);
         entries.reverse();
+        // A page element's own key is kept beside its set (see `Props`), so that elements alike share one.
+        let dom_key = entries
+            .iter()
+            .position(|(name, _)| *name == rsui::core::symbol!("dom_key"))
+            .map(|at| entries.remove(at).1);
         let mut recent = host.recent_props.borrow_mut();
         let place = recent_place(&entries);
         let found = (0..RECENT_WAYS).find(|&way| same_entries(&recent.sets[place][way], &entries));
@@ -4088,7 +4093,10 @@ fn native_props(mut entries: Vec<(Symbol, rsui::core::PropValue)>) -> Props {
         if entries.capacity() <= 32 {
             host.native_entries.replace(entries);
         }
-        props
+        match dom_key {
+            Some(key) => Props::with_dom_key(&props, key),
+            None => props,
+        }
     })
 }
 
@@ -4430,6 +4438,11 @@ pub fn engine_memory() -> (rsui_js::MemoryUse, rsui_js::Footprint, u32) {
         let engine = engine.as_ref().expect("the app has been loaded");
         (engine.memory(), engine.footprint(), engine.collections())
     })
+}
+
+/// For measuring: each file's functions, instructions and property caches.
+pub fn code_by_file() -> Vec<(String, usize, usize, usize)> {
+    HOST.with(|host| host.engine.borrow().as_ref().map(Engine::code_by_file).unwrap_or_default())
 }
 
 /// Captures mappings while the thread's engine still owns its JIT allocations.

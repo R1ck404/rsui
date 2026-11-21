@@ -346,6 +346,63 @@ impl UiAlloc {
             .collect()
     }
 
+    /// For measuring: each class's bytes in whole 4 KB pages of its chunks that no block in use touches, as
+    /// (free pages' bytes, of them in the part of a chunk never handed out yet).
+    pub fn free_page_bytes(&self) -> Vec<(usize, usize, usize)> {
+        CLASSES
+            .iter()
+            .zip(CLASS_SIZES)
+            .map(|(c, size)| {
+                c.with(|s| {
+                    let (mut free, mut tail) = (0, 0);
+                    let mut at = s.available;
+                    while !at.is_null() {
+                        // SAFETY: the class lock is held, so the chunk's free list and offsets are as they are.
+                        unsafe {
+                            let base = at.cast::<u8>();
+                            let blocks = (CHUNK_SIZE - HEADER_SIZE) / size;
+                            let mut is_free = [false; CHUNK_SIZE / 16];
+                            let mut b = (*at).free;
+                            while !b.is_null() {
+                                is_free[(b.addr() - base.addr() - HEADER_SIZE) / size] = true;
+                                b = b.cast::<*mut u8>().read();
+                            }
+                            let carved = ((*at).next_offset - HEADER_SIZE) / size;
+                            for page in 0..CHUNK_SIZE / 4096 {
+                                let (from, to) = (page * 4096, page * 4096 + 4096);
+                                let mut used = false;
+                                let mut untouched = true;
+                                for k in 0..blocks {
+                                    let (bs, be) = (HEADER_SIZE + k * size, HEADER_SIZE + (k + 1) * size);
+                                    if be <= from || bs >= to {
+                                        continue;
+                                    }
+                                    if k < carved {
+                                        untouched = false;
+                                        if !is_free[k] {
+                                            used = true;
+                                        }
+                                    }
+                                }
+                                if page == 0 {
+                                    used = true;
+                                }
+                                if !used {
+                                    free += 4096;
+                                    if untouched {
+                                        tail += 4096;
+                                    }
+                                }
+                            }
+                            at = (*at).next;
+                        }
+                    }
+                    (size, free, tail)
+                })
+            })
+            .collect()
+    }
+
     pub fn retained_bytes(&self) -> usize {
         CLASSES
             .iter()

@@ -145,14 +145,23 @@ fn young_eighths() -> usize {
     }
 }
 
-/// The most that may be made between small collections, whatever is alive: what `RSUI_GC_YOUNG_CAP` says, in megabytes,
-/// or no limit.
+/// The most that may be made between small collections, whatever is alive: 12 MB, or what `RSUI_GC_YOUNG_CAP` says, in
+/// megabytes, with `0` for no limit.
+///
+/// Three-eighths of what's alive is room the list of objects keeps between collections, and it only binds on a big heap:
+/// the long list (120 MB alive) made 45 MB between small collections, and ended 10 MB lower with this (148 -> 137 MB
+/// private at the end, 164 -> 148 at its peak), Mantine's page 4 MB lower, with no more than 1% more time collecting. An
+/// 8 MB cap took 3 MB more off each, but made shadcn's page and the long list 2% slower, from the full collections
+/// that more of what's made becoming old brings on. Below 32 MB alive, as for js-bench and the explorer, it's as before.
+const YOUNG_CAP_MB: usize = 12;
+
 fn young_cap() -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CAP: AtomicUsize = AtomicUsize::new(0);
     match CAP.load(Ordering::Relaxed) {
         0 => {
-            let cap = std::env::var("RSUI_GC_YOUNG_CAP").ok().and_then(|value| value.parse::<usize>().ok()).filter(|mb| *mb > 0).map_or(usize::MAX, |mb| mb << 20);
+            let mb = std::env::var("RSUI_GC_YOUNG_CAP").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(YOUNG_CAP_MB);
+            let cap = if mb == 0 { usize::MAX } else { mb << 20 };
             CAP.store(cap, Ordering::Relaxed);
             cap
         }
@@ -2608,10 +2617,12 @@ impl Vm {
     /// which the entry's epoch says (every prototype on the way is, through the shapes in between).
     fn forget_freed_shapes(&mut self, freed: &[u64]) {
         let gone = |shape: u32| shape != NONE && is_marked(freed, shape as usize);
-        for entry in self.caches.iter_mut() {
-            if gone(entry.shape) || gone(entry.other) {
-                entry.shape = NONE;
-                entry.other = NONE;
+        for range in self.caches_in_use() {
+            for entry in &mut self.caches[range] {
+                if gone(entry.shape) || gone(entry.other) {
+                    entry.shape = NONE;
+                    entry.other = NONE;
+                }
             }
         }
         for found in &mut self.lookups {
@@ -2701,8 +2712,8 @@ impl Vm {
                 check(Atom(found.atom), &|| format!("remembered lookup {at}"));
             }
         }
-        for (at, entry) in self.caches.iter().enumerate() {
-            check(entry.atom, &|| format!("place {at} in the code"));
+        for at in self.caches_in_use().into_iter().flatten() {
+            check(self.caches[at].atom, &|| format!("place {at} in the code"));
         }
         for (index, proto) in self.protos.iter().enumerate() {
             let what = || format!("compiled function {index}");
@@ -2786,7 +2797,8 @@ impl Vm {
                 "{when}: the engine holds free shape {shape}"
             );
         }
-        for (at, entry) in self.caches.iter().enumerate() {
+        for at in self.caches_in_use().into_iter().flatten() {
+            let entry = &self.caches[at];
             assert!(
                 entry.shape == NONE || usable(entry.shape),
                 "{when}: place {at} in the code remembers shape {}, which is free",

@@ -1435,6 +1435,57 @@ functions when they're first called (`LazyCompile::NodeModules`) had shadcn's pa
 its parse tree. An object of 48 bytes needs three properties inside it rather than four and a `Kind` of 16 bytes with its
 tag in the object's header, which is every `match` on an object's kind, and the JIT's addressing (`handle << 6`) besides.
 
+The third round (t3/push-memory-floor-lower) looked at what isn't the elements' JavaScript, and kept three things:
+
+- **The code lists' gaps give their pages back.** A full collection frees the code of what can't run any more, which is
+  mostly files' top levels, as each runs once; that left 286K of shadcn's 655K instructions and 61K of its 145K property
+  caches as gaps that kept their memory. The whole pages inside a gap are decommitted now (see rsui-js's `DESIGN.md`).
+- **A page element's `dom_key` goes beside a set of props that's shared.** No two of a page's elements had the same props,
+  as each has its own `dom_key`, so the sets bridge.rs keeps for elements alike to share (`RecentProps`) never matched, and
+  each of the long list's 20,000 rows and cells had a set of about 300 bytes. Now `native_props` looks a set up without
+  its `dom_key`, and the props are a 64-byte block with the key and the shared set (`Props::with_dom_key` in rsui-core):
+  still one pointer, so an element's still 56 bytes, and everything reading props still finds `dom_key` among them.
+- **At most 12 MB is made between small collections** (`RSUI_GC_YOUNG_CAP`, see rsui-js's `DESIGN.md`), which only binds
+  above 32 MB alive.
+
+Private memory, the median over eight lengths of the environment, against 9ca439f0, in MB (`si`/`mi`/`fxi`/`lli` steps for
+`RSUI_INSPECT=0`, the bench scripts' for traced):
+
+| | shadcn | Mantine | explorer | long list |
+|---|---|---|---|---|
+| End, `RSUI_INSPECT=0` | 110.0 (112.7) | 110.4 (115.0) | 29.7 (29.6) | 132.5 (147.7) |
+| Peak, `RSUI_INSPECT=0` | 117.2 (118.9) | 113.6 (117.9) | 32.4 (32.4) | 143.0 (164.4) |
+| A second after starting, `RSUI_INSPECT=0` | 110.6 (111.7) | 109.3 (114.5) | 27.0 (27.0) | |
+| Working set at the end, `RSUI_INSPECT=0` | 136.3 (138.9) | 138.1 (143.1) | 50.0 (49.9) | 148.3 (162.7) |
+| End, traced | 119.3 (120.8) | 125.5 (128.4) | 33.6 (33.4) | 141.9 (162.8) |
+| Peak, traced | 123.6 (125.3) | 127.4 (132.4) | 33.6 (33.4) | 141.9 (162.8) |
+
+Of the long list's 15 MB, the shared props are 5 and the cap 10; of shadcn's 2.7, the code's gaps 2.2; Mantine's is the
+cap. Process CPU over a session, `RSUI_INSPECT=0`, two salted builds a side, medians of twelve alternating runs: shadcn's
+page and the explorer as base, Mantine 0.3% more, the long list 1.8% more, of which 1.3% is the cap (one more full
+collection as it builds its rows, 19 ms, and more small ones; with `RSUI_GC_YOUNG_CAP=16` the long list ends 4.7 MB lower
+rather than 10 and costs nothing, and Mantine's as before). Starting, the long list is 2% slower for the same full
+collection; shadcn's page is 1.5% slower, but by as much in a build of base with only measuring code added, so that's how
+the program's laid out. js-bench's peaks are as they were (geomean 5.13 MB both), and its time is too, against the faster
+of base's two salted fat-LTO builds (the other is 15-25% slower on every bench, which is the salt).
+
+Measured and left:
+
+- **Compiling a function when it's first called, from its text.** `RSUI_LAZY_COMPILE=all` (a knob for measuring) shows
+  what never runs: shadcn's code lists are 8.0 MB rather than 11.0 (instructions 3.5 rather than 5.2), Mantine's 3.2
+  rather than 4.3, the explorer's 1.3 rather than 2.7, the long list's 1.6 rather than 2.5. Getting that without the parse
+  trees means parsing one function again from where its text is, with what the parser knew there: whether the file's JSX
+  is a page's (decided for the whole file, by reading it twice), the private names of the classes around it, strictness,
+  and the numbers it gives functions. That's a parser of its own to keep the same as the other, for 1-3 MB.
+- **Whole pages of rsui-alloc's chunks that nothing uses** (`RSUI_FREE_PAGES=1`): 2.8 MB of shadcn's 16 MB of room, 2.3 of
+  Mantine's, so the room is free blocks between blocks in use on almost every page, and giving pages back isn't where it is.
+- **`RSUI_EXACT=1`**, shrinking objects' storage to fit after full collections: Mantine 2.6 MB and the explorer 1.7 lower,
+  but the long list 6 MB higher, as the blocks move to smaller classes' chunks and leave the old ones with room.
+- **Waiting longer for full collections that find nothing dead.** The long list's start has eighteen, each of them finding
+  1-3% of what had become old dead. Making the next wait up to four times as long cut its collecting by 15 ms, but
+  Mantine's page then ended 7.5 MB higher, as its full collections while it starts do find what's let go of.
+- **A cap of 8 MB**: 3 MB more off the long list and Mantine's page, 2% more CPU on shadcn's page and the long list.
+
 ## How it's tested
 
 `--do` is how an agent uses a running app, in one shell command, with plain text coming back. There's no server to set up, and no state

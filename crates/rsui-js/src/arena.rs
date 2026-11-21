@@ -27,6 +27,8 @@ const STEP: usize = 16 * 1024;
 /// objects at the end of a run decided whether it had. Asking for it a megabyte at a time is 80 calls to the system
 /// over the whole of that list, and a page costs the same to zero whenever it's first written.
 const AHEAD: usize = 1024 * 1024;
+/// What the system gives memory back in.
+const PAGE: usize = 4096;
 
 pub(crate) struct Arena<T> {
     base: *mut T,
@@ -218,6 +220,42 @@ impl<T> Arena<T> {
             VirtualFree(self.start().add(keep).cast(), have - keep, MEM_DECOMMIT);
         }
         self.committed = (keep - self.offset) / size_of::<T>();
+    }
+
+    /// Hands back the real memory of the whole pages inside places `from..to`, which nothing may read until
+    /// [`Arena::recommit_within`] has brought them back, as zeros.
+    pub(crate) fn decommit_inside(&mut self, from: usize, to: usize) {
+        let (first, last) = self.pages_inside(from, to);
+        if last > first {
+            // SAFETY: the pages are inside the list, and the caller says nothing reads them until they're committed again.
+            unsafe {
+                VirtualFree(first as *mut c_void, last - first, MEM_DECOMMIT);
+            }
+        }
+    }
+
+    /// Brings back the real memory of the pages that places `from..to` are on and that are wholly inside places
+    /// `gap_from..gap_to`, which [`Arena::decommit_inside`] may have given back.
+    pub(crate) fn recommit_within(&mut self, gap_from: usize, gap_to: usize, from: usize, to: usize) {
+        let (inside_first, inside_last) = self.pages_inside(gap_from, gap_to);
+        let size = size_of::<T>();
+        let first = (self.base as usize + from * size) & !(PAGE - 1);
+        let last = (self.base as usize + to * size).next_multiple_of(PAGE);
+        let (first, last) = (first.max(inside_first), last.min(inside_last));
+        if last > first {
+            // SAFETY: the range is inside the list's reserved addresses, and committing a page that has memory already
+            // leaves what's on it as it is.
+            let done = unsafe { VirtualAlloc(first as *mut c_void, last - first, MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!done.is_null(), "out of memory");
+        }
+    }
+
+    /// The addresses of the first and past the last whole page inside places `from..to`.
+    fn pages_inside(&self, from: usize, to: usize) -> (usize, usize) {
+        let size = size_of::<T>();
+        let first = (self.base as usize + from * size).next_multiple_of(PAGE);
+        let last = (self.base as usize + to * size) & !(PAGE - 1);
+        (first, last.max(first))
     }
 
     /// Only for the interpreter, which has just written the place after the end, or finished with the last one.

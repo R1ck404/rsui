@@ -36,8 +36,8 @@ pub(crate) struct Gaps {
 }
 
 impl Gaps {
-    /// The start of a gap that's at least this long, which no longer counts as free.
-    fn take(&mut self, length: u32) -> Option<u32> {
+    /// The start of a gap that's at least this long, which no longer counts as free, and the gap it was in.
+    fn take(&mut self, length: u32) -> Option<(u32, (u32, u32))> {
         let at = self.list.iter().position(|&(_, size)| size >= length)?;
         let (start, size) = self.list[at];
         if size == length {
@@ -46,14 +46,34 @@ impl Gaps {
             self.list[at] = (start + length, size - length);
         }
         self.total -= length as usize;
-        Some(start)
+        Some((start, (start, size)))
     }
 
-    /// Adds these, which mustn't overlap what's free already, putting together any that touch.
-    fn give(&mut self, freed: &mut Vec<(u32, u32)>) {
-        if freed.is_empty() {
-            return;
+    /// The stretches between the gaps, up to `length`, which are all that may be read of a list whose gaps may have
+    /// had their memory given back.
+    pub(crate) fn in_use(&self, length: usize) -> Vec<std::ops::Range<usize>> {
+        let mut ranges = Vec::with_capacity(self.list.len() + 1);
+        let mut from = 0;
+        for &(start, size) in &self.list {
+            let start = (start as usize).min(length);
+            if start > from {
+                ranges.push(from..start);
+            }
+            from = from.max(start + size as usize);
         }
+        if length > from {
+            ranges.push(from..length);
+        }
+        ranges
+    }
+
+    /// Adds these, which mustn't overlap what's free already, putting together any that touch, and says which gaps
+    /// they're in now.
+    fn give(&mut self, freed: &mut Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+        if freed.is_empty() {
+            return Vec::new();
+        }
+        let starts: Vec<u32> = freed.iter().map(|&(start, _)| start).collect();
         self.total += freed.iter().map(|&(_, size)| size as usize).sum::<usize>();
         self.list.append(freed);
         self.list.sort_unstable_by_key(|&(start, _)| start);
@@ -65,6 +85,16 @@ impl Gaps {
             }
         }
         self.list = kept;
+        let mut grown: Vec<(u32, u32)> = starts
+            .into_iter()
+            .filter_map(|start| {
+                let at = self.list.partition_point(|&(gap, _)| gap <= start).checked_sub(1)?;
+                Some(self.list[at])
+            })
+            .collect();
+        grown.sort_unstable();
+        grown.dedup();
+        grown
     }
 
     /// How long a list `length` long can be once a gap reaching its end is taken off, which is taken off.
@@ -104,8 +134,10 @@ pub(crate) struct CodeRoom {
 impl Vm {
     /// Puts a function's instructions where there's room for them, and says where that is.
     pub(crate) fn place_code(&mut self, code: &[Op]) -> u32 {
-        if let Some(start) = self.code_room.code.take(code.len() as u32) {
-            self.code[start as usize..start as usize + code.len()].copy_from_slice(code);
+        if let Some((start, (gap, size))) = self.code_room.code.take(code.len() as u32) {
+            let (from, to) = (start as usize, start as usize + code.len());
+            self.code.recommit_within(gap as usize, (gap + size) as usize, from, to);
+            self.code[from..to].copy_from_slice(code);
             return start;
         }
         let start = self.code.len() as u32;
@@ -119,8 +151,10 @@ impl Vm {
         if caches.is_empty() {
             return self.caches.len() as u32;
         }
-        if let Some(start) = self.code_room.caches.take(caches.len() as u32) {
-            self.caches[start as usize..start as usize + caches.len()].copy_from_slice(caches);
+        if let Some((start, (gap, size))) = self.code_room.caches.take(caches.len() as u32) {
+            let (from, to) = (start as usize, start as usize + caches.len());
+            self.caches.recommit_within(gap as usize, (gap + size) as usize, from, to);
+            self.caches[from..to].copy_from_slice(caches);
             return start;
         }
         let start = self.caches.len() as u32;
@@ -185,6 +219,31 @@ impl Vm {
             named.resize(word + 1, 0);
         }
         named[word] |= 1 << (id % 64);
+    }
+
+    /// For measuring: each file's functions, instructions and property caches, the biggest first.
+    pub(crate) fn code_by_file(&self) -> Vec<(String, usize, usize, usize)> {
+        let free: std::collections::HashSet<u32> = self.code_room.free_protos.iter().copied().collect();
+        let mut by: std::collections::HashMap<crate::text::Atom, (usize, usize, usize)> = std::collections::HashMap::new();
+        for id in 0..self.protos.len() {
+            if free.contains(&(id as u32)) {
+                continue;
+            }
+            let (code, caches) = self.code_room.spans[id];
+            let entry = by.entry(self.protos[id].file).or_default();
+            entry.0 += 1;
+            entry.1 += code as usize;
+            entry.2 += caches as usize;
+        }
+        let mut list: Vec<_> = by.into_iter().map(|(file, (n, code, caches))| (self.atom_text(file), n, code, caches)).collect();
+        list.sort_by_key(|row| std::cmp::Reverse(row.2));
+        list.insert(0, (format!("(free room; arenas hold {} ops, {} caches, {} consts, {} protos)", self.code.len(), self.caches.len(), self.consts.len(), self.protos.len()), self.code_room.free_protos.len(), self.code_room.code.total as usize, self.code_room.caches.total as usize));
+        list
+    }
+
+    /// The stretches of `caches` that aren't gaps, which are all that may be read of it. See [`Gaps::in_use`].
+    pub(crate) fn caches_in_use(&self) -> Vec<std::ops::Range<usize>> {
+        self.code_room.caches.in_use(self.caches.len())
     }
 
     /// The bytes compiled code takes up, leaving out what's free.
@@ -275,15 +334,34 @@ impl Vm {
             self.jit.forget(id as u32);
         }
         let room = &mut self.code_room;
-        room.code.give(&mut code_freed);
-        room.caches.give(&mut caches_freed);
-        // What's free at the end of each list goes, rather than waiting there to be used again.
-        let keep = room.code.trim(self.code.len());
+        let code_gaps = room.code.give(&mut code_freed);
+        let cache_gaps = room.caches.give(&mut caches_freed);
+        // What's free at the end of each list goes, rather than waiting there to be used again. Its pages may have
+        // been given back while it was a gap before the end, and what's past the end has to have memory behind it.
+        let length = self.code.len();
+        let keep = room.code.trim(length);
+        self.code.recommit_within(keep, length, keep, length);
         self.code.truncate(keep);
         self.code.release_unused(0);
-        let keep = room.caches.trim(self.caches.len());
+        let length = self.caches.len();
+        let keep = room.caches.trim(length);
+        self.caches.recommit_within(keep, length, keep, length);
         self.caches.truncate(keep);
         self.caches.release_unused(0);
+        // The whole pages inside a gap that's grown are given back, as nothing reads a gap until it's handed out again
+        // (and what goes through every place in the code skips the gaps: see `Gaps::in_use`). A file's top level runs
+        // once and goes, which left 2.3 MB of instructions and 1.5 MB of places as gaps on shadcn's page.
+        for (start, size) in code_gaps {
+            if ((start + size) as usize) <= self.code.len() {
+                self.code.decommit_inside(start as usize, (start + size) as usize);
+            }
+        }
+        for (start, size) in cache_gaps {
+            if ((start + size) as usize) <= self.caches.len() {
+                self.caches.decommit_inside(start as usize, (start + size) as usize);
+            }
+        }
+        let room = &mut self.code_room;
         while self.protos.last().is_some_and(|proto| proto.start == FREED)
             && !is_named(&room.named, self.protos.len() - 1)
         {
@@ -499,12 +577,14 @@ mod tests {
     #[test]
     fn gaps_put_together_what_touches_and_hand_out_the_first_that_fits() {
         let mut gaps = Gaps::default();
-        gaps.give(&mut vec![(10, 5), (0, 4), (4, 2)]);
+        assert_eq!(gaps.give(&mut vec![(10, 5), (0, 4), (4, 2)]), [(0, 6), (10, 5)]);
         assert_eq!(gaps.list, [(0, 6), (10, 5)]);
         assert_eq!(gaps.total, 11);
-        assert_eq!(gaps.take(5), Some(0));
+        assert_eq!(gaps.in_use(20), [6..10, 15..20]);
+        assert_eq!(gaps.take(5), Some((0, (0, 6))));
         assert_eq!(gaps.list, [(5, 1), (10, 5)]);
-        assert_eq!(gaps.take(5), Some(10));
+        assert_eq!(gaps.in_use(15), [0..5, 6..10]);
+        assert_eq!(gaps.take(5), Some((10, (10, 5))));
         assert_eq!(gaps.take(2), None);
         assert_eq!(gaps.total, 1);
         gaps.give(&mut vec![(6, 4)]);

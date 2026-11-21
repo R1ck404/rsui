@@ -222,9 +222,17 @@ Measured on 2026-11-20 on rsui-tsx's page apps (see "Where the memory goes" in i
   them), the map from each constant to its place in the list of constants (1.1 MB on shadcn's page), which only saves a
   constant being put in twice by code compiled later, and the memory kept for parsing. A module found after it reads its
   folder again.
-- **Room between small collections** is three-eighths of what's alive, with no limit: the long list makes 34 MB between
-  two, and that's the 40% of free places in the list of objects after a collection. `RSUI_GC_YOUNG` (eighths, 1-8) and
-  `RSUI_GC_YOUNG_CAP` (megabytes) change it, for measuring what that trades.
+- **Room between small collections** is three-eighths of what's alive, and at most 12 MB (`RSUI_GC_YOUNG_CAP`, `0` for
+  none): the long list made 45 MB between two, and that's the 40% of free places in the list of objects after a collection.
+  With the cap it ends 10 MB lower and peaks 16 MB lower, for one more full collection as it starts and 1.3% more CPU; an
+  8 MB cap cost 2% on shadcn's page and the long list, from the full collections that more becoming old brings on.
+  `RSUI_GC_YOUNG` (eighths, 1-8) changes the share, for measuring what that trades.
+- **Code that's gone.** A full collection frees the code of functions that can't run any more (`compiled.rs`), and a gap
+  before the end of the list of instructions or of property caches kept its memory until something compiled later fitted
+  in it. Most of that is files' top levels, which run once: 286K of shadcn's 655K instructions and 61K of its 145K places
+  were gaps. The whole pages inside a gap are decommitted after the collection, and committed again (as zeros) when the gap
+  is handed out or trimmed off the end; what goes through every place in the code skips the gaps (`Gaps::in_use`), as a
+  page given back can't be read. 2.2 MB of shadcn's page.
 - **Going through everything watched after a collection.** What a component keeps of a call (`keeping.rs`) watches what
   it was worked out from, faking young objects old so the write barrier sees a change to them, and every collection went
   through all of those afterwards to fake again what was young: 2.5 ms of each small collection on Mantine's page. A small

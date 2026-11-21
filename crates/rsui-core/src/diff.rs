@@ -80,40 +80,41 @@ impl Differ {
 
     /// Both sets are sorted by name, so one pass over them finds every change.
     fn props(&mut self, old: &Props, new: &Props) {
-        // A shared set is the same as itself, however long it is.
-        if old.identity() == new.identity() {
+        // A shared set is the same as itself, however long it is, and a `dom_key` beside it is all else there is.
+        let own = old.dom_key() == new.dom_key();
+        if own && old.identity() == new.identity() {
             return;
         }
-        let (old, new) = (old.entries(), new.entries());
-        if old == new {
+        if own && old.entries() == new.entries() {
             return;
         }
-        let (mut i, mut j) = (0, 0);
-        while i < old.len() || j < new.len() {
-            let order = match (old.get(i), new.get(j)) {
+        let (mut old, mut new) = (old.iter().peekable(), new.iter().peekable());
+        loop {
+            let order = match (old.peek(), new.peek()) {
                 (Some((old_name, _)), Some((new_name, _))) => old_name.cmp(new_name),
                 (Some(_), None) => Ordering::Less,
-                _ => Ordering::Greater,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => break,
             };
             if order == Ordering::Less {
+                let (name, _) = old.next().expect("there's one, as it was looked at");
                 self.patches.push(Patch::RemoveProp {
                     path: self.here(),
-                    name: old[i].0,
+                    name,
                 });
-                i += 1;
                 continue;
             }
-            if order == Ordering::Greater || old[i].1 != new[j].1 {
+            let (name, value) = new.next().expect("there's one, as it was looked at");
+            if order == Ordering::Greater || old.peek().is_some_and(|(_, was)| *was != value) {
                 self.patches.push(Patch::SetProp {
                     path: self.here(),
-                    name: new[j].0,
-                    value: new[j].1.clone(),
+                    name,
+                    value: value.clone(),
                 });
             }
             if order == Ordering::Equal {
-                i += 1;
+                old.next();
             }
-            j += 1;
         }
     }
 

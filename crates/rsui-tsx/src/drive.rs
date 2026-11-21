@@ -1205,6 +1205,12 @@ impl Desk {
                     }
                 }
                 println!("  allocator classes:{classes}");
+                if std::env::var_os("RSUI_FREE_PAGES").is_some() {
+                    let pages = rsui::UiAlloc.free_page_bytes();
+                    let (all, tail): (usize, usize) = pages.iter().fold((0, 0), |(a, t), (_, f, u)| (a + f, t + u));
+                    let each: Vec<String> = pages.iter().map(|(size, f, u)| format!("{size}: {} KB ({} untouched)", f / 1024, u / 1024)).collect();
+                    println!("  allocator free pages: {} KB, {} KB of it never handed out; {}", all / 1024, tail / 1024, each.join(", "));
+                }
                 let (spans, room) = rsui_spans::footprint();
                 println!("  spans: {spans} kept in {room} B");
                 for one in &self.windows {
@@ -1213,6 +1219,11 @@ impl Desk {
                     }
                 }
                 println!("  {}", bridge::tracing_footprint());
+                if std::env::var_os("RSUI_CODE_FILES").is_some() {
+                    for (file, protos, code, caches) in bridge::code_by_file().iter().take(60) {
+                        println!("  code {code} ops, {caches} caches, {protos} functions: {file}");
+                    }
+                }
                 if std::env::var_os("RSUI_STRING_DUPES").is_some() {
                     let (count, bytes, again) = bridge::duplicate_strings();
                     println!("  strings with text of their own: {count}, {bytes} B, {again} B of it the same as another's");

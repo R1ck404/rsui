@@ -419,8 +419,42 @@ impl fmt::Debug for PropFilter {
 /// Because a set is immutable, [`insert`](Self::insert) and
 /// [`remove`](Self::remove) copy it. To build a set in one step, use
 /// `Props::from([(name, value), ...])`.
+///
+/// A page element's `dom_key` is the one prop that's its own. When the rest of its props are a set another element has
+/// too (a long list's rows and their cells), its props are a small block of their own holding only the `dom_key`, beside
+/// the set they share (see [`Props::with_dom_key`]): 64 bytes, rather than a whole set of their own for each. It's still
+/// one of the props to everything that reads them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Props(Option<ThinArc<PropFilter, PropEntry>>);
+pub struct Props(Option<ThinArc<PropHeader, PropEntry>>);
+
+/// What a block of props says of itself: which names are in it, and, for one that holds only a `dom_key`, the set the
+/// rest of its props are.
+#[derive(Clone, PartialEq, Eq)]
+struct PropHeader {
+    filter: PropFilter,
+    shared: Option<ThinArc<PropHeader, PropEntry>>,
+}
+
+impl fmt::Debug for PropHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.shared {
+            // A set's header is an implementation detail; preserve Props' debug format.
+            None => fmt::Debug::fmt(&(), f),
+            Some(shared) => fmt::Debug::fmt(shared, f),
+        }
+    }
+}
+
+/// A block of props that holds them all itself.
+fn plain_set(filter: PropFilter, entries: impl ExactSizeIterator<Item = PropEntry>) -> ThinArc<PropHeader, PropEntry> {
+    ThinArc::from_header_and_iter(PropHeader { filter, shared: None }, entries)
+}
+
+/// The name of the prop that can be kept beside a shared set. See [`Props`].
+#[inline]
+fn dom_key_name() -> Symbol {
+    crate::symbol!("dom_key")
+}
 
 impl Props {
     pub fn new() -> Self {
@@ -432,11 +466,28 @@ impl Props {
     }
 
     pub fn len(&self) -> usize {
-        self.entries().len()
+        self.entries().len() + usize::from(self.own().is_some())
     }
 
     pub fn clear(&mut self) {
         self.0 = None;
+    }
+
+    /// `shared` with a `dom_key` of its own, beside `shared` rather than copied in with it, so that elements alike but for
+    /// their `dom_key`s share one set.
+    pub fn with_dom_key(shared: &Props, value: PropValue) -> Props {
+        let Some(set) = shared.0.as_ref().filter(|set| {
+            set.header.header.shared.is_none() && set.slice.iter().all(|(name, _)| *name != dom_key_name())
+        }) else {
+            let mut props = shared.clone();
+            props.insert(dom_key_name(), value);
+            return props;
+        };
+        let filter = PropFilter(set.header.header.filter.0 | PropFilter::from_names(std::iter::once(dom_key_name())).0);
+        Self(Some(ThinArc::from_header_and_iter(
+            PropHeader { filter, shared: Some(set.clone()) },
+            std::iter::once((dom_key_name(), value)),
+        )))
     }
 
     /// Replaces this set from a reusable buffer, leaving the buffer empty with
@@ -451,15 +502,20 @@ impl Props {
         entries.reverse();
         entries.dedup_by_key(|(name, _)| *name);
         entries.reverse();
-        if self.entries() == entries.as_slice() {
+        if self.own().is_none() && self.entries() == entries.as_slice() {
             entries.clear();
         } else {
             let filter = PropFilter::from_names(entries.iter().map(|(name, _)| *name));
-            *self = Self(Some(ThinArc::from_header_and_iter(filter, entries.drain(..))));
+            *self = Self(Some(plain_set(filter, entries.drain(..))));
         }
     }
 
     pub fn get(&self, name: &str) -> Option<&PropValue> {
+        if let Some((own, value)) = self.own()
+            && own.as_str() == name
+        {
+            return Some(value);
+        }
         let position = self.position_of(name)?;
         Some(&self.entries()[position].1)
     }
@@ -468,9 +524,15 @@ impl Props {
     /// strings, for when this runs often enough to matter.
     #[inline]
     pub fn get_symbol(&self, name: Symbol) -> Option<&PropValue> {
-        let entries = self.0.as_ref()?;
-        if entries.header.header.0 & PropFilter::bit(name) == 0 {
+        let mut entries = self.0.as_ref()?;
+        if entries.header.header.filter.0 & PropFilter::bit(name) == 0 {
             return None;
+        }
+        if let Some(shared) = &entries.header.header.shared {
+            if entries.slice[0].0 == name {
+                return Some(&entries.slice[0].1);
+            }
+            entries = shared;
         }
         entries.slice
             .iter()
@@ -478,14 +540,23 @@ impl Props {
             .map(|(_, value)| value)
     }
 
-    /// What this set is, as a number. Two sets with the same number are the same set, so what's
-    /// been worked out from one can be reused for the other.
+    /// What this set is, as a number, but for a `dom_key` kept beside it (see [`Props::with_dom_key`]). Two sets with the
+    /// same number are the same set but for that, so what's been worked out from one's other props can be reused for
+    /// the other.
     #[inline]
     pub fn identity(&self) -> usize {
         self.entries().as_ptr() as usize
     }
 
+    /// The `dom_key` kept beside a shared set (see [`Props::with_dom_key`]), which [`identity`](Self::identity) leaves
+    /// out. One that's in the set itself isn't this.
+    #[inline]
+    pub fn dom_key(&self) -> Option<&PropValue> {
+        self.own().map(|(_, value)| value)
+    }
+
     pub fn insert(&mut self, name: impl Into<Symbol>, value: impl Into<PropValue>) {
+        self.make_plain();
         let name = name.into();
         let mut value = Some(value.into());
         let entries = self.entries();
@@ -500,10 +571,11 @@ impl Props {
             Ordering::Greater => entries[index + replaced - 1].clone(),
         });
         let filter = PropFilter::from_names(entries.iter().map(|(key, _)| *key).chain(std::iter::once(name)));
-        *self = Self(Some(ThinArc::from_header_and_iter(filter, items)));
+        *self = Self(Some(plain_set(filter, items)));
     }
 
     pub fn remove(&mut self, name: &str) -> Option<PropValue> {
+        self.make_plain();
         let position = self.position_of(name)?;
         let entries = self.entries();
         let removed = entries[position].1.clone();
@@ -517,30 +589,58 @@ impl Props {
         } else {
             let filter = PropFilter::from_names(entries.iter().enumerate()
                 .filter(|(index, _)| *index != position).map(|(_, (name, _))| *name));
-            Self(Some(ThinArc::from_header_and_iter(filter, items)))
+            Self(Some(plain_set(filter, items)))
         };
         Some(removed)
     }
 
+    /// Every prop, in order by name.
     pub fn iter(&self) -> impl Iterator<Item = (Symbol, &PropValue)> {
-        self.entries().iter().map(|(name, value)| (*name, value))
+        let entries = self.entries();
+        let own = self.own();
+        let (before, after) = match own {
+            Some((name, _)) => entries.split_at(entries.partition_point(|(existing, _)| existing < name)),
+            None => (entries, &entries[entries.len()..]),
+        };
+        before
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .chain(own.map(|(name, value)| (*name, value)))
+            .chain(after.iter().map(|(name, value)| (*name, value)))
     }
 
     /// These props combined with `other`, whose values win if a name is in both.
     pub fn merged(&self, other: &Props) -> Props {
         Self::from_entries(
-            self.entries()
-                .iter()
-                .chain(other.entries())
-                .cloned()
+            self.iter()
+                .chain(other.iter())
+                .map(|(name, value)| (name, value.clone()))
                 .collect(),
         )
     }
 
+    /// The set, in order by name: for props that hold only a `dom_key` beside a shared set, that set, without it.
     pub(crate) fn entries(&self) -> &[PropEntry] {
         match &self.0 {
-            Some(entries) => &entries.slice,
+            Some(entries) => match &entries.header.header.shared {
+                Some(shared) => &shared.slice,
+                None => &entries.slice,
+            },
             None => &[],
+        }
+    }
+
+    /// The `dom_key` kept beside a shared set, if that's what these are.
+    #[inline]
+    fn own(&self) -> Option<&PropEntry> {
+        let entries = self.0.as_ref()?;
+        entries.header.header.shared.as_ref().map(|_| &entries.slice[0])
+    }
+
+    /// Has a `dom_key` kept beside a shared set copied in with it, before these are changed.
+    fn make_plain(&mut self) {
+        if self.own().is_some() {
+            *self = Self::from_entries(self.iter().map(|(name, value)| (name, value.clone())).collect());
         }
     }
 
@@ -560,7 +660,7 @@ impl Props {
         entries.dedup_by_key(|(name, _)| *name);
         entries.reverse();
         let filter = PropFilter::from_names(entries.iter().map(|(name, _)| *name));
-        Self(Some(ThinArc::from_header_and_iter(filter, entries.into_iter())))
+        Self(Some(plain_set(filter, entries.into_iter())))
     }
 }
 
@@ -607,10 +707,9 @@ macro_rules! shared_props {
 
 impl Serialize for Props {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let entries = self.entries();
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (name, value) in entries {
-            map.serialize_entry(name, value)?;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (name, value) in self.iter() {
+            map.serialize_entry(&name, value)?;
         }
         map.end()
     }
@@ -753,7 +852,7 @@ mod prop_filter_tests {
             } else {
                 expected.keys().fold(0, |mask, &name| mask | PropFilter::bit(name))
             };
-            assert_eq!(bag.header.header.0, mask);
+            assert_eq!(bag.header.header.filter.0, mask);
         }
         assert_eq!(*props, entries.into_iter().collect::<Props>());
     }
@@ -806,6 +905,45 @@ mod prop_filter_tests {
     }
 
     #[test]
+    fn a_dom_key_beside_a_shared_set_is_one_of_its_props() {
+        let shared: Props = [("class", PropValue::from("row")), ("width", PropValue::Int(3)), ("aria", PropValue::Bool(true))].into();
+        let keyed = Props::with_dom_key(&shared, PropValue::from("__dom7"));
+        let plain = {
+            let mut plain = shared.clone();
+            plain.insert("dom_key", "__dom7");
+            plain
+        };
+        assert_eq!(keyed.len(), plain.len());
+        assert_eq!(keyed.get("dom_key"), plain.get("dom_key"));
+        for name in ["aria", "class", "dom_key", "width", "missing"] {
+            assert_eq!(keyed.get(name), plain.get(name), "{name}");
+            assert_eq!(keyed.get_symbol(Symbol::new(name)), plain.get_symbol(Symbol::new(name)), "{name}");
+        }
+        assert!(keyed.iter().eq(plain.iter()));
+        assert_eq!(serde_json::to_string(&keyed).unwrap(), serde_json::to_string(&plain).unwrap());
+        assert_eq!(keyed.identity(), shared.identity());
+        assert_eq!(keyed.merged(&Props::new()), plain);
+        let (mut changed, mut also) = (keyed.clone(), plain.clone());
+        changed.insert("width", 4i64);
+        also.insert("width", 4i64);
+        assert_eq!(changed, also);
+        let (mut changed, mut also) = (keyed.clone(), plain.clone());
+        assert_eq!(changed.remove("dom_key"), also.remove("dom_key"));
+        assert_eq!(changed, also);
+        assert_eq!(changed, shared);
+        // One with a key of its own already has it put in its place.
+        assert_eq!(Props::with_dom_key(&plain, PropValue::from("__dom8")).get("dom_key"), Some(&PropValue::from("__dom8")));
+        let node = |props: &Props| Element::new(Role::Group).props(props.clone()).into_node();
+        let other = Props::with_dom_key(&shared, PropValue::from("__dom9"));
+        assert!(crate::diff(&node(&keyed), &node(&plain)).is_empty());
+        let set = crate::diff(&node(&keyed), &node(&other));
+        assert!(matches!(set.as_slice(), [crate::Patch::SetProp { name, value, .. }]
+            if *name == Symbol::new("dom_key") && *value == PropValue::from("__dom9")), "{set:?}");
+        let removed = crate::diff(&node(&keyed), &node(&shared));
+        assert!(matches!(removed.as_slice(), [crate::Patch::RemoveProp { name, .. }] if *name == Symbol::new("dom_key")), "{removed:?}");
+    }
+
+    #[test]
     fn collisions_never_hide_present_keys_or_create_false_matches() {
         let mut buckets = [None; 64];
         let (one, two) = (0..65).find_map(|i| {
@@ -830,9 +968,10 @@ mod prop_filter_tests {
         assert_eq!(std::mem::size_of::<Props>(), std::mem::size_of::<usize>());
         assert_eq!(std::mem::size_of::<PropFilter>(), 8);
         type Old = triomphe::HeaderSlice<triomphe::HeaderWithLength<()>, [PropEntry; 1]>;
-        type New = triomphe::HeaderSlice<triomphe::HeaderWithLength<PropFilter>, [PropEntry; 1]>;
+        type New = triomphe::HeaderSlice<triomphe::HeaderWithLength<PropHeader>, [PropEntry; 1]>;
         assert_eq!(std::mem::align_of::<Old>(), std::mem::align_of::<New>());
-        assert_eq!(std::mem::offset_of!(New, slice) - std::mem::offset_of!(Old, slice), 8);
+        // The names' filter, and the shared set beside a `dom_key` (see `Props::with_dom_key`).
+        assert_eq!(std::mem::offset_of!(New, slice) - std::mem::offset_of!(Old, slice), 16);
         let props: Props = [("z", 2i64), ("a", 1), ("z", 3)].into();
         let old = Some(ThinArc::from_header_and_iter((), props.entries().iter().cloned()));
         assert_eq!(format!("{props:?}"), format!("Props({old:?})"));
