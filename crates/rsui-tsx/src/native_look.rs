@@ -68,7 +68,9 @@ pub(crate) fn restyle(vm: &mut Vm, tag: &str, props: Value, gathered: &mut Gathe
         None
     };
     let tag = control.tag();
-    let native = look::restyle(control, variant.as_deref(), &mut gathered.entries, |name| warn(tag, name.as_str()));
+    let native = look::restyle(control, variant.as_deref(), &mut gathered.entries, |name| {
+        warn(tag, if name.as_str() == "class_name" { "className" } else { name.as_str() });
+    });
     Ok(Some(native))
 }
 

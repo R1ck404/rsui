@@ -230,6 +230,7 @@ pub fn is_visual(name: Symbol) -> bool {
             | "pressed_text_color"
             | "plain_disabled"
             | "text_align"
+            | "class_name"
     ) || ["border_", "shadow_", "outline_", "font_", "padding_", "background_", "focus_", "scrollbar_"]
         .iter()
         .any(|start| name.starts_with(start))
