@@ -557,6 +557,42 @@ declare module 'rsui' {
         onDragLeave?: (event: PageDragEvent) => void;
         onDrop?: (event: PageDragEvent) => void;
     }
+
+    // The system's own popups (plan 059, part 2).
+
+    /** A time of day, on a 24-hour clock. */
+    export interface TimeOfDay {
+        /** From 0 to 23. */
+        hours: number;
+        /** From 0 to 59. */
+        minutes: number;
+    }
+
+    /**
+     * The system's own popups, each one call and a promise of its answer, the same on every system. On Android they're
+     * Android's: an AlertDialog, a list dialog for a sheet, the date and time pickers, the share chooser and a Toast. On
+     * Windows a confirm, alert or sheet is a task dialog, a picker is a dialog around Windows' own calendar or time
+     * control, `share` is the system's share sheet, and a toast is a small window of rsui's that fades away. Elsewhere
+     * they aren't there yet, and each promise is rejected saying so. A button that isn't named says what the system's own
+     * does, in its language. While an app's checked with `--do` none comes up: what's asked is said, and the step
+     * `dialog "ANSWER"` (or `dialog cancel`) says what the next one's answered with.
+     */
+    export const native: {
+        /** Whether to go ahead: true once the `confirm` button's pressed, false if it's cancelled however that's done. `destructive` is for what can't be undone. */
+        confirm(options: { title: string; message?: string; confirm?: string; cancel?: string; destructive?: boolean }): Promise<boolean>;
+        /** Says something, and is done once it's been seen. */
+        alert(options: { title: string; message?: string; ok?: string }): Promise<void>;
+        /** One of these, by its place in the list, or null if none was chosen. On Windows the cancel button is always the system's own. */
+        sheet(options: { title?: string; options: string[]; cancel?: string }): Promise<number | null>;
+        /** A day, from `min` to `max`: a Date on it, at `value`'s time of day or midnight, or null if none was picked. */
+        pickDate(options?: { value?: Date; min?: Date; max?: Date }): Promise<Date | null>;
+        /** A time of day, or null if none was picked. */
+        pickTime(options?: { value?: TimeOfDay }): Promise<TimeOfDay | null>;
+        /** The system's share sheet with this text and address. It's done once that's up; where it's shared to isn't said. */
+        share(options: { text?: string; url?: string; title?: string }): Promise<void>;
+        /** A little message that goes away by itself, after a while longer with `long`. */
+        toast(text: string, options?: { long?: boolean }): void;
+    };
 }
 
 // What code written for a page uses: its tags as elements, CSS for the whole page, and the window as `body` has it. styled-components,

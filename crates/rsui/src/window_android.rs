@@ -375,12 +375,17 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
     props: P,
 ) -> Result<(), RunError> {
     MAIN_OPENED.with(|opened| opened.set(true));
-    let (read, mut scale, night, keyboard) = lock()
+    let (read, write, mut scale, night, keyboard) = lock()
         .as_ref()
-        .map(|glue| (glue.read, glue.scale, glue.night, glue.keyboard))
+        .map(|glue| (glue.read, glue.write, glue.scale, glue.night, glue.keyboard))
         .ok_or_else(|| RunError::Window("the app hasn't started".to_owned()))?;
     let text = crate::default_text_engine()?;
     let mut app = App::new(render, props, text, (1, 1), scale);
+    // What another thread has for the app, as what a popup was answered with, wakes the loop as what the activity says does.
+    app.set_waker(move || {
+        // SAFETY: the pipe is open for as long as the process is; a full pipe already has a wake in it.
+        unsafe { libc::write(write, [1u8].as_ptr().cast(), 1) };
+    });
     let _ = app.feed(&Input::DarkMode(night));
     let mut shown: Option<Shown> = None;
     let mut needs_draw = true;
