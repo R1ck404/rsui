@@ -1,11 +1,11 @@
-//! The window on Linux, under Wayland: one xdg-shell toplevel, drawn into shared memory with the CPU renderer for now,
-//! the GPU's Vulkan renderer coming in its place (plan 058, §5.5).
+//! The window on Linux, under Wayland: one xdg-shell toplevel, drawn with Vulkan on the GPU where there is one (plan 058,
+//! §5.5), and otherwise into shared memory with the CPU renderer.
 //!
-//! It speaks Wayland through `wayland-client`'s own Rust code, so there's no libwayland to load. It binds only what the
-//! first frame needs: the compositor, shared memory, xdg-shell and the seat, with decorations and cursor shapes if the
-//! compositor has them. A compositor that draws no title bar (GNOME's) leaves the app to draw its own, as a frameless
-//! window on Windows does, and dragging that moves the window. The keyboard's keymap is compiled by libxkbcommon, which is
-//! loaded the first time a keymap arrives.
+//! It speaks Wayland through libwayland, loaded when the window opens, as Vulkan needs libwayland's own `wl_display` to
+//! draw on the surface. It binds only what the first frame needs: the compositor, shared memory, xdg-shell and the seat,
+//! with decorations and cursor shapes if the compositor has them. A compositor that draws no title bar (GNOME's) leaves
+//! the app to draw its own, as a frameless window on Windows does, and dragging that moves the window. The keyboard's
+//! keymap is compiled by libxkbcommon, which is loaded the first time a keymap arrives.
 //!
 //! What runs is as on Windows: what comes in is fed to the app, a frame is drawn when it says one's needed, and the
 //! thread sleeps in `poll` until the compositor says something or the app's next timer is due.
@@ -25,7 +25,7 @@ use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface, wl_touch,
 };
-use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::wp::cursor_shape::v1::client::{wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -547,8 +547,28 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
     let mut size_now = physical(logical, scale);
     let text = crate::default_text_engine()?;
     let mut app = App::new(render, props, text, size_now, scale as f32);
-    let mut renderer = Renderer::offscreen(size_now).map_err(RunError::Render)?;
-    let mut frames = Frames::new(&shm, &handle, size_now);
+    // What another thread wakes the loop with when the app has something to show, as a page's timer or an image that's
+    // been read does: an eventfd, which the loop sleeps on beside the connection. The waker keeps it open for as long as
+    // it might be called.
+    // SAFETY: a new descriptor, owned from here on if it was made.
+    let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    let wake = (wake >= 0).then(|| std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(wake) }));
+    if let Some(wake) = wake.clone() {
+        app.set_waker(move || {
+            let one = 1u64;
+            // SAFETY: eight bytes to an eventfd that's open, as this holds it.
+            unsafe { libc::write(wake.as_raw_fd(), (&raw const one).cast(), 8) };
+        });
+    }
+    // Declared after the surface and connection, so that it's dropped before them, as it draws on them.
+    let mut renderer = match gpu_renderer(&connection, &surface, size_now) {
+        Some(renderer) => renderer,
+        None => Renderer::offscreen(size_now).map_err(RunError::Render)?,
+    };
+    let mut frames = if renderer.draws_to_window() { None } else { Frames::new(&shm, &handle, size_now) };
+    // Whether a frame callback's been asked for that no commit has taken yet: Vulkan commits when it presents, and a frame
+    // that turns out to be the same as the last presents nothing.
+    let mut frame_asked = false;
     let mut next_buffer = 0usize;
     let mut cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1> = None;
     let mut cursor_now: Option<Cursor> = None;
@@ -704,8 +724,10 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
         if wanted != size_now {
             size_now = wanted;
             let _ = renderer.resize(size_now);
-            frames = Frames::new(&shm, &handle, size_now);
-            state.free = [true; 2];
+            if !renderer.draws_to_window() {
+                frames = Frames::new(&shm, &handle, size_now);
+                state.free = [true; 2];
+            }
             app.resize(size_now, scale as f32);
             needs_draw = true;
         }
@@ -741,7 +763,33 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
                 },
             );
         }
-        if needs_draw && !waiting_for_frame && let Some(frames) = frames.as_mut() {
+        if needs_draw && !waiting_for_frame && renderer.draws_to_window() {
+            // The frame callback and the scale go with the commit Vulkan makes when it presents.
+            if !frame_asked {
+                surface.frame(&handle, ());
+                frame_asked = true;
+            }
+            surface.set_buffer_scale(scale);
+            match app.render(&mut renderer) {
+                Ok(()) => {
+                    if !renderer.showed_nothing() {
+                        waiting_for_frame = true;
+                        frame_asked = false;
+                    }
+                    needs_draw = false;
+                }
+                Err(error) => {
+                    // The GPU's gone, or never could draw here: the CPU draws from now on, into shared memory.
+                    if std::env::var_os("RSUI_VULKAN").is_some() {
+                        eprintln!("rsui: Vulkan stopped drawing ({error}); drawing with the CPU");
+                    }
+                    renderer = Renderer::offscreen(size_now).map_err(RunError::Render)?;
+                    frames = Frames::new(&shm, &handle, size_now);
+                    state.free = [true; 2];
+                    app.renderer_replaced();
+                }
+            }
+        } else if needs_draw && !waiting_for_frame && let Some(frames) = frames.as_mut() {
             let which = if state.free[next_buffer] { Some(next_buffer) } else if state.free[1 - next_buffer] { Some(1 - next_buffer) } else { None };
             if let Some(which) = which
                 && app.render(&mut renderer).is_ok()
@@ -775,11 +823,46 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
         }
         let Some(guard) = queue.prepare_read() else { continue };
         let timeout = due.map_or(-1, |at| at.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as c_int);
-        let mut poll = libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: one descriptor, the connection's, which is open.
-        let ready = unsafe { libc::poll(&raw mut poll, 1, timeout) };
-        if ready > 0 {
+        let mut polls = [
+            libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake.as_ref().map_or(-1, |wake| wake.as_raw_fd()), events: libc::POLLIN, revents: 0 },
+        ];
+        // SAFETY: the connection's descriptor and the eventfd, which are open; a negative one is left out.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout) };
+        if ready > 0 && polls[1].revents != 0 {
+            let mut count = 0u64;
+            // SAFETY: reading the eventfd's count, eight bytes, empties it.
+            unsafe { libc::read(polls[1].fd, (&raw mut count).cast(), 8) };
+        }
+        if ready > 0 && polls[0].revents != 0 {
             guard.read().map_err(|error| failed("Wayland", &error))?;
+        }
+    }
+}
+
+/// A renderer that draws on the surface with Vulkan, or nothing if Vulkan can't, for the CPU to draw instead. Setting
+/// `RSUI_VULKAN` (to anything) says which it is and why.
+fn gpu_renderer(connection: &Connection, surface: &wl_surface::WlSurface, size: (u32, u32)) -> Option<Renderer> {
+    let display = connection.backend().display_ptr().cast::<c_void>();
+    let target = surface.id().as_ptr().cast::<c_void>();
+    let told = std::env::var_os("RSUI_VULKAN").is_some();
+    if display.is_null() || target.is_null() {
+        return None;
+    }
+    // SAFETY: both are libwayland's, alive for as long as the window's loop runs, and the renderer is dropped before
+    // either goes.
+    match unsafe { Renderer::for_wayland(display, target, size) } {
+        Ok(renderer) => {
+            if told {
+                eprintln!("rsui: drawing with Vulkan");
+            }
+            Some(renderer)
+        }
+        Err(error) => {
+            if told {
+                eprintln!("rsui: drawing with the CPU, as {error}");
+            }
+            None
         }
     }
 }
