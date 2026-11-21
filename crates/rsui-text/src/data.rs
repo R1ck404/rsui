@@ -11,6 +11,8 @@ pub(crate) enum FontData {
     Static(&'static [u8]),
     #[cfg(windows)]
     Mapped(windows::Mapping),
+    #[cfg(unix)]
+    Mapped(rsui_os::map::Mapping),
 }
 
 impl FontData {
@@ -18,7 +20,7 @@ impl FontData {
         match self {
             Self::Owned(bytes) => bytes,
             Self::Static(bytes) => bytes,
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             Self::Mapped(mapping) => mapping.bytes(),
         }
     }
@@ -26,9 +28,9 @@ impl FontData {
     /// Whether this is a file on the disk, rather than only in memory.
     pub(crate) fn is_on_the_disk(&self) -> bool {
         match self {
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             Self::Mapped(_) => true,
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             Self::Owned(_) => true,
             _ => false,
         }
@@ -43,7 +45,11 @@ impl FontData {
         {
             windows::Mapping::open(path).map(Self::Mapped)
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            rsui_os::map::Mapping::open(path).map(Self::Mapped)
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             std::fs::read(path).map(|bytes| Self::Owned(bytes.into()))
         }

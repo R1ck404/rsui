@@ -1,6 +1,8 @@
 //! Which of the fonts that come with Windows have the characters the main font doesn't, so that text in
 //! any language shows up without an app having to choose. Each one is only opened when text first needs
-//! it, and is mapped from its file, so this costs next to nothing for the ones that are never used.
+//! it, and is mapped from its file, so this costs next to nothing for the ones that are never used. Other systems'
+//! lists are in `unix_fonts.rs`.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::ops::RangeInclusive;
 
@@ -132,6 +134,7 @@ fn bold_of(file: &str) -> Option<(&'static str, u32)> {
     })
 }
 
+#[cfg(windows)]
 impl TextEngine {
     /// Adds the fonts that come with Windows for every other language and for emoji, each opened only
     /// once there's text that needs it, and bold ones for bold text.
@@ -144,6 +147,35 @@ impl TextEngine {
             }
         }
         self
+    }
+}
+
+#[cfg(not(windows))]
+impl TextEngine {
+    /// Adds the fonts the system comes with for every other language and for emoji, each opened only once there's
+    /// text that needs it. Each is a list of the files it might be, which are tried in order then.
+    #[must_use]
+    pub fn with_system_fallbacks(mut self) -> Self {
+        for (candidates, characters) in crate::unix_fonts::fallbacks(&user_language()) {
+            for path in candidates {
+                self = self.with_lazy_fallback(path, characters);
+            }
+        }
+        self
+    }
+}
+
+/// The system's UI font, regular and bold, as files: Segoe UI on Windows, Roboto on Android, the San Francisco font on
+/// macOS, and Noto Sans or DejaVu Sans on Linux, whichever there is.
+pub fn system_ui_font_files() -> (Option<&'static str>, Option<&'static str>) {
+    #[cfg(windows)]
+    {
+        (Some("C:/Windows/Fonts/segoeui.ttf"), Some("C:/Windows/Fonts/segoeuib.ttf"))
+    }
+    #[cfg(not(windows))]
+    {
+        let (regular, bold) = crate::unix_fonts::ui_font_candidates();
+        (crate::unix_fonts::first_that_exists(regular), crate::unix_fonts::first_that_exists(bold))
     }
 }
 
@@ -163,10 +195,16 @@ fn user_language() -> String {
 
 #[cfg(not(windows))]
 fn user_language() -> String {
-    std::env::var("LANG").unwrap_or_default()
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())
+        // `ja_JP.UTF-8` is `ja-JP`.
+        .map(|value| value.split(['.', '@']).next().unwrap_or_default().replace('_', "-"))
+        .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

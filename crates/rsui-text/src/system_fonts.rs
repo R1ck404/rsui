@@ -1,21 +1,28 @@
 //! Finding a font by its name, from what Windows says is installed. This is only looked at the first time something asks
-//! for a font by name, so a program that doesn't has one registry key fewer to read.
+//! for a font by name, so a program that doesn't has one registry key fewer to read. Elsewhere it's what's in the
+//! system's font folders (see `unix_fonts.rs`).
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::font::{Font, read_u16, read_u32};
 
+#[cfg(windows)]
 const LOCAL_MACHINE: *mut c_void = 0x8000_0002u32 as usize as *mut c_void;
+#[cfg(windows)]
 const CURRENT_USER: *mut c_void = 0x8000_0001u32 as usize as *mut c_void;
+#[cfg(windows)]
 const READ: u32 = 0x2_0019;
+#[cfg(windows)]
 const KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
 
 // Kernelbase has these too, and it's always loaded, where advapi32 would load three more libraries just to start up. The
 // name is the one Windows promises to keep pointing at whichever library has them.
+#[cfg(windows)]
 #[link(name = "api-ms-win-core-registry-l1-1-0", kind = "raw-dylib")]
 unsafe extern "system" {
     fn RegOpenKeyExW(
@@ -38,6 +45,7 @@ unsafe extern "system" {
     fn RegCloseKey(key: *mut c_void) -> i32;
 }
 
+#[cfg(windows)]
 fn read_key(root: *mut c_void, into: &mut HashMap<String, (PathBuf, u32)>) {
     let name: Vec<u16> = KEY.encode_utf16().chain(Some(0)).collect();
     let mut key = std::ptr::null_mut();
@@ -75,6 +83,7 @@ fn read_key(root: *mut c_void, into: &mut HashMap<String, (PathBuf, u32)>) {
 }
 
 /// `Arial Bold (TrueType)` has one font in it, and `Cambria & Cambria Math (TrueType)` has one for each name, in that order.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn add_entry(shown: &str, file: &str, into: &mut HashMap<String, (PathBuf, u32)>) {
     let names = shown.rsplit_once(" (").map_or(shown, |(names, _)| names);
     let path = if file.contains('\\') || file.contains('/') {
@@ -89,6 +98,7 @@ fn add_entry(shown: &str, file: &str, into: &mut HashMap<String, (PathBuf, u32)>
     }
 }
 
+#[cfg(windows)]
 fn all_fonts() -> &'static HashMap<String, (PathBuf, u32)> {
     static FONTS: OnceLock<HashMap<String, (PathBuf, u32)>> = OnceLock::new();
     FONTS.get_or_init(|| {
@@ -98,6 +108,12 @@ fn all_fonts() -> &'static HashMap<String, (PathBuf, u32)> {
         read_key(CURRENT_USER, &mut fonts);
         fonts
     })
+}
+
+#[cfg(not(windows))]
+fn all_fonts() -> &'static HashMap<String, (PathBuf, u32)> {
+    static FONTS: OnceLock<HashMap<String, (PathBuf, u32)>> = OnceLock::new();
+    FONTS.get_or_init(crate::unix_fonts::all_fonts)
 }
 
 /// The file and which font in it, for a name like `Segoe UI Bold`. A name that's a path is that file.
@@ -555,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn windows_has_the_font_it_comes_with() {
         assert!(find("Segoe UI").is_some());
         assert!(find("SEGOE ui bold").is_some());

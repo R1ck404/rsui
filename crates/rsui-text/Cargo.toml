@@ -15,6 +15,9 @@ rsui-core = { path = "../rsui-core" }
 rsui-image = { path = "../rsui-image" }
 rsui-layout = { path = "../rsui-layout" }
 
+[target.'cfg(unix)'.dependencies]
+rsui-os = { path = "../rsui-os" }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1"

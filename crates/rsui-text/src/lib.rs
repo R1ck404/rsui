@@ -53,6 +53,8 @@ mod rich;
 mod shape;
 mod southeast;
 mod system_fonts;
+#[cfg(not(windows))]
+mod unix_fonts;
 
 pub mod bidi;
 mod unicode_tables;
@@ -66,6 +68,7 @@ pub use engine::{
     FontStyle, Line, PlacedGlyph, TextEngine, TextLayout, TextStyle, max_lines, space_letters,
     space_words, wrapped_line,
 };
+pub use fallback::system_ui_font_files;
 pub use files::{FileReader, read_by_reader, read_file, read_files_with};
 pub use font::{ColorLayer, Font, FontError, FontMetrics, OutlineSink};
 pub use raster::{GlyphBitmap, Rasterizer, SystemGlyphs};
