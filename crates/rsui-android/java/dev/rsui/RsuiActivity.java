@@ -126,12 +126,14 @@ public class RsuiActivity extends Activity implements SurfaceHolder.Callback2 {
         @Override
         public boolean onTouchEvent(MotionEvent event) {
             int action = event.getActionMasked();
-            int index = event.getActionIndex();
-            nativeTouch(action, event.getPointerId(index), event.getX(index), event.getY(index));
+            // A move is of every finger that's down; anything else is of the one it says.
             if (action == MotionEvent.ACTION_MOVE) {
                 for (int at = 0; at < event.getPointerCount(); at++) {
                     nativeTouch(action, event.getPointerId(at), event.getX(at), event.getY(at));
                 }
+            } else {
+                int index = event.getActionIndex();
+                nativeTouch(action, event.getPointerId(index), event.getX(index), event.getY(index));
             }
             return true;
         }

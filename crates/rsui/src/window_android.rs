@@ -485,7 +485,13 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
                 }
                 Event::Commit(text) => {
                     app.set_input_time(now);
-                    retype(&mut app, &mut composing, &text);
+                    // Some keyboards send Enter as a new line typed, rather than as the key.
+                    if text == "\n" {
+                        composing.clear();
+                        let _ = app.feed(&Input::Key(KeyPress::new(KeyCode::Enter)));
+                    } else {
+                        retype(&mut app, &mut composing, &text);
+                    }
                     false
                 }
                 Event::Delete { before, after } => {
