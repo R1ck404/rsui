@@ -18,6 +18,8 @@ const WORKER_STACK: usize = 512 * 1024;
 
 /// What's being waited for has this to say for itself. Nothing in here belongs to JavaScript, as it comes from another
 /// thread.
+// Responses only come from Windows' requests until other systems have theirs.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Outcome {
     Nothing,
     Null,
@@ -322,6 +324,7 @@ impl Vm {
     }
 
     /// The same, for only waiting to hear something, which could never happen. What's checking that an app has settled doesn't wait for it.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn in_own_thread_quietly(
         &mut self,
         job: impl FnOnce() -> Outcome + Send + 'static,

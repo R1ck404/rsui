@@ -128,6 +128,7 @@ fn windows_paths_with_a_drive_and_no_root_are_relative_to_that_drive() {
 /// in a variable called `=Q:`, or the working folder if that's on the drive, or else the drive's root. Node can't set
 /// one of those variables through `process.env`, so this only checks a drive that has none, and the working folder's.
 #[test]
+#[cfg(windows)]
 fn resolving_a_drive_relative_path_uses_the_folder_that_drive_was_in() {
     assert_eq!(
         run_cjs("drive_resolve", r#"

@@ -231,7 +231,7 @@ struct Inside {
 impl Mailbox {
     fn post(&self, letter: Letter) {
         let later = {
-            let mut inside = crate::iocp::lock(&self.inside);
+            let mut inside = crate::lock(&self.inside);
             match inside.waiting.pop_front() {
                 Some(later) => later,
                 None => {
@@ -245,7 +245,7 @@ impl Mailbox {
 
     fn close(&self) {
         let waiting = {
-            let mut inside = crate::iocp::lock(&self.inside);
+            let mut inside = crate::lock(&self.inside);
             inside.closed = true;
             std::mem::take(&mut inside.waiting)
         };
@@ -256,7 +256,7 @@ impl Mailbox {
 
     /// What's next, if it's here, or `null` if nothing more can come. Otherwise `later` is kept until then.
     fn next(&self, later: Later) {
-        let mut inside = crate::iocp::lock(&self.inside);
+        let mut inside = crate::lock(&self.inside);
         let outcome = match inside.letters.pop_front() {
             Some(letter) => Outcome::Letter(letter),
             None if inside.closed => Outcome::Null,

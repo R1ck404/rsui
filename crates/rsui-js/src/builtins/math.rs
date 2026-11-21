@@ -758,7 +758,37 @@ fn compact_digits(
 }
 
 /// What a language writes between the parts of a number, and whether it writes `%` and money after the number and
+/// a space, for the languages most used. Others write numbers as English does.
+#[cfg(not(windows))]
+fn separators_of(locale: Option<&str>) -> (String, String, bool, bool) {
+    let users = || {
+        ["LC_ALL", "LC_NUMERIC", "LANG"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.is_empty() && value != "C" && value != "POSIX")
+            .map(|value| value.split(['.', '@']).next().unwrap_or_default().replace('_', "-"))
+            .unwrap_or_default()
+    };
+    let locale = locale.map_or_else(users, str::to_owned).to_ascii_lowercase();
+    let language = locale.split('-').next().unwrap_or_default();
+    let text = |decimal: &str, group: &str, percent_after: bool, money_after: bool| {
+        (decimal.to_owned(), group.to_owned(), percent_after, money_after)
+    };
+    match language {
+        "de" if locale == "de-ch" => text(".", "\u{2019}", false, false),
+        "de" | "nl" | "id" | "it" | "es" | "pt" | "tr" | "da" | "el" | "ro" | "hr" | "sl" | "sr" | "vi" => {
+            text(",", ".", language == "de" || language == "da" || language == "tr", true)
+        }
+        "fr" | "ru" | "pl" | "cs" | "sk" | "fi" | "nb" | "no" | "sv" | "uk" | "bg" | "hu" | "lt" | "lv" | "et" => {
+            text(",", "\u{A0}", true, true)
+        }
+        _ => text(".", ",", false, false),
+    }
+}
+
+/// What a language writes between the parts of a number, and whether it writes `%` and money after the number and
 /// a space. Windows knows this for every language, and it's only asked about ones other than the most common.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn separators_of(locale: Option<&str>) -> (String, String, bool, bool) {
     #[link(name = "kernel32")]

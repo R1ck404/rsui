@@ -40,6 +40,7 @@ pub(crate) struct AstMemory {
 
 #[allow(unsafe_code)]
 mod system {
+    #[cfg(windows)]
     use std::ffi::c_void;
 
     pub(super) const MEM_COMMIT: u32 = 0x1000;
@@ -48,6 +49,7 @@ mod system {
     pub(super) const PAGE_NOACCESS: u32 = 1;
     pub(super) const PAGE_READWRITE: u32 = 4;
 
+    #[cfg(windows)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub(super) fn VirtualAlloc(
@@ -58,6 +60,8 @@ mod system {
         ) -> *mut c_void;
         pub(super) fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
     }
+    #[cfg(not(windows))]
+    pub(super) use rsui_os::vm::windows_like::{VirtualAlloc, VirtualFree};
 
     pub(super) const MEM_DECOMMIT: u32 = 0x4000;
 }

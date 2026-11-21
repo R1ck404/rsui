@@ -12,6 +12,7 @@
 
 use super::FreeSlots;
 use crate::arena::Arena;
+#[cfg(windows)]
 use std::ffi::c_void;
 
 const PAGE: usize = 4096;
@@ -19,11 +20,14 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_DECOMMIT: u32 = 0x4000;
 const PAGE_READWRITE: u32 = 4;
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
 }
+#[cfg(not(windows))]
+use rsui_os::vm::windows_like::{VirtualAlloc, VirtualFree};
 
 thread_local! {
     /// Turns giving back on for the engines on this thread, whatever the environment says, for tests, and for the
@@ -300,8 +304,12 @@ impl crate::text::Strings {
     }
 }
 
+/// Elsewhere what's given back can still be read, as zeros (see `rsui_os::vm`), so there's no fault to report.
+#[cfg(all(test, not(windows)))]
+fn report_faults() {}
+
 /// In tests, a read of a page that's been given back says where it came from, rather than ending the run with no word.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn report_faults() {
     #[repr(C)]
     struct Record {

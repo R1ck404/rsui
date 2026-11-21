@@ -11,6 +11,10 @@ mod buffer;
 mod path;
 mod path_posix;
 mod path_win32;
+#[cfg(windows)]
+mod watch;
+#[cfg(not(windows))]
+#[path = "host/watch_unix.rs"]
 mod watch;
 pub(crate) mod zlib;
 
@@ -987,7 +991,16 @@ pub(super) fn install(vm: &mut Vm) {
     // `Object.prototype.toString` calls it `[object process]`, which is how packages such as axios know they're in Node.
     let tag = vm.new_str("process");
     vm.add_property(process, text::SYMBOL_TO_STRING_TAG, tag, CONFIGURABLE);
-    let platform = vm.new_str(if cfg!(windows) { "win32" } else { "linux" });
+    // What Node says on each: macOS is `darwin`, and Android is `android`, though it's Linux underneath.
+    let platform = vm.new_str(if cfg!(windows) {
+        "win32"
+    } else if cfg!(target_vendor = "apple") {
+        "darwin"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else {
+        "linux"
+    });
     let platform_atom = vm.intern_str("platform");
     vm.add_property(process, platform_atom, platform, PLAIN);
     let version = vm.new_str("v22.0.0");
