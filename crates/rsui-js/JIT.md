@@ -33,7 +33,8 @@ and loops is dispatch and bookkeeping between instructions, which is what a temp
 | `RSUI_OPT=0` (or `off`) | with `jit-opt` built in, compiled code records nothing, and is the code it is without the feature. |
 | `RSUI_OPT_LOG=1` | with `jit-opt`, a line for each function that's due for the optimizing tier, and what all the feedback came to when the engine goes. |
 
-Other targets build with the feature and never compile anything (`mode()` is always `Off` there).
+64-bit Arm on Linux and Android has a backend of its own (see "AArch64"). Other targets, macOS on Apple silicon
+among them for now, build with the feature and never compile anything (`mode()` is always `Off` there).
 
 Binary size (`run.exe`, shipped settings, round 4): 2,739,712 bytes without the feature, 3,047,424 with it (+301 KB,
 of which about 60 KB is the second copy of the interpreter's loop); the app benchmark's executable 5,377,024 and 5,683,200. The code
@@ -746,6 +747,48 @@ against 39 and 37), 1,811, 1,308 and 1,184, furthest behind on call_apply, class
 float_math (0.1-0.3 of Node). With the feature and `RSUI_JIT=0` the geomean against the build without it was 1.014, with
 call- and generator-heavy code up to 8% slower: what the interpreter shares with the JIT's helpers is compiled
 differently when they call it too.
+
+## AArch64
+
+`arm64.rs` (with its assembler, `asm_arm64.rs`) compiles for 64-bit Arm on Linux and Android, which build.rs marks
+with the `jit_backend` cfg, from the same jobs as `x64.rs`: what both share (the job, `Look`, `Layout`, `Compiled`,
+`Done`) is in `plan.rs`, and `mod.rs` reaches whichever backend there is as `arch`. Its code works on the same frames,
+values and helpers, and is entered and left the same ways; what differs is the machine:
+
+- The engine's fixed things are in x19-x27 (`REGS`, `FRAME`, `VM`, `INT`, `ICS`, `UNDEF`, `OBJECTS`, `CELLS`, and
+  `EMPTY` in x27), which AAPCS64 has a function keep. Templates work in x0-x15; x16/x17 are the assembler's (a call's
+  address, an offset too big for an instruction). x18 is never touched, as Apple and Windows keep it.
+- Helpers are `extern "C"` there: `helpers.rs` declares each through `jit_abi!`, which is `extern "win64"` on x86-64
+  (on every system, as before) and `extern "C"` elsewhere. A helper's `u32` is only in w0, so code tests it as 32 bits.
+- A compiled function is called with `blr` and keeps x29/x30 on the machine's stack for its own calls (`stp`/`ldp`),
+  so the stack stays 16-byte aligned; it hands back the value in x0 and how it went in w1. A slot is the entry plus
+  the "worth entering" bit, as on x86-64, so a call clears the bit before branching to it.
+- Constants are `movz`/`movn`/`movk` (or one `orr` of a logical immediate); a conditional branch reaches 1 MB, so a
+  function whose cold code is further than that from its hot code is assembled again with each one as the opposite
+  condition over a `b` (`Asm::new(long)`).
+- `memory_unix.rs` writes code through the writable view and then cleans the data cache (`dc cvau`) and invalidates the
+  instruction cache (`ic ivau`) for it, to the inner shareable domain, then `isb`; the engine's thread runs an `isb`
+  of its own before running code the worker wrote (`Vm::jit_collect`).
+- macOS (MAP_JIT, `pthread_jit_write_protect_np`) is a TODO in `jit/mod.rs`.
+
+It doesn't yet do everything `x64.rs` does, and what it doesn't goes the longer ways, which give the same answers:
+calls aren't compiled in line or made to a callee known ahead, functions aren't compiled again with what their calls
+learned, no value is kept in a machine register from one instruction to the next, what a place knew is written into
+the code only for the global object, writes to places that have seen several shapes, typed arrays' elements, `new`
+and `super(...)`, `instanceof` and `%` of anything but non-negative ints go to helpers, and nothing records feedback.
+
+Under qemu-aarch64 (which only says roughly what a phone would), with the `bench` profile: int_loop 2.40 s
+interpreted, 0.58 s compiled; float_math 4.67 / 2.19; fib 2.12 / 0.44; prop_mono 1.44 / 0.38; method_calls 1.74 /
+0.51; richards 2.70 / 0.95.
+
+To test it on x86-64 Linux (WSL), with Rust's own linker and no C compiler for the target:
+
+```
+rustup target add aarch64-unknown-linux-musl
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=yes -C linker-flavor=ld.lld" CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64 cargo test -p rsui-js --features jit --lib --target aarch64-unknown-linux-musl
+```
+
+(The three tests of `fetch` and `http` fail there whatever the JIT does, as a static musl build has no libcurl.)
 
 ## What's next
 
