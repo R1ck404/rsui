@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 pub use rsui::{App, KeyCode, KeyPress};
 
-pub const STACK_LIMIT: usize = 512 * 1024;
+/// How much stack the script may use before it's told its code is nested too deeply. A debug build's frames are several
+/// times a release build's, and a test thread has 2 MB, so a debug build gets most of that, and a page that the release
+/// build reads with room to spare is still read.
+pub const STACK_LIMIT: usize = if cfg!(debug_assertions) { 1536 * 1024 } else { 512 * 1024 };
 
 /// Where something with this key is, in the tree.
 pub fn path_of(node: &rsui::core::Node, key: &str, path: &mut Vec<u32>) -> bool {

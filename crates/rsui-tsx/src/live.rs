@@ -1059,6 +1059,26 @@ export default function App() {
     #[test]
     #[cfg(windows)]
     fn a_viewer_looks_at_an_app_over_its_pipe_and_goes_back_through_its_state() {
+        // This sets environment variables for the whole process and names what it makes after the process, which the
+        // other tests running beside it read and share: apps they start take the wrong one for the viewer's, or think
+        // they're the viewer. It failed about half the times it ran with the rest, and never alone. So it runs in a
+        // process of its own, which is this same test run again with nothing else in it.
+        const OWN_PROCESS: &str = "RSUI_TEST_OWN_PROCESS";
+        if std::env::var_os(OWN_PROCESS).is_none() {
+            let name = "live::tests::a_viewer_looks_at_an_app_over_its_pipe_and_goes_back_through_its_state";
+            let ran = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(OWN_PROCESS, "1")
+                .output()
+                .unwrap();
+            assert!(
+                ran.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            return;
+        }
         let folder = std::env::temp_dir().join(format!("rsui-live-test-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("app.tsx");
