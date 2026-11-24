@@ -260,7 +260,7 @@ fn assign_is_what_object_assign_does() {
 
 /// How long each of these takes, in nanoseconds a time, against JavaScript doing the same, for DESIGN.md.
 #[test]
-#[ignore]
+#[ignore = "a measurement for DESIGN.md, for looking at with --nocapture"]
 fn bulk_speed() {
     let source = r#"
         const N = 200000;

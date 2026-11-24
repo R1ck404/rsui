@@ -290,7 +290,7 @@ fn filters_parse_as_css_says() {
 /// How long drawing what the canvas benchmarks draw takes here, without JavaScript:
 /// `cargo test --release -p rsui-render --lib canvas::tests::timing -- --ignored --nocapture`.
 #[test]
-#[ignore]
+#[ignore = "a measurement, for looking at with --nocapture"]
 fn timing() {
     let mut seed = 1u32;
     let mut random = move || {
@@ -338,7 +338,7 @@ fn timing() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a measurement, for looking at with --nocapture"]
 fn timing_parts() {
     let mut seed = 1u32;
     let mut random = move || {
@@ -382,7 +382,7 @@ fn timing_parts() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a measurement, for looking at with --nocapture"]
 fn timing_image_parts() {
     let image = Rc::new(Image { width: 32, height: 32, pixels: vec![200; 32 * 32 * 4] });
     let shader = Shader::Image {
@@ -421,7 +421,7 @@ fn timing_image_parts() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a measurement, for looking at with --nocapture"]
 fn timing_hairline_cache() {
     let id = create(800, 600, false);
     let mut same = vec![op(SELECT), f64::from(id), op(STROKE_COLOR), color(30, 60, 200, 128)];
@@ -441,7 +441,7 @@ fn timing_hairline_cache() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a measurement, for looking at with --nocapture"]
 fn timing_hair_walk() {
     let mut steps = 0u64;
     let start = std::time::Instant::now();

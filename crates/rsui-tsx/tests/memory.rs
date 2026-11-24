@@ -93,7 +93,7 @@ fn click_times(hands: &mut Hands, key: &str, times: u32) {
 /// Shows what a component made anew each time it's drawn keeps, after 100, 1,000 and 10,000 times, and what keeps the
 /// most recent of what grew. It's for looking at with `--ignored --nocapture`, not a test.
 #[test]
-#[ignore]
+#[ignore = "for looking at with --nocapture, not a test"]
 fn census_of_a_new_component_each_time() {
     let mut hands = Hands::open(&write("census", NEW_COMPONENT_EACH_TIME), (400, 300));
     let mut done = 0;

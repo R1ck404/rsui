@@ -58,7 +58,7 @@ fn saving_again_and_again_keeps_one_version_of_the_code() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a longer soak of the examples that prints what the engine keeps, for looking at with --nocapture"]
 fn soak_the_examples() {
     code_after_saves("tests/apps/tasks.tsx", 50, true);
     code_after_saves("tests/apps/gallery.tsx", 50, true);
