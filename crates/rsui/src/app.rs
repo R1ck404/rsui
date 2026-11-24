@@ -43,6 +43,7 @@ pub use events::DropPhase;
 use events::{Captured, Kind, follow_along, keys_along};
 
 const REGULAR_FONT: &str = "C:/Windows/Fonts/segoeui.ttf";
+#[cfg_attr(not(windows), allow(dead_code))]
 const BOLD_FONT: &str = "C:/Windows/Fonts/segoeuib.ttf";
 pub(crate) const BACKGROUND: Color = Color::hex(0xF6F8FA);
 
@@ -72,6 +73,10 @@ const REVEAL_MARGIN: f32 = 8.0;
 const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 /// How long a hover color takes to come and go.
 const HOVER_FADE: Duration = Duration::from_millis(100);
+/// Where scrollbars only show while something scrolls (a phone's: see `rsui_render::fade_scrollbars`), how long one stays
+/// after it last moved, and how long it takes to fade, as Android's own do.
+const SCROLLBAR_STAYS: Duration = Duration::from_millis(300);
+const SCROLLBAR_FADE: Duration = Duration::from_millis(250);
 /// How long scrolling takes to get where it's going.
 const SCROLL_GLIDE: Duration = Duration::from_millis(120);
 
@@ -80,7 +85,11 @@ const SCROLL_GLIDE: Duration = Duration::from_millis(120);
 pub enum RunError {
     Font(FontError),
     Render(RenderError),
+    #[cfg(windows)]
     Window(windows::core::Error),
+    /// Elsewhere, what the system said, or that there's no window system to open one with yet.
+    #[cfg(not(windows))]
+    Window(String),
 }
 
 impl fmt::Display for RunError {
@@ -107,6 +116,7 @@ impl From<RenderError> for RunError {
     }
 }
 
+#[cfg(windows)]
 impl From<windows::core::Error> for RunError {
     fn from(error: windows::core::Error) -> Self {
         Self::Window(error)
@@ -125,8 +135,16 @@ pub fn window_scale() -> f32 {
 
 /// The system's UI font, in regular and bold.
 pub fn default_text_engine() -> Result<TextEngine, RunError> {
-    let mut engine = TextEngine::new(Font::open(REGULAR_FONT)?);
-    if let Ok(bold) = Font::open(BOLD_FONT) {
+    #[cfg(windows)]
+    let (regular, bold) = (REGULAR_FONT, Some(BOLD_FONT));
+    // Elsewhere it's whichever of the fonts the system's UI uses there is (see `rsui_text::system_ui_font_files`).
+    #[cfg(not(windows))]
+    let (regular, bold) = {
+        let (regular, bold) = rsui_text::system_ui_font_files();
+        (regular.unwrap_or(REGULAR_FONT), bold)
+    };
+    let mut engine = TextEngine::new(Font::open(regular)?);
+    if let Some(Ok(bold)) = bold.map(Font::open) {
         engine = engine.with_bold(bold);
     }
     Ok(engine.with_system_fallbacks())
@@ -217,6 +235,7 @@ impl Measure for Measuring<'_> {
 
 
 /// What says whether the tree assistive technology sees might have changed.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) type AccessFingerprint = (u64, Option<Vec<u32>>, (u32, u32), u32);
 
 /// What a window should do after an event.
@@ -349,6 +368,41 @@ fn eased(started: Instant, now: Instant, duration: Duration) -> f32 {
         1.0 - (now.saturating_duration_since(started).as_secs_f32() / duration.as_secs_f32());
     let left = left.clamp(0.0, 1.0);
     1.0 - left * left * left
+}
+
+/// How long Material's ripple takes to spread across what was pressed, and to fade in and out, as Compose has them
+/// (`RippleAnimation`: `RadiusDuration`, `FadeInDuration`, `FadeOutDuration`).
+const RIPPLE_SPREAD: Duration = Duration::from_millis(225);
+const RIPPLE_FADE_IN: Duration = Duration::from_millis(75);
+const RIPPLE_FADE_OUT: Duration = Duration::from_millis(150);
+
+/// A press spreading out from where it landed, on something that says it ripples (`ripple`), as a control in Material's look
+/// does. It's only kept while animations are on.
+struct RippleNow {
+    path: Vec<u32>,
+    /// Where it landed, in logical pixels from the window's top left.
+    x: f32,
+    y: f32,
+    since: Instant,
+    let_go: Option<Instant>,
+    spread: f32,
+    strength: f32,
+}
+
+impl RippleNow {
+    /// Moves it along to `now`, saying whether it's still showing.
+    fn step(&mut self, now: Instant) -> bool {
+        let on = now.saturating_duration_since(self.since);
+        self.spread = eased(self.since, now, RIPPLE_SPREAD);
+        let fade_in = (on.as_secs_f32() / RIPPLE_FADE_IN.as_secs_f32()).min(1.0);
+        // It fades once it's let go, though not before it's spread all the way.
+        let fade_out = self.let_go.map_or(1.0, |let_go| {
+            let from = let_go.max(self.since + RIPPLE_SPREAD);
+            1.0 - now.saturating_duration_since(from).as_secs_f32() / RIPPLE_FADE_OUT.as_secs_f32()
+        });
+        self.strength = fade_in.min(fade_out).clamp(0.0, 1.0);
+        self.let_go.is_none() || self.strength > 0.0
+    }
 }
 
 /// A scrollbar being dragged.
@@ -514,6 +568,8 @@ pub struct App {
     animations: bool,
     /// When the pointer got to what it's on, while that's still fading in.
     hover_since: Option<Instant>,
+    /// Where scrollbars fade, what last scrolled and when, whose scrollbar shows until it's faded.
+    scrolled: Option<(Vec<u32>, Instant)>,
     hover_amount: f32,
     /// What the pointer's left, while that's still fading out: since when, and how much it started with.
     leaving: Option<(Vec<u32>, Instant, f32)>,
@@ -533,6 +589,8 @@ pub struct App {
     pointer_keys: [Vec<Option<Key>>; 3],
     title_wanted: Option<rsui_core::Text>,
     pressed: Option<Press>,
+    /// The ripple a press set off, if what was pressed has one.
+    ripple: Option<RippleNow>,
     dragged: Option<Dragged>,
     /// Whether the pointer is dragging out a selection in the focused input.
     selecting: bool,
@@ -722,6 +780,7 @@ impl App {
             hovered: None,
             animations: false,
             hover_since: None,
+            scrolled: None,
             hover_amount: 1.0,
             leaving: None,
             leaving_amount: 0.0,
@@ -734,6 +793,7 @@ impl App {
             pointer_keys: [Vec::new(), Vec::new(), Vec::new()],
             title_wanted: None,
             pressed: None,
+            ripple: None,
             dragged: None,
             selecting: false,
             dark_mode: None,
@@ -1067,6 +1127,7 @@ impl App {
             self.hover_since = None;
             self.hover_amount = 1.0;
             self.leaving = None;
+            self.ripple = None;
             self.invalidate_automatic();
             self.repaint = true;
         }
@@ -1086,7 +1147,9 @@ impl App {
     fn app_animating(&self) -> bool {
         self.runtime.moves_every_frame_in_view(|path, node| self.motion_might_show(path, node))
             || self.hover_since.is_some()
+            || self.scrolled.is_some()
             || self.leaving.is_some()
+            || self.ripple.is_some()
             || self.glide.is_some()
             || self.runtime.scrolled_waiting()
     }
@@ -1202,6 +1265,20 @@ impl App {
                 self.hover_since = None;
                 self.hover_amount = 1.0;
             }
+        }
+        if let Some((_, since)) = &self.scrolled {
+            if now.saturating_duration_since(*since) >= SCROLLBAR_STAYS + SCROLLBAR_FADE {
+                self.scrolled = None;
+            }
+            self.invalidate_automatic();
+            self.repaint = true;
+        }
+        if let Some(ripple) = &mut self.ripple {
+            if !ripple.step(now) {
+                self.ripple = None;
+            }
+            self.invalidate_automatic();
+            self.repaint = true;
         }
         if let Some((_, since, start)) = &self.leaving {
             self.leaving_amount = start * (1.0 - eased(*since, now, HOVER_FADE));
@@ -1496,6 +1573,25 @@ impl App {
         } else {
             Frame::Needed
         }
+    }
+
+    /// The colors at the middle of the top and bottom edges of what's drawn, as the nearest solid background under each has
+    /// them: what a phone's status and navigation bars beside the window are given, so the app goes on under them. None
+    /// where there's no solid one.
+    pub fn edge_colors(&mut self) -> (Option<rsui_render::Color>, Option<rsui_render::Color>) {
+        let (width, height) = (self.size.0 as f32, self.size.1 as f32);
+        let mut at = |y: f32| {
+            let path = self.path_at(width / 2.0, y)?;
+            let root = self.runtime.root();
+            (0..=path.len()).rev().find_map(|depth| {
+                let Some(PropValue::Int(color)) = find(root, &path[..depth])?.props.get("background") else {
+                    return None;
+                };
+                let [r, g, b, a] = u32::try_from(*color).ok()?.to_be_bytes();
+                (a == 255).then_some(rsui_render::Color { r, g, b, a })
+            })
+        };
+        (at(1.0), at(height - 1.0))
     }
 
     /// How big the window is, in physical pixels.
@@ -2029,6 +2125,20 @@ impl App {
                 .as_ref()
                 .and_then(|(path, scroll)| Some((at(path)?, *scroll))),
             pressed: self.pressed.as_ref().and_then(|press| at(&press.path)),
+            scrolling: self.scrolled.as_ref().and_then(|(path, since)| {
+                let gone = Instant::now().saturating_duration_since(*since).saturating_sub(SCROLLBAR_STAYS);
+                let shows = 1.0 - (gone.as_secs_f32() / SCROLLBAR_FADE.as_secs_f32()).min(1.0);
+                Some((at(path)?, shows))
+            }),
+            ripple: self.ripple.as_ref().and_then(|ripple| {
+                Some(rsui_render::Ripple {
+                    element: at(&ripple.path)?,
+                    x: ripple.x,
+                    y: ripple.y,
+                    spread: ripple.spread,
+                    strength: ripple.strength,
+                })
+            }),
             ring: focused
                 .filter(|(focus, _)| focus.ring || focus.edit.is_some())
                 .map(|(_, element)| element),
@@ -3070,6 +3180,11 @@ impl App {
         }
         self.pressed = self.nearest_at(x, y, activates).map(|path| {
             let node = node_at(self.runtime.root(), &path);
+            // What ripples, as a control in Material's look does, spreads from here. With animations off it shows as pressed.
+            if self.animations && node.props.get("ripple").is_some() {
+                let now = Instant::now();
+                self.ripple = Some(RippleNow { path: path.clone(), x, y, since: now, let_go: None, spread: 0.0, strength: 0.0 });
+            }
             if has_pressed(node) {
                 #[cfg(feature = "automatic-render")]
                 if let Some(p) = &mut self.pilot {
@@ -3330,6 +3445,7 @@ impl App {
             }
             press
         });
+        self.let_go_of_ripple();
         if let Some(dragged) = self.dragged.take() {
             let (dx, dy) = (x - dragged.last.0, y - dragged.last.1);
             let _ = self.send_drag(&dragged.path, "end", x, y, dx, dy);
@@ -3601,6 +3717,14 @@ impl App {
         if self.pressed.take().is_some() {
             self.invalidate_automatic();
             self.repaint = true;
+        }
+        self.let_go_of_ripple();
+    }
+
+    /// A ripple fades once what set it off is let go.
+    fn let_go_of_ripple(&mut self) {
+        if let Some(ripple) = &mut self.ripple {
+            ripple.let_go.get_or_insert_with(Instant::now);
         }
     }
 
@@ -4964,6 +5088,10 @@ impl App {
             if node.actions.contains(ActionKind::Scroll)
                 && self.move_scroller(&path, step, sideways)?
             {
+                if rsui_render::scrollbars_fade() {
+                    self.scrolled = Some((path, Instant::now()));
+                    self.repaint = true;
+                }
                 return Ok(());
             }
             // What's underneath something on top doesn't scroll because of it.
@@ -5260,6 +5388,10 @@ impl App {
     /// The scrollbar at this position, if there is one, which is the innermost that's there. Pressing
     /// on the thumb grabs it where it is. Anywhere else on the track brings the thumb there first.
     fn scrollbar_at(&mut self, x: f32, y: f32) -> Option<ScrollDrag> {
+        // A phone's scrollbars only show what's scrolling, and aren't taken hold of: a finger by the edge moves what's there.
+        if rsui_render::scrollbars_fade() {
+            return None;
+        }
         let mut path = self.path_at(x, y)?;
         let (x, y) = (x / self.scale, y / self.scale);
         loop {
@@ -5370,6 +5502,7 @@ impl App {
 
     /// Whether what [`access_tree`](Self::access_tree) would say could have changed since this was
     /// last this. Working the tree out takes time, so it's only done if it might be different.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn access_fingerprint(&self) -> AccessFingerprint {
         (
             self.tree_changes,

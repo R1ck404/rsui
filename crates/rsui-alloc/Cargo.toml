@@ -14,3 +14,6 @@ owners = []
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rsui-os = { path = "../rsui-os" }

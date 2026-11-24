@@ -5,8 +5,11 @@
 //! strip between the two that can be dragged to share the room out differently. Giving it back, or this window closing,
 //! makes it a window of its own again, as it was. It's the other program's still: it draws itself and takes its own input.
 
+#[cfg(windows)]
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::*;
+#[cfg(windows)]
 use windows::core::BOOL;
 
 /// Which edge of the window the other one goes along.
@@ -24,11 +27,14 @@ pub struct DockRequest {
     pub size: f32,
 }
 
+#[cfg(windows)]
 /// The strip between the two, in logical pixels, which is what's dragged.
 const GAP: f32 = 5.0;
+#[cfg(windows)]
 /// The least either side has, in logical pixels.
 const LEAST: f32 = 160.0;
 
+#[cfg(windows)]
 /// Another window that's been taken in, and how it was before.
 pub(crate) struct Docked {
     pub(crate) child: HWND,
@@ -40,6 +46,7 @@ pub(crate) struct Docked {
     rect: RECT,
 }
 
+#[cfg(windows)]
 /// The main window of a process: one that's shown, has no owner, and isn't a child.
 pub(crate) fn window_of(pid: u32) -> Option<HWND> {
     struct Search {
@@ -71,16 +78,19 @@ pub(crate) fn window_of(pid: u32) -> Option<HWND> {
     search.found
 }
 
+#[cfg(windows)]
 trait NullWindow {
     fn is_err_or_null(&self) -> bool;
 }
 
+#[cfg(windows)]
 impl NullWindow for windows::core::Result<HWND> {
     fn is_err_or_null(&self) -> bool {
         self.as_ref().map_or(true, |window| window.0.is_null())
     }
 }
 
+#[cfg(windows)]
 /// Takes `child` into `parent`, with no frame, along `side`.
 pub(crate) fn adopt(parent: HWND, child: HWND, side: DockSide, size: f32) -> Docked {
     let mut rect = RECT::default();
@@ -108,6 +118,7 @@ pub(crate) fn adopt(parent: HWND, child: HWND, side: DockSide, size: f32) -> Doc
     }
 }
 
+#[cfg(windows)]
 impl Docked {
     /// Whether it's the window of process `pid`, which once it's inside this one isn't found among the windows of their own.
     pub(crate) fn belongs_to(&self, pid: u32) -> bool {
@@ -208,6 +219,7 @@ impl Docked {
     }
 }
 
+#[cfg(windows)]
 #[cfg(test)]
 mod tests {
     use super::*;

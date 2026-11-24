@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(windows)]
 use std::os::windows::io::AsHandle;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -663,6 +665,7 @@ fn pbkdf2_native(vm: &mut Vm, args: Args) -> Run<Value> {
 
 // About the machine.
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Default)]
 struct MemoryStatus {
@@ -677,6 +680,7 @@ struct MemoryStatus {
     extended: u64,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct VersionInfo {
     size: u32,
@@ -687,6 +691,12 @@ struct VersionInfo {
     service_pack: [u16; 128],
 }
 
+#[cfg(windows)]
+use windows as platform;
+#[cfg(not(windows))]
+use unix as platform;
+
+#[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows {
     use super::{MemoryStatus, VersionInfo};
@@ -761,11 +771,102 @@ mod windows {
     }
 }
 
+/// The same, for Linux, Android and macOS.
+#[cfg(not(windows))]
+#[allow(unsafe_code)]
+mod unix {
+    /// All the memory there is, and how much of it's free for the taking.
+    pub(super) fn memory() -> (u64, u64) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // What's "available" counts what the system would give back from its caches, as Node's `freemem` does.
+            let read = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+            let field = |name: &str| {
+                read.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                    .map_or(0, |kb| kb * 1024)
+            };
+            (field("MemTotal:"), field("MemAvailable:"))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let mut total = 0u64;
+            let mut size = size_of::<u64>();
+            // SAFETY: the name ends in a zero, and the value has room for what it says.
+            unsafe {
+                libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut total).cast(), &raw mut size, std::ptr::null_mut(), 0);
+            }
+            // SAFETY: no preconditions.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+            // macOS counts the pages that are free and those it would give back from its caches apart.
+            let count = |name: &std::ffi::CStr| {
+                let mut pages = 0u32;
+                let mut size = size_of::<u32>();
+                // SAFETY: as for the total.
+                unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut pages).cast(), &raw mut size, std::ptr::null_mut(), 0) };
+                u64::from(pages)
+            };
+            let free = count(c"vm.page_free_count") + count(c"vm.page_purgeable_count");
+            (total, free * page)
+        }
+    }
+
+    pub(super) fn milliseconds_up() -> u64 {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: the time has room for what's written.
+        unsafe { libc::clock_gettime(CLOCK, &raw mut now) };
+        now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000
+    }
+
+    pub(super) fn process_id() -> u32 {
+        std::process::id()
+    }
+
+    /// Waits for another program to finish, and gives its exit code, or nothing for one a signal ended. It's waited
+    /// for without being reaped, so `Child` still knows it and reaps it once it's asked.
+    pub(super) fn wait_for_exit(process: u32) -> Option<i32> {
+        // SAFETY: the information has room for what's written, and waiting with `WNOWAIT` changes nothing about it.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            loop {
+                let done = libc::waitid(libc::P_PID, process as libc::id_t, &raw mut info, libc::WEXITED | libc::WNOWAIT);
+                if done == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return None;
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let status = info.si_status();
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let status = info.si_status;
+            (info.si_code == libc::CLD_EXITED).then_some(status)
+        }
+    }
+
+    pub(super) fn version() -> String {
+        // SAFETY: the names have room for what's written.
+        unsafe {
+            let mut names: libc::utsname = std::mem::zeroed();
+            if libc::uname(&raw mut names) != 0 {
+                return String::new();
+            }
+            std::ffi::CStr::from_ptr(names.release.as_ptr()).to_string_lossy().into_owned()
+        }
+    }
+}
+
 /// `machine()`, which is what `os` is written with.
 fn machine(vm: &mut Vm, _: Args) -> Run<Value> {
-    let (total, free) = windows::memory();
+    let (total, free) = platform::memory();
     let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-    let release = windows::version();
+    let release = platform::version();
     let out = vm.new_plain();
     let set_number = |vm: &mut Vm, name: &str, value: f64| {
         let atom = vm.intern_str(name);
@@ -779,8 +880,8 @@ fn machine(vm: &mut Vm, _: Args) -> Run<Value> {
     set_number(vm, "totalmem", total as f64);
     set_number(vm, "freemem", free as f64);
     set_number(vm, "cpus", cpus as f64);
-    set_number(vm, "uptime", windows::milliseconds_up() as f64 / 1000.0);
-    set_number(vm, "pid", f64::from(windows::process_id()));
+    set_number(vm, "uptime", platform::milliseconds_up() as f64 / 1000.0);
+    set_number(vm, "pid", f64::from(platform::process_id()));
     let text = vm.new_str(&release);
     let atom = vm.intern_str("release");
     vm.define(out.handle(), atom, text, crate::object::PLAIN);
@@ -862,6 +963,29 @@ fn read_program(vm: &mut Vm, args: &Args) -> Run<Program> {
 }
 
 impl Program {
+    /// Elsewhere a shell command goes to `/bin/sh -c`, as Node has it, and there are no console windows to keep away.
+    #[cfg(not(windows))]
+    fn command(&self) -> Command {
+        let mut command = if self.shell {
+            let mut command = Command::new(if cfg!(target_os = "android") { "/system/bin/sh" } else { "/bin/sh" });
+            command.arg("-c").arg(&self.file);
+            command
+        } else {
+            let mut command = Command::new(&self.file);
+            command.args(&self.arguments);
+            command
+        };
+        if let Some(folder) = &self.folder {
+            command.current_dir(folder);
+        }
+        if let Some(environment) = &self.environment {
+            command.env_clear();
+            command.envs(environment.iter().map(|(name, value)| (name, value)));
+        }
+        command
+    }
+
+    #[cfg(windows)]
     fn command(&self) -> Command {
         // Without this, each one would bring up a console window from a program with a window of its own.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1010,6 +1134,7 @@ fn wait_for(vm: &mut Vm, args: Args) -> Run<Value> {
     let number = vm.arg(&args, 0);
     let number = vm.to_number(number)? as u32;
     // It's waited on through a copy of what names it, so that it can still be stopped, or forgotten, while it's waited on.
+    #[cfg(windows)]
     let process = running().lock().ok().and_then(|all| {
         all.get(&number)?
             .child
@@ -1017,13 +1142,30 @@ fn wait_for(vm: &mut Vm, args: Args) -> Run<Value> {
             .try_clone_to_owned()
             .ok()
     });
+    // Elsewhere it's waited on by its process id, without being reaped; it's reaped through `Child` once it's done.
+    #[cfg(not(windows))]
+    let process = running().lock().ok().and_then(|all| Some(all.get(&number)?.child.id()));
     let Some(process) = process else {
         return Ok(vm.settled_promise(Outcome::Null));
     };
     Ok(
-        vm.in_own_thread(move || match windows::wait_for_exit(&process) {
-            Some(code) => Outcome::Number(f64::from(code)),
-            None => Outcome::Null,
+        vm.in_own_thread(move || {
+            #[cfg(windows)]
+            let code = windows::wait_for_exit(&process);
+            #[cfg(not(windows))]
+            let code = {
+                let code = unix::wait_for_exit(process);
+                if let Ok(mut all) = running().lock()
+                    && let Some(one) = all.get_mut(&number)
+                {
+                    let _ = one.child.try_wait();
+                }
+                code
+            };
+            match code {
+                Some(code) => Outcome::Number(f64::from(code)),
+                None => Outcome::Null,
+            }
         }),
     )
 }
@@ -1309,7 +1451,22 @@ fn set_time_of(vm: &mut Vm, args: Args) -> Run<Value> {
     Ok(Value::UNDEFINED)
 }
 
+/// `locale()`: elsewhere, what the environment says, as `en_GB.UTF-8`, written as `en-GB`.
+#[cfg(not(windows))]
+fn user_locale(vm: &mut Vm, _: Args) -> Run<Value> {
+    let said = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty() && value != "C" && value != "POSIX");
+    let text = said
+        .map(|value| value.split(['.', '@']).next().unwrap_or_default().replace('_', "-"))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "en-US".to_owned());
+    Ok(vm.new_str(&text))
+}
+
 /// `locale()`, which is what the user's Windows says, like `en-GB`.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn user_locale(vm: &mut Vm, _: Args) -> Run<Value> {
     #[link(name = "kernel32")]

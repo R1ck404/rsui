@@ -9,6 +9,9 @@
 //! sample taken at a bad moment is wrong rather than harmful, and the numbers in it are checked before they're used.
 //! Turning them into names is done on the engine's own thread, in [`Vm::take_samples`], which keeps each sample as a span
 //! of kind [`rsui_spans::Kind::Sample`] with its stack as the label, outermost first.
+//!
+//! Only Windows has the stopping and copying written yet; elsewhere sampling says it can't start.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 use std::collections::HashMap;
 use std::sync::Mutex;

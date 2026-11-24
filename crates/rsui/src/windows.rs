@@ -382,6 +382,7 @@ fn tell() {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn tell_with(function: fn()) {
     TELL.with(|tell| tell.set(Some(function)));
 }

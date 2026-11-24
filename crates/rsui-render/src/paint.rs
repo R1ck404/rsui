@@ -273,6 +273,9 @@ enum Part {
     Shaped,
     /// A shadow under text, whose details are read when it's drawn.
     TextShadow,
+    /// What a control drawn in the platform's look has that changes as it's used (`ripple`, `focus_line`, `focus_background`,
+    /// `focus_ring`, `pressed_text_color`), whose details are read when it's drawn.
+    Native,
 }
 
 /// How many places [`PartTable`] has, as a power of two. It's mostly empty, so that a prop that
@@ -369,6 +372,11 @@ const PARTS: &[(&str, Part)] = &[
     ("clip_path", Part::Shaped),
     ("outline_width", Part::Outline),
     ("border_style", Part::BorderStyle),
+    ("ripple", Part::Native),
+    ("focus_line", Part::Native),
+    ("focus_background", Part::Native),
+    ("focus_ring", Part::Native),
+    ("pressed_text_color", Part::Native),
 ];
 
 pub(crate) static NAMES: LazyLock<Names> = LazyLock::new(|| Names {
@@ -433,6 +441,9 @@ pub(crate) struct Look {
     pub(crate) outlined: bool,
     /// What its border is made of: a line, dashes or dots, as `border_style` says.
     pub(crate) border_pattern: BorderPattern,
+    /// Whether it's a control in the platform's look, with a ripple or a look of its own while it has the keyboard. See
+    /// [`Part::Native`].
+    pub(crate) native: bool,
     /// Whether this has any of the things most elements don't: changing colors, a border or fading.
     /// Drawing checks this once, instead of checking for each of them.
     pub(crate) unusual: bool,
@@ -524,6 +535,10 @@ impl Look {
                     self.unusual = true;
                 }
                 Part::TextShadow => self.text_shadow = true,
+                Part::Native => {
+                    self.native = true;
+                    self.unusual = true;
+                }
                 Part::Outline => {
                     self.outlined = number(value) > 0.0;
                     self.unusual |= self.outlined;

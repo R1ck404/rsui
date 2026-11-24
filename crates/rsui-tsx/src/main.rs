@@ -51,6 +51,7 @@ the same, and `--agent` has `ui_why` and `ui_frames`.
 To hand it to someone:
 
   rsui-tsx --pack out.exe [--icon app.ico] app.tsx    makes one program, with nothing else to install
+  rsui-tsx config [--platform android] [app]          prints what its rsui.config.ts says, as JSON, or what's wrong with it
   rsui-tsx --react-compiler --pack out.exe app.tsx   compiles project React code at build time (requires Node on the build machine)
     --pack-diagnostics                            enables environment-driven test steps and live inspection in the artifact
     --react-compiler-root DIR                      source root (repeatable; defaults to nearest project folder)
@@ -81,6 +82,37 @@ fn read_steps(given: &str) -> Result<String, String> {
     match given.strip_prefix('@') {
         Some(file) => std::fs::read_to_string(file).map_err(|error| format!("{file}: {error}")),
         None => Ok(given.to_owned()),
+    }
+}
+
+/// `rsui-tsx config [--platform P] [APP]`: prints the app's `rsui.config.ts` as JSON, with what it leaves out filled in, for
+/// scripts that can't run TypeScript, or says what's wrong with it.
+fn print_config(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut platform = None;
+    let mut app = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--platform" => platform = args.next(),
+            // JSON is all it prints, so this is only for saying so.
+            "--json" => {}
+            _ if arg.starts_with('-') => {
+                eprintln!("`rsui-tsx config` takes --platform windows|android|macos|linux and the app, not {arg}");
+                return ExitCode::FAILURE;
+            }
+            _ => app = Some(arg),
+        }
+    }
+    let app = app.unwrap_or_else(|| ".".to_owned());
+    match rsui_tsx::app_config(app.as_ref(), platform.as_deref()) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -137,6 +169,10 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
     if packed.is_none() && args.peek().is_some_and(|arg| arg == "new") {
         return new_app(args.nth(1));
+    }
+    if packed.is_none() && args.peek().is_some_and(|arg| arg == "config") {
+        args.next();
+        return print_config(args);
     }
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -307,6 +343,7 @@ fn main() -> ExitCode {
             rsui_tsx::Options {
                 title: None,
                 watch: watch && !is_packed,
+                write_code_cache: None,
             },
         ),
     };

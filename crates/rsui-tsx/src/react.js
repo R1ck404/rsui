@@ -310,7 +310,8 @@ function isValidElement(value) {
 }
 
 function createElement(type, props, ...kids) {
-    if (typeof type === 'string' && globalThis.__rsuiDom !== undefined) {
+    // One that says `native` is rsui's own, in the platform's look.
+    if (typeof type === 'string' && globalThis.__rsuiDom !== undefined && (props == null || props.native !== true)) {
         type = globalThis.__rsuiDom(type) ?? type;
     }
     // Its props are always an object of its own, copied from what it's given, as React's `createElement` makes them: what's given

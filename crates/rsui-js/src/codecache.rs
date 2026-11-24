@@ -308,7 +308,11 @@ pub(crate) struct Block {
 
 static BLOCK: OnceLock<Option<Block>> = OnceLock::new();
 
-/// The block in this program, if it's packed with one that's for this build and reads.
+/// A block kept in a file of its own, and the folder its files' paths are from: see [`use_code_cache_file`].
+static CACHE_FILE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+
+/// The block in this program, if it's packed with one that's for this build and reads, or else the one in the file
+/// [`use_code_cache_file`] gave.
 pub(crate) fn block() -> Option<&'static Block> {
     BLOCK
         .get_or_init(|| {
@@ -316,10 +320,42 @@ pub(crate) fn block() -> Option<&'static Block> {
                 return None;
             }
             let _time = crate::startup::span(crate::startup::Phase::CacheRead, || None);
-            let (bytes, root) = crate::packed::read_code_block()?;
+            let (bytes, root) = crate::packed::read_code_block().or_else(|| {
+                let (file, root) = CACHE_FILE.get()?;
+                Some((std::fs::read(file).ok()?.into(), root.clone()))
+            })?;
             Block::read(bytes, &root)
         })
         .as_ref()
+}
+
+/// Has a program that runs its files from the disk, rather than packed, load what they compile to from `file`, as a packed
+/// one does from inside itself, where it's there: a file is only loaded from it while it's as long as it was, and only by
+/// the build of the engine that wrote it, and anything else is compiled as it would have been. Its files' paths are from
+/// `root`. It's for an app on a phone, which writes it the first time it starts ([`write_code_cache_file`]), as it can't be
+/// made when the app's built, by another build of the engine. Said before anything's compiled; it's read once, then.
+pub fn use_code_cache_file(file: &Path, root: &Path) {
+    let _ = CACHE_FILE.set((file.to_owned(), root.to_owned()));
+}
+
+/// Writes what an app's files compiled to, `code`, as [`use_code_cache_file`] reads it: the files inside `root`, as they
+/// are now on the disk, and the modules that come with the engine. It's written beside `file` and moved there, so a
+/// program that stops while it's written leaves none rather than half of one.
+pub fn write_code_cache_file(code: &CompiledCode, root: &Path, file: &Path) -> std::io::Result<()> {
+    let mut sizes = HashMap::new();
+    for recorded in &code.files {
+        if let Named::File(path) = &recorded.name
+            && path.starts_with(root)
+            && let Some(size) = std::fs::metadata(path).ok().and_then(|data| u32::try_from(data.len()).ok())
+        {
+            sizes.insert(path.clone(), size);
+        }
+    }
+    let block = write_block(code, root, &sizes);
+    let mut staged = file.as_os_str().to_owned();
+    staged.push(".new");
+    std::fs::write(&staged, block)?;
+    std::fs::rename(&staged, file)
 }
 
 impl Block {

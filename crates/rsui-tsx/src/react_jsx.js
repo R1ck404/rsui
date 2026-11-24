@@ -3,7 +3,8 @@
 const { Fragment } = require('rsui');
 
 function jsx(type, props, key) {
-    if (typeof type === 'string' && globalThis.__rsuiDom !== undefined) {
+    // One that says `native` is rsui's own, in the platform's look.
+    if (typeof type === 'string' && globalThis.__rsuiDom !== undefined && props.native !== true) {
         type = globalThis.__rsuiDom(type) ?? type;
     }
     // What it's given is its own, made for this call, and it keeps its `children` there as React's does.

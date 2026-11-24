@@ -43,6 +43,29 @@ pub fn system_is_dark() -> bool {
     result == 0 && light == 0
 }
 
+/// The shades of the accent color the user's chosen, as Windows works them out for its own controls (`AccentPalette`):
+/// three lighter, the color itself, three darker and one more, each red, green, blue and alpha. Fluent's controls use the
+/// first darker on a light background and the second lighter on a dark one.
+pub(crate) fn accent_palette() -> Option<[[u8; 4]; 8]> {
+    const CURRENT_USER: isize = 0x8000_0001_u32 as i32 as isize;
+    const ONLY_BINARY: u32 = 0x08;
+    let mut palette = [[0u8; 4]; 8];
+    let mut size = size_of_val(&palette) as u32;
+    // SAFETY: the names end in a terminator, and `palette` is as big as `size` says.
+    let result = unsafe {
+        RegGetValueW(
+            CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent").as_ptr(),
+            w!("AccentPalette").as_ptr(),
+            ONLY_BINARY,
+            std::ptr::null_mut(),
+            palette.as_mut_ptr().cast(),
+            &raw mut size,
+        )
+    };
+    (result == 0 && size as usize == size_of_val(&palette)).then_some(palette)
+}
+
 /// Whether this is something it's safe to hand to whatever opens it. Text in a program can come from
 /// anywhere, and what opens `file:` or a program's own scheme can run anything.
 pub fn can_open_url(url: &str) -> bool {

@@ -19,6 +19,8 @@ rsui-core = { path = "../rsui-core" }
 rsui-image = { path = "../rsui-image" }
 rsui-layout = { path = "../rsui-layout" }
 rsui-text = { path = "../rsui-text" }
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -33,8 +35,14 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Vulkan, loaded from the system when the first window is drawn, so nothing is linked at build time.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+
 [dev-dependencies]
 proptest = "1"
+
+[target.'cfg(windows)'.dev-dependencies]
 windows ={ version = "0.62", features = [
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Gdi",

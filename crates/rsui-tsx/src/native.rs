@@ -531,6 +531,7 @@ fn host_app_file(vm: &mut Vm, _: Args) -> Result<Value, Value> {
 }
 
 /// A GUID, as Windows lays it out.
+#[cfg(windows)]
 const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
     let (a, b, c) = (a.to_le_bytes(), b.to_le_bytes(), c.to_le_bytes());
     [
@@ -540,6 +541,7 @@ const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 }
 
 /// The user's own folders that [`user_folder`] knows, by the names Electron gives them, with the ids Windows knows them by.
+#[cfg(windows)]
 #[rustfmt::skip]
 const USER_FOLDERS: [(&str, [u8; 16]); 7] = [
     ("desktop", guid(0xB4BF_CC3A, 0xDB2C, 0x424C, [0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41])),
@@ -551,8 +553,35 @@ const USER_FOLDERS: [(&str, [u8; 16]); 7] = [
     ("recent", guid(0xAE50_C081, 0xEBD2, 0x438A, [0x86, 0x55, 0x8A, 0x09, 0x2E, 0x34, 0x98, 0x7A])),
 ];
 
+/// Where one of the user's own folders is: on Linux as `~/.config/user-dirs.dirs` says, which the desktop keeps in the
+/// person's language, and otherwise in their home by its English name, as macOS and Android have them.
+#[cfg(not(windows))]
+pub(crate) fn user_folder(name: &str) -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let (key, english) = match name {
+        "desktop" => ("XDG_DESKTOP_DIR", "Desktop"),
+        "documents" => ("XDG_DOCUMENTS_DIR", "Documents"),
+        "downloads" => ("XDG_DOWNLOAD_DIR", "Downloads"),
+        "music" => ("XDG_MUSIC_DIR", "Music"),
+        "pictures" => ("XDG_PICTURES_DIR", "Pictures"),
+        "videos" => ("XDG_VIDEOS_DIR", if cfg!(target_vendor = "apple") { "Movies" } else { "Videos" }),
+        "recent" => return Some(home.join(".local/share/recently-used.xbel")).filter(|_| cfg!(target_os = "linux")),
+        _ => return None,
+    };
+    let config = std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), std::path::PathBuf::from);
+    let said = std::fs::read_to_string(config.join("user-dirs.dirs")).ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            let value = line.strip_prefix(key)?.trim_start().strip_prefix('=')?.trim().trim_matches('"');
+            let value = value.replace("$HOME", &home.to_string_lossy());
+            Some(std::path::PathBuf::from(value))
+        })
+    });
+    Some(said.unwrap_or_else(|| home.join(english)))
+}
+
 /// Where Windows says one of the user's own folders is, which can be somewhere else than in their home, as when OneDrive
 /// keeps their documents: `desktop`, `documents`, `downloads`, `music`, `pictures`, `videos` or `recent`.
+#[cfg(windows)]
 pub(crate) fn user_folder(name: &str) -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     #[link(name = "shell32.dll", kind = "raw-dylib", modifiers = "+verbatim")]

@@ -29,11 +29,26 @@ rsui-layout = { path = "../rsui-layout" }
 rsui-render = { path = "../rsui-render" }
 rsui-runtime = { path = "../rsui-runtime" }
 rsui-text = { path = "../rsui-text" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Wayland, through libwayland, loaded when the window opens (nothing's linked at build time), as Vulkan draws on its own
+# `wl_display`; the protocols are generated at build time.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = { version = "0.31", default-features = false, features = ["system", "dlopen"] }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging", "unstable"] }
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
+    # The share sheet, in `popups`.
+    "ApplicationModel_DataTransfer",
+    "Foundation",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
+    "Win32_System_ApplicationInstallationAndServicing",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
@@ -58,6 +73,8 @@ windows-core = "0.62"
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1"
+
+[target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_StationsAndDesktops",

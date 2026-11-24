@@ -40,9 +40,16 @@ pub mod access;
 mod app;
 #[cfg(feature = "mutation-pilot")]
 pub use app::mutation_pilot::MutationPilot;
+#[cfg(windows)]
+pub mod desktop;
+// Each system's own desktop services come in as they're written; until then, the same names that do nothing.
+#[cfg(not(windows))]
+#[path = "desktop_none.rs"]
 pub mod desktop;
 pub mod dialogs;
+pub mod popups;
 mod dock;
+#[cfg(windows)]
 mod drop;
 pub mod edit;
 pub mod embed;
@@ -52,14 +59,44 @@ mod input_log;
 pub mod inspect;
 mod pill;
 mod marks;
+pub mod native_look;
 #[cfg(feature = "idle-probe")]
 mod native_cycles;
 pub mod replay;
+#[cfg(windows)]
 mod system;
+#[cfg(not(windows))]
+#[path = "system_none.rs"]
+mod system;
+#[cfg(windows)]
 mod uia;
 mod widgets;
+#[cfg(windows)]
 mod shell_layer;
+#[cfg(windows)]
 mod window;
+// Android's window is the activity's (see `rsui::android`).
+#[cfg(target_os = "android")]
+#[path = "window_android.rs"]
+mod window;
+// Linux's window is Wayland's (X11 comes later).
+#[cfg(target_os = "linux")]
+#[path = "window_wayland.rs"]
+mod window;
+// AppKit on macOS comes in here as it's written. Until then, what runs headless works, and opening a window says it can't.
+#[cfg(not(any(windows, target_os = "android", target_os = "linux")))]
+#[path = "window_none.rs"]
+mod window;
+
+/// What an app's library on Android uses: starting the app when rsui's activity is made, handing on what the activity
+/// hears, and the app's own folder and files.
+#[cfg(target_os = "android")]
+pub mod android {
+    pub use crate::window::{
+        commit, compose, configuration, copy_assets, data_folder, delete, destroy, finish_composing, focus, key, low_memory, on_bar_colors,
+        redraw, shown, start, surface, touch,
+    };
+}
 mod windows;
 
 pub use app::{

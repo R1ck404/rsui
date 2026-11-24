@@ -314,14 +314,333 @@ mod system {
     }
 }
 
+/// Elsewhere the local zone is the system's zone file, as `/etc/localtime` or what `$TZ` names: a list of the moments
+/// its offset changes, and a rule, as `$TZ` would be written, for after the last of them.
 #[cfg(not(windows))]
 mod system {
-    pub(super) fn offset_at(_: f64) -> f64 {
-        0.0
+    use std::sync::OnceLock;
+
+    /// One of the offsets a zone has had: seconds ahead of UTC, whether it's summer time, and what it's called.
+    #[derive(Clone)]
+    struct Kind {
+        offset: i32,
+        summer: bool,
+        name: String,
     }
 
-    pub(super) fn zone_name(_: f64) -> String {
-        "Coordinated Universal Time".to_owned()
+    /// A rule such as `CET-1CEST,M3.5.0,M10.5.0/3`: the standard offset, and the summer one with when it starts and ends.
+    #[derive(Clone)]
+    struct Rule {
+        standard: Kind,
+        summer: Option<(Kind, Change, Change)>,
+    }
+
+    /// When in a year an offset changes: a month, a week of it (5 is the last) and a day of the week, at a time of day,
+    /// or a day of the year.
+    #[derive(Clone, Copy)]
+    enum Day {
+        MonthWeekDay(u32, u32, u32),
+        /// Counting from 1, never counting the 29th of February.
+        Julian(u32),
+        /// Counting from 0, counting the 29th of February.
+        Ordinal(u32),
+    }
+
+    #[derive(Clone, Copy)]
+    struct Change {
+        day: Day,
+        seconds: i32,
+    }
+
+    struct Zone {
+        changes: Vec<(i64, usize)>,
+        kinds: Vec<Kind>,
+        rule: Option<Rule>,
+    }
+
+    fn zone() -> Option<&'static Zone> {
+        static ZONE: OnceLock<Option<Zone>> = OnceLock::new();
+        ZONE.get_or_init(|| {
+            let said = std::env::var("TZ").ok().filter(|said| !said.is_empty());
+            if let Some(said) = &said {
+                let name = said.strip_prefix(':').unwrap_or(said);
+                if let Some(zone) = find_file(name).and_then(|bytes| read_tzif(&bytes)) {
+                    return Some(zone);
+                }
+                if let Some(rule) = read_rule(said) {
+                    return Some(Zone { changes: Vec::new(), kinds: Vec::new(), rule: Some(rule) });
+                }
+            }
+            if cfg!(target_os = "android") {
+                return None;
+            }
+            std::fs::read("/etc/localtime").ok().and_then(|bytes| read_tzif(&bytes))
+        })
+        .as_ref()
+    }
+
+    /// The file for a zone's name, as `Europe/Amsterdam`, in the places systems keep them.
+    fn find_file(name: &str) -> Option<Vec<u8>> {
+        if name.starts_with('/') {
+            return std::fs::read(name).ok();
+        }
+        if name.contains("..") {
+            return None;
+        }
+        ["/usr/share/zoneinfo", "/var/db/timezone/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo"]
+            .iter()
+            .find_map(|folder| std::fs::read(format!("{folder}/{name}")).ok())
+    }
+
+    /// Reads a TZif file, version 2 or later if it is one, as the 64-bit times it has after the 32-bit ones.
+    fn read_tzif(bytes: &[u8]) -> Option<Zone> {
+        let header = |at: usize| -> Option<[usize; 6]> {
+            if bytes.get(at..at + 4)? != b"TZif" {
+                return None;
+            }
+            let count = |n: usize| -> Option<usize> {
+                let from = at + 20 + n * 4;
+                Some(u32::from_be_bytes(bytes.get(from..from + 4)?.try_into().ok()?) as usize)
+            };
+            // UT/local, standard/wall, leap seconds, transitions, types, abbreviation bytes.
+            Some([count(0)?, count(1)?, count(2)?, count(3)?, count(4)?, count(5)?])
+        };
+        let first = header(0)?;
+        let version = *bytes.get(4)?;
+        let size = |counts: &[usize; 6], time: usize| {
+            counts[3] * time + counts[3] + counts[4] * 6 + counts[5] + counts[2] * (time + 4) + counts[1] + counts[0]
+        };
+        let (at, counts, time) = if version >= b'2' {
+            let second = 44 + size(&first, 4);
+            (second, header(second)?, 8)
+        } else {
+            (0, first, 4)
+        };
+        let [_, _, _, transitions, types, abbreviations] = counts;
+        let mut read = at + 44;
+        let mut changes = Vec::with_capacity(transitions);
+        let times = bytes.get(read..read + transitions * time)?;
+        read += transitions * time;
+        let indexes = bytes.get(read..read + transitions)?;
+        read += transitions;
+        for (index, &kind) in indexes.iter().enumerate() {
+            let raw = &times[index * time..index * time + time];
+            let when = if time == 8 {
+                i64::from_be_bytes(raw.try_into().ok()?)
+            } else {
+                i64::from(i32::from_be_bytes(raw.try_into().ok()?))
+            };
+            changes.push((when, usize::from(kind)));
+        }
+        let records = bytes.get(read..read + types * 6)?;
+        read += types * 6;
+        let names = bytes.get(read..read + abbreviations)?;
+        let mut kinds = Vec::with_capacity(types);
+        for record in records.chunks_exact(6) {
+            let offset = i32::from_be_bytes(record[..4].try_into().ok()?);
+            let start = usize::from(record[5]).min(names.len());
+            let end = names[start..].iter().position(|&byte| byte == 0).map_or(names.len(), |end| start + end);
+            kinds.push(Kind { offset, summer: record[4] != 0, name: String::from_utf8_lossy(&names[start..end]).into_owned() });
+        }
+        if kinds.is_empty() || changes.iter().any(|(_, kind)| *kind >= kinds.len()) {
+            return None;
+        }
+        // After the second block comes the rule for what's past its last change, between two newlines.
+        let rule = if version >= b'2' {
+            let end = at + 44 + size(&counts, 8);
+            bytes.get(end..).and_then(|rest| {
+                let rest = std::str::from_utf8(rest).ok()?;
+                read_rule(rest.trim_matches('\n').lines().next()?)
+            })
+        } else {
+            None
+        };
+        Some(Zone { changes, kinds, rule })
+    }
+
+    /// Reads a rule written as `$TZ` is: `EST5EDT,M3.2.0,M11.1.0`. Offsets in it are hours behind UTC.
+    fn read_rule(text: &str) -> Option<Rule> {
+        let mut rest = text.as_bytes();
+        let name = |rest: &mut &[u8]| -> Option<String> {
+            if rest.first() == Some(&b'<') {
+                let end = rest.iter().position(|&byte| byte == b'>')?;
+                let name = String::from_utf8_lossy(&rest[1..end]).into_owned();
+                *rest = &rest[end + 1..];
+                return Some(name);
+            }
+            let end = rest.iter().position(|byte| !byte.is_ascii_alphabetic()).unwrap_or(rest.len());
+            if end < 3 {
+                return None;
+            }
+            let name = String::from_utf8_lossy(&rest[..end]).into_owned();
+            *rest = &rest[end..];
+            Some(name)
+        };
+        let time = |rest: &mut &[u8]| -> Option<i32> {
+            let sign = match rest.first() {
+                Some(b'-') => {
+                    *rest = &rest[1..];
+                    -1
+                }
+                Some(b'+') => {
+                    *rest = &rest[1..];
+                    1
+                }
+                _ => 1,
+            };
+            let mut total = 0;
+            for (part, scale) in [3600, 60, 1].into_iter().enumerate() {
+                let end = rest.iter().position(|byte| !byte.is_ascii_digit()).unwrap_or(rest.len());
+                if end == 0 {
+                    if part == 0 {
+                        return None;
+                    }
+                    break;
+                }
+                let number: i32 = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+                total += number * scale;
+                *rest = &rest[end..];
+                if rest.first() == Some(&b':') && part < 2 {
+                    *rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            Some(sign * total)
+        };
+        let standard_name = name(&mut rest)?;
+        let standard_offset = -time(&mut rest)?;
+        let standard = Kind { offset: standard_offset, summer: false, name: standard_name };
+        if rest.is_empty() {
+            return Some(Rule { standard, summer: None });
+        }
+        let summer_name = name(&mut rest)?;
+        let summer_offset = if rest.first().is_some_and(|byte| *byte != b',') { -time(&mut rest)? } else { standard_offset + 3600 };
+        let change = |rest: &mut &[u8]| -> Option<Change> {
+            if rest.first() != Some(&b',') {
+                return None;
+            }
+            *rest = &rest[1..];
+            let number = |rest: &mut &[u8]| -> Option<u32> {
+                let end = rest.iter().position(|byte| !byte.is_ascii_digit()).unwrap_or(rest.len());
+                let number = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+                *rest = &rest[end..];
+                Some(number)
+            };
+            let day = match rest.first() {
+                Some(b'M') => {
+                    *rest = &rest[1..];
+                    let month = number(rest)?;
+                    *rest = rest.strip_prefix(b".")?;
+                    let week = number(rest)?;
+                    *rest = rest.strip_prefix(b".")?;
+                    Day::MonthWeekDay(month, week, number(rest)?)
+                }
+                Some(b'J') => {
+                    *rest = &rest[1..];
+                    Day::Julian(number(rest)?)
+                }
+                _ => Day::Ordinal(number(rest)?),
+            };
+            let seconds = if rest.first() == Some(&b'/') {
+                *rest = &rest[1..];
+                time(rest)?
+            } else {
+                7200
+            };
+            Some(Change { day, seconds })
+        };
+        let starts = change(&mut rest)?;
+        let ends = change(&mut rest)?;
+        let summer = Kind { offset: summer_offset, summer: true, name: summer_name };
+        Some(Rule { standard, summer: Some((summer, starts, ends)) })
+    }
+
+    /// The moment, in seconds from 1970 in UTC, that `change` comes in `year`, for a zone that's `offset` ahead then.
+    fn moment_of(change: Change, year: i64, offset: i32) -> i64 {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days = match change.day {
+            Day::Julian(day) => {
+                let day = i64::from(day.clamp(1, 365));
+                super::days_from_civil(year, 1, 1) + day - 1 + i64::from(leap && day > 59)
+            }
+            Day::Ordinal(day) => super::days_from_civil(year, 1, 1) + i64::from(day.min(365)),
+            Day::MonthWeekDay(month, week, weekday) => {
+                let month = i64::from(month.clamp(1, 12));
+                let first = super::days_from_civil(year, month, 1);
+                // 1970-01-01 was a Thursday.
+                let first_weekday = (first + 4).rem_euclid(7);
+                let mut day = first + (i64::from(weekday) - first_weekday).rem_euclid(7) + (i64::from(week.clamp(1, 5)) - 1) * 7;
+                let next_month = if month == 12 { super::days_from_civil(year + 1, 1, 1) } else { super::days_from_civil(year, month + 1, 1) };
+                while day >= next_month {
+                    day -= 7;
+                }
+                day
+            }
+        };
+        days * 86_400 + i64::from(change.seconds) - i64::from(offset)
+    }
+
+    fn kind_by_rule(rule: &Rule, seconds: i64) -> &Kind {
+        let Some((summer, starts, ends)) = &rule.summer else { return &rule.standard };
+        let year = super::fields_of(seconds as f64 * 1000.0).year;
+        let start = moment_of(*starts, year, rule.standard.offset);
+        let end = moment_of(*ends, year, summer.offset);
+        let in_summer = if start < end { seconds >= start && seconds < end } else { seconds >= start || seconds < end };
+        if in_summer { summer } else { &rule.standard }
+    }
+
+    /// What the zone is at a moment, in milliseconds from 1970 in UTC.
+    fn kind_at(time: f64) -> Option<Kind> {
+        let zone = zone()?;
+        let seconds = (time / 1000.0).floor() as i64;
+        let after = zone.changes.partition_point(|(when, _)| *when <= seconds);
+        if after == zone.changes.len() && let Some(rule) = &zone.rule {
+            return Some(kind_by_rule(rule, seconds).clone());
+        }
+        let index = match after {
+            // Before the first change it's the first kind that isn't summer time, as the format says.
+            0 => zone.kinds.iter().position(|kind| !kind.summer).unwrap_or(0),
+            after => zone.changes[after - 1].1,
+        };
+        zone.kinds.get(index).cloned().or_else(|| zone.rule.as_ref().map(|rule| rule.standard.clone()))
+    }
+
+    pub(super) fn offset_at(time: f64) -> f64 {
+        if !time.is_finite() {
+            return 0.0;
+        }
+        kind_at(time).map_or(0.0, |kind| f64::from(kind.offset) * 1000.0)
+    }
+
+    pub(super) fn zone_name(time: f64) -> String {
+        match kind_at(time) {
+            Some(kind) if !kind.name.is_empty() => kind.name,
+            _ => "Coordinated Universal Time".to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_rule_says_when_summer_time_is() {
+            let rule = read_rule("CET-1CEST,M3.5.0,M10.5.0/3").expect("it reads");
+            assert_eq!(rule.standard.offset, 3600);
+            // 2024-07-01 is in summer time, 2024-01-15 isn't; summer starts 2024-03-31 at 01:00 UTC.
+            let july = super::super::days_from_civil(2024, 7, 1) * 86_400;
+            let january = super::super::days_from_civil(2024, 1, 15) * 86_400;
+            assert_eq!(kind_by_rule(&rule, july).offset, 7200);
+            assert_eq!(kind_by_rule(&rule, january).offset, 3600);
+            let starts = super::super::days_from_civil(2024, 3, 31) * 86_400 + 3600;
+            assert_eq!(kind_by_rule(&rule, starts - 1).offset, 3600);
+            assert_eq!(kind_by_rule(&rule, starts).offset, 7200);
+            let us = read_rule("EST5EDT,M3.2.0,M11.1.0").expect("it reads");
+            assert_eq!(us.standard.offset, -5 * 3600);
+            assert_eq!(kind_by_rule(&us, july).name, "EDT");
+            assert_eq!(read_rule("<+0330>-3:30").expect("it reads").standard.offset, 3 * 3600 + 1800);
+        }
     }
 
     pub(super) fn format(
@@ -960,8 +1279,53 @@ fn read_locale_options(vm: &mut Vm, args: &Args) -> Run<LocaleOptions> {
     Ok(options)
 }
 
+/// The locale to go by: the one asked for, or the user's.
+#[cfg(not(windows))]
+fn locale_or_users(locale: Option<&str>) -> String {
+    locale.map(str::to_owned).unwrap_or_else(|| {
+        ["LC_ALL", "LC_TIME", "LANG"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.is_empty() && value != "C" && value != "POSIX")
+            .map(|value| value.split(['.', '@']).next().unwrap_or_default().replace('_', "-"))
+            .unwrap_or_else(|| "en-US".to_owned())
+    })
+}
+
+/// Which way around a language writes dates, and what goes between the numbers, for the languages most used; others
+/// write the day first with slashes, as most of the world does.
+#[cfg(not(windows))]
+fn date_order_of(locale: Option<&str>) -> (DateOrder, String) {
+    let locale = locale_or_users(locale).to_ascii_lowercase();
+    let language = locale.split('-').next().unwrap_or_default();
+    let american = ["en-us", "en", "en-ph", "en-ca"];
+    if american.contains(&locale.as_str()) || language == "fil" {
+        return (DateOrder::MonthDayYear, "/".to_owned());
+    }
+    match language {
+        "zh" | "ja" => (DateOrder::YearMonthDay, "/".to_owned()),
+        "hu" | "lt" | "sv" => (DateOrder::YearMonthDay, "-".to_owned()),
+        "fr" if locale == "fr-ca" => (DateOrder::YearMonthDay, "-".to_owned()),
+        "ko" => (DateOrder::YearMonthDay, ". ".to_owned()),
+        "de" | "ru" | "pl" | "cs" | "sk" | "fi" | "nb" | "no" | "da" | "tr" | "uk" | "ro" | "bg" | "hr" | "sl" | "et"
+        | "lv" | "is" | "sr" | "az" | "kk" => (DateOrder::DayMonthYear, ".".to_owned()),
+        "nl" => (DateOrder::DayMonthYear, "-".to_owned()),
+        _ => (DateOrder::DayMonthYear, "/".to_owned()),
+    }
+}
+
+/// Whether a language writes hours from 1 to 12, as American English does, rather than up to 24.
+#[cfg(not(windows))]
+fn uses_twelve_hours(locale: Option<&str>) -> bool {
+    let locale = locale_or_users(locale).to_ascii_lowercase();
+    let language = locale.split('-').next().unwrap_or_default();
+    matches!(locale.as_str(), "en-us" | "en" | "en-au" | "en-ca" | "en-in" | "en-nz" | "en-ph" | "es-mx" | "es-us" | "zh-tw")
+        || matches!(language, "hi" | "ar" | "ko" | "bn" | "ur" | "fil")
+}
+
 /// Which way around a language writes dates, and what goes between the numbers. Windows knows this for every language, and
 /// this is only asked about ones besides American English.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn date_order_of(locale: Option<&str>) -> (DateOrder, String) {
     #[link(name = "kernel32")]
@@ -996,6 +1360,7 @@ fn date_order_of(locale: Option<&str>) -> (DateOrder, String) {
 }
 
 /// Whether a language writes hours from 1 to 12, as American English does, rather than up to 24.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn uses_twelve_hours(locale: Option<&str>) -> bool {
     #[link(name = "kernel32")]

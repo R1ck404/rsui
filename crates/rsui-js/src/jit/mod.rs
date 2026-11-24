@@ -10,18 +10,38 @@
 //! compiles every function it can the first time it's called, which is for testing. `RSUI_JIT_LOG=1` writes a line
 //! about each function compiled, and what all of it came to when the engine goes.
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+// `jit_backend` is set by build.rs where there's a backend: x86-64, and 64-bit Arm on Linux and Android.
+// TODO(macOS): Apple silicon wants its code memory mapped with MAP_JIT and written between
+// `pthread_jit_write_protect_np(0)` and `(1)` on the writing thread (memfd isn't there); with that in a `memory_apple.rs`,
+// build.rs can set `jit_backend` for aarch64 macOS too. arm64.rs already leaves x18 alone, which Apple reserves.
+#[cfg(all(jit_backend, target_arch = "aarch64"))]
+mod arm64;
+#[cfg(target_arch = "x86_64")]
 mod asm;
-#[cfg(all(windows, target_arch = "x86_64", feature = "jit-opt"))]
+#[cfg(all(jit_backend, target_arch = "aarch64"))]
+mod asm_arm64;
+#[cfg(all(jit_backend, feature = "jit-opt"))]
 pub(crate) mod feedback;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 mod helpers;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod memory;
-#[cfg(all(test, windows, target_arch = "x86_64"))]
+// Elsewhere code memory is a memfd mapped twice, as the Windows one is a section mapped twice.
+#[cfg(all(not(windows), jit_backend))]
+#[path = "memory_unix.rs"]
+mod memory;
+#[cfg(jit_backend)]
+mod plan;
+#[cfg(all(test, jit_backend))]
 mod tests;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod x64;
+
+/// The backend that turns a job into machine code for this machine.
+#[cfg(all(jit_backend, target_arch = "aarch64"))]
+use arm64 as arch;
+#[cfg(target_arch = "x86_64")]
+use x64 as arch;
 
 use crate::op::Op;
 use crate::value::Value;
@@ -54,7 +74,7 @@ pub(crate) fn mode() -> Mode {
     static MODE: AtomicU8 = AtomicU8::new(0);
     match MODE.load(Ordering::Relaxed) {
         0 => {
-            let available = cfg!(all(windows, target_arch = "x86_64"));
+            let available = cfg!(jit_backend);
             let mode = match std::env::var("RSUI_JIT").as_deref() {
                 _ if !available => Mode::Off,
                 Ok("0" | "off") => Mode::Off,
@@ -140,11 +160,11 @@ pub(crate) struct Jit {
     /// So the interpreter only has to look further when the low bit is set. The list is as long as the list of
     /// protos, and never moves, so that the interpreter and compiled code can read it without looking.
     pub(crate) slots: crate::arena::Arena<u64>,
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(jit_backend)]
     pub(crate) backend: Option<Box<Backend>>,
     /// The backend's way in from Rust, once there is one (which there is if anything's been compiled).
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    trampoline: Option<x64::Trampoline>,
+    #[cfg(jit_backend)]
+    trampoline: Option<arch::Trampoline>,
     /// Whether making the backend failed, so it isn't tried again.
     unavailable: bool,
     pub(crate) stats: Stats,
@@ -163,7 +183,7 @@ pub(crate) struct Jit {
     pub(crate) site: usize,
     /// The last functions helpers looked for records of (see `feedback::site_of`), by their protos' low bits: the proto,
     /// where its instructions start, its block, and where each instruction's record is.
-    #[cfg(all(windows, target_arch = "x86_64", feature = "jit-opt"))]
+    #[cfg(all(jit_backend, feature = "jit-opt"))]
     pub(crate) fb_last: [(u32, u32, usize, std::sync::Arc<[u32]>); 8],
 }
 
@@ -208,9 +228,9 @@ impl Jit {
             floor: 0,
             value: Value::UNDEFINED,
             slots: crate::arena::Arena::with_limit(1 << 24),
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(jit_backend)]
             backend: None,
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(jit_backend)]
             trampoline: None,
             unavailable: false,
             stats: Stats::default(),
@@ -221,14 +241,14 @@ impl Jit {
             generic: std::collections::HashMap::new(),
             #[cfg(feature = "jit-opt")]
             site: 0,
-            #[cfg(all(windows, target_arch = "x86_64", feature = "jit-opt"))]
+            #[cfg(all(jit_backend, feature = "jit-opt"))]
             fb_last: std::array::from_fn(|_| (u32::MAX, 0, 0, std::sync::Arc::from([]))),
         }
     }
 
     /// How many bytes of code there are, and how much memory they take.
     pub(crate) fn code_bytes(&self) -> (usize, usize) {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         if let Some(backend) = &self.backend {
             return (backend.used, backend.committed);
         }
@@ -243,7 +263,7 @@ impl Jit {
 
     /// Where each compiled function's code is, and each of its instructions', for a profile (`Engine::jit_code`).
     pub(crate) fn code_map(vm: &Vm) -> Vec<crate::JitCode> {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         if let Some(backend) = &vm.jit.backend {
             return backend
                 .code_map()
@@ -315,7 +335,7 @@ impl Jit {
     /// A proto has gone, as nothing could run it any more (see `compiled.rs`). What was waiting for its loop goes with
     /// it; what machine code it has is kept, as its number is never another's then.
     pub(crate) fn forget(&mut self, proto: u32) {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         if let Some(backend) = self.backend.as_deref_mut() {
             backend.deferred.remove(&proto);
         }
@@ -325,21 +345,21 @@ impl Jit {
 
 
 /// What the JIT keeps for an engine once it's compiling, on the engine's thread.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 #[derive(Default)]
 pub(crate) struct Backend {
     /// What writes the code, here on the engine's thread, when every function is compiled the first time it's
     /// called (`RSUI_JIT=eager`), or if there's no thread to be had.
-    writer: Option<x64::Writer>,
+    writer: Option<arch::Writer>,
     /// Else the thread that writes it.
     worker: Option<Worker>,
     /// What keeps the memory the worker writes code in there, while this engine can run it.
     code: Option<std::sync::Arc<memory::Views>>,
     /// What's known of each function compiled: its newest code.
-    pub(crate) compiled: std::collections::HashMap<u32, x64::Compiled, foldhash::fast::FixedState>,
+    pub(crate) compiled: std::collections::HashMap<u32, plan::Compiled, foldhash::fast::FixedState>,
     /// What's known of code that's been compiled again (see `Vm::jit_recompile`), which frames may still be running
     /// and whose counts it still counts down, with the function it's for.
-    retired: Vec<(u32, x64::Compiled)>,
+    retired: Vec<(u32, plan::Compiled)>,
     /// The functions given to the worker that it hasn't finished, whose slots say they're due meanwhile.
     queued: std::collections::HashSet<u32, foldhash::fast::FixedState>,
     /// The functions with a loop that were due as they were called, and are compiled at their loop's next turn
@@ -353,11 +373,11 @@ pub(crate) struct Backend {
     waiting: std::collections::HashMap<u32, feedback::Waiting, foldhash::fast::FixedState>,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 impl Backend {
     /// For a profile: each function compiled, with where its code is and where each of its instructions' hot and
     /// cold code starts, from there.
-    fn code_map(&self) -> impl Iterator<Item = (u32, &x64::Compiled)> {
+    fn code_map(&self) -> impl Iterator<Item = (u32, &plan::Compiled)> {
         self.compiled
             .iter()
             .map(|(&proto, compiled)| (proto, compiled))
@@ -371,14 +391,14 @@ impl Backend {
 /// has all it needs, so the engine never waits for the thread: when it goes, the thread finishes what it's doing and
 /// ends. (Waiting for it there could hang: an app's engine goes as its thread ends, when Windows won't let a thread
 /// start or end until that's done.)
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 struct Worker {
     shared: std::sync::Arc<Shared>,
 }
 
 /// What the engine and its worker share: a lock and a condition variable, which the engine already has for reading
 /// files ahead, rather than channels, which were most of the 68 KB this added to the program.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 #[derive(Default)]
 struct Shared {
     queue: std::sync::Mutex<Queue>,
@@ -388,16 +408,16 @@ struct Shared {
     finished: std::sync::atomic::AtomicBool,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 #[derive(Default)]
 struct Queue {
-    jobs: std::collections::VecDeque<x64::Job>,
+    jobs: std::collections::VecDeque<plan::Job>,
     done: Vec<Message>,
     /// The engine has gone.
     closed: bool,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -410,26 +430,26 @@ impl Shared {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 enum Message {
     /// The worker has made its writer: the way into its code, and what keeps its memory there.
-    Ready(x64::Trampoline, std::sync::Arc<memory::Views>),
+    Ready(arch::Trampoline, std::sync::Arc<memory::Views>),
     /// There's no JIT to be had here.
     Unavailable,
-    Done(x64::Done),
+    Done(plan::Done),
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 impl Worker {
     /// Starts the thread, which makes the writer first. `None` if there's no thread to be had.
-    fn start(bases: x64::Bases, timed: bool) -> Option<Self> {
+    fn start(bases: plan::Bases, timed: bool) -> Option<Self> {
         let shared = std::sync::Arc::new(Shared::default());
         let theirs = shared.clone();
         std::thread::Builder::new()
             .name("rsui-js jit".into())
             .stack_size(1 << 20)
             .spawn(move || {
-                let Some((mut writer, trampoline)) = x64::Writer::new(bases, CODE_LIMIT, timed) else {
+                let Some((mut writer, trampoline)) = arch::Writer::new(bases, CODE_LIMIT, timed) else {
                     theirs.finish(Message::Unavailable);
                     return;
                 };
@@ -454,7 +474,7 @@ impl Worker {
         Some(Self { shared })
     }
 
-    fn send(&self, job: x64::Job) {
+    fn send(&self, job: plan::Job) {
         self.shared.lock().jobs.push_back(job);
         self.shared.given.notify_one();
     }
@@ -468,7 +488,7 @@ impl Worker {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(jit_backend)]
 impl Drop for Worker {
     fn drop(&mut self) {
         // The thread finishes what it's doing and ends; nothing waits for it.
@@ -503,7 +523,7 @@ impl Drop for Jit {
                     self.stats.inlined, self.stats.left_line, self.stats.recompiled, self.stats.missed
                 );
             }
-            #[cfg(all(windows, target_arch = "x86_64", feature = "jit-opt"))]
+            #[cfg(all(jit_backend, feature = "jit-opt"))]
             self.say_feedback();
             let mut generic: Vec<_> = self.generic.iter().collect();
             generic.sort_by(|a, b| b.1.cmp(a.1));
@@ -529,13 +549,13 @@ impl Drop for Jit {
 }
 
 /// For tests: which instruction has the record at `at`.
-#[cfg(all(test, windows, target_arch = "x86_64", feature = "jit-opt"))]
+#[cfg(all(test, target_arch = "x86_64", feature = "jit-opt"))]
 fn at_of(layout: &feedback::Layout, at: u32) -> usize {
     layout.offsets.iter().position(|&offset| offset == at).expect("a record is an instruction's")
 }
 
 /// For tests: the records of the compiled function named `name`, each with the name of the instruction it's for.
-#[cfg(all(test, windows, target_arch = "x86_64", feature = "jit-opt"))]
+#[cfg(all(test, target_arch = "x86_64", feature = "jit-opt"))]
 #[allow(unsafe_code)]
 pub(crate) fn feedback_of(vm: &Vm, name: &str) -> Vec<(String, Vec<u8>)> {
     let Some(backend) = &vm.jit.backend else {
@@ -576,7 +596,7 @@ pub(crate) fn feedback_of(vm: &Vm, name: &str) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-#[cfg(all(windows, target_arch = "x86_64", feature = "jit-opt"))]
+#[cfg(all(jit_backend, feature = "jit-opt"))]
 impl Jit {
     /// For `RSUI_OPT_LOG`: what the functions' feedback came to (see `feedback::Summary`).
     #[allow(unsafe_code)]
@@ -738,8 +758,8 @@ fn compilable(vm: &Vm, proto_id: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-use x64::CODE_MIN;
+#[cfg(jit_backend)]
+use plan::CODE_MIN;
 
 /// Whether a function's code is worth going into from the interpreter or Rust, rather than interpreting it, which is
 /// cheaper for something short with no loop or call. Compiled code calls it directly either way.
@@ -747,7 +767,7 @@ use x64::CODE_MIN;
 fn worth_entering(code: u64) -> bool {
     code & 1 != 0
 }
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[cfg(not(jit_backend))]
 const CODE_MIN: u64 = u64::MAX;
 
 /// A slot `s` with `s - 3` below this is counting, and not due yet: the interpreter takes 2 off it itself.
@@ -783,7 +803,7 @@ impl Vm {
         if self.jit_code(frame.proto, 1, true).is_none() {
             return Next::Interpret;
         }
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         {
             let Some(target) = self.jit_entry(frame.proto, frame.pc) else {
                 return Next::Interpret;
@@ -824,7 +844,7 @@ impl Vm {
     /// next called. Whether it was due as it was called or at its loop came down to how its calls and turns added up
     /// to the threshold, and float_math's `advance` compiled as it was called took 15% longer.
     fn jit_compile(&mut self, proto: u32, at_loop: bool) -> Option<u64> {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         {
             if self.jit.unavailable {
                 self.jit_refuse(proto);
@@ -832,7 +852,7 @@ impl Vm {
             }
             let backend = self.jit.backend.get_or_insert_with(Box::default);
             // Compiled already, ahead of being due, as a callee of a function compiled before it.
-            if let Some(code) = backend.compiled.get(&proto).map(x64::Compiled::slot) {
+            if let Some(code) = backend.compiled.get(&proto).map(plan::Compiled::slot) {
                 self.jit_give(proto, code);
                 return Some(code);
             }
@@ -860,7 +880,7 @@ impl Vm {
             self.jit_send(jobs, proto);
             self.jit_code_of(proto)
         }
-        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        #[cfg(not(jit_backend))]
         {
             let _ = (proto, at_loop, compilable as fn(&Vm, u32) -> Result<(), &'static str>);
             None
@@ -868,7 +888,7 @@ impl Vm {
     }
 
     /// Whether a function has a loop: a jump back.
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(jit_backend)]
     fn has_loop(&self, proto: u32) -> bool {
         let proto = &self.protos[proto as usize];
         let Some(length) = extent(self, proto) else {
@@ -881,9 +901,9 @@ impl Vm {
     /// The jobs of compiling a function for the `generation`th time (0 the first): first those of the callees worth
     /// compiling ahead of it that don't have code (see `x64::Look::inline_candidates`), which its calls can then call
     /// directly or compile in line, then its own. `None` if it can't be compiled.
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    fn jit_jobs(&mut self, proto: u32, generation: u8) -> Option<Vec<x64::Job>> {
-        let candidates = x64::Look::new(self, proto)?.inline_candidates(self.jit.threshold);
+    #[cfg(jit_backend)]
+    fn jit_jobs(&mut self, proto: u32, generation: u8) -> Option<Vec<plan::Job>> {
+        let candidates = plan::Look::new(self, proto)?.inline_candidates(self.jit.threshold);
         let mut jobs = Vec::new();
         for callee in candidates {
             let backend = self.jit.backend.as_deref()?;
@@ -894,21 +914,21 @@ impl Vm {
             {
                 continue;
             }
-            if let Some(job) = x64::Job::new(self, callee, 0, false) {
+            if let Some(job) = plan::Job::new(self, callee, 0, false) {
                 jobs.push(job);
             }
         }
-        jobs.push(x64::Job::new(self, proto, generation, true)?);
+        jobs.push(plan::Job::new(self, proto, generation, true)?);
         Some(jobs)
     }
 
     /// Compiles what the jobs are for: on the worker's thread, unless every function is compiled as it's first called
     /// (which is for tests), or a test asks for it to be there and then, or there's no thread to be had. `proto` is the
     /// function they're for, the last.
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    fn jit_send(&mut self, jobs: Vec<x64::Job>, proto: u32) {
+    #[cfg(jit_backend)]
+    fn jit_send(&mut self, jobs: Vec<plan::Job>, proto: u32) {
         if self.jit.mode != Mode::Eager && self.jit.background {
-            let bases = x64::Bases::of(self);
+            let bases = plan::Bases::of(self);
             let Some(backend) = self.jit.backend.as_deref_mut() else {
                 return;
             };
@@ -930,12 +950,12 @@ impl Vm {
     }
 
     /// Compiles what the jobs are for on the engine's thread, making the writer first if there isn't one.
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    fn jit_compile_here(&mut self, jobs: Vec<x64::Job>) {
-        let bases = x64::Bases::of(self);
+    #[cfg(jit_backend)]
+    fn jit_compile_here(&mut self, jobs: Vec<plan::Job>) {
+        let bases = plan::Bases::of(self);
         let backend = self.jit.backend.get_or_insert_with(Box::default);
         if backend.writer.is_none() {
-            match x64::Writer::new(bases, CODE_LIMIT, logging()) {
+            match arch::Writer::new(bases, CODE_LIMIT, logging()) {
                 Some((writer, trampoline)) => {
                     backend.writer = Some(writer);
                     self.jit.trampoline = Some(trampoline);
@@ -959,7 +979,7 @@ impl Vm {
     }
 
     /// Puts in place what the worker has finished, and says what function `proto`'s slot says then.
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(jit_backend)]
     fn jit_collect(&mut self, proto: u32) -> Option<u64> {
         let mut installed = false;
         let messages = self
@@ -1001,9 +1021,19 @@ impl Vm {
             // Code another processor wrote is about to run on this one, which wants an instruction that has it see
             // those instructions as they are now (Intel's manual, on code one processor writes for another to run).
             // SAFETY: every x86-64 has CPUID.
+            #[cfg(target_arch = "x86_64")]
             #[allow(unused_unsafe, unsafe_code)]
             unsafe {
                 std::arch::x86_64::__cpuid(0);
+            }
+            // On Arm the writer has cleaned the data cache and invalidated the instruction cache for the code, out to
+            // every core (see `memory_unix.rs`); this core still wants an `isb` before it fetches it, so that nothing
+            // it fetched earlier is used (the Arm ARM, on concurrent modification and execution of instructions).
+            // SAFETY: an instruction barrier, which touches nothing.
+            #[cfg(target_arch = "aarch64")]
+            #[allow(unsafe_code)]
+            unsafe {
+                std::arch::asm!("isb", options(nostack, preserves_flags));
             }
         }
         self.jit_code_of(proto)
@@ -1012,8 +1042,8 @@ impl Vm {
     /// Puts a compiled function in place. Its slot says where its code is from now on, if the job said to give it the
     /// code, or the function is due by now; a callee compiled ahead of its caller is given its code when it's due.
     /// Code compiled again takes the place of the function's old code, which is kept, as frames may be running it.
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    fn jit_install(&mut self, done: x64::Done) {
+    #[cfg(jit_backend)]
+    fn jit_install(&mut self, done: plan::Done) {
         let proto = done.proto_id;
         self.jit.stats.compiling += done.took;
         let Some(backend) = self.jit.backend.as_deref_mut() else {
@@ -1074,7 +1104,7 @@ impl Vm {
     }
 
     /// A function is given its code: from now on its slot says where that is.
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(jit_backend)]
     fn jit_give(&mut self, proto: u32, slot: u64) {
         self.jit.stats.compiled += 1;
         if let Some(compiled) = self.jit.backend.as_deref().and_then(|backend| backend.compiled.get(&proto)) {
@@ -1098,7 +1128,7 @@ impl Vm {
     /// A compiled function's count towards the optimizing tier has come to 0, as its code took one off at its entry
     /// and each loop's jump back: it's due if its feedback has settled (see `feedback::due`), which with no tier yet
     /// is only counted, and said with `RSUI_OPT_LOG`.
-    #[cfg(all(windows, target_arch = "x86_64", feature = "jit-opt"))]
+    #[cfg(all(jit_backend, feature = "jit-opt"))]
     #[allow(unsafe_code)]
     pub(crate) fn opt_due(&mut self, proto: u32) {
         self.jit.stats.counted_out += 1;
@@ -1140,8 +1170,9 @@ impl Vm {
     ///   meanwhile go the way that works for any callee, which is only slower.
     /// - Else (a call of callbacks, or of natives) the count starts again, longer each time.
     #[allow(unsafe_code)]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn jit_recompile(&mut self, proto: u32, pc: u32, counter: *mut u64) -> usize {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         {
             use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
             // SAFETY: the counter is a compiled function's, which is kept as long as the engine, and its code gave it.
@@ -1173,7 +1204,7 @@ impl Vm {
                     }
                     _ => {
                         if self.jit.backend.as_deref().is_some_and(|backend| backend.queued.contains(&proto)) {
-                            count.store(x64::RECOMPILE_POLL, Relaxed);
+                            count.store(plan::RECOMPILE_POLL, Relaxed);
                         }
                         0
                     }
@@ -1181,7 +1212,7 @@ impl Vm {
             }
             let learned = {
                 let compiled = &backend.compiled[&proto];
-                x64::Look::new(self, proto).is_some_and(|look| {
+                plan::Look::new(self, proto).is_some_and(|look| {
                     compiled
                         .unguessed
                         .iter()
@@ -1192,7 +1223,7 @@ impl Vm {
                 let backend = self.jit.backend.as_deref_mut().expect("the backend is there");
                 let compiled = backend.compiled.get_mut(&proto).expect("the function has code");
                 compiled.waits = (compiled.waits + 1).min(10);
-                count.store(x64::RECOMPILE_AFTER << compiled.waits, Relaxed);
+                count.store(plan::RECOMPILE_AFTER << compiled.waits, Relaxed);
                 return 0;
             }
             let generation = backend.compiled[&proto].generation + 1;
@@ -1200,7 +1231,7 @@ impl Vm {
                 count.store(u64::MAX, Relaxed);
                 return 0;
             };
-            count.store(x64::RECOMPILE_POLL, Relaxed);
+            count.store(plan::RECOMPILE_POLL, Relaxed);
             self.jit_send(jobs, proto);
             match newest(self) {
                 Some((target, false)) => {
@@ -1210,7 +1241,7 @@ impl Vm {
                 _ => 0,
             }
         }
-        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        #[cfg(not(jit_backend))]
         {
             let _ = (proto, pc, counter);
             0
@@ -1259,7 +1290,7 @@ impl Vm {
     /// a handler an error was thrown to. In its code, if it can be gone into there.
     #[inline(never)]
     fn jit_resume(&mut self, stop: usize) -> crate::vm::Run<Value> {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         {
             let frame = *self.frames.last().expect("a frame is to run");
             // A frame compiled code has left to the interpreter to its end stays there.
@@ -1274,7 +1305,7 @@ impl Vm {
     }
 
     /// Where in a function's code to go in at its instruction `pc`, if it can be gone into there.
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(jit_backend)]
     fn jit_entry(&self, proto: u32, pc: u32) -> Option<usize> {
         let start = self.protos[proto as usize].start;
         let compiled = self.jit.backend.as_ref()?.compiled.get(&proto)?;
@@ -1302,7 +1333,7 @@ impl Vm {
 
     /// Runs the frame on top from `target` in its code, until it's returned: as `run_loop(stop)` does.
     fn jit_run_from(&mut self, stop: usize, target: usize) -> crate::vm::Run<Value> {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         {
             return match self.jit_go(target) {
                 // The frame that was entered has returned.
@@ -1339,7 +1370,7 @@ impl Vm {
     /// Runs compiled code from `target`, in the frame on top, and says what the interpreter does next.
     #[allow(unsafe_code)]
     fn jit_run(&mut self, stop: usize, target: usize) -> Next {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(jit_backend)]
         {
             // SAFETY: there's a frame on top.
             let ret_dst = unsafe { (*self.frames.as_ptr().add(self.frames.len() - 1)).ret_dst };
@@ -1375,7 +1406,7 @@ impl Vm {
 
     /// Runs compiled code from `target` in the frame on top, until that frame returns or the code leaves it: how it
     /// left (see `helpers`), with what it handed back in `jit.value`.
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(jit_backend)]
     #[inline(always)]
     #[allow(unsafe_code)]
     fn jit_go(&mut self, target: usize) -> u32 {

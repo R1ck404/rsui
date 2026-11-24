@@ -1,5 +1,6 @@
 //! The limit on how much can be in RAM. It's on the whole process, so this has a program to itself, and one test so
-//! that nothing runs beside it.
+//! that nothing runs beside it. Only Windows has such a limit.
+#![cfg(windows)]
 
 use std::ffi::c_void;
 

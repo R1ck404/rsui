@@ -557,6 +557,42 @@ declare module 'rsui' {
         onDragLeave?: (event: PageDragEvent) => void;
         onDrop?: (event: PageDragEvent) => void;
     }
+
+    // The system's own popups (plan 059, part 2).
+
+    /** A time of day, on a 24-hour clock. */
+    export interface TimeOfDay {
+        /** From 0 to 23. */
+        hours: number;
+        /** From 0 to 59. */
+        minutes: number;
+    }
+
+    /**
+     * The system's own popups, each one call and a promise of its answer, the same on every system. On Android they're
+     * Android's: an AlertDialog, a list dialog for a sheet, the date and time pickers, the share chooser and a Toast. On
+     * Windows a confirm, alert or sheet is a task dialog, a picker is a dialog around Windows' own calendar or time
+     * control, `share` is the system's share sheet, and a toast is a small window of rsui's that fades away. Elsewhere
+     * they aren't there yet, and each promise is rejected saying so. A button that isn't named says what the system's own
+     * does, in its language. While an app's checked with `--do` none comes up: what's asked is said, and the step
+     * `dialog "ANSWER"` (or `dialog cancel`) says what the next one's answered with.
+     */
+    export const native: {
+        /** Whether to go ahead: true once the `confirm` button's pressed, false if it's cancelled however that's done. `destructive` is for what can't be undone. */
+        confirm(options: { title: string; message?: string; confirm?: string; cancel?: string; destructive?: boolean }): Promise<boolean>;
+        /** Says something, and is done once it's been seen. */
+        alert(options: { title: string; message?: string; ok?: string }): Promise<void>;
+        /** One of these, by its place in the list, or null if none was chosen. On Windows the cancel button is always the system's own. */
+        sheet(options: { title?: string; options: string[]; cancel?: string }): Promise<number | null>;
+        /** A day, from `min` to `max`: a Date on it, at `value`'s time of day or midnight, or null if none was picked. */
+        pickDate(options?: { value?: Date; min?: Date; max?: Date }): Promise<Date | null>;
+        /** A time of day, or null if none was picked. */
+        pickTime(options?: { value?: TimeOfDay }): Promise<TimeOfDay | null>;
+        /** The system's share sheet with this text and address. It's done once that's up; where it's shared to isn't said. */
+        share(options: { text?: string; url?: string; title?: string }): Promise<void>;
+        /** A little message that goes away by itself, after a while longer with `long`. */
+        toast(text: string, options?: { long?: boolean }): void;
+    };
 }
 
 // What code written for a page uses: its tags as elements, CSS for the whole page, and the window as `body` has it. styled-components,
@@ -576,6 +612,66 @@ declare module 'rsui/web' {
     export function TextArea(props: any): any;
     export function Select(props: any): any;
     export function Option(props: any): any;
+}
+
+/**
+ * An app's `rsui.config.ts`, beside its `package.json`: who the app is and how it's packed. It's read when the app's packed,
+ * and by `rsui-tsx config`, never while a packed app runs. What a window is like (`title`, `size`, `frameless`) stays as
+ * exports of the main file. Whatever's left out comes from `package.json` or the folder's name.
+ *
+ * ```ts
+ * import { defineConfig } from 'rsui/config';
+ * export default defineConfig(({ platform }) => ({
+ *     id: 'com.example.todo',
+ *     name: 'To-do',
+ *     icon: 'icon.png',
+ *     permissions: platform === 'android' ? ['network'] : [],
+ * }));
+ * ```
+ */
+declare module 'rsui/config' {
+    export type Platform = 'windows' | 'android' | 'macos' | 'linux';
+    /** What an app may ask the system for. Android is told in its manifest; elsewhere it's asked for when it's first used. */
+    export type Permission = 'network' | 'notifications' | 'camera' | 'microphone' | 'location' | 'vibrate';
+    export interface AppConfig {
+        /**
+         * Who the app is, written the other way round from a web address, as `com.example.todo`: Android's package name,
+         * Apple's bundle id, the app id Linux and Windows know it by. Two apps with the same one replace each other.
+         * Otherwise `dev.rsui.<its name>`.
+         */
+        id?: string;
+        /** What the launcher, the taskbar and the title of its store page show. Otherwise `package.json`'s name. */
+        name?: string;
+        /** As `1.2.3`. Otherwise `package.json`'s. */
+        version?: string;
+        /** A .png (256 by 256 is best) or a .ico, from this file's folder. */
+        icon?: string;
+        /** Files to pack beside what the app loads, as `assets/**`, and what to leave out of them, as `**\/*.psd`. */
+        files?: { include?: string[]; exclude?: string[] };
+        permissions?: Permission[];
+        /**
+         * What rsui's own elements with `native` look like: `system` is the platform's own (Material on Android, Fluent on
+         * Windows, macOS's on a Mac); the others are that one everywhere.
+         */
+        theme?: 'system' | 'material' | 'fluent' | 'mac';
+        android?: {
+            /** 29 (Android 10) or later. */
+            minSdk?: number;
+            targetSdk?: number;
+            orientation?: 'any' | 'portrait' | 'landscape';
+            /** Otherwise made from `version`: 1.2.3 is 10203. Each one installed has to be bigger than the one before. */
+            versionCode?: number;
+        };
+        macos?: { category?: string; minimumSystemVersion?: string };
+        windows?: {};
+        linux?: { categories?: string[] };
+    }
+    export interface ConfigContext {
+        /** Which system it's being packed for. */
+        platform: Platform;
+        mode: 'development' | 'production';
+    }
+    export function defineConfig(config: AppConfig | ((context: ConfigContext) => AppConfig)): typeof config;
 }
 
 /**
@@ -1902,6 +1998,91 @@ interface PageFieldProps<T = HTMLInputElement> extends PageProps<T> {
     onInput?: (event: PageChangeEvent<T>) => void;
 }
 
+// `native` on rsui's own elements (plan 059): the platform's own look, Material 3 on Android and Fluent on Windows, drawn by
+// rsui. With it, how the element looks is the platform's, so `className` and the visual parts of `style` (colors, borders,
+// corners, shadows, type, padding) aren't there; where it goes and how big it is are. What only one platform has goes in
+// `android`, `windows`, `macos` or `linux`, which the others leave alone. `native` is on or off, never a platform's name.
+
+/** What a native control keeps of `Style`: where it goes and how big it is. */
+type NativeLayoutKeys =
+    | 'width' | 'height' | 'minWidth' | 'maxWidth' | 'minHeight' | 'maxHeight'
+    | 'margin' | 'marginX' | 'marginY' | 'marginTop' | 'marginRight' | 'marginBottom' | 'marginLeft'
+    | 'position' | 'top' | 'left' | 'right' | 'bottom' | 'flex' | 'grow' | 'shrink' | 'alignSelf'
+    | 'gridColumn' | 'gridRow' | 'overlay' | 'overlayX' | 'overlayY'
+    | 'opacity' | 'scale' | 'scaleX' | 'scaleY' | 'rotate' | 'transform' | 'transformOrigin' | 'translateX' | 'translateY';
+type NativeLayout = Pick<import('rsui').Style, NativeLayoutKeys>;
+/** What a platform has nothing of yet for this control. */
+type NoPlatformExtras = Record<string, never>;
+/** What every native control has: what it does and where it goes, and what's said for each platform's look. */
+type NativeBase<Android, Windows> = Omit<import('rsui').ElementProps, keyof import('rsui').Style | 'style'> & NativeLayout & {
+    /** Drawn in the platform's look: Material 3 on Android, Fluent on Windows, as `theme` in `rsui.config.ts` says. */
+    native: true;
+    /** Where it goes, as the attributes beside it say. How it looks is the platform's. */
+    style?: NativeLayout;
+    /** Only for Material 3's look, as on Android; ignored elsewhere. */
+    android?: Android;
+    /** Only for Fluent's look, as on Windows; ignored elsewhere. */
+    windows?: Windows;
+    /** For macOS's look, which isn't written yet. */
+    macos?: NoPlatformExtras;
+    /** For Linux's look, which is Fluent's for now. */
+    linux?: NoPlatformExtras;
+};
+interface NativeButtonAndroid {
+    /** Material 3's kinds of button: `filled` unless this says. */
+    variant?: 'filled' | 'tonal' | 'outlined' | 'text' | 'elevated';
+}
+interface NativeButtonWindows {
+    /** WinUI's: `standard` unless this says; `accent` is the one to press, `subtle` has no background until it's pointed at. */
+    variant?: 'standard' | 'accent' | 'subtle';
+}
+interface NativeFieldAndroid {
+    /** Material 3's text fields: `outlined` unless this says. */
+    variant?: 'outlined' | 'filled';
+}
+type NativeButtonProps = NativeBase<NativeButtonAndroid, NativeButtonWindows>;
+type NativeInputProps = Omit<NativeBase<NativeFieldAndroid, NoPlatformExtras>, 'onChange'> & {
+    value?: string;
+    /** What shows while it's empty. */
+    placeholder?: string;
+    /** Several lines, this many high. */
+    rows?: number;
+    /** Shows dots rather than what's typed. */
+    password?: boolean;
+    readOnly?: boolean;
+    maxLength?: number;
+    /** Its new text, each time it changes. */
+    onChange?: (value: string) => void;
+    /** As `onChange`. */
+    onInput?: (value: string) => void;
+};
+type NativeToggleProps = Omit<NativeBase<NoPlatformExtras, NoPlatformExtras>, 'onChange'> & {
+    checked?: boolean;
+    /** What it'll be now: ticked or on, or not. */
+    onChange?: (checked: boolean) => void;
+};
+type NativeSliderProps = Omit<NativeBase<NoPlatformExtras, NoPlatformExtras>, 'onChange' | 'children'> & {
+    value: number;
+    /** 0 unless it says. */
+    min?: number;
+    /** 100 unless it says. */
+    max?: number;
+    /** 1 unless it says. */
+    step?: number;
+    /** Its new value, as it's dragged, clicked along, or moved with the arrow keys, Home, End and Page Up and Down. */
+    onChange?: (value: number) => void;
+};
+type NativeProgressProps = Omit<NativeBase<NoPlatformExtras, NoPlatformExtras>, 'onChange' | 'children'> & {
+    value: number;
+    /** 1 unless it says. */
+    max?: number;
+};
+/** A window whose background, text and type are the platform's, for native controls to be on. It places what's in it as a `window` does. */
+type NativeWindowProps = NativeBase<NoPlatformExtras, NoPlatformExtras> &
+    Pick<import('rsui').Style, 'direction' | 'gap' | 'padding' | 'paddingX' | 'paddingY' | 'paddingTop' | 'paddingRight' | 'paddingBottom' | 'paddingLeft' | 'align' | 'justify'>;
+/** What says an element isn't native: `native={false}`, or nothing. */
+type NotNative = { native?: false };
+
 declare const __jsx: (type: unknown, props: unknown, ...children: unknown[]) => import('rsui').Element;
 declare const __Fragment: import('rsui').Component<{ children?: import('rsui').Child }>;
 
@@ -1947,17 +2128,23 @@ declare namespace JSX {
         onResize?: (rows: number, columns: number) => void;
     }
     interface IntrinsicElements {
-        window: Props;
+        window: (Props & NotNative) | NativeWindowProps;
         group: Props;
         row: Props;
         column: Props;
         text: Props;
         /// Part of the text it's in, which can look different and wraps along with the rest.
         span: SharedProps & PageExtras<HTMLSpanElement>;
-        button: SharedProps & PageExtras<HTMLButtonElement> & { type?: string };
+        button: (SharedProps & PageExtras<HTMLButtonElement> & { type?: string } & NotNative) | NativeButtonProps;
         link: Props;
-        input: SharedProps & { value?: string; placeholder?: string; placeholderColor?: string; rows?: number } & PageExtras<HTMLInputElement> & { type?: string; checked?: boolean; defaultValue?: string; defaultChecked?: boolean; onInput?: (event: PageChangeEvent<HTMLInputElement>) => void };
-        checkbox: Props & { checked?: boolean };
+        input: (SharedProps & { value?: string; placeholder?: string; placeholderColor?: string; rows?: number } & PageExtras<HTMLInputElement> & { type?: string; checked?: boolean; defaultValue?: string; defaultChecked?: boolean; onInput?: (event: PageChangeEvent<HTMLInputElement>) => void } & NotNative) | NativeInputProps;
+        checkbox: (Props & { checked?: boolean } & NotNative) | NativeToggleProps;
+        /** A switch that's on or off, as a checkbox is. */
+        switch: (Props & { checked?: boolean } & NotNative) | NativeToggleProps;
+        /** A value along a track, which is only native for now: `<slider native value={v} onChange={setV} />`. */
+        slider: NativeSliderProps;
+        /** How far something's got, which is only native for now: `<progress native value={0.4} />`. */
+        progress: NativeProgressProps;
         item: Props;
         image: Props & { src: string; fit?: 'contain' | 'cover' | 'fill' };
         dialog: Props;

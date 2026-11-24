@@ -49,6 +49,7 @@ pub(super) fn interaction_safe(e: &Element, i: Interaction<'_>) -> bool {
         && i.tooltip.is_none()
         && i.overlay.is_none()
         && i.resting_area.is_none()
+        && i.ripple.is_none()
 }
 
 impl Default for PilotPaint {
@@ -59,7 +60,7 @@ impl Default for PilotPaint {
             plan_ready: false,
             epoch: 0,
             revision: 0,
-            region: crate::gpu::NO_AREA,
+            region: crate::area::NO_AREA,
             contributors: Vec::new(),
             target: 0,
             first: 0,
@@ -265,7 +266,7 @@ impl Painter {
     }
 
     fn build_owned_plan(&mut self) {
-        use crate::gpu::{NO_AREA, area_of, intersect, is_empty, union};
+        use crate::area::{NO_AREA, area_of, intersect, is_empty, union};
         self.pilot.plan_ready = true;
         let mut region = NO_AREA;
         for batch in &self.scene.batches {

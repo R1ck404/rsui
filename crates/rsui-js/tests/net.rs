@@ -158,6 +158,8 @@ fn listening_where_something_already_is_says_what_node_says() {
 }
 
 #[test]
+// Windows' own: its named pipes, and `findstr`.
+#[cfg(windows)]
 fn a_named_pipe_carries_both_ways_at_once() {
     let name = format!(r"\\.\pipe\rsui-test-{}", std::process::id());
     let source = format!(
@@ -207,6 +209,8 @@ fn a_named_pipe_carries_both_ways_at_once() {
 }
 
 #[test]
+// Windows' own: its named pipes, and `findstr`.
+#[cfg(windows)]
 fn a_named_pipe_can_be_written_the_other_way() {
     let name = format!(r"\\?\pipe\rsui-test-other-{}", std::process::id());
     let source = format!(
@@ -411,6 +415,7 @@ const WEB_SOCKET_SERVER: &str = r#"
 "#;
 
 #[test]
+#[cfg_attr(not(windows), ignore = "WebSockets aren't on this system yet")]
 fn a_web_socket_opens_and_echoes_text_and_bytes_and_closes() {
     let source = format!(
         r#"{WEB_SOCKET_SERVER}
@@ -677,6 +682,8 @@ fn an_error_made_by_a_class_with_a_getter_for_its_name_does_not_run_that_early()
 }
 
 #[test]
+// Windows' own: its named pipes, and `findstr`.
+#[cfg(windows)]
 fn stopping_a_pipe_server_right_as_it_is_about_to_wait_cannot_get_stuck() {
     let name = format!(r"\\.\pipe\rsui-test-stop-{}", std::process::id());
     let source = format!(
@@ -827,6 +834,8 @@ fn udp_sent_to_nowhere_in_particular_goes_to_this_machine() {
 }
 
 #[test]
+// Windows' own: its named pipes, and `findstr`.
+#[cfg(windows)]
 fn another_program_is_heard_and_told_things_and_finishes() {
     assert_eq!(
         run(

@@ -779,7 +779,8 @@ fn calls_compiled_in_line_that_have_to_go_on_in_the_callee() {
     );
     // (The run compiled once hot is the last.)
     let stats = LAST.with(|last| last.get());
-    assert!(stats.inlined > 0 && stats.left_line > 0, "{stats:?}");
+    // (arm64.rs doesn't compile calls in line, or functions again, yet.)
+    assert!(!cfg!(target_arch = "x86_64") || stats.inlined > 0 && stats.left_line > 0, "{stats:?}");
 }
 
 #[test]
@@ -815,7 +816,8 @@ fn calls_compiled_in_line_with_captured_variables_and_collections() {
     );
     // (The run compiled once hot is the last.)
     let stats = LAST.with(|last| last.get());
-    assert!(stats.inlined > 0 && stats.left_line > 0, "{stats:?}");
+    // (arm64.rs doesn't compile calls in line, or functions again, yet.)
+    assert!(!cfg!(target_arch = "x86_64") || stats.inlined > 0 && stats.left_line > 0, "{stats:?}");
 }
 
 #[test]
@@ -888,7 +890,8 @@ fn code_compiled_before_its_later_loops_ran_is_compiled_again() {
         "#,
     );
     let stats = LAST.with(|last| last.get());
-    assert!(stats.recompiled > 0 && stats.inlined > 0, "{stats:?}");
+    // (arm64.rs doesn't compile calls in line, or functions again, yet.)
+    assert!(!cfg!(target_arch = "x86_64") || stats.recompiled > 0 && stats.inlined > 0, "{stats:?}");
 }
 
 #[test]
@@ -916,7 +919,8 @@ fn methods_at_places_that_have_seen_several_shapes() {
         "#,
     );
     let stats = LAST.with(|last| last.get());
-    assert!(stats.inlined > 0 && stats.left_line > 0, "{stats:?}");
+    // (arm64.rs doesn't compile calls in line, or functions again, yet.)
+    assert!(!cfg!(target_arch = "x86_64") || stats.inlined > 0 && stats.left_line > 0, "{stats:?}");
 }
 
 #[test]
@@ -953,7 +957,8 @@ fn shapes_written_into_the_code_and_what_changes_under_them() {
 }
 
 /// The feedback compiled code records (`jit::feedback`): each kind of record says what its instruction met.
-#[cfg(feature = "jit-opt")]
+// (Only x64.rs records feedback.)
+#[cfg(all(feature = "jit-opt", target_arch = "x86_64"))]
 mod feedback {
     use super::super::feedback::*;
     use super::super::{Mode, feedback_of};

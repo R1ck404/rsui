@@ -136,6 +136,7 @@ pub fn any() -> bool {
 }
 
 /// Does `run` with what's registered taken out, so that what each is told can register or let go of others.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn with_entries(run: impl FnOnce(&mut Vec<Entry>)) {
     let mut taken = EMBEDDED.with(|all| std::mem::take(&mut *all.borrow_mut()));
     run(&mut taken);
@@ -150,6 +151,7 @@ fn with_entries(run: impl FnOnce(&mut Vec<Entry>)) {
 }
 
 /// Tells everything kept in `window` where it is now, from `places`, and hides what's in it that isn't there any more.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn place_in(window: isize, places: Vec<(u64, Place)>) {
     with_entries(|entries| {
         for entry in entries.iter_mut() {
@@ -176,6 +178,7 @@ pub(crate) fn place_in(window: isize, places: Vec<(u64, Place)>) {
 }
 
 /// Tells what's showing in `window` that the window has moved.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn window_moved(window: isize) {
     with_entries(|entries| {
         for entry in entries.iter_mut().filter(|entry| entry.shown.as_ref().is_some_and(|(there, _)| *there == window)) {
@@ -185,6 +188,7 @@ pub(crate) fn window_moved(window: isize) {
 }
 
 /// Forgets where what was in `window` was, as it's gone, and so has everything inside it.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn window_gone(window: isize) {
     with_entries(|entries| {
         for entry in entries.iter_mut() {

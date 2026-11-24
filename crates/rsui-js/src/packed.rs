@@ -588,9 +588,16 @@ pub(crate) fn read_file(path: &Path) -> io::Result<String> {
 
 /// Fills `bytes` from `file`, starting `at` bytes in, without moving where it's at, so threads can share it.
 pub(crate) fn read_at(file: &File, mut bytes: &mut [u8], mut at: u64) -> io::Result<()> {
+    #[cfg(windows)]
     use std::os::windows::fs::FileExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
     while !bytes.is_empty() {
-        match file.seek_read(bytes, at)? {
+        #[cfg(windows)]
+        let read = file.seek_read(bytes, at);
+        #[cfg(unix)]
+        let read = file.read_at(bytes, at);
+        match read? {
             0 => return Err(io::ErrorKind::UnexpectedEof.into()),
             read => {
                 bytes = &mut bytes[read..];
@@ -621,6 +628,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn paths_that_mean_the_same_are_the_same() {
         assert_eq!(
             key(Path::new(r"C:\App\.\src\..\Main.TSX")),
@@ -660,18 +668,17 @@ mod tests {
         .unwrap();
         drop(file);
         let list = read_list(&program).unwrap();
+        // Paths in the list are as the system writes them.
+        let native = |path: &str| path.replace('\\', std::path::MAIN_SEPARATOR_STR);
         assert_eq!(list.entry, "main.tsx");
-        assert_eq!(list.run_order, [r"sub\other.js", "main.tsx"]);
+        assert_eq!(list.run_order, [native(r"sub\other.js"), "main.tsx".to_owned()]);
         assert_eq!(list.builtins, builtins);
         assert_eq!(
             list.links,
-            [(
-                r"node_modules\pkg".to_owned(),
-                r"node_modules\.pnpm\pkg@1".to_owned()
-            )]
+            [(native(r"node_modules\pkg"), native(r"node_modules\.pnpm\pkg@1"))]
         );
         assert_eq!(list.files.len(), 2);
-        assert_eq!(list.files[1].0, r"sub\other.js");
+        assert_eq!(list.files[1].0, native(r"sub\other.js"));
         assert_eq!(list.code, None);
         let bytes = std::fs::read(&program).unwrap();
         let (place, size, kept) = list.files[1].1;
@@ -686,6 +693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_path_through_a_link_in_node_modules_is_where_the_link_leads() {
         let pnpm = Path::new(r"C:\app\node_modules\.pnpm");
         let links = [
@@ -841,6 +849,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn tidying_a_path_works_out_the_dots() {
         assert_eq!(
             tidied(Path::new(r"C:\app\.\src\..\main.tsx")),

@@ -3830,6 +3830,7 @@ const result = before + ' ' + require('./later.js');",
 }
 
 #[test]
+#[cfg(any(windows, target_vendor = "apple"))]
 fn a_file_asked_for_with_other_letters_is_the_same_module() {
     let said = run_modules(
         "letters",
@@ -4409,6 +4410,7 @@ fn the_web_globals_do_not_show_up_among_the_keys_of_the_global_object() {
 }
 
 #[test]
+#[cfg_attr(not(windows), ignore = "dates in words come from Windows; other systems' aren't written yet")]
 fn a_locale_that_is_not_one_is_the_users_and_digits_follow_the_numbering_system() {
     // shadcn's calendar writes its month dropdown with `toLocaleString("default", { month: "short" })`, and react-day-picker
     // its Persian digits with `Intl.NumberFormat("en-US", { numberingSystem: "arabext" })`.
@@ -6160,6 +6162,7 @@ fn a_package_can_say_its_files_are_es_modules() {
 }
 
 #[test]
+#[cfg(windows)]
 fn file_urls_and_the_older_url_functions_are_what_node_has() {
     let said = run_program(
         "url",

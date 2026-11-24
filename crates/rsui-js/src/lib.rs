@@ -23,8 +23,18 @@ mod gc;
 mod generator;
 #[cfg(windows)]
 mod http;
+#[cfg(not(windows))]
+#[path = "http_unix.rs"]
+mod http;
 mod inspect;
+#[cfg(windows)]
 mod iocp;
+#[cfg(not(windows))]
+mod reactor;
+#[cfg(windows)]
+use iocp::lock;
+#[cfg(not(windows))]
+use reactor::lock;
 #[cfg(feature = "jit")]
 mod jit;
 #[cfg(feature = "jsprof")]
@@ -33,6 +43,10 @@ mod keeping;
 mod lexer;
 mod modules;
 mod narrow;
+#[cfg(windows)]
+mod net;
+#[cfg(not(windows))]
+#[path = "net_unix.rs"]
 mod net;
 mod object;
 mod op;
@@ -56,7 +70,7 @@ use std::path::Path;
 
 pub use bulk::Keys;
 pub use census::{Census, CensusGroup};
-pub use codecache::CompiledCode;
+pub use codecache::{CompiledCode, use_code_cache_file, write_code_cache_file};
 pub use embed::{DataProperty, DataSurfaceError, HostFunction, Root};
 pub use keeping::KeptCounts;
 pub use reads::NO_READS;

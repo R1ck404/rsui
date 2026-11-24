@@ -14,11 +14,14 @@ const MEM_RELEASE: u32 = 0x8000;
 const PAGE_NOACCESS: u32 = 1;
 const PAGE_READWRITE: u32 = 4;
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
 }
+#[cfg(not(windows))]
+use rsui_os::vm::windows_like::{VirtualAlloc, VirtualFree};
 
 /// Real memory is asked for in steps of this, or an eighth of what there is if that's more, up to [`AHEAD`].
 const STEP: usize = 16 * 1024;

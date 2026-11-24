@@ -1,4 +1,6 @@
 //! A native Windows input backlog must not postpone every presentation until the pointer is released.
+// Real Win32 windows and dialogs, which only Windows has.
+#![cfg(windows)]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

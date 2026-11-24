@@ -1,0 +1,15 @@
+[package]
+name = "rsui-os"
+description = "The few things rsui asks of the operating system below the window: memory by the page, stacks, and libraries loaded when first wanted."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

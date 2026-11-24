@@ -99,14 +99,23 @@ impl Default for TextWorld {
 }
 
 /// The system's UI font, as an app's text starts with.
+#[cfg(windows)]
 const REGULAR_FONT: &str = "C:/Windows/Fonts/segoeui.ttf";
+#[cfg(windows)]
 const BOLD_FONT: &str = "C:/Windows/Fonts/segoeuib.ttf";
 
 impl TextWorld {
     fn engine(&mut self) -> Option<&mut TextEngine> {
         if self.engine.is_none() {
-            let mut engine = TextEngine::new(Font::open(REGULAR_FONT).ok()?);
-            if let Ok(bold) = Font::open(BOLD_FONT) {
+            #[cfg(windows)]
+            let (regular, bold) = (REGULAR_FONT, Some(BOLD_FONT));
+            #[cfg(not(windows))]
+            let (regular, bold) = {
+                let (regular, bold) = rsui_text::system_ui_font_files();
+                (regular?, bold)
+            };
+            let mut engine = TextEngine::new(Font::open(regular).ok()?);
+            if let Some(Ok(bold)) = bold.map(Font::open) {
                 engine = engine.with_bold(bold);
             }
             self.engine = Some(engine.with_system_fallbacks());

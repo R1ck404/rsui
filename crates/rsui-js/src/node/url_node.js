@@ -1,5 +1,5 @@
 'use strict';
-// Node's `url`: the web's `URL`, what turns paths into `file:` URLs and back, as Windows has paths, and the older
+// Node's `url`: the web's `URL`, what turns paths into `file:` URLs and back, as the system has paths, and the older
 // `url.parse`, `url.format` and `url.resolve` that a lot of packages still use. It's only compiled if something asks for it.
 
 const { URL, URLSearchParams, toASCII, toUnicode } = require('internal/url');
@@ -14,7 +14,8 @@ function fileURLToPath(given, options) {
     if (url.protocol !== 'file:') {
         throw invalid('ERR_INVALID_URL_SCHEME', 'The URL must be of scheme file');
     }
-    const windows = options?.windows ?? true;
+    // As Node has it: Windows' paths on Windows, and everywhere else the others'.
+    const windows = options?.windows ?? process.platform === 'win32';
     const pathname = url.pathname;
     if (!windows) {
         if (url.hostname !== '') {
@@ -43,7 +44,8 @@ function pathToFileURL(path, options) {
     if (typeof path !== 'string') {
         throw invalid('ERR_INVALID_ARG_TYPE', 'The "path" argument must be of type string. Received ' + typeof path);
     }
-    const windows = options?.windows ?? true;
+    // As Node has it: Windows' paths on Windows, and everywhere else the others'.
+    const windows = options?.windows ?? process.platform === 'win32';
     const nodePath = require('path');
     if (windows && path.startsWith('\\\\')) {
         // `\\server\share\file`, which is the share on that machine, and `\\?\UNC\server\share\file`, which is the same
