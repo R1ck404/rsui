@@ -614,6 +614,7 @@ dependencies = [
  "foldhash",
  "itoa",
  "proptest",
+ "rsui-alloc",
  "serde",
  "serde_json",
  "thin-vec",

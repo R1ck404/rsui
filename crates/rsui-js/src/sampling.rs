@@ -146,6 +146,9 @@ fn start(_place: Place, _every: Duration) -> Option<Sampling> {
 fn start(place: Place, every: Duration) -> Option<Sampling> {
     use std::ffi::c_void;
 
+    // A handle is pointer-sized, so `isize` here and `*mut c_void` in rsui-alloc's declaration of `GetCurrentProcess` are the same
+    // to the calling convention.
+    #[allow(clashing_extern_declarations)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentThreadId() -> u32;

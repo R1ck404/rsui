@@ -548,8 +548,8 @@ impl Vm {
         };
         let func = native.func as usize;
         let on = &self.objects[on.index()].kind;
-        (func == crate::builtins::collections::collection_has as usize && matches!(on, Kind::Set(_) | Kind::Map(_)))
-            || (func == crate::builtins::collections::map_get as usize && matches!(on, Kind::Map(_)))
+        (func == crate::builtins::collections::collection_has as *const () as usize && matches!(on, Kind::Set(_) | Kind::Map(_)))
+            || (func == crate::builtins::collections::map_get as *const () as usize && matches!(on, Kind::Map(_)))
     }
 
     /// Notes what was read to be given to a call, and that `which` says wasn't taken, as read as itself.

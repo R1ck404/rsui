@@ -11,3 +11,6 @@ repository.workspace = true
 [features]
 # Counts what each stage of the program is holding, for measuring: see `owners.rs`. Off unless asked for.
 owners = []
+
+[lints]
+workspace = true

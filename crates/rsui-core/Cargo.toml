@@ -8,7 +8,12 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Runs the benchmarks on `rsui-alloc`, as an application would: `cargo bench -p rsui-core --features ui-alloc`.
+ui-alloc = ["dep:rsui-alloc"]
+
 [dependencies]
+rsui-alloc = { path = "../rsui-alloc", optional = true }
 ecow = { version = "0.3.1", features = ["serde"] }
 foldhash = "0.2.0"
 itoa = "1.0.18"
@@ -24,3 +29,6 @@ proptest = "1"
 [[bench]]
 name = "core"
 harness = false
+
+[lints]
+workspace = true

@@ -957,7 +957,7 @@ pub(crate) fn color(text: &str) -> Option<Cow<'static, str>> {
             && digits
                 .bytes()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
-        return fits.then(|| Cow::Owned(value));
+        return fits.then_some(Cow::Owned(value));
     }
     if let Ok(at) = NAMED.binary_search_by(|(name, _)| name.cmp(&value.as_str())) {
         return Some(Cow::Borrowed(NAMED[at].1));

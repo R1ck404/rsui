@@ -13,3 +13,6 @@ rsui-core = { path = "../rsui-core" }
 rsui-headless = { path = "../rsui-headless" }
 rsui-runtime = { path = "../rsui-runtime" }
 serde_json = "1"
+
+[lints]
+workspace = true

@@ -2042,10 +2042,8 @@ impl<'v> Declarer<'v> {
                     props.set("background", text("currentcolor"));
                     return Ok(());
                 }
-                if name == "background" {
-                    if self.set_background_layers(props, value, true)? {
-                        return Ok(());
-                    }
+                if name == "background" && self.set_background_layers(props, value, true)? {
+                    return Ok(());
                 }
                 if let Some(paint) = paint_of(value) {
                     props.set("background", paint);

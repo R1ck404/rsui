@@ -208,12 +208,12 @@ fn uses_viewport_units(text: &str) -> bool {
         let rest = rest.trim_start_matches(js_space);
         let lower = rest.as_bytes();
         let mut place = 0;
-        if lower.first().is_some_and(|b| matches!(b.to_ascii_lowercase(), b's' | b'l' | b'd')) {
-            if lower.get(1).is_some_and(|b| b.to_ascii_lowercase() == b'v') {
-                place = 1;
-            }
+        if lower.first().is_some_and(|b| matches!(b.to_ascii_lowercase(), b's' | b'l' | b'd'))
+            && lower.get(1).is_some_and(|b| b.eq_ignore_ascii_case(&b'v'))
+        {
+            place = 1;
         }
-        if !lower.get(place).is_some_and(|b| b.to_ascii_lowercase() == b'v') {
+        if !lower.get(place).is_some_and(|b| b.eq_ignore_ascii_case(&b'v')) {
             continue;
         }
         let after = &lower[place + 1..];

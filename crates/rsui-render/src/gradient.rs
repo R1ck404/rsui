@@ -24,6 +24,9 @@ enum Where {
 /// `#rrggbbaa`, then where it is, as `20%` or `20px`, if it says. The kind is an angle in degrees for a linear one, as
 /// `"90|#ff0000ff 0%|#0000ffff"`, or `radial`, then `circle` or `ellipse`, how big it is, and where its middle is, as
 /// `radial ellipse farthest-corner 50% 50%` or `radial circle 40px 0% 10px`. A kind that starts with `*` repeats.
+///
+/// What the renderer draws goes through [`draw_gradient_tiled`]. This is that, untiled, as the tests ask for it.
+#[cfg(test)]
 pub(crate) fn draw_gradient(
     spec: &str,
     width: u32,

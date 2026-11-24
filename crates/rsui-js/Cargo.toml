@@ -32,3 +32,6 @@ rsui-alloc = { path = "../rsui-alloc" }
 
 [dev-dependencies]
 rsui-alloc = { path = "../rsui-alloc" }
+
+[lints]
+workspace = true

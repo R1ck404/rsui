@@ -44,3 +44,5 @@ rsui-headless = { path = "../rsui-headless" }
 rsui-image = { path = "../rsui-image" }
 serde_json = "1"
 
+[lints]
+workspace = true

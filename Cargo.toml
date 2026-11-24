@@ -25,6 +25,13 @@ publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/R1ck404/rsui"
 
+[workspace.lints.clippy]
+# `!(x > 0.0)` is written on purpose where x can be NaN: it is true for NaN as well as for numbers that aren't above zero.
+neg_cmp_op_on_partial_ord = "allow"
+# Style lints with no bug behind them. The few places they point at are left as written.
+type_complexity = "allow"
+too_many_arguments = "allow"
+
 # What a finished program should use. Measured against the defaults, the gallery goes from 668 KB to
 # 493 KB and runs slightly faster. `opt-level = "s"` gets it to 378 KB at about 5% slower.
 [profile.release]

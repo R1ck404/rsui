@@ -146,14 +146,13 @@ impl Path {
             return;
         }
         // A subpath that's only a point stays, as a stroke with round caps draws a dot for one with a line of no length.
-        if self.open {
-            if let Some(last) = self.subpaths.last()
-                && last.end - last.start == 1
-            {
-                // Only a moveTo: it's replaced.
-                self.points.truncate(last.start as usize);
-                self.subpaths.pop();
-            }
+        if self.open
+            && let Some(last) = self.subpaths.last()
+            && last.end - last.start == 1
+        {
+            // Only a moveTo: it's replaced.
+            self.points.truncate(last.start as usize);
+            self.subpaths.pop();
         }
         let at = self.points.len() as u32;
         self.points.push(point);
@@ -528,6 +527,7 @@ impl Default for StrokeStyle {
 
 /// Turns a path into what its stroke covers, as polygons filled with the nonzero rule, in canvas pixels. `m` is the transform
 /// at the time of stroking, whose space the stroke's widths are in.
+#[derive(Default)]
 pub struct Stroker {
     user: Vec<(f32, f32)>,
     dashed: Vec<(Vec<(f32, f32)>, bool)>,
@@ -535,11 +535,6 @@ pub struct Stroker {
     right: Vec<(f32, f32)>,
 }
 
-impl Default for Stroker {
-    fn default() -> Self {
-        Self { user: Vec::new(), dashed: Vec::new(), left: Vec::new(), right: Vec::new() }
-    }
-}
 
 impl Stroker {
     pub fn stroke(&mut self, path: &Path, style: &StrokeStyle, m: &Matrix, lines: &mut Vec<[f32; 4]>) {

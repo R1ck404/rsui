@@ -47,7 +47,7 @@ pub(crate) fn number_text(number: f64) -> Text {
     };
     // From a millionth up to 10^21 JavaScript writes the digits with a point and no exponent, as Rust does, and whole
     // numbers below 10^15 as they are.
-    let written = if number.fract() == 0.0 && abs < 1e15 && abs >= 1.0 {
+    let written = if number.fract() == 0.0 && (1.0..1e15).contains(&abs) {
         write!(buffer, "{}", number as i64)
     } else if (1e-6..1e21).contains(&abs) {
         write!(buffer, "{number}")

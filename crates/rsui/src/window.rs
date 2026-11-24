@@ -2164,7 +2164,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
         }
         WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == windows::Win32::UI::Shell::THBN_CLICKED as usize => {
-            thumbnail_button_clicked(window, (wparam.0 & 0xFFFF) as usize);
+            thumbnail_button_clicked(window, wparam.0 & 0xFFFF);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -3850,10 +3850,9 @@ pub fn run_sized<P: 'static, R: IntoNode + 'static>(
             // A naturally delivered paint already had its opportunity. Under a
             // backlog, allow a bounded slice of continuous input between forced
             // paints; a slow frame must not reduce input service to one message.
-            if message.message == WM_PAINT {
-                input_batch.painted();
-            } else if input_batch.checkpoint(input_began, Instant::now(), more_continuous_input(&message))
-                && present_due_windows(&mut frame_windows)
+            if message.message == WM_PAINT
+                || (input_batch.checkpoint(input_began, Instant::now(), more_continuous_input(&message))
+                    && present_due_windows(&mut frame_windows))
             {
                 input_batch.painted();
             }
@@ -3937,7 +3936,7 @@ mod tests {
             assert!(more_continuous_input(&wheel), "mixed hover/wheel input may share a service slice");
             let key = MSG { message: WM_KEYDOWN, ..MSG::default() };
             assert!(!more_continuous_input(&key), "keys checkpoint even when more input is queued");
-            let other_window = MSG { hwnd: HWND(1usize as *mut c_void), ..wheel };
+            let other_window = MSG { hwnd: HWND(std::ptr::dangling_mut::<c_void>()), ..wheel };
             assert!(!more_continuous_input(&other_window), "another window must get its checkpoint");
             assert!(PeekMessageW(&mut next, None, 0, 0, PM_REMOVE).as_bool());
             assert_eq!(next.message, WM_MOUSEMOVE, "inspection must not remove or reorder input");

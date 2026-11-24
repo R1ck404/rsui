@@ -428,7 +428,7 @@ fn pack_and_draw(
     let cache = times
         .lines()
         .filter(|line| line.starts_with("cache "))
-        .last()
+        .next_back()
         .unwrap_or_default()
         .to_owned();
     let size = std::fs::metadata(&program).unwrap().len();

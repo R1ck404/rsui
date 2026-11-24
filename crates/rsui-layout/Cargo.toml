@@ -23,3 +23,6 @@ triomphe = "0.1.17"
 [[bench]]
 name = "layout"
 harness = false
+
+[lints]
+workspace = true

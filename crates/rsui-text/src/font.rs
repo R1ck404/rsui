@@ -331,7 +331,7 @@ impl Font {
             _ => None,
         };
 
-        let typo = tables.os2.as_ref().map(|range| table(range)).and_then(|os2| Some((read_i16(os2, 68)?, read_i16(os2, 70)?)));
+        let typo = tables.os2.as_ref().map(&table).and_then(|os2| Some((read_i16(os2, 68)?, read_i16(os2, 70)?)));
         let vary = tables.fvar.clone().and_then(|fvar| {
             let axes = variations::axes(table(&fvar));
             if axes.is_empty() {

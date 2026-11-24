@@ -300,7 +300,7 @@ fn kerning_is_right_for_every_pair_however_they_share_the_cache() {
                 let (a, b) = (font.glyph(first).unwrap(), font.glyph(second).unwrap());
                 let expected = f32::from(font.advance(a))
                     + f32::from(font.advance(b))
-                    + f32::from(font.kerning(a, b));
+                    + font.kerning(a, b);
                 let pair = format!("{first}{second}");
                 let width = text.measure(&pair, style, f32::INFINITY).width;
                 assert_eq!(width, expected, "{pair}");

@@ -237,7 +237,7 @@ impl Vm {
         }
         let mut list: Vec<_> = by.into_iter().map(|(file, (n, code, caches))| (self.atom_text(file), n, code, caches)).collect();
         list.sort_by_key(|row| std::cmp::Reverse(row.2));
-        list.insert(0, (format!("(free room; arenas hold {} ops, {} caches, {} consts, {} protos)", self.code.len(), self.caches.len(), self.consts.len(), self.protos.len()), self.code_room.free_protos.len(), self.code_room.code.total as usize, self.code_room.caches.total as usize));
+        list.insert(0, (format!("(free room; arenas hold {} ops, {} caches, {} consts, {} protos)", self.code.len(), self.caches.len(), self.consts.len(), self.protos.len()), self.code_room.free_protos.len(), self.code_room.code.total, self.code_room.caches.total));
         list
     }
 

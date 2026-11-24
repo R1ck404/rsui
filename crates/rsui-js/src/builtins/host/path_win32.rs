@@ -413,10 +413,7 @@ pub(super) fn normalize(path: &[u16]) -> Vec<u16> {
         out.extend_from_slice(&tail);
         return out;
     }
-    let mut out = match device {
-        Some(device) => device,
-        None => Vec::new(),
-    };
+    let mut out = device.unwrap_or_default();
     if is_absolute {
         out.push(BACKSLASH);
     }

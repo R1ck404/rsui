@@ -2037,7 +2037,7 @@ export * from './star.mjs';
         assert_eq!(printed, expected);
         // Each file, and `path`, was loaded rather than compiled, and what each of the four files' names the app imports
         // was found to be was known.
-        assert!(crate::startup::count_loaded() >= before + APP.len() as u32 + 1);
+        assert!(crate::startup::count_loaded() > before + APP.len() as u32);
         assert!(crate::startup::count_resolved_so_far() >= resolved_before + 4);
 
         // Function by function, what was loaded is what compiling there makes, though numbered differently.

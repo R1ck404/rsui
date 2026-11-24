@@ -859,8 +859,8 @@ pub struct Layout {
     last_looked_at: usize,
     list_sizes: Vec<(usize, f32, f32)>,
     paragraphs: bool,
-    /// Says that this has gone when it does, for [`Layout::info_of`].
-    gone: Gone,
+    /// Says that this has gone when it does, for [`Layout::info_of`]. Only held for its `Drop`.
+    _gone: Gone,
 }
 
 #[derive(Default, Clone)]

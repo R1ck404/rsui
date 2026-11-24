@@ -223,14 +223,12 @@ fn rows_brought_near_are_drawn_and_stay_drawn() {
     let file = app("brought-near", SKIPPING);
     let said = run(
         &file,
-        &format!(
-            "size 600 400\nwait 100\nclickat 100 10\npress end\n\
+        &"size 600 400\nwait 100\nclickat 100 10\npress end\n\
              eval \"document.querySelectorAll('.row .name').length\"\n\
              eval \"document.querySelector('[data-index=\\\"1999\\\"] .name').textContent\"\n\
              eval \"document.querySelector('[data-index=\\\"1000\\\"] .name') === null\"\n\
              eval \"document.querySelector('[data-index=\\\"0\\\"] .name') !== null\"\n\
-             eval \"document.getElementById('rows').scrollTop\""
-        ),
+             eval \"document.getElementById('rows').scrollTop\"".to_string(),
     );
     // The last rows are drawn once the selection's gone to them, and the first stay as they were, while what's between them,
     // which was never near, isn't.

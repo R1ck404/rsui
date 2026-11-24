@@ -303,7 +303,7 @@ pub(crate) fn device_delta(table: &[u8], device: usize, store: Store<'_>) -> f32
 /// Where a delta-set index map sends `index`: which of a store's lists, and which item in it. A map with nothing in it
 /// sends each index to that item of the first list.
 pub(crate) fn map_index(map: &[u8], index: u32) -> Option<(u16, u16)> {
-    let format = *map.get(0)?;
+    let format = *map.first()?;
     let entry_format = *map.get(1)?;
     let (count, first) = match format {
         0 => (u32::from(read_u16(map, 2)?), 4),

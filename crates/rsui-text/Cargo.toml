@@ -23,3 +23,6 @@ rsui-alloc = { path = "../rsui-alloc" }
 [[bench]]
 name = "text"
 harness = false
+
+[lints]
+workspace = true

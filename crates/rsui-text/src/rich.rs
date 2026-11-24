@@ -329,7 +329,6 @@ fn bidi_control(element: &Element) -> Option<(char, char, bool)> {
 }
 
 /// How much padding something in a paragraph has on its left and right, which takes in its border, as what's laid out has it,
-
 /// then its margins there, and its padding above and below, if it has any.
 fn sides_of(element: &Element) -> Option<[f32; 6]> {
     static NAMES: LazyLock<[Symbol; 8]> = LazyLock::new(|| {

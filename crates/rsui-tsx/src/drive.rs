@@ -109,7 +109,7 @@ fn scrolled_sum(node: &Node) -> f64 {
         Some(PropValue::Int(y)) => *y as f64,
         _ => 0.0,
     };
-    own + node.children.iter().map(|child| scrolled_sum(child)).sum::<f64>()
+    own + node.children.iter().map(scrolled_sum).sum::<f64>()
 }
 
 /// A window of the app.
@@ -1797,13 +1797,6 @@ impl Desk {
                 .map_err(|error| format!("{}: {error}", file.text))?;
                 println!("  {width} by {height}, in {}", file.text);
                 return Ok(());
-            }
-            ("eval", [code]) => {
-                // Code run in the page, as a browser's console runs it, saying what it came to, and then what it changed.
-                self.pass()?;
-                let said = bridge::evaluate(&code.text)?;
-                let short: String = said.chars().take(300).collect();
-                println!("  = {short}{}", if short.len() < said.len() { "..." } else { "" });
             }
             ("evalto", [file, code]) => {
                 // What code run in the page comes to, written to a file as it is (a string's own text), for what reads the

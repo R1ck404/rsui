@@ -4273,9 +4273,9 @@ impl App {
         }
         // Escape that nothing took lets go of the keyboard in rsui's own UI; a page's element keeps it, as in a browser.
         if key.code == KeyCode::Escape
-            && !self
+            && self
                 .focused()
-                .is_some_and(|path| page_key(node_at(self.runtime.root(), path)).is_some())
+                .is_none_or(|path| page_key(node_at(self.runtime.root(), path)).is_none())
         {
             self.set_focus(None, false);
         }
@@ -5258,7 +5258,6 @@ impl App {
     }
 
     /// The scrollbar at this position, if there is one, which is the innermost that's there. Pressing
-
     /// on the thumb grabs it where it is. Anywhere else on the track brings the thumb there first.
     fn scrollbar_at(&mut self, x: f32, y: f32) -> Option<ScrollDrag> {
         let mut path = self.path_at(x, y)?;

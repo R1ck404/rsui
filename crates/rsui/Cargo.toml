@@ -70,3 +70,6 @@ windows = { version = "0.62", features = [
 [[bench]]
 name = "frame"
 harness = false
+
+[lints]
+workspace = true

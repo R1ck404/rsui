@@ -2,6 +2,10 @@
 //! are what Edge measures, as `getBoundingClientRect`, for spans of each text at 100 pixels: Edge's widths are whole
 //! 64ths of a pixel, rounded up, so these are within one of those.
 
+// Those widths are exact 64ths, and are written out in full, as measured, rather than as the shortest number that reads back as the
+// same `f32`, which is what the lint wants.
+#![allow(clippy::excessive_precision)]
+
 use std::path::Path;
 
 use rsui_core::Symbol;

@@ -555,7 +555,7 @@ impl<M: Measure> Pass<'_, M> {
             role: node.role,
             name: node.name.clone(),
             props: node.props.clone(),
-            actions: node.actions.clone(),
+            actions: node.actions,
             children: node.children[before..=after].iter().cloned().collect(),
         };
         let window_style = Style {
@@ -981,7 +981,7 @@ impl<M: Measure> Pass<'_, M> {
             role: node.role,
             name: node.name.clone(),
             props: node.props.clone(),
-            actions: node.actions.clone(),
+            actions: node.actions,
             children: thin_vec::ThinVec::new(),
         };
         let mut boxes = thin_vec::ThinVec::new();
@@ -1034,7 +1034,7 @@ impl<M: Measure> Pass<'_, M> {
             role: node.role,
             name: node.name.clone(),
             props: node.props.clone(),
-            actions: node.actions.clone(),
+            actions: node.actions,
             children: sorted.iter().map(|&at| node.children[at].clone()).collect(),
         };
         let mut taken: Vec<Option<LayoutBox>> = std::mem::take(&mut current.children).into_iter().map(Some).collect();
@@ -4005,7 +4005,6 @@ impl<M: Measure> Pass<'_, M> {
 }
 
 /// Turns what's laid out from the start to the end around, as CSS's `row-reverse` and `column-reverse` have it: each child is as
-
 /// far from the end of what's inside the padding as it was from the start.
 fn reverse_along(current: &mut LayoutBox, style: &Style, row: bool, size: Size) {
     for child in current

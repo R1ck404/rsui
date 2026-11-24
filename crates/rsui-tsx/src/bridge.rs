@@ -416,14 +416,14 @@ fn pass_on_what_was_said(updates: &mut Updates<'_>) {
     }
 }
 
-/// What a handler written for the web is given about something that happened, from what came with it: where the pointer
-/// was, which button and key, and what's along the way from the root to what it happened to.
-/// The last event that was made into one for code written for the web, by its [`serial`](rsui::runtime::Event::serial): the same
-/// one, for another handler, is the same object, which `newEvent` in `layer.js` keeps, so what's along the way isn't said again.
+// The last event that was made into one for code written for the web, by its [`serial`](rsui::runtime::Event::serial): the same
+// one, for another handler, is the same object, which `newEvent` in `layer.js` keeps, so what's along the way isn't said again.
 thread_local! {
     static LAST_EVENT_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// What a handler written for the web is given about something that happened, from what came with it: where the pointer
+/// was, which button and key, and what's along the way from the root to what it happened to.
 fn event_value(vm: &mut Vm, event: &rsui::runtime::Event) -> Value {
     let again = event.serial != 0 && LAST_EVENT_SERIAL.with(std::cell::Cell::get) == event.serial;
     let modifiers = &event.modifiers;
@@ -1929,10 +1929,8 @@ fn pump_with(updates: &mut Updates<'_>, timer: bool) {
         }
         // What's changed is drawn before any timer runs, as a browser does: a timer that's been replaced by what that drawing does
         // mustn't run as it was. A timer that's due waits for one frame of that, and no more.
-        if !host.dirty.borrow().is_empty() || effects_waiting {
-            if !timer || !host.timer_waited.replace(true) {
-                return engine.next_timer_in();
-            }
+        if (!host.dirty.borrow().is_empty() || effects_waiting) && (!timer || !host.timer_waited.replace(true)) {
+            return engine.next_timer_in();
         }
         if timer {
             host.timer_waited.set(false);
@@ -4011,6 +4009,7 @@ impl RecentProps {
             .count()
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = &Props> {
         self.sets.iter().flatten()
     }

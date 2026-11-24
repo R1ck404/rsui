@@ -2048,7 +2048,7 @@ impl Motions {
 
 /// The CSS properties a transition of `prop` stands for, as its rule says, or the prop itself. `-` is none: what moves with
 /// another prop that says what's moving, as what's drawn of an outline does with CSS's `outline-width`.
-fn css_names<'a>(prop: Symbol, names: &'a str) -> impl Iterator<Item = &'a str> {
+fn css_names(prop: Symbol, names: &str) -> impl Iterator<Item = &str> {
     let own = if names.is_empty() { Some(prop.as_str()) } else { None };
     names
         .split(',')

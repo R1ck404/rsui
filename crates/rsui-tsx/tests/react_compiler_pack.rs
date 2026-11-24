@@ -239,7 +239,7 @@ fn compiled_modules_keep_original_resolution_and_run_standalone_with_and_without
         let line = log
             .lines()
             .filter(|line| line.starts_with("cache "))
-            .last()
+            .next_back()
             .unwrap();
         if cache {
             let counts: Vec<u32> = line
