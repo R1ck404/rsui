@@ -8,6 +8,8 @@ window gets the same app drawn by the GPU.
 
 **Status:** version 0.1.0. Windows 10 or later only. The APIs can still change.
 
+![The file explorer demo, written in TypeScript with rsui](demos/file-explorer/screenshots/details.png)
+
 ## Getting started
 
 You need Windows, and [Rust](https://rustup.rs) 1.85 or later with the MSVC toolchain. You don't need Node or a browser, and the app you
@@ -87,18 +89,18 @@ Working on an app needs no window and no person.
 
 `import ... from 'react'` works, and so does JSX written for a page, with nothing to convert.
 
-- **React 19:** class components, error boundaries, `Suspense`, every hook, `use` and actions. `<form action={fn}>` works with
+- React 19: class components, error boundaries, `Suspense`, every hook, `use` and actions. `<form action={fn}>` works with
   `useFormStatus`, `requestSubmit`, Enter and `FormData`.
-- **Markup and CSS:** `className`, `import './app.css'`, CSS modules, and `<style>` or `<link>` anywhere in `<head>`, applied in the order they
+- Markup and CSS: `className`, `import './app.css'`, CSS modules, and `<style>` or `<link>` anywhere in `<head>`, applied in the order they
   appear. Tables are laid out as tables. The same matcher serves CSS and `querySelector`, `matches` and `closest`, so `li + li`,
   `:nth-child(2 of .row)`, `:has()` and Tailwind's `group-hover:` and `peer-checked:` behave the same in both.
-- **Events and the DOM:** events carry where the pointer was and which keys were held. Keys reach `keydown` handlers before a field takes
+- Events and the DOM: events carry where the pointer was and which keys were held. Keys reach `keydown` handlers before a field takes
   them. Clipboard, text composition, `tabIndex`, drag and drop (including from other programs), `document.addEventListener`,
   `scrollTop`, `scrollIntoView` and `scroll` events all work, and so do refs to elements, `getBoundingClientRect` and
   `getComputedStyle`. `<dialog>` has `showModal()`. `scrollbar-color` and `scrollbar-width` are supported.
-- **Browser state:** `localStorage` works, and `history` and `location` are kept in memory, so react-router's `BrowserRouter` runs as it is.
+- Browser state: `localStorage` works, and `history` and `location` are kept in memory, so react-router's `BrowserRouter` runs as it is.
   A rejected promise with nothing to catch it is logged and delivered to `unhandledrejection`, as in a browser.
-- **Libraries from npm** run as they are. Packages are found the way a bundler for a browser finds them, using their `browser` builds, and
+- Libraries from npm run as they are. Packages are found the way a bundler for a browser finds them, using their `browser` builds, and
   `document`, `window` and the rest of the DOM load only when something touches them, so an app that never touches the DOM doesn't pay for
   it. Redux Toolkit, react-redux, zustand, TanStack Query (with Table and Virtual), react-i18next, react-router, Radix, Headless UI,
   React Aria, Floating UI, motion, react-hook-form, react-select, styled-components, emotion, sonner and recharts have all been run.
@@ -179,6 +181,19 @@ turns it off, and `crates/rsui-js/JIT.md` describes it.
 | `rsui-headless` | Running an app with no window, for tests and agents |
 | `rsui-agent` | Tools over the Model Context Protocol that let an agent operate an app |
 
+## How it's put together
+
+An app is a tree of elements. `rsui-core` keeps it and compares each new one with the last to find what changed, and layout, text
+and drawing work from that tree. JavaScript has a small part: it runs components and event handlers, and nothing else. Diffing,
+layout, text and painting stay in Rust, so a slow moment in JavaScript is short, and an app that's doing nothing runs none.
+
+Each part has budgets for what it adds to a program's size, how much memory it takes and how long it takes. `crates/rsui-js/DESIGN.md`
+lists those for the engine, says which are met and which aren't, and treats anything over budget as a bug. The numbers under "What it
+costs" come from the same measuring, and `crates/rsui-core/PERFORMANCE.md` keeps what was tried and didn't work, so it isn't tried
+again.
+
+The one place a browser is used is the `<webview>` element, for other people's web pages, which are written for Chromium and expect it.
+
 ## Your own Rust program
 
 Every program should include this line, since `rsui` is built around it:
@@ -190,6 +205,26 @@ static ALLOCATOR: rsui::UiAlloc = rsui::UiAlloc;
 
 Copy `.cargo/config.toml` from this repo too. It links the part of the C runtime that a clean Windows install may lack into your
 program, for 23 KB. Without it, the program won't start on some machines.
+
+## More to read
+
+| File | What's in it |
+|---|---|
+| `crates/rsui-tsx/rsui.d.ts` | The API, with a description of everything |
+| `crates/rsui-tsx/DESIGN.md` | How an app runs, how it differs from React, keeping long lists fast, and where the memory goes |
+| `crates/rsui-js/DESIGN.md` | The JavaScript engine: its budgets, how it works, and what it doesn't have yet |
+| `crates/rsui-js/JIT.md` | The baseline JIT |
+| `crates/rsui-core/PERFORMANCE.md` | What was measured and tried in the core, so it isn't tried again |
+| `crates/rsui-webview/DESIGN.md` | Why and how other people's web pages are shown |
+
+## Building and testing
+
+```
+cargo build --release -p rsui-tsx
+cargo test -p rsui-core -p rsui-layout -p rsui-text -p rsui-image -p rsui-alloc -p rsui-js
+```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rest: what CI checks, which tests open windows, and how to measure a change.
 
 ## License
 
