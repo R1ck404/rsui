@@ -3,3 +3,8 @@ target/
 __pycache__/
 node_modules/
 **/.rsui/react-compiler/
+
+# What an app saves beside itself while it runs: its settings, and inspector traces. A trace holds the paths and values of
+# whoever recorded it, so none belongs here.
+rsui-storage/
+*.rsuitrace

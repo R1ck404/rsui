@@ -1,0 +1,2 @@
+# Text is stored with LF in the repository and checked out with whatever the platform uses.
+* text=auto
