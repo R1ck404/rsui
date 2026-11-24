@@ -65,11 +65,15 @@ const sheets = [];
 /// found from all of them together is found again then. What's only been added to one changes only what it was about: see
 /// `touchedRules`.
 let sheetsShape = 0;
+/// How many times a sheet has been put in or taken out. What `sheetRanks` kept is out of date once this changes, which the number of
+/// sheets doesn't say: one taken out and another put in, as `removeChild()` and `appendChild()` of a `<style>` do, leave as many.
+let sheetsEdited = 0;
 let sheet = newSheet();
 
 function newSheet() {
     const made = { page: [], classes: new Map(), tags: new Map(), tagRules: new Map(), complex: [], keys: new Set() };
     sheets.push(made);
+    sheetsEdited += 1;
     return made;
 }
 
@@ -84,6 +88,7 @@ function dropSheet(one) {
     const at = sheets.indexOf(one);
     if (at >= 0) {
         sheets.splice(at, 1);
+        sheetsEdited += 1;
         forgetSheet(one);
     }
 }
@@ -121,6 +126,7 @@ function sheetInHead(node) {
         place = after === undefined ? -1 : sheets.indexOf(after);
     }
     sheets.splice(place < 0 ? sheets.length : place, 0, made);
+    sheetsEdited += 1;
     return made;
 }
 
@@ -379,6 +385,13 @@ function noteRule(steps, declarations) {
                 for (const inner of pseudo.list ?? []) {
                     for (const one of inner ?? []) {
                         stepFeatures(one, features);
+                        if (one.pseudo.some((state) => FOCUS_STATES.includes(state.name))) {
+                            // `.panel:has(.field:focus)` is about `.panel`, but what makes it so is the focus moving, which nothing
+                            // about `.panel` or `.field` says: see `focusMoved`.
+                            for (const key of subjects) {
+                                hasFocusSubjects.add(key);
+                            }
+                        }
                     }
                 }
             }
@@ -423,6 +436,20 @@ function pageChanged(features) {
 
 /// The keys of what rules with `:has()` are about, which is about what's drawn inside it.
 const hasSubjects = new Set();
+/// The keys of what rules are about whose `:has()` looks at something's focus, as `.panel:has(.field:focus)` does.
+const hasFocusSubjects = new Set();
+const FOCUS_STATES = ['focus', 'focus-visible', 'focus-within'];
+
+/// Says that the focus has moved, for what a `:has()` is about that looks at it, as nothing else would: what's in it has no rule of
+/// its own about its focus, so it isn't kept track of, and nothing is drawn again for it moving.
+function focusMoved() {
+    if (hasFocusSubjects.size > 0) {
+        for (const key of hasFocusSubjects) {
+            restyleKey(key);
+        }
+        restyled();
+    }
+}
 function hasHas(step) {
     return step.pseudo.some((one) => one.name === 'has' || (one.list ?? []).some((inner) => (inner ?? []).some(hasHas)));
 }
@@ -2443,8 +2470,8 @@ function pageClassesLook(classes, key = null) {
 /// Where each sheet is in the cascade, for as long as that's so.
 let ranks = { shape: -1, of: new Map() };
 function sheetRanks() {
-    if (ranks.shape !== sheetsShape || ranks.count !== sheets.length) {
-        ranks = { shape: sheetsShape, count: sheets.length, of: new Map(sheets.map((one, at) => [one, at])) };
+    if (ranks.shape !== sheetsShape || ranks.edited !== sheetsEdited) {
+        ranks = { shape: sheetsShape, edited: sheetsEdited, of: new Map(sheets.map((one, at) => [one, at])) };
     }
     return ranks.of;
 }
@@ -13779,6 +13806,7 @@ function moveFocus(next, tellRust = true, options = undefined) {
         return;
     }
     focusedElement = next;
+    focusMoved();
     if (before !== null) {
         changedSinceFocus(before);
         dispatchOn(before, focusEvent('blur', next, false));
@@ -15889,7 +15917,9 @@ class PageSelectorOwn {
         this.id = typeof props.id === 'string' ? props.id : undefined;
         this.classes = classesOf(props.className);
         this.props = props;
-        this.state = live.state ?? 0;
+        // Rust only says how something is if a rule of its own asks, so what has the focus is told from here: a selector that
+        // looks at it, as `.panel:has(.field:focus)` does of `.field`, finds it either way.
+        this.state = (live.state ?? 0) | (focusedElement !== null && (focusedElement.__live === live || live.handle === focusedElement) ? FOCUS : 0);
         this.empty = node.children.length === 0 && (node.entry[5] === undefined || node.entry[5] === '');
         this.kind = 'element';
         this.node = node;

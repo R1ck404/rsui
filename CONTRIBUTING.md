@@ -28,8 +28,7 @@ tests of `rsui-tsx` run apps through the same path as `--do`, so set `RSUI_SANDB
 anything they would save to your own settings goes there instead.
 
 Some tests are marked `#[ignore]`, and the attribute says why. Most are measurements to run by hand with `--ignored --nocapture`.
-Two record bugs that are known and not fixed yet: in `class_declarations.rs`, reordering elements in `<head>`, and in
-`selector_tree.rs`, `:has(:focus)` when only an ancestor has the focus.
+The rest need something the test machine may not have, such as Node or the sound device.
 
 ## Before sending a change
 

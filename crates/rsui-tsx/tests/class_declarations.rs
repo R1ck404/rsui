@@ -100,7 +100,6 @@ fn viewport_resize_updates_declarations_without_a_media_breakpoint() {
 }
 
 #[test]
-#[ignore = "Baseline head reorder fails independently of declaration caching; separate DOM ordering bug"]
 fn replacing_and_reordering_real_sheets_preserves_declarations_and_cascade() {
     let mut ui = open(
         r#"

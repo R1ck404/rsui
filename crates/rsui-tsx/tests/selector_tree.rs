@@ -136,7 +136,6 @@ fn native_to_styled_ownership_and_portal_membership_refresh_live_descriptors() {
 }
 
 #[test]
-#[ignore = "Baseline ancestor-only :has(:focus) fails even without topology reuse; separate focus dependency issue"]
 fn focus_state_changes_are_visible_inside_has() {
     let mut ui = open(
         r#"
@@ -153,8 +152,7 @@ fn focus_state_changes_are_visible_inside_has() {
     ui.wait_for("phase 2");
 }
 
-// A direct focus rule registers the baseline focus dependency; keep the unsupported
-// ancestor-only case above as its own unchanged ignored regression.
+// The same, with a rule of its own about the focus, which Rust tracks.
 #[test]
 fn tracked_focus_state_changes_are_visible_inside_has() {
     let mut ui = open(
