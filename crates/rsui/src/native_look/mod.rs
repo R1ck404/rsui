@@ -228,6 +228,7 @@ pub fn is_visual(name: Symbol) -> bool {
             | "line_through"
             | "overline"
             | "css_filter"
+            | "backdrop_blur"
             | "text_shadow"
             | "letter_spacing"
             | "word_spacing"

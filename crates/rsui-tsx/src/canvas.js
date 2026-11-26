@@ -19,7 +19,7 @@ const SELECT = 1, SAVE = 2, RESTORE = 3, TRANSFORM = 4, RESET = 5, ALPHA = 6, CO
     QUAD = 34, BEZIER = 35, ARC = 36, ARC_TO = 37, ELLIPSE = 38, RECT = 39, ROUND_RECT = 40, CLOSE = 41, FILL = 42, STROKE = 43,
     CLIP = 44, FILL_PATH = 45, STROKE_PATH = 46, CLIP_PATH = 47, FILL_RECT = 48, STROKE_RECT = 49, CLEAR_RECT = 50, FILL_TEXT = 51,
     STROKE_TEXT = 52, DRAW_IMAGE = 53, LINEAR = 54, RADIAL = 55, CONIC = 56, STOP = 57, PATTERN = 58, PATTERN_TRANSFORM = 59,
-    PATH_DEFINE = 60, FREE = 61, IMAGE_SOURCE = 62, ADD_PATH = 65;
+    PATH_DEFINE = 60, FREE = 61, IMAGE_SOURCE = 62, ADD_PATH = 65, FILL_DITHER = 66;
 
 // The list, which is used again for each lot.
 let list = new Float64Array(1 << 15);
@@ -1169,10 +1169,47 @@ class CanvasRenderingContext2D {
     }
 
     rect(x, y, w, h) {
-        this._numbers(RECT, [x, y, w, h]);
+        const nx = +x;
+        const ny = +y;
+        const nw = +w;
+        const nh = +h;
+        if (nx - nx + (ny - ny) + (nw - nw) + (nh - nh) !== 0) {
+            return;
+        }
+        if (selected !== this._id || count + 5 > list.length) {
+            on(this._id, 5);
+        }
+        list[count++] = RECT;
+        list[count++] = nx;
+        list[count++] = ny;
+        list[count++] = nw;
+        list[count++] = nh;
     }
 
     roundRect(x, y, w, h, radii = 0) {
+        // One radius for every corner, as it mostly is: nothing to make for it.
+        if (typeof radii === 'number') {
+            const r = oneRadius(radii, 'CanvasRenderingContext2D');
+            const nx = +x;
+            const ny = +y;
+            const nw = +w;
+            const nh = +h;
+            if (r !== r || nx - nx + (ny - ny) + (nw - nw) + (nh - nh) !== 0) {
+                return;
+            }
+            if (selected !== this._id || count + 13 > list.length) {
+                on(this._id, 13);
+            }
+            list[count++] = ROUND_RECT;
+            list[count++] = nx;
+            list[count++] = ny;
+            list[count++] = nw;
+            list[count++] = nh;
+            for (let i = 0; i < 8; i += 1) {
+                list[count++] = r;
+            }
+            return;
+        }
         const corners = roundRectRadii(radii, 'roundRect', 'CanvasRenderingContext2D');
         const values = [x, y, w, h].map(Number);
         if (!finite(...values) || corners === null) {
@@ -1291,6 +1328,34 @@ class CanvasRenderingContext2D {
 
     clearRect(x, y, w, h) {
         this._rect(CLEAR_RECT, x, y, w, h);
+    }
+
+    /// Not in the standard: dots in the fill, `size` pixels across on a grid `step` apart (every other row half a step along), shown
+    /// where a field's level is above the dot's threshold in a 4 by 4 Bayer matrix, so they thin out in an even weave as it falls.
+    /// `field` is `cols` by `rows` levels, `cell` apart from the origin, read between by the neighbours; a level of 1 or more
+    /// shows every dot and one of 0 or less none. One call, where `rect()` for each dot was one for each and a walk of each one's
+    /// four lines. Needs a transform that only moves and resizes.
+    fillDither(field, cols, rows, cell, step = 4, size = 2) {
+        const c = Math.floor(+cols);
+        const r = Math.floor(+rows);
+        const n = c * r;
+        if (!(c >= 2 && r >= 2) || !(field && field.length >= n) || !(+cell > 0 && +step > 0 && +size > 0) || n > 16777216) {
+            return;
+        }
+        this._op(FILL_DITHER, 5 + n);
+        list[count++] = c;
+        list[count++] = r;
+        list[count++] = +cell;
+        list[count++] = +step;
+        list[count++] = +size;
+        if (field.length === n && typeof list.set === 'function') {
+            list.set(field, count);
+            count += n;
+        } else {
+            for (let i = 0; i < n; i++) {
+                list[count++] = +field[i];
+            }
+        }
     }
 
     _rect(code, x, y, w, h) {
@@ -1430,6 +1495,17 @@ class CanvasRenderingContext2D {
 }
 
 /// `roundRect()`'s radii, as each corner's across and down, from the top left round, or `null` for what draws nothing.
+/// A radius given as one number, as `roundRectRadii` checks it: NaN for one that isn't finite, which draws nothing.
+function oneRadius(r, kind) {
+    if (r - r !== 0) {
+        return NaN;
+    }
+    if (r < 0) {
+        throw new RangeError(`Failed to execute 'roundRect' on '${kind}': Radius value ${r} is negative.`);
+    }
+    return r;
+}
+
 function roundRectRadii(radii, method, kind) {
     const all = Array.isArray(radii) || (radii !== null && typeof radii === 'object' && typeof radii[Symbol.iterator] === 'function' && typeof radii !== 'string') ? Array.from(radii) : [radii];
     if (all.length < 1 || all.length > 4) {
@@ -1566,6 +1642,46 @@ class Path2D {
         this._ops.push(code, ...values.map(Number));
     }
 
+    // The steps a path is mostly made of, without an array for each: a path of thousands of dots makes thousands of these. A
+    // number that isn't finite leaves the step out, as `_push` does (`v - v` is 0 only for one that is).
+
+    moveTo(x, y) {
+        const nx = +x;
+        const ny = +y;
+        if (nx - nx + (ny - ny) === 0) {
+            this._ops.push(MOVE, nx, ny);
+        }
+    }
+    lineTo(x, y) {
+        const nx = +x;
+        const ny = +y;
+        if (nx - nx + (ny - ny) === 0) {
+            this._ops.push(LINE, nx, ny);
+        }
+    }
+    rect(x, y, w, h) {
+        const nx = +x;
+        const ny = +y;
+        const nw = +w;
+        const nh = +h;
+        if (nx - nx + (ny - ny) + (nw - nw) + (nh - nh) === 0) {
+            this._ops.push(RECT, nx, ny, nw, nh);
+        }
+    }
+    arc(x, y, radius, startAngle, endAngle, anticlockwise = false) {
+        const r = +radius;
+        if (r < 0) {
+            throw domException('IndexSizeError', `Failed to execute 'arc' on 'Path2D': The radius provided (${radius}) is negative.`);
+        }
+        const nx = +x;
+        const ny = +y;
+        const a0 = +startAngle;
+        const a1 = +endAngle;
+        if (nx - nx + (ny - ny) + (r - r) + (a0 - a0) + (a1 - a1) === 0) {
+            this._ops.push(ARC, nx, ny, r, a0, a1, anticlockwise ? 1 : 0);
+        }
+    }
+
     addPath(path, transform) {
         if (!(path instanceof Path2D)) {
             throw new TypeError("Failed to execute 'addPath' on 'Path2D': parameter 1 is not of type 'Path2D'.");
@@ -1581,23 +1697,11 @@ class Path2D {
     closePath() {
         this._ops.push(CLOSE);
     }
-    moveTo(x, y) {
-        this._push(MOVE, [x, y]);
-    }
-    lineTo(x, y) {
-        this._push(LINE, [x, y]);
-    }
     quadraticCurveTo(cx, cy, x, y) {
         this._push(QUAD, [cx, cy, x, y]);
     }
     bezierCurveTo(c1x, c1y, c2x, c2y, x, y) {
         this._push(BEZIER, [c1x, c1y, c2x, c2y, x, y]);
-    }
-    arc(x, y, radius, startAngle, endAngle, anticlockwise = false) {
-        if (Number(radius) < 0) {
-            throw domException('IndexSizeError', `Failed to execute 'arc' on 'Path2D': The radius provided (${radius}) is negative.`);
-        }
-        this._push(ARC, [x, y, radius, startAngle, endAngle, anticlockwise ? 1 : 0]);
     }
     arcTo(x1, y1, x2, y2, radius) {
         if (Number(radius) < 0) {
@@ -1611,10 +1715,18 @@ class Path2D {
         }
         this._push(ELLIPSE, [x, y, radiusX, radiusY, rotation, startAngle, endAngle, anticlockwise ? 1 : 0]);
     }
-    rect(x, y, w, h) {
-        this._push(RECT, [x, y, w, h]);
-    }
     roundRect(x, y, w, h, radii = 0) {
+        if (typeof radii === 'number') {
+            const r = oneRadius(radii, 'Path2D');
+            const nx = +x;
+            const ny = +y;
+            const nw = +w;
+            const nh = +h;
+            if (r === r && nx - nx + (ny - ny) + (nw - nw) + (nh - nh) === 0) {
+                this._ops.push(ROUND_RECT, nx, ny, nw, nh, r, r, r, r, r, r, r, r);
+            }
+            return;
+        }
         const corners = roundRectRadii(radii, 'roundRect', 'Path2D');
         if (corners !== null) {
             this._push(ROUND_RECT, [x, y, w, h, ...corners]);

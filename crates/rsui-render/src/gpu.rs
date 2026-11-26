@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::fmt;
 
 use rsui_text::Upload;
-use windows::Win32::Foundation::{HMODULE, HWND, RECT};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL,
     D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
@@ -28,8 +28,9 @@ use windows::core::{HRESULT, Interface, s, w};
 
 use crate::images::ImageUpload;
 use crate::paint::Color;
-use crate::scene::{Batch, Filter, Layer, PixelRect, Quad, RoundClip, Scene};
+use crate::scene::{BACKDROP_IMAGE, Batch, Filter, Layer, PixelRect, Quad, RoundClip, Scene};
 use crate::transform::Matrix;
+use crate::area::backdrop_areas;
 pub(crate) use crate::area::{
     NO_AREA, NO_ROUND_CLIPS, RoundSlots, area_of, intersect, is_empty, layer_quad, placed_area, round_clips_of, union,
 };
@@ -44,6 +45,13 @@ mod gpu_probe;
 const VERTEX_SHADER: &[u8] = include_bytes!("quad_vs.dxbc");
 const PIXEL_SHADER: &[u8] = include_bytes!("quad_ps.dxbc");
 const IMAGE_SHADER: &[u8] = include_bytes!("image_ps.dxbc");
+const BACKDROP_SHADER: &[u8] = include_bytes!("backdrop_ps.dxbc");
+
+struct BackdropTarget {
+    size: (u32, u32),
+    texture: ID3D11Texture2D,
+    picture: ID3D11ShaderResourceView,
+}
 
 /// How many quads the buffer starts with room for. Most UIs need far less.
 const FIRST_QUAD_CAPACITY: u32 = 2048;
@@ -82,13 +90,18 @@ impl From<windows::core::Error> for RenderError {
 
 enum Target {
     Window(IDXGISwapChain1),
-    /// For drawing without a window. `readback` is where pixels are copied for reading.
+    /// For drawing without a window.
     Offscreen {
         texture: ID3D11Texture2D,
-        readback: ID3D11Texture2D,
         /// A second buffer to swap with, to behave as a window's buffers do.
         spare: Option<(ID3D11Texture2D, ID3D11RenderTargetView)>,
     },
+}
+
+struct FrameCapture {
+    region: PixelRect,
+    staging: ID3D11Texture2D,
+    copied: bool,
 }
 
 /// What puts a window's swap chain over the window, through DirectComposition, rather than the window having one of its own.
@@ -166,6 +179,9 @@ pub struct Renderer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     target: Target,
+    frame_capture: Option<FrameCapture>,
+    // At most one staging surface. Submission-only renderers never allocate one.
+    staging: std::cell::RefCell<Option<((u32, u32), ID3D11Texture2D)>>,
     /// The window this draws to, if it's one.
     window: HWND,
     /// What shows a window's swap chain. There's none if DirectComposition couldn't be had, and the swap chain is then the
@@ -226,6 +242,8 @@ pub struct Renderer {
     /// What something faded as a whole is drawn on before it's put down, as big as what's drawn to, made when it's first needed.
     layer_target: Option<((u32, u32), ID3D11RenderTargetView, ID3D11ShaderResourceView)>,
     layer_sampler: Option<ID3D11SamplerState>,
+    backdrop_shader: Option<ID3D11PixelShader>,
+    backdrop_targets: [Option<BackdropTarget>; 2],
 }
 
 /// Puts round clips where the shaders read them: each one's edges, its top corners, its bottom corners (bottom right first, as
@@ -415,6 +433,7 @@ pub struct WorkingSetLimit {
     was: Option<(usize, usize)>,
 }
 
+const QUOTA_LIMITS_HARDWS_MIN_ENABLE: u32 = 0x1;
 const QUOTA_LIMITS_HARDWS_MIN_DISABLE: u32 = 0x2;
 const QUOTA_LIMITS_HARDWS_MAX_ENABLE: u32 = 0x4;
 const QUOTA_LIMITS_HARDWS_MAX_DISABLE: u32 = 0x8;
@@ -472,7 +491,11 @@ impl WorkingSetLimit {
             {
                 return Self { was: None };
             }
-            let limit = (counters.working_set + room).max(at_least);
+            // Respect a limit owned by the host process or another starting window.
+            if flags & (QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE) != 0 {
+                return Self { was: None };
+            }
+            let limit = counters.working_set.saturating_add(room).max(at_least);
             let set = SetProcessWorkingSetSizeEx(
                 process,
                 minimum,
@@ -842,6 +865,8 @@ impl Renderer {
             device,
             context,
             target,
+            frame_capture: None,
+            staging: Default::default(),
             window: HWND::default(),
             composition: None,
             see_through: false,
@@ -889,6 +914,8 @@ impl Renderer {
             last_layers: Vec::new(),
             layer_target: None,
             layer_sampler: None,
+            backdrop_shader: None,
+            backdrop_targets: [None, None],
             #[cfg(feature = "render-diagnostics")]
             full_layer_targets: false,
             images: HashMap::new(),
@@ -941,6 +968,23 @@ impl Renderer {
         self.frames_since_compact = self.frames_since_compact.saturating_add(1);
         match &mut self.target {
             Target::Window(chain) => {
+                if let Some(capture) = &mut self.frame_capture {
+                    let region = capture.region;
+                    let source = D3D11_BOX {
+                        left: region.left as u32,
+                        top: region.top as u32,
+                        front: 0,
+                        right: region.right as u32,
+                        bottom: region.bottom as u32,
+                        back: 1,
+                    };
+                    // SAFETY: the capture region is inside the swap chain and matches the staging texture.
+                    unsafe {
+                        let back: ID3D11Texture2D = chain.GetBuffer(0)?;
+                        self.context.CopySubresourceRegion(&capture.staging, 0, 0, 0, 0, &back, 0, Some(&source));
+                    }
+                    capture.copied = true;
+                }
                 let mut rect = self.dirty.map(|area| RECT {
                     left: area.left,
                     top: area.top,
@@ -980,6 +1024,42 @@ impl Renderer {
             Target::Offscreen { .. } => {}
         }
         Ok(())
+    }
+
+    /// Runs a window draw and reads the requested physical pixels in the swap chain's BGRA order.
+    #[doc(hidden)]
+    pub fn capture_window_region(
+        &mut self,
+        region: PixelRect,
+        draw: impl FnOnce(&mut Self) -> Result<(), RenderError>,
+    ) -> Result<Vec<u8>, RenderError> {
+        if !matches!(self.target, Target::Window(_))
+            || self.frame_capture.is_some()
+            || is_empty(region)
+            || region.left < 0
+            || region.top < 0
+            || region.right as u32 > self.size.0
+            || region.bottom as u32 > self.size.1
+        {
+            return Err(windows::core::Error::from(E_INVALIDARG).into());
+        }
+        let width = (region.right - region.left) as u32;
+        let height = (region.bottom - region.top) as u32;
+        let staging = self.staging_texture((width, height))?;
+        self.frame_capture = Some(FrameCapture {
+            region,
+            staging,
+            copied: false,
+        });
+        // Even if the scene is unchanged, the next swap chain buffer may have older pixels.
+        self.known = false;
+        let drawn = draw(self);
+        let capture = self.frame_capture.take().expect("the capture was set above");
+        drawn?;
+        if !capture.copied {
+            return Err(windows::core::Error::from(E_FAIL).into());
+        }
+        self.read_staging(&capture.staging, width as usize, height as usize, true)
     }
 
     /// Whether the last frame was the same as the one before, so wasn't shown, which also means nothing
@@ -1103,6 +1183,8 @@ impl Renderer {
             right: self.size.0 as i32,
             bottom: self.size.1 as i32,
         };
+        let has_backdrop = scene.batches.iter().any(|batch| batch.image == BACKDROP_IMAGE);
+        let backdrop_affected = has_backdrop || self.last_batches.iter().any(|batch| batch.image == BACKDROP_IMAGE);
         // What's different from the last frame.
         // What's turned or resized isn't where its quads say, so what's changed is worked out from where their transforms put
         // them, and what's filtered or faded differently from its own quads (`changed_area_placed`).
@@ -1189,6 +1271,8 @@ impl Renderer {
             )
         };
         let change = intersect(union(change, layer_damage), whole);
+        // A change outside a blur box can still change what it samples.
+        let change = if backdrop_affected && !is_empty(change) { whole } else { change };
         #[cfg(feature = "render-diagnostics")]
         self.observe(|work| work.change = change);
         self.nothing_to_show = is_empty(change) && self.known && !is_empty(whole);
@@ -1314,6 +1398,13 @@ impl Renderer {
         if !scene.transforms.is_empty() {
             self.make_image_pipeline()?;
         }
+        if has_backdrop {
+            self.make_image_pipeline()?;
+            self.prepare_backdrop(0, self.size)?;
+            if let Some((size, _, _)) = &self.layer_target {
+                self.prepare_backdrop(1, *size)?;
+            }
+        }
         // SAFETY: everything bound here stays alive for the draw calls, as `self` owns it.
         unsafe {
             self.write_frame_constants()?;
@@ -1406,7 +1497,22 @@ impl Renderer {
                         scene.atlas_size,
                     )?;
                 }
-                if batch.image != 0 {
+                if batch.image == BACKDROP_IMAGE {
+                    let matrix = batch.transform.checked_sub(1).and_then(|at| scene.transforms.get(usize::from(at))).copied();
+                    let origin = in_layer.map_or((0, 0), |at| self.layer_origin(&layers[at]));
+                    let (slot, source) = if in_layer.is_some() {
+                        (1, &self.layer_target.as_ref().expect("drawing on a layer").1)
+                    } else {
+                        (0, &view)
+                    };
+                    if let Some(quad) = scene.quads.get(batch.first as usize) {
+                        self.draw_backdrop(slot, source, origin, clip, quad, matrix, batch.first)?;
+                        // This was a different pixel shader from either of the normal drawing shaders.
+                        context.PSSetShader(&self.pixel_shader, None);
+                        drawing_image = false;
+                    }
+                    continue;
+                } else if batch.image != 0 {
                     let (Some((shader, sampler)), Some(picture)) =
                         (&self.image_pipeline, self.images.get(&batch.image))
                     else {
@@ -1632,43 +1738,13 @@ impl Renderer {
         let Target::Window(chain) = &self.target else {
             return Ok(Vec::new());
         };
-        let (width, height) = (self.size.0 as usize, self.size.1 as usize);
-        let mut pixels = vec![0u8; width * height * 4];
-        // SAFETY: the description comes from the buffer being copied, so the copy fits, and the
-        // mapped memory holds `RowPitch` bytes for each of its rows until `Unmap`.
+        let staging = self.staging_texture(self.size)?;
+        // SAFETY: the swap chain and staging texture have the renderer size and BGRA format.
         unsafe {
             let back: ID3D11Texture2D = chain.GetBuffer(0)?;
-            let mut description = D3D11_TEXTURE2D_DESC::default();
-            back.GetDesc(&mut description);
-            let mut staging = None;
-            self.device.CreateTexture2D(
-                &D3D11_TEXTURE2D_DESC {
-                    Usage: D3D11_USAGE_STAGING,
-                    BindFlags: 0,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                    MiscFlags: 0,
-                    ..description
-                },
-                None,
-                Some(&mut staging),
-            )?;
-            let staging: ID3D11Texture2D = staging.expect("the call succeeded");
             self.context.CopyResource(&staging, &back);
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-            for (row, target) in pixels.chunks_exact_mut(width * 4).enumerate() {
-                target.copy_from_slice(std::slice::from_raw_parts(
-                    mapped
-                        .pData
-                        .cast::<u8>()
-                        .add(row * mapped.RowPitch as usize),
-                    width * 4,
-                ));
-            }
-            self.context.Unmap(&staging, 0);
         }
-        Ok(pixels)
+        self.read_staging(&staging, self.size.0 as usize, self.size.1 as usize, true)
     }
 
     /// Lets go of the spare back buffer, for when things have gone quiet, and says whether it
@@ -1698,6 +1774,7 @@ impl Renderer {
     fn make_buffers(&mut self, size: (u32, u32)) -> Result<(), RenderError> {
         self.view = None;
         self.layer_target = None;
+        self.backdrop_targets = [None, None];
         self.known = false;
         self.frames_since_compact = 0;
         // SAFETY: nothing refers to the old buffers, as the view was just released and
@@ -1774,9 +1851,11 @@ impl Renderer {
     /// Release idle CPU history and oversized quad storage without OS working-set
     /// trimming. Live images and the font atlas stay ready for the next frame.
     pub fn trim_storage(&mut self) {
+        self.staging.get_mut().take();
         // This temporary surface is reconstructible and never contains the
         // authoritative window image. The context is unbound below as well.
         self.layer_target = None;
+        self.backdrop_targets = [None, None];
         let needed = (self.last_quads.len().min(u32::MAX as usize) as u32)
             .max(FIRST_QUAD_CAPACITY)
             .checked_next_power_of_two()
@@ -1810,22 +1889,146 @@ impl Renderer {
     /// The pixels drawn so far, as red, green, blue and alpha for each, in rows from the
     /// top. Only offscreen renderers have this.
     pub fn read_pixels(&self) -> Result<Vec<u8>, RenderError> {
-        let Target::Offscreen {
-            texture,
-            readback,
-            spare,
-        } = &self.target
-        else {
+        self.read_offscreen(false)
+    }
+
+    /// Offscreen pixels in the texture's native blue, green, red, alpha order.
+    #[doc(hidden)]
+    pub fn read_pixels_bgra(&self) -> Result<Vec<u8>, RenderError> {
+        self.read_offscreen(true)
+    }
+
+    fn read_offscreen(&self, bgra: bool) -> Result<Vec<u8>, RenderError> {
+        let region = PixelRect {
+            left: 0,
+            top: 0,
+            right: self.size.0 as i32,
+            bottom: self.size.1 as i32,
+        };
+        self.read_offscreen_region(region, bgra)
+    }
+
+    /// Reads just the requested physical pixels from the most recently shown buffer.
+    #[doc(hidden)]
+    pub fn read_offscreen_region(
+        &self,
+        region: PixelRect,
+        bgra: bool,
+    ) -> Result<Vec<u8>, RenderError> {
+        let Some(staging) = self.copy_offscreen_region(region)? else {
             return Ok(Vec::new());
+        };
+        self.read_staging(
+            &staging,
+            (region.right - region.left) as usize,
+            (region.bottom - region.top) as usize,
+            bgra,
+        )
+    }
+
+    /// Blocks until the frame is complete. Only four bytes cross the GPU readback boundary.
+    #[doc(hidden)]
+    pub fn wait_for_frame(&self) -> Result<(), RenderError> {
+        let Some(staging) = self.copy_offscreen_region(PixelRect {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        })?
+        else {
+            return Ok(());
+        };
+        // SAFETY: this staging texture supports CPU reads; Map synchronizes the preceding copy.
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            self.context.Unmap(&staging, 0);
+        }
+        Ok(())
+    }
+
+    fn copy_offscreen_region(
+        &self,
+        region: PixelRect,
+    ) -> Result<Option<ID3D11Texture2D>, RenderError> {
+        let Target::Offscreen { texture, spare } = &self.target else {
+            return Ok(None);
+        };
+        if is_empty(region)
+            || region.left < 0
+            || region.top < 0
+            || region.right as u32 > self.size.0
+            || region.bottom as u32 > self.size.1
+        {
+            return Err(windows::core::Error::from(E_INVALIDARG).into());
+        }
+        let staging = self.staging_texture((
+            (region.right - region.left) as u32,
+            (region.bottom - region.top) as u32,
+        ))?;
+        let source = D3D11_BOX {
+            left: region.left as u32,
+            top: region.top as u32,
+            front: 0,
+            right: region.right as u32,
+            bottom: region.bottom as u32,
+            back: 1,
         };
         // After swapping, the spare buffer is the one that was just shown.
         let texture = spare.as_ref().map_or(texture, |(shown, _)| shown);
-        let (width, height) = (self.size.0 as usize, self.size.1 as usize);
+        // SAFETY: the validated box fits the source and matches the staging texture dimensions and format.
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&source))
+        };
+        Ok(Some(staging))
+    }
+
+    fn staging_texture(&self, size: (u32, u32)) -> Result<ID3D11Texture2D, RenderError> {
+        let mut cached = self.staging.borrow_mut();
+        if let Some((_, texture)) = cached.as_ref().filter(|(was, _)| *was == size) {
+            return Ok(texture.clone());
+        }
+        let (width, height) = size;
+        let mut staging = None;
+        // SAFETY: the texture description is valid and the output slot is writable.
+        unsafe {
+            self.device.CreateTexture2D(
+                &D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: FORMAT,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    ..Default::default()
+                },
+                None,
+                Some(&mut staging),
+            )?;
+        }
+        let staging = staging.expect("the call succeeded");
+        *cached = Some((size, staging.clone()));
+        Ok(staging)
+    }
+
+    fn read_staging(
+        &self,
+        readback: &ID3D11Texture2D,
+        width: usize,
+        height: usize,
+        bgra: bool,
+    ) -> Result<Vec<u8>, RenderError> {
         let mut pixels = vec![0u8; width * height * 4];
         // SAFETY: the mapped memory is at least `RowPitch` by `height` bytes until `Unmap`,
         // and the copy stays within both it and `pixels`.
         unsafe {
-            self.context.CopyResource(readback, texture);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
                 .Map(readback, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
@@ -1837,9 +2040,12 @@ impl Renderer {
                         .add(row * mapped.RowPitch as usize),
                     width * 4,
                 );
-                for (to, from) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
-                    // The texture is blue, green, red, alpha.
-                    to.copy_from_slice(&[from[2], from[1], from[0], from[3]]);
+                if bgra {
+                    target.copy_from_slice(source);
+                } else {
+                    for (to, from) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+                        to.copy_from_slice(&[from[2], from[1], from[0], from[3]]);
+                    }
                 }
             }
             self.context.Unmap(readback, 0);
@@ -1966,6 +2172,64 @@ impl Renderer {
         self.full_layer_targets = full;
         self.layer_target = None;
         self.known = false;
+    }
+
+    fn prepare_backdrop(&mut self, slot: usize, size: (u32, u32)) -> Result<(), RenderError> {
+        if self.backdrop_shader.is_none() {
+            // SAFETY: this is the shader built from `quad.hlsl` for this device.
+            unsafe { self.device.CreatePixelShader(BACKDROP_SHADER, None, Some(&mut self.backdrop_shader))?; }
+        }
+        if self.backdrop_targets[slot].as_ref().is_some_and(|target| target.size == size) {
+            return Ok(());
+        }
+        let mut texture = None;
+        let mut picture = None;
+        // SAFETY: each description is valid and the texture remains alive through its view.
+        unsafe {
+            self.device.CreateTexture2D(&D3D11_TEXTURE2D_DESC {
+                Width: size.0, Height: size.1, MipLevels: 1, ArraySize: 1,
+                Format: FORMAT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            }, None, Some(&mut texture))?;
+            self.device.CreateShaderResourceView(texture.as_ref().expect("created a texture"), None, Some(&mut picture))?;
+        }
+        self.backdrop_targets[slot] = Some(BackdropTarget {
+            size, texture: texture.expect("created a texture"), picture: picture.expect("created a view"),
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_backdrop(
+        &self, slot: usize, source: &ID3D11RenderTargetView, origin: (i32, i32),
+        clip: PixelRect, quad: &Quad, matrix: Option<Matrix>, index: u32,
+    ) -> Result<(), RenderError> {
+        let target = self.backdrop_targets[slot].as_ref().expect("prepared the backdrop target");
+        let shader = self.backdrop_shader.as_ref().expect("prepared the backdrop shader");
+        let (_, sampler) = self.image_pipeline.as_ref().expect("prepared the image sampler");
+        let (visible, sample) = backdrop_areas(quad, clip, matrix, origin, target.size);
+        if is_empty(visible) { return Ok(()); }
+        let copy = D3D11_BOX {
+            left: sample.left as u32, top: sample.top as u32, front: 0,
+            right: sample.right as u32, bottom: sample.bottom as u32, back: 1,
+        };
+        let context = &self.context;
+        // SAFETY: source and snapshot have the same dimensions and format. The input and output bindings are disjoint.
+        unsafe {
+            let drawn = source.GetResource()?;
+            context.OMSetRenderTargets(None, None);
+            context.PSSetShaderResources(1, Some(&[None]));
+            context.CopySubresourceRegion(&target.texture, 0, copy.left, copy.top, 0, &drawn, 0, Some(&copy));
+            context.OMSetRenderTargets(Some(&[Some(source.clone())]), None);
+            context.PSSetShader(shader, None);
+            context.PSSetSamplers(0, Some(&[Some(sampler.clone())]));
+            context.PSSetShaderResources(1, Some(&[Some(target.picture.clone())]));
+            context.RSSetScissorRects(Some(&[RECT { left: visible.left, top: visible.top, right: visible.right, bottom: visible.bottom }]));
+            context.DrawInstanced(4, 1, 0, index);
+            context.PSSetShaderResources(1, Some(&[None]));
+        }
+        Ok(())
     }
 
     fn make_layer_target(&mut self, needed: (u32, u32)) -> Result<(), RenderError> {
@@ -2557,20 +2821,10 @@ fn offscreen_target(
         BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
         ..Default::default()
     };
-    let (mut texture, mut readback, mut view) = (None, None, None);
+    let (mut texture, mut view) = (None, None);
     // SAFETY: the descriptions are valid for the calls.
     unsafe {
         device.CreateTexture2D(&description, None, Some(&mut texture))?;
-        device.CreateTexture2D(
-            &D3D11_TEXTURE2D_DESC {
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                ..description
-            },
-            None,
-            Some(&mut readback),
-        )?;
         let texture: &ID3D11Texture2D = texture.as_ref().expect("the call succeeded");
         device.CreateRenderTargetView(texture, None, Some(&mut view))?;
     }
@@ -2592,7 +2846,6 @@ fn offscreen_target(
     Ok((
         Target::Offscreen {
             texture: texture.expect("the call succeeded"),
-            readback: readback.expect("the call succeeded"),
             spare,
         },
         view.expect("the call succeeded"),

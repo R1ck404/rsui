@@ -8,6 +8,7 @@ use crate::value::Value;
 use crate::vm::{Args, Job, Run, Vm};
 
 mod buffer;
+pub(crate) mod file_stream;
 mod path;
 mod path_posix;
 mod path_win32;
@@ -275,6 +276,9 @@ pub(crate) fn file_natives(vm: &mut Vm) -> Value {
         ("statLater", 1, file_stat_later),
         ("readBytes", 1, file_read_bytes),
         ("readBytesLater", 1, file_read_bytes_later),
+        ("streamReader", 2, file_stream::create),
+        ("streamRead", 2, file_stream::read),
+        ("streamClose", 1, file_stream::close),
         ("writeBytes", 3, file_write_bytes),
         ("writeBytesLater", 3, file_write_bytes_later),
         ("copy", 2, file_copy),

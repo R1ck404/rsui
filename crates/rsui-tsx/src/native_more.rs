@@ -617,27 +617,55 @@ fn host_notification_dismiss(_: &mut Vm, _: Args) -> Result<Value, Value> {
     Ok(Value::UNDEFINED)
 }
 
-/// `windowCapture(id, action)`: a picture of what's in the window, told to `action` as `png ` and a PNG file's bytes as hex, or as
-/// `error ` and why not. It's taken once the window isn't being drawn, which it is while this runs. A window that's being
-/// checked rather than shown has nothing to take a picture of, as `shot` is for that.
+type CapturePixels = Result<(u32, u32, Vec<u8>), String>;
+thread_local! {
+    static CAPTURE_REQUESTS: std::cell::RefCell<std::collections::HashMap<u32, std::sync::mpsc::Sender<CapturePixels>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+static NEXT_CAPTURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// `windowCapture(id, x?, y?, w?, h?, raw?)`: base64 PNG, or BGRA bytes followed by the physical width and height.
 fn host_window_capture(vm: &mut Vm, args: Args) -> Result<Value, Value> {
-    let (id, action) = (number_at(vm, args, 0), number_at(vm, args, 1));
+    let id = number_at(vm, args, 0);
     if !real() {
         return Err(failed(vm, "there's no window shown to take a picture of here, which the `shot` step is for"));
     }
-    rsui::on_window_captured(|action, picture| {
-        let said = match picture {
-            Ok((width, height, pixels)) => {
-                let png = crate::png::encode_drawn(width as usize, height as usize, &pixels);
-                let hex: String = png.iter().map(|byte| format!("{byte:02x}")).collect();
-                format!("png {hex}")
-            }
-            Err(why) => format!("error {why}"),
-        };
-        bridge::fire_desktop_event(action, Some(said));
+    let request = NEXT_CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    CAPTURE_REQUESTS.with(|requests| requests.borrow_mut().insert(request, sender));
+    rsui::on_window_captured(|request, picture| {
+        if let Some(sender) = CAPTURE_REQUESTS.with(|requests| requests.borrow_mut().remove(&request)) {
+            let _ = sender.send(picture);
+        }
     });
-    rsui::change_window(rsui::WindowId(id), rsui::WindowChange::Capture(action));
-    Ok(Value::UNDEFINED)
+    let region = [1, 2, 3, 4].map(|index| args.get(vm, index).as_number());
+    let raw = args.get(vm, 5) == Value::TRUE;
+    let change = if raw {
+        rsui::WindowChange::CapturePixels(request, region)
+    } else if region.iter().all(|value| value.is_finite()) && region[2] > 0.0 && region[3] > 0.0 {
+        rsui::WindowChange::CaptureRegion(request, region)
+    } else {
+        rsui::WindowChange::Capture(request)
+    };
+    rsui::change_window(rsui::WindowId(id), change);
+    let receive = move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "The window did not supply a frame".to_owned())?
+    };
+    Ok(if raw {
+        vm.later_bytes(move || {
+            let (width, height, mut pixels) = receive()?;
+            pixels.extend_from_slice(&width.to_le_bytes());
+            pixels.extend_from_slice(&height.to_le_bytes());
+            Ok(pixels)
+        })
+    } else {
+        vm.later(move || {
+            let (width, height, pixels) = receive()?;
+            let png = crate::png::encode_drawn(width as usize, height as usize, &pixels);
+            Ok(Some(base64(&png)))
+        })
+    })
 }
 
 /// `updateConfirmHealthy()`: says this version of a packed program works, so it's kept rather than the one before it.
@@ -1049,9 +1077,8 @@ pub(crate) fn press_media_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `folderList(path)`: a promise of what's in a folder, a line for each thing: its name, then flags (1 a folder, 2 hidden,
-/// 4 the system's, 8 read-only, 16 a link), its size, and when it was changed and made, in milliseconds, with tabs between.
-/// No name can have a tab or a new line in it on Windows. It's only read, so it's real while an app's being checked too.
+/// `folderList(path)`: a name terminated by NUL, then flags, size, modified and created, separated by tabs.
+/// Only the numeric tail is newline-terminated, so tabs and newlines in a Unix filename stay intact.
 fn host_folder_list(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     use std::fmt::Write as _;
     let path = path_at(vm, args, 0);
@@ -1064,7 +1091,7 @@ fn host_folder_list(vm: &mut Vm, args: Args) -> Result<Value, Value> {
                 | u32::from(one.system) << 2
                 | u32::from(one.readonly) << 3
                 | u32::from(one.link) << 4;
-            let _ = writeln!(text, "{}\t{flags}\t{}\t{}\t{}", one.name, one.size, one.modified as i64, one.created as i64);
+            let _ = writeln!(text, "{}\0{flags}\t{}\t{}\t{}", one.name, one.size, one.modified as i64, one.created as i64);
         }
         Ok(Some(text))
     }))

@@ -107,6 +107,45 @@ mod partial {
             )
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn cropped_readback_matches_the_shown_buffer_after_resize_and_sync() {
+        let mut renderer = Renderer::offscreen_flipping(SIZE).unwrap();
+        let bounds = PixelRect {
+            left: 1,
+            top: 2,
+            right: 5,
+            bottom: 7,
+        };
+        for size in [SIZE, (21, 18), SIZE] {
+            renderer.resize(size).unwrap();
+            let quads = [super::solid(
+                [2.0, 1.0, 2.0, 4.0],
+                Color::hex(0xe16a32),
+                0.0,
+            )];
+            renderer.render(&mut scene_of(&quads, 40), CLEAR).unwrap();
+            renderer.wait_for_frame().unwrap();
+            let full = renderer.read_pixels().unwrap();
+            let mut expected = Vec::new();
+            for y in 2..7 {
+                let offset = (y * size.0 as usize + 1) * 4;
+                expected.extend_from_slice(&full[offset..offset + 16]);
+            }
+            assert_eq!(
+                renderer.read_offscreen_region(bounds, false).unwrap(),
+                expected
+            );
+            for pixel in expected.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            assert_eq!(
+                renderer.read_offscreen_region(bounds, true).unwrap(),
+                expected
+            );
+        }
+    }
+
     fn change() -> impl Strategy<Value = Change> {
         prop_oneof![
             3 => (any::<usize>(), -6.0f32..6.0, -6.0f32..6.0)
@@ -985,6 +1024,50 @@ fn drawn_with(root: &Node) -> Vec<u8> {
     renderer.read_pixels().unwrap()
 }
 
+#[test]
+fn backdrop_blur_softens_earlier_pixels_inside_the_card() {
+    let place = |element: Element, x: i64, y: i64| {
+        element.prop("position", "absolute").prop("left", x).prop("top", y)
+    };
+    let background = |left, color| place(block(Style::new().width(100.0).height(100.0), color), left, 0);
+    let make_tree = |right| {
+        let glass = Element::new(Role::Group).props(painted(
+            Style::new().width(24.0).height(48.0),
+            Paint::new().backdrop_blur(6.0).corner_radius(10.0),
+        ));
+        let mark = place(block(Style::new().width(4.0).height(6.0), WHITE), 98, 43);
+        Element::new(Role::Window)
+            .child(background(0, RED))
+            .child(background(100, right))
+            .child(place(glass, 88, 26))
+            .child(mark)
+            .into_node()
+    };
+    let mut fixture = Fixture::new();
+    let mut renderer = Renderer::offscreen(WINDOW).unwrap();
+    let mut check = |renderer: &mut Renderer| {
+        renderer.render(fixture.scene(&make_tree(BLUE), 1.0), WHITE).unwrap();
+        let pixels = renderer.read_pixels().unwrap();
+        let red = pixel_at(&pixels, 99, 20);
+        let blue = pixel_at(&pixels, 100, 20);
+        let mixed = pixel_at(&pixels, 99, 55);
+        assert_eq!(pixel_at(&pixels, 99, 45), [255; 3], "a later foreground stays sharp");
+        assert_eq!(pixel_at(&pixels, 88, 27), red, "the rounded corner stays outside the blur");
+        assert_ne!(red, blue);
+        assert!(mixed[0] > 30 && mixed[2] > 30, "both sides contribute to {mixed:?}");
+
+        renderer.render(fixture.scene(&make_tree(WHITE), 1.0), WHITE).unwrap();
+        let changed = renderer.read_pixels().unwrap();
+        assert_ne!(pixel_at(&changed, 99, 55), mixed, "the snapshot refreshes as the backdrop changes");
+    };
+    check(&mut renderer);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(mut vulkan) = Renderer::offscreen_vulkan(WINDOW) {
+        check(&mut vulkan);
+        assert_eq!(Renderer::vulkan_validation_errors(), 0);
+    }
+}
+
 /// Something square in the middle of the window, as it's described by these.
 fn square_with(name: &str, value: impl Into<PropValue>) -> Node {
     let root = Element::new(Role::Window)
@@ -1177,6 +1260,35 @@ fn what_scrolls_inside_something_resized_is_still_cut_off_at_its_edges() {
         TURNED_WHITE,
         "past where it's cut off"
     );
+}
+
+#[test]
+fn a_scrollbar_thumb_with_a_size_can_be_a_pill_with_room_round_it() {
+    // What CSS's `::-webkit-scrollbar-thumb` says with `border-radius` and a transparent `border`: a 12 wide bar, its thumb 3 in
+    // from every side of it, and as round as there's room for.
+    let root: Node = Element::new(Role::Window)
+        .props(painted(Style::new(), Paint::new().background(WHITE)))
+        .child(
+            Element::new(Role::Group)
+                .props(painted(
+                    Style::new().width(40.0).height(60.0).scroll_y(0.0),
+                    Paint::new(),
+                ))
+                .prop("scrollbar_size", 12.0)
+                .prop("scrollbar_inset", 3.0)
+                .prop("scrollbar_radius", 999.0)
+                .prop("scrollbar_thumb", 0x0000_FFFF_i64)
+                .child(block(Style::new().width(40.0).height(300.0), WHITE)),
+        )
+        .into_node();
+    let pixels = drawn_with(&root);
+    let blue = [0, 0, 255];
+    // The thumb is 24 long, from 3 down to 27, and 6 across, from 31 to 37.
+    assert_eq!(pixel_at(&pixels, 34, 15), blue, "its middle");
+    assert_eq!(pixel_at(&pixels, 29, 15), TURNED_WHITE, "room between it and the bar's edge");
+    assert_eq!(pixel_at(&pixels, 38, 15), TURNED_WHITE, "room between it and the side");
+    assert_eq!(pixel_at(&pixels, 34, 1), TURNED_WHITE, "room above it");
+    assert_eq!(pixel_at(&pixels, 31, 3), TURNED_WHITE, "its corner is cut away");
 }
 
 /// Resource mutations must be compared using two independent, persistent GPU histories.

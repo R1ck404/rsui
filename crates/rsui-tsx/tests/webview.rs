@@ -120,6 +120,31 @@ fn what_the_page_does_reaches_the_app() {
 }
 
 #[test]
+fn a_view_updates_its_kept_keys_without_loading_the_page_again() {
+    let file = app(
+        "remap",
+        r#"
+        import { useState } from 'react';
+        import { PageWindow } from 'rsui/web';
+
+        export default function App() {
+            const [key, setKey] = useState('Ctrl+T');
+            return (
+                <PageWindow>
+                    <button onClick={() => setKey('Ctrl+K')}>Remap</button>
+                    <webview src="https://example.com/start" keys={[key]} onKey={(k) => console.log('kept ' + k.name)} />
+                </PageWindow>
+            );
+        }
+        "#,
+    );
+    let said = works(&file, "webview key ctrl+t; click Remap; webview key ctrl+t; webview key ctrl+k");
+    assert_eq!(said.matches("kept Ctrl+T").count(), 1, "{said}");
+    assert_eq!(said.matches("kept Ctrl+K").count(), 1, "{said}");
+    assert_eq!(said.matches("it would load https://example.com/start").count(), 1, "{said}");
+}
+
+#[test]
 fn a_computer_without_webview2_is_told_what_to_do() {
     let file = app("missing", BROWSER);
     let said = works(&file, "webview unavailable");

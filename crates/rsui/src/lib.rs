@@ -48,6 +48,8 @@ pub mod desktop;
 pub mod desktop;
 pub mod dialogs;
 pub mod popups;
+pub mod pty;
+pub mod video;
 mod dock;
 #[cfg(windows)]
 mod drop;

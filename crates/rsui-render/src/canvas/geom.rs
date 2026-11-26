@@ -110,6 +110,17 @@ pub struct ArcPoints {
     pub out: f32,
 }
 
+/// A whole circle in a path, on the canvas: its points from `first` to `last`, as an arc all the way round under a transform
+/// that only moves, turns and resizes left them. A fill that's only circles that don't touch can work out each one's cover from
+/// how far each pixel is from its center, rather than from its lines (see `Path::circles`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Circle {
+    pub first: u32,
+    pub last: u32,
+    pub center: (f32, f32),
+    pub radius: f32,
+}
+
 /// A path, as lines from point to point on the canvas.
 #[derive(Debug, Clone, Default)]
 pub struct Path {
@@ -117,6 +128,8 @@ pub struct Path {
     pub subpaths: Vec<Subpath>,
     /// Where arcs' points are, for what draws them on the arc instead.
     pub arcs: Vec<ArcPoints>,
+    /// The whole circles in it.
+    pub circles: Vec<Circle>,
     /// Whether the last subpath is still being added to, which `moveTo` or `closePath` ends.
     open: bool,
 }
@@ -126,7 +139,109 @@ impl Path {
         self.points.clear();
         self.subpaths.clear();
         self.arcs.clear();
+        self.circles.clear();
         self.open = false;
+    }
+
+    /// The circles it's made of, as `(x, y, radius)` on the canvas, if every part of it with an inside is one whole circle, no
+    /// two of them come within a pixel and a half of each other, and none is less than a pixel across. Filled, each covers its
+    /// own pixels and no other's, whichever rule the fill goes by.
+    pub fn circles(&self, out: &mut Vec<(f32, f32, f32)>) -> bool {
+        out.clear();
+        if self.circles.is_empty() {
+            return false;
+        }
+        let mut next = 0;
+        for sub in &self.subpaths {
+            if sub.end - sub.start <= 1 {
+                continue;
+            }
+            // The circle whose last point is this subpath's, with nothing before its first but where it starts.
+            while next < self.circles.len() && self.circles[next].last < sub.end - 1 {
+                next += 1;
+            }
+            let Some(circle) = self.circles.get(next) else {
+                return false;
+            };
+            if circle.last != sub.end - 1 || circle.first < sub.start || circle.radius < 1.0 {
+                return false;
+            }
+            let start = self.points[circle.first as usize];
+            if self.points[sub.start as usize..circle.first as usize].iter().any(|p| *p != start) {
+                return false;
+            }
+            out.push((circle.center.0, circle.center.1, circle.radius));
+        }
+        if out.is_empty() {
+            return false;
+        }
+        // None near another: by their left edges, each against those whose left edge is before its right one.
+        let mut order: Vec<usize> = (0..out.len()).collect();
+        order.sort_by(|a, b| (out[*a].0 - out[*a].2).total_cmp(&(out[*b].0 - out[*b].2)));
+        for (k, &i) in order.iter().enumerate() {
+            let (x, y, r) = out[i];
+            for &j in &order[k + 1..] {
+                let (x2, y2, r2) = out[j];
+                if x2 - r2 > x + r + 1.5 {
+                    break;
+                }
+                let reach = r + r2 + 1.5;
+                if (x2 - x) * (x2 - x) + (y2 - y) * (y2 - y) < reach * reach {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The rectangles it's made of, as `[x0, y0, x1, y1]` on the canvas, if every part of it with an inside is one whose sides go
+    /// across and down, and no two share a pixel. Filled, each covers its own pixels and no other's, whichever rule the fill goes
+    /// by, so each can be laid on by itself. Checked in one pass, so only for rectangles that come in order: by the row they
+    /// start on, and along it from the left, as a grid of dots is made.
+    pub fn rects(&self, out: &mut Vec<[f32; 4]>) -> bool {
+        out.clear();
+        // The row of pixels each began and ended on (the same two for every rectangle of a row), and the last pixel any has covered.
+        let mut band = (f32::NAN, f32::NAN);
+        let mut below = i32::MIN;
+        let mut right = i32::MIN;
+        for (points, _) in self.each() {
+            if points.len() <= 1 {
+                continue;
+            }
+            if points.len() != 4 {
+                return false;
+            }
+            let (xs, ys) = ([points[0].0, points[1].0, points[2].0, points[3].0], [points[0].1, points[1].1, points[2].1, points[3].1]);
+            let axis = (xs[0] == xs[1] && ys[1] == ys[2] && xs[2] == xs[3] && ys[3] == ys[0])
+                || (ys[0] == ys[1] && xs[1] == xs[2] && ys[2] == ys[3] && xs[3] == xs[0]);
+            if !axis {
+                return false;
+            }
+            let rect = [xs[0].min(xs[2]), ys[0].min(ys[2]), xs[0].max(xs[2]), ys[0].max(ys[2])];
+            // Rectangles that are far off, or empty, aren't worth being careful about.
+            if !rect.iter().all(|v| v.abs() < 1.0e7) || rect[2] <= rect[0] || rect[3] <= rect[1] {
+                return false;
+            }
+            let (left, top) = (rect[0].floor() as i32, rect[1].floor() as i32);
+            let (end, bottom) = (rect[2].ceil() as i32, rect[3].ceil() as i32);
+            if band == (rect[1], rect[3]) {
+                // Along the same row: past the last one's pixels.
+                if left < right {
+                    return false;
+                }
+                right = end;
+            } else {
+                // A new row: below every pixel any before has covered.
+                if top < below {
+                    return false;
+                }
+                band = (rect[1], rect[3]);
+                right = end;
+            }
+            below = below.max(bottom);
+            out.push(rect);
+        }
+        out.len() > 1
     }
 
     /// Its points, with those between each arc's ends put back on the arc, as a stroke a pixel wide is drawn through them.
@@ -285,6 +400,13 @@ impl Path {
         // Each point is the last turned by the same angle, which needs no sine or cosine of its own.
         let (step_sin, step_cos) = (sweep / steps as f32).sin_cos();
         let (mut sin, mut cos) = start.sin_cos();
+        // Where its first point is, and whether it's a whole circle that stays one on the canvas.
+        let starts = self.points.len() as u32 - 1;
+        let round = radii.0 == radii.1
+            && radii.0 > 0.0
+            && sweep.abs() >= std::f32::consts::TAU - 1e-4
+            && (m.a - m.d).abs() <= 1e-6 * m.a.abs().max(1.0)
+            && (m.b + m.c).abs() <= 1e-6 * m.b.abs().max(1.0);
         let first = self.points.len() as u32;
         for _ in 1..steps {
             (sin, cos) = (sin * step_cos + cos * step_sin, cos * step_cos - sin * step_sin);
@@ -296,6 +418,10 @@ impl Path {
             self.arcs.push(ArcPoints { start: first, end, center: m.apply(center.0, center.1), out });
         }
         self.line_to(point(start + sweep));
+        if round {
+            let last = self.points.len() as u32 - 1;
+            self.circles.push(Circle { first: starts, last, center: m.apply(center.0, center.1), radius: radii.0 * m.scale() });
+        }
     }
 
     /// `arcTo()`: a line to where the arc starts, and the arc that turns from one line to the other, in user space.
@@ -349,6 +475,26 @@ impl Path {
     /// A rectangle, as its own closed subpath, as `rect()` adds it.
     pub fn rect(&mut self, m: &Matrix, x: f32, y: f32, w: f32, h: f32) {
         if ![x, y, w, h].iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let corners = [m.apply(x, y), m.apply(x + w, y), m.apply(x + w, y + h), m.apply(x, y + h)];
+        if corners.iter().all(|c| c.0.is_finite() && c.1.is_finite()) {
+            // The same as a moveTo, three lineTos and a close, and the moveTo after it, as one: a lone point from a moveTo is
+            // replaced, as a moveTo does it.
+            if self.open
+                && let Some(last) = self.subpaths.last()
+                && last.end - last.start == 1
+            {
+                self.points.truncate(last.start as usize);
+                self.subpaths.pop();
+            }
+            let at = self.points.len() as u32;
+            self.points.extend_from_slice(&corners);
+            // After a rect, the path is at its first corner, in a new subpath.
+            self.points.push(corners[0]);
+            self.subpaths.push(Subpath { start: at, end: at + 4, closed: true });
+            self.subpaths.push(Subpath { start: at + 4, end: at + 5, closed: false });
+            self.open = true;
             return;
         }
         self.move_to(m.apply(x, y));

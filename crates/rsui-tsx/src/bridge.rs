@@ -46,6 +46,7 @@ const DESKTOP_UPDATES: &str = include_str!("desktop/updates.js");
 const DESKTOP_MORE: &str = include_str!("desktop/more.js");
 const DESKTOP_PICTURES: &str = include_str!("desktop/pictures.js");
 const DESKTOP_MEDIA: &str = include_str!("desktop/media.js");
+const DESKTOP_PTY: &str = include_str!("desktop/pty.js");
 /// `native` from `rsui`, the system's own popups, loaded the first time it's used: see `popups.rs`.
 const NATIVE_POPUPS: &str = include_str!("native_popups.js");
 /// The browser's names for what `rsui/desktop` does, for code written for a page.
@@ -1233,6 +1234,7 @@ pub(crate) const HOST_MODULES: &[(&str, &str)] = &[
     ("rsui/desktop/more", DESKTOP_MORE),
     ("rsui/desktop/pictures", DESKTOP_PICTURES),
     ("rsui/desktop/media", DESKTOP_MEDIA),
+    ("rsui/desktop/pty", DESKTOP_PTY),
     ("rsui/native", NATIVE_POPUPS),
     ("rsui/web-routes", WEB_ROUTES),
     ("rsui/dom-globals", DOM_GLOBALS),
@@ -1353,6 +1355,8 @@ fn set_up_layer(engine: &mut Engine) -> Result<Internals, String> {
         .chain(crate::native::FUNCTIONS)
         .chain(crate::native_more::FUNCTIONS)
         .chain(crate::native_more::MORE_FUNCTIONS)
+        .chain(crate::native_pty::FUNCTIONS)
+        .chain(crate::native_video::FUNCTIONS)
         .chain(crate::geometry::FUNCTIONS)
         .chain(crate::why::FUNCTIONS)
         .chain(crate::webview::FUNCTIONS)

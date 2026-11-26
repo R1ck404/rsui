@@ -29,8 +29,12 @@ pub fn ceil(x: f32) -> f32 {
 /// How many cells a band has at most, which is what's kept between shapes.
 const BAND_CELLS: usize = 1 << 20;
 /// How many cells across each mark says a line touched, so that a row a shape crosses far apart, as a wavy line's does, is
-/// only added up where lines are.
-const CHUNK: usize = 32;
+/// only added up where lines are. Small enough that a path of many small shapes, as a field of dots is, hands out each dot's
+/// part of a row and not the whole row between them.
+const CHUNK: usize = 8;
+/// Less than this much of a pixel covered is none of it, as it comes to 0 of 255: what's left of the sum after a shape is closed
+/// is often a little off 0, and taken as nothing the row can be handed out in parts again.
+const NOTHING: f32 = 1.0 / 512.0;
 
 /// A rectangle of whole pixels, from `x0, y0` up to but not including `x1, y1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +206,9 @@ impl Rasterizer {
                                 *cell = 0.0;
                                 *out = cover(total);
                             }
-                        } else if total == 0.0 {
+                        } else if total.abs() < NOTHING {
+                            // Nothing of these pixels is covered: the part handed out ends here. The sum goes on as it is,
+                            // so what comes after is the same as adding every cell up.
                             if let Some(at) = from.take() {
                                 each(top + r as i32, reach.x0 + at as i32, &self.row[..c - at]);
                             }
@@ -408,8 +414,9 @@ mod tests {
                 expected[y as usize * 700 + x as usize..][..row.len()].copy_from_slice(row);
             });
             assert!(handed < 700 * 30, "{handed}");
+            // The same, but for what's left of the sum where a shape closed, which comes to nothing of a pixel either way.
             for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
-                assert_eq!(a.to_bits(), b.to_bits(), "{even_odd} at {i}: {a} {b}");
+                assert!(a.to_bits() == b.to_bits() || (*a < NOTHING && *b < NOTHING), "{even_odd} at {i}: {a} {b}");
             }
         }
     }

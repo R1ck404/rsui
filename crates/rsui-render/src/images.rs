@@ -3,11 +3,11 @@
 //! The pixels of an image only exist on the GPU, as there's no need for a second copy. If the GPU is
 //! let go of, or the image is needed at another size, it's simply read again from its file.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rsui_core::Text;
@@ -57,6 +57,36 @@ fn built_in_bytes(source: &str) -> Option<&'static [u8]> {
     built_in().lock().ok()?.get(source).copied()
 }
 
+/// An encoded image kept in memory for the lifetime of this handle. The name can be used as an
+/// image source, including in CSS. A decode already in flight keeps the bytes until it finishes.
+pub struct MemoryImage(String);
+
+type MemoryImages = Mutex<HashMap<String, Arc<Vec<u8>>>>;
+
+fn memory_images() -> &'static MemoryImages {
+    static IMAGES: OnceLock<MemoryImages> = OnceLock::new();
+    IMAGES.get_or_init(Mutex::default)
+}
+
+impl MemoryImage {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let name = format!("rsui-image:{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        memory_images().lock().expect("image registry").insert(name.clone(), Arc::new(bytes));
+        Self(name)
+    }
+
+    pub fn source(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for MemoryImage {
+    fn drop(&mut self) {
+        memory_images().lock().expect("image registry").remove(&self.0);
+    }
+}
+
 /// Where a path that doesn't say where it's from is from.
 static FILES_FROM: OnceLock<PathBuf> = OnceLock::new();
 
@@ -72,16 +102,19 @@ fn file_of(source: &str) -> PathBuf {
     }
 }
 
-fn read_all(source: &str) -> Option<Cow<'static, [u8]>> {
-    // What's drawn at a size of its own is read from where it's from.
+fn with_bytes<T>(source: &str, read: impl FnOnce(&[u8]) -> T) -> Option<T> {
     let source = source.split_once(DRAWN_AT).map_or(source, |(from, _)| from);
+    if source.starts_with("rsui-image:") {
+        let bytes = memory_images().lock().ok()?.get(source)?.clone();
+        return Some(read(&bytes));
+    }
     if let Some(bytes) = built_in_bytes(source) {
-        return Some(Cow::Borrowed(bytes));
+        return Some(read(bytes));
     }
     if let Some(bytes) = data_url(source) {
-        return Some(Cow::Owned(bytes));
+        return Some(read(&bytes));
     }
-    rsui_text::read_file(&file_of(source)).ok().map(Cow::Owned)
+    Some(read(&rsui_text::read_file(&file_of(source)).ok()?))
 }
 
 /// What separates where a picture drawn at a size of its own is from, and that size, in what it's kept by.
@@ -177,8 +210,8 @@ fn read_size(source: &str) -> Option<Found> {
             shape_only: false,
         })
     };
-    if source.starts_with("data:") || source.ends_with(".svg") || source.contains(".svg?") {
-        return pixels(&read_all(source)?);
+    if source.starts_with("rsui-image:") || source.starts_with("data:") || source.ends_with(".svg") || source.contains(".svg?") {
+        return with_bytes(source, pixels)?;
     }
     match read_pixel_size(source) {
         Some(size) => Some(Found {
@@ -187,7 +220,7 @@ fn read_size(source: &str) -> Option<Found> {
             shape_only: false,
         }),
         // Not made of pixels, or not of a kind that's known, which could be an SVG by any name.
-        None => pixels(&read_all(source)?),
+        None => with_bytes(source, pixels)?,
     }
 }
 
@@ -247,20 +280,19 @@ struct Finished {
 
 /// Reads an image, as an animation if it's one and they're wanted.
 pub(crate) fn read_image(source: &str, target: (u32, u32), animations: bool) -> Loaded {
-    let Some(bytes) = read_all(source) else {
-        return Loaded::Failed;
-    };
-    if crate::svg_image::is_svg(&bytes) {
-        return crate::svg_image::draw_svg(&bytes, target).map_or(Loaded::Failed, Loaded::Picture);
-    }
-    if animations && is_animated(&bytes) {
-        if let Ok(animation) = decode_animation(&bytes, target) {
-            if animation.frames.len() > 1 {
-                return Loaded::Animation(animation);
+    with_bytes(source, |bytes| {
+        if crate::svg_image::is_svg(bytes) {
+            return crate::svg_image::draw_svg(bytes, target).map_or(Loaded::Failed, Loaded::Picture);
+        }
+        if animations && is_animated(bytes) {
+            if let Ok(animation) = decode_animation(bytes, target) {
+                if animation.frames.len() > 1 {
+                    return Loaded::Animation(animation);
+                }
             }
         }
-    }
-    decode(&bytes, target).map_or(Loaded::Failed, Loaded::Picture)
+        decode(bytes, target).map_or(Loaded::Failed, Loaded::Picture)
+    }).unwrap_or(Loaded::Failed)
 }
 
 #[derive(Default)]
@@ -988,7 +1020,7 @@ impl Images {
         }
         // What was drawn at a size of its own is kept only while it's shown, as there's one for each size.
         self.entries.retain(|source, entry| {
-            !(source.contains(DRAWN_AT) && entry.on_gpu.is_none() && entry.reading.is_none())
+            !((source.contains(DRAWN_AT) || source.starts_with("rsui-image:")) && entry.on_gpu.is_none() && entry.reading.is_none())
         });
     }
 
@@ -1015,6 +1047,17 @@ impl Images {
     pub fn gpu_bytes(&self) -> usize {
         self.gpu_bytes
     }
+}
+
+#[test]
+fn a_memory_image_can_be_read_only_while_its_owner_keeps_it() {
+    let image = MemoryImage::new(br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="5"><rect width="4" height="5" fill="red"/></svg>"#.to_vec());
+    let source = image.source().to_owned();
+    assert_eq!(image_size(&source), Some((4, 5)));
+    assert!(matches!(read_image(&source, (4, 5), false), Loaded::Picture(_)));
+    drop(image);
+    assert_eq!(image_size(&source), None);
+    assert!(matches!(read_image(&source, (4, 5), false), Loaded::Failed));
 }
 
 #[cfg(test)]

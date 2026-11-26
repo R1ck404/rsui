@@ -148,6 +148,34 @@ fn pointer_capture_keeps_the_pointer_until_the_button_comes_up() {
     hands.wait_for("log gotpointercapture:grab pointerup:grab lostpointercapture:grab click:grab");
 }
 
+#[test]
+fn releasing_capture_in_pointer_up_notifies_after_bubbling() {
+    let before = r#"function Capture() {
+    const [log, setLog] = React.useState([]);
+    const note = (what) => setLog((was) => [...was, what]);
+    React.useEffect(() => {
+        for (const type of ['pointerup', 'lostpointercapture', 'click']) {
+            window.addEventListener(type, (event) => note(type + ':' + event.target.id));
+        }
+    }, []);
+    return <dom.div>
+        <dom.div id="grab" className="box"
+            onPointerDown={(e) => e.currentTarget.setPointerCapture(e.pointerId)}
+            onPointerUp={(e) => {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+                note('captured:' + e.currentTarget.hasPointerCapture(e.pointerId));
+            }}>grab</dom.div>
+        <dom.div className="box">other</dom.div>
+        <dom.div>{'log ' + log.join(' ')}</dom.div>
+    </dom.div>;
+}"#;
+    let mut hands = open("release-on-up", ".box { width: 100px; height: 40px; }", before, "<Capture />", (400, 300));
+    hands.down_at(20.0, 20.0);
+    hands.move_at(20.0, 60.0);
+    hands.up_at(20.0, 60.0);
+    hands.wait_for("log captured:false pointerup:grab lostpointercapture:grab click:grab");
+}
+
 /// An animation that's played to its end isn't played again because what it's on is made again with the same animation, as CSS
 /// has it: a drawer that's pressed (and re-rendered) stays where its slide-in left it.
 #[test]

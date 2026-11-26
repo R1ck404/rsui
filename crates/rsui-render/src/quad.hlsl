@@ -281,6 +281,28 @@ Drawn image_ps(Pixel input) {
     return drawn(image_color(input) * round_clips_cover(input));
 }
 
+Drawn backdrop_ps(Pixel input) {
+    uint width, height;
+    picture.GetDimensions(width, height);
+    float2 size = float2(width, height);
+    float step = min(input.shape.w * sharpness, 4096.0) * 0.75;
+    // Normalized Gaussian weights for samples spaced three quarters of a standard deviation apart.
+    const float weights[4] = { 0.30131, 0.22743, 0.09782, 0.024095 };
+    float4 color = 0;
+    [unroll] for (int y = -3; y <= 3; ++y) {
+        [unroll] for (int x = -3; x <= 3; ++x) {
+            float2 at = (input.position.xy + float2(x, y) * step) / size;
+            color += picture.SampleLevel(smooth, at, 0) * (weights[abs(x)] * weights[abs(y)]);
+        }
+    }
+    float coverage = rounded_cover(input.local, input.shape.xy, input.shape.z) * round_clips_cover(input);
+    Drawn result;
+    result.color = color * coverage;
+    // The blurred premultiplied pixel replaces the backdrop, including its alpha.
+    result.cover = coverage.xxxx;
+    return result;
+}
+
 Drawn ps(Pixel input) {
     // A glyph with a byte for each part of each pixel, of which this reads the middle one, with the others on either side.
     // A browser doesn't do this through a filter either.

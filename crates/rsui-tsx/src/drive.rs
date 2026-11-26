@@ -149,8 +149,7 @@ impl Open {
         // Waiting for the GPU to finish, as showing a frame in a window does: offscreen, nothing else holds the frames back,
         // and the driver would queue up hundreds of them.
         renderer
-            .read_pixels()
-            .map(|_| ())
+            .wait_for_frame()
             .map_err(|error| error.to_string())
     }
 
@@ -1184,6 +1183,23 @@ impl Desk {
                 );
                 let (heap, allocated, committed) = crate::process_memory::process_heap();
                 println!("  process heap: {heap}, {allocated} B allocated, {committed} B committed");
+                #[cfg(feature = "render-diagnostics")]
+                {
+                    let (canvases, pixels) = rsui::render::canvas::surface_storage();
+                    println!("  canvas: {canvases} live surfaces, {pixels} B CPU pixel capacity");
+                    for one in &self.windows {
+                        let painter = one.app.render_storage();
+                        println!("  painter: {} B estimated texture payload, {} B pending image payload capacity, {} atlas entries",
+                            painter.image_payload_estimate, painter.image_payload.capacity_bytes, painter.atlas.entries);
+                        #[cfg(windows)]
+                        if let Some(renderer) = &one.renderer {
+                            let storage = renderer.retained_storage();
+                            println!("  renderer: {} B quad buffer, {} B atlas, {} B opacity layer, {} images",
+                                storage.quad_buffer_capacity_bytes, storage.atlas_capacity_bytes,
+                                storage.layer_target_capacity_bytes, storage.image_entries);
+                        }
+                    }
+                }
                 let (memory, footprint, collections) = bridge::engine_memory();
                 println!(
                     "  engine: objects {} B, strings {} B, shapes {} B, code {} B, stack {} B, {} collections",
@@ -1740,6 +1756,10 @@ impl Desk {
                 crate::native::second_instance(&words)?;
             }
             ("power", [what]) => crate::native::power(&what.text)?,
+            ("pty", words) if !words.is_empty() => {
+                let words: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
+                crate::native_pty::step(&words)?;
+            }
             ("webview", words) if !words.is_empty() => {
                 let words: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
                 crate::webview::step(&words)?;
@@ -1772,11 +1792,19 @@ impl Desk {
                 };
                 let size = (number(width)?, number(height)?);
                 let one = self.here_mut()?;
-                one.size = size;
-                let _ = one.app.feed(&Input::Resize { width: size.0, height: size.1, scale: 1.0 });
-                // It's a new size of picture to draw to.
-                if one.renderer.take().is_some() {
-                    one.app.renderer_replaced();
+                if size != one.size {
+                    if let Some(renderer) = &mut one.renderer
+                        && let Err(error) = renderer.resize(size)
+                    {
+                        // A failed buffer replacement may have released the old view.
+                        // Keep the old logical size and recreate the renderer on the next draw.
+                        one.renderer = None;
+                        one.app.renderer_replaced();
+                        return Err(error.to_string());
+                    }
+                    one.size = size;
+                    one.app.feed(&Input::Resize { width: size.0, height: size.1, scale: 1.0 })
+                        .map_err(|error| error.to_string())?;
                 }
             }
             ("rects", [file]) => {
@@ -2237,7 +2265,7 @@ fn print_split() {
     println!("  split {}", parts.join(" "));
 }
 
-pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"ANSWER\" (what the next dialog or popup gets: a path, a button, a sheet's option or its number, a day as 2026-11-21, a time as 14:05), dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide, record on|off (sample where JavaScript is, for save). A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT. For what a web page in a <WebView> would do: webview load URL, webview inpage URL, webview fail URL [CODE], webview title TEXT, webview popup URL, webview key KEYS, webview fullscreen on|off, webview message JSON, webview close, webview crash, webview unavailable";
+pub(crate) const STEPS: &str = "The steps are: look, click TARGET [ctrl] [shift] [alt] [win], drag TARGET FROM TO [STEPS], dragto TARGET TARGET [STEPS], glide TARGET X0 Y0 X1 Y1 MOVES PER_SECOND [WATCH], dropfiles TARGET PATH..., droptext TARGET TEXT, rightclick TARGET, middleclick TARGET, hover TARGET, move TARGET, type TARGET TEXT, write TEXT, compose TEXT, press KEY [TARGET], scroll TARGET ROWS, wheelat X Y ROWS, spin X Y ROWS COUNT EVERY_MS, burst move|down|up|dblclick X Y [wheel X Y ROWS]..., act TARGET ACTION [INPUT], expect [no] \"TEXT\", wait MILLISECONDS, wait [no] \"TEXT\" [MILLISECONDS], window ID, window \"TITLE\", close, dialog \"ANSWER\" (what the next dialog or popup gets: a path, a button, a sheet's option or its number, a day as 2026-11-21, a time as 14:05), dialog cancel, size WIDTH HEIGHT, animations on|off (transitions and CSS animations play from that step on; off unless a step says, so shots come out the same), active on|off, shown on|off, shot FILE, rects FILE, clickat X Y [ctrl] [shift] [alt] [win], rightclickat X Y, hoverat X Y, moveat X Y, downat X Y, upat X Y, clicksat X Y CLICKS, wheel [X Y] DX DY (where X Y can be css:SELECTOR for a page's element, or left out for where the pointer is), eval \"CODE\", evalto FILE \"CODE\", waitjs \"CODE\" [MILLISECONDS], shots FOLDER MILLISECONDS [EVERY], settle MILLISECONDS|default. To see why things render: why TARGET, frames, profile, save FILE.rsuitrace, history, goto CHANGE, logpoint FILE:LINE \"EXPRESSION\", logpoint off FILE:LINE|all, logpoints, break FILE:LINE, break off FILE:LINE|all, breakpoints, inspect on|off|show|hide, record on|off (sample where JavaScript is, for save). A target is #key, @path, or \"text\" it's called. For what the desktop would do: global KEYS, tray [ITEM], menubar ITEM, popup ITEM, thumb BUTTON, media KEY, notification, soundends, secondinstance [ARGUMENT...], power WHAT. For what a web page in a <WebView> would do: webview load URL, webview inpage URL, webview fail URL [CODE], webview title TEXT, webview popup URL, webview key KEYS, webview fullscreen on|off, webview message JSON, webview close, webview crash, webview unavailable. For what a program in a pty would do: pty out [N] TEXT (as it printed it, with \\e \\r \\n), pty exit [N] [CODE], pty written [N] [clear], pty size [N], pty list";
 
 /// A word of a step, with whether it was in quotes, which is what makes `"#1"` some text rather than a key.
 #[derive(Debug, Clone)]
@@ -2439,6 +2467,32 @@ pub(crate) fn run_steps(path: &Path, stack_limit: usize, steps: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_target_resize_leaves_the_original_window_drawable() {
+        std::thread::Builder::new()
+            .stack_size(crate::STACK)
+            .spawn(|| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/apps/bridge_list.tsx");
+                let mut desk = Desk::open(&path, crate::STACK / 8 * 7, (400, 300)).unwrap();
+                let size = desk.here().unwrap().size;
+                let before = desk.here_mut().unwrap().draw().unwrap();
+                // WARP permits unusually wide single-row textures. Use a hardware
+                // device here to exercise a real allocation failure without a large buffer.
+                let Ok(hardware) = Renderer::offscreen_on_hardware(size) else { return; };
+                let window = desk.here_mut().unwrap();
+                window.renderer = Some(hardware);
+                window.app.renderer_replaced();
+                window.draw().unwrap();
+                assert!(desk.run("size 65536 1").is_err());
+                assert_eq!(desk.here().unwrap().size, size);
+                assert_eq!(desk.here_mut().unwrap().draw().unwrap(), before);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn read(text: &str) -> Vec<Vec<(String, bool)>> {
         parse_steps(text)

@@ -335,6 +335,55 @@ fn local_storage_and_storage_are_one_store_and_each_hears_the_other() {
 }
 
 #[test]
+fn storage_reuses_identical_commits_preserves_mutable_reads_and_recovers_from_failed_writes() {
+    let file = checks(
+        "storage-commits",
+        "import { storage } from 'rsui/desktop'; import fs from 'fs';",
+        r#"
+        const path = process.env.RSUI_STORAGE_FILE;
+        const read = () => JSON.parse(fs.readFileSync(path, 'utf8'));
+        const write = fs.writeFileSync;
+        let writes = 0;
+        fs.writeFileSync = (...args) => { writes++; return write(...args); };
+        const events = [];
+        storage.set('prefs', { width: 2 });
+        storage.onChange(({key, value}) => {
+            events.push(key);
+            if (key === 'shared') value.fromListener = true;
+        });
+        storage.set('prefs', { width: 2 });
+        if (writes !== 1 || events.length !== 1) throw Error('identical write or missed event');
+        storage.get('prefs').width = 3;
+        storage.set('shared', {});
+        if (read().prefs.width !== 3) throw Error('lost a mutation through get');
+        storage.set('count', 1);
+        if (!read().shared.fromListener) throw Error('lost a mutation through the listener');
+        const rename = fs.renameSync;
+        fs.renameSync = () => { throw Error('simulated rename failure'); };
+        try { storage.set('count', 9); } catch {}
+        fs.renameSync = rename;
+        if (storage.get('count') !== 1 || read().count !== 1) throw Error('partial commit published');
+        storage.set('count', 9);
+        if (read().count !== 9) throw Error('retry lost update');
+        const replaced = read();
+        replaced.count = 0;
+        write(path, JSON.stringify(replaced));
+        storage.set('count', 9);
+        if (read().count !== 9) throw Error('same-sized external replacement won');
+        storage.get('prefs').toJSON = (key) => key;
+        storage.set('__proto__', 'ordinary key');
+        const document = read();
+        if (document.prefs !== 'prefs' || document['__proto__'] !== 'ordinary key') throw Error('member semantics');
+        storage.delete('count');
+        if ('count' in read()) throw Error('not deleted');
+        storage.clear();
+        return Object.keys(read()).length;
+        "#,
+    );
+    works(&file, "wait \"said\"; expect \"said 0\"");
+}
+
+#[test]
 fn hiding_the_window_and_covering_the_screen_are_heard_by_the_page_once_each() {
     let file = app(
         "visibility",
@@ -461,6 +510,30 @@ fn picture_file(folder: &std::path::Path) -> PathBuf {
 }
 
 #[test]
+fn folder_list_preserves_names_and_metadata() {
+    let file = checks(
+        "folder-list",
+        "import { files } from 'rsui/desktop'; import { join } from 'path';",
+        r#"
+        const rows = await files.list(join(process.env.RSUI_SANDBOX, 'entries'));
+        const names = rows.filter(r => !r.folder).map(r => r.name).sort();
+        const expected = ['名前📁.txt'];
+        if (process.platform !== 'win32') expected.push('tab\tnewline\n.txt');
+        const metadata = rows.every(r => typeof r.hidden === 'boolean' && typeof r.system === 'boolean'
+            && typeof r.readonly === 'boolean' && typeof r.link === 'boolean'
+            && typeof r.modified === 'number' && typeof r.created === 'number' && (r.folder || r.size === 3));
+        return [JSON.stringify(names) === JSON.stringify(expected.sort()), rows.some(r => r.name === 'sub' && r.folder), metadata].join(' ');
+        "#,
+    );
+    let entries = file.with_file_name("sandbox").join("entries");
+    std::fs::create_dir_all(entries.join("sub")).unwrap();
+    std::fs::write(entries.join("名前📁.txt"), "abc").unwrap();
+    #[cfg(unix)]
+    std::fs::write(entries.join("tab\tnewline\n.txt"), "abc").unwrap();
+    works(&file, "wait \"said\"; expect \"said true true true\"");
+}
+
+#[test]
 fn a_file_s_thumbnail_and_icon_are_read_for_real_as_pngs() {
     let file = checks(
         "files",
@@ -469,19 +542,31 @@ fn a_file_s_thumbnail_and_icon_are_read_for_real_as_pngs() {
         const here = dirname(process.env.RSUI_SANDBOX);
         const looks = (one, most) => one !== null && one.width > 0 && one.width <= most && one.height > 0 && one.height <= most
             && one.png[0] === 137 && one.png[1] === 80 && one.url.startsWith('data:image/png;base64,');
+        let decodes = 0;
+        const from = Buffer.from;
+        Buffer.from = function (...args) {
+            if (args[1] === 'base64') decodes++;
+            return from.apply(this, args);
+        };
         const thumbnail = await files.thumbnail(join(here, 'picture.bmp'), { size: 64 });
+        const urlOnly = thumbnail.url.startsWith('data:image/png;base64,') && decodes === 0;
+        const bytes = thumbnail.png;
+        const cached = bytes === thumbnail.png && decodes === 1;
+        Buffer.from = from;
         const icon = await files.icon(join(here, 'note.txt'));
         const none = await files.thumbnail(join(here, 'note.txt'));
         let missing = '';
         try { await files.icon(join(here, 'nothing.txt')); } catch (error) { missing = error.message; }
-        return [looks(thumbnail, 64), looks(icon, 32), none === null || looks(none, 256), missing.includes("there's nothing at")].join(' ');
+        const valid = looks(thumbnail, 64);
+        thumbnail.png = null;
+        return [urlOnly, cached, thumbnail.png === null, valid, looks(icon, 32), none === null || looks(none, 256), missing.includes("there's nothing at")].join(' ');
         "#,
     );
     let here = file.parent().unwrap();
     picture_file(here);
     std::fs::write(here.join("note.txt"), "hi").unwrap();
     let said = works(&file, "wait \"said\" 10000");
-    assert!(said.contains("said true true true true"), "{said}");
+    assert!(said.contains("said true true true true true true true"), "{said}");
 }
 
 #[test]

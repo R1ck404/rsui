@@ -51,6 +51,32 @@ fn a_single_line_measures_the_sum_of_its_advances() {
     );
 }
 
+#[test]
+fn shaped_text_uses_the_styled_baseline_and_line_spacing() {
+    let mut engine = engine();
+    // A word joiner forces shaping without drawing a glyph of its own.
+    let text = "\u{2060}A\n\u{2060}A";
+    let natural = engine.layout(text, STYLE, f32::INFINITY);
+    assert_eq!(natural.lines[0].baseline, 8.0);
+    assert_eq!(natural.lines[1].baseline, 19.0);
+
+    let style = TextStyle {
+        line_height: Some(19.0),
+        ..STYLE
+    };
+    let plain = engine.layout("A\nA", style, f32::INFINITY);
+    let shaped = engine.layout(text, style, f32::INFINITY);
+    assert_eq!(shaped.height(), 38.0);
+    for (shaped, plain) in shaped.lines.iter().zip(&plain.lines) {
+        assert_eq!(shaped.baseline, plain.baseline);
+    }
+    assert_eq!(shaped.glyphs, plain.glyphs);
+
+    let mut input = rsui_text::TextLayout::default();
+    engine.layout_across_into("\u{2060}A", style, (0.0, 30.0), &mut input);
+    assert_eq!(input.glyphs, plain.glyphs[..1]);
+}
+
 /// 1 pixel per 10 units, with the test font's kerning.
 fn kerned_engine() -> TextEngine {
     TextEngine::new(test_font(Options {

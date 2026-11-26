@@ -98,6 +98,7 @@ pub struct Paint {
     background: Option<Color>,
     text: Option<Color>,
     corner_radius: Option<f32>,
+    backdrop_blur: Option<f32>,
     opacity: Option<f32>,
     hover: Option<Color>,
     pressed: Option<Color>,
@@ -111,6 +112,7 @@ impl Paint {
             background: None,
             text: None,
             corner_radius: None,
+            backdrop_blur: None,
             opacity: None,
             hover: None,
             pressed: None,
@@ -163,6 +165,12 @@ impl Paint {
         self
     }
 
+    /// Softens the pixels already drawn behind this box by this many logical pixels.
+    pub const fn backdrop_blur(mut self, pixels: f32) -> Self {
+        self.backdrop_blur = Some(pixels);
+        self
+    }
+
     /// Puts a shadow behind this, `blur` pixels soft, and `down` pixels below it.
     pub const fn shadow(mut self, color: Color, blur: f32, down: f32) -> Self {
         self.shadow = Some((color, blur, down));
@@ -187,6 +195,9 @@ impl From<Paint> for Props {
                 Symbol::new("corner_radius"),
                 PropValue::Float(f64::from(radius)),
             ));
+        }
+        if let Some(pixels) = paint.backdrop_blur {
+            entries.push((Symbol::new("backdrop_blur"), PropValue::Float(f64::from(pixels))));
         }
         if let Some(color) = paint.hover {
             entries.push((
@@ -269,6 +280,7 @@ enum Part {
     BackgroundImage,
     /// What colors go through, whose details are read when it's drawn.
     Filter,
+    BackdropBlur,
     /// Corners that aren't all the same circle, or a shape it's cut to, whose details are read when it's drawn.
     Shaped,
     /// A shadow under text, whose details are read when it's drawn.
@@ -367,6 +379,7 @@ const PARTS: &[(&str, Part)] = &[
     ("background_gradient", Part::Gradient),
     ("background_image", Part::BackgroundImage),
     ("css_filter", Part::Filter),
+    ("backdrop_blur", Part::BackdropBlur),
     ("corner_radii", Part::Shaped),
     ("text_shadow", Part::TextShadow),
     ("clip_path", Part::Shaped),
@@ -433,6 +446,7 @@ pub(crate) struct Look {
     pub(crate) background_image: bool,
     /// Whether its colors, and what's in it, go through a filter, as `css_filter` says.
     pub(crate) filtered: bool,
+    pub(crate) backdrop_blur: f32,
     /// Whether its corners aren't all the same circle, or it's cut to a shape, as `corner_radii` and `clip_path` say.
     pub(crate) shaped: bool,
     /// Whether its text has a shadow, as `text_shadow` says.
@@ -529,6 +543,10 @@ impl Look {
                 Part::Filter => {
                     self.filtered = true;
                     self.unusual = true;
+                }
+                Part::BackdropBlur => {
+                    self.backdrop_blur = number(value);
+                    self.unusual |= self.backdrop_blur > 0.0;
                 }
                 Part::Shaped => {
                     self.shaped = true;

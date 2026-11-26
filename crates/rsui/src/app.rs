@@ -2971,6 +2971,8 @@ impl App {
     pub fn pointer_leave(&mut self) {
         // What's waiting to hear where it went last hears that first.
         self.send_move();
+        // Boundary events need the last pointer coordinates, even when the new hit path is empty.
+        self.tell_pointer(&[], hovering_name(), 0);
         self.pointer = None;
         self.update_hover();
     }

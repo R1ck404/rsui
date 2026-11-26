@@ -3061,6 +3061,116 @@ fn host_props_same(vm: &mut Vm, args: Args) -> Run<Value> {
     Ok(Value::bool(a.is_object() && b.is_object() && vm.shallow_equal(a, b) && (shallow || vm.holds_no_objects(b))))
 }
 
+/// Compare a homogeneous list of leaf component elements in one crossing. Unknown element shapes, children
+/// and reordered keys stay with the general reconciler. The two results are the reconciled render list and
+/// the rows whose props changed for the CSS flow checks (which use shallow equality even for ordinary components).
+fn host_compare_rows(vm: &mut Vm, args: Args) -> Run<Value> {
+    let (old, shown, next, kind) = (
+        args.get(vm, 0),
+        args.get(vm, 1),
+        args.get(vm, 2),
+        args.get(vm, 3),
+    );
+    let shallow = args.get(vm, 4) == Value::TRUE;
+    let Some((&first, _)) = vm
+        .array_elements(next)
+        .and_then(|items| items.split_first())
+    else {
+        return Ok(Value::UNDEFINED);
+    };
+    let mut fields = Vec::new();
+    if !vm.named_data_slots(first, &mut fields) {
+        return Ok(Value::UNDEFINED);
+    }
+    let [type_name, key_name, kids_name, props_name, children_name] =
+        ["type", "key", "kids", "props", "children"].map(|name| vm.atom(name));
+    let slot = |name| {
+        fields
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, slot)| *slot)
+    };
+    let (Some(ty), Some(key), Some(kids), Some(props)) = (
+        slot(type_name),
+        slot(key_name),
+        slot(kids_name),
+        slot(props_name),
+    ) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let row_shape = vm.shape_stamp(first);
+    let first_props = vm.slot_value(first, props);
+    if !vm.named_data_slots(first_props, &mut fields)
+        || fields.iter().any(|(key, _)| *key == children_name)
+    {
+        return Ok(Value::UNDEFINED);
+    }
+    let prop_shape = vm.shape_stamp(first_props);
+    let (Some(old_rows), Some(previous), Some(rows)) = (
+        vm.array_elements(old),
+        vm.array_elements(shown),
+        vm.array_elements(next),
+    ) else {
+        return Ok(Value::UNDEFINED);
+    };
+    if old_rows.len() != rows.len() || previous.len() != rows.len() {
+        return Ok(Value::UNDEFINED);
+    }
+    let len = rows.len();
+    let mut merged = Vec::with_capacity(len);
+    let mut added = Vec::new();
+    let mut used_old = 0;
+    for ((&old, &was), &row) in old_rows.iter().zip(previous).zip(rows) {
+        if old != was {
+            return Ok(Value::UNDEFINED);
+        }
+        if row == was {
+            merged.push(was);
+            used_old += 1;
+            continue;
+        }
+        let row_key = vm.slot_value(row, key);
+        if vm.shape_stamp(was) != row_shape
+            || vm.shape_stamp(row) != row_shape
+            || vm.slot_value(was, ty) != kind
+            || vm.slot_value(row, ty) != kind
+            || (row_key.is_number() && row_key.as_number().is_nan())
+            || !vm.same(vm.slot_value(was, key), row_key)
+            || vm.slot_value(was, kids) != Value::NULL
+            || vm.slot_value(row, kids) != Value::NULL
+        {
+            return Ok(Value::UNDEFINED);
+        }
+        let (a, b) = (vm.slot_value(was, props), vm.slot_value(row, props));
+        if vm.shape_stamp(a) != prop_shape || vm.shape_stamp(b) != prop_shape {
+            return Ok(Value::UNDEFINED);
+        }
+        let same = vm.shallow_equal(a, b);
+        if !same {
+            added.push(row);
+        }
+        if a == b || (same && (shallow || vm.holds_no_objects(b))) {
+            merged.push(was);
+            used_old += 1;
+        } else {
+            merged.push(row);
+        }
+    }
+    let list = if used_old == 0 {
+        next
+    } else if used_old == merged.len() {
+        shown
+    } else {
+        vm.new_array(merged)
+    };
+    let changed = if added.len() == len {
+        next
+    } else {
+        vm.new_array(added)
+    };
+    Ok(vm.new_array(vec![list, changed]))
+}
+
 /// `cssProbe(tag, classes, props, mode, size)`: for measuring what it costs to hand an element to Rust, which nothing that's
 /// committed calls. Mode 0 does nothing; 1 reads the tag, each class and each prop (a string's text); 2 does that and makes an
 /// object of `size` numbers to give back, as a finished look would be.
@@ -3108,7 +3218,7 @@ fn host_probe(vm: &mut Vm, args: Args) -> Run<Value> {
     Ok(out)
 }
 
-pub(crate) const FUNCTIONS: [(&str, HostFunction); 15] = [
+pub(crate) const FUNCTIONS: [(&str, HostFunction); 16] = [
     ("cssProbe", host_probe),
     ("cssKinds", host_kinds),
     ("cssForget", host_forget),
@@ -3124,6 +3234,7 @@ pub(crate) const FUNCTIONS: [(&str, HostFunction); 15] = [
     ("cssVariableKeys", host_variable_keys),
     ("cssVariablesSame", host_variables_same),
     ("propsSame", host_props_same),
+    ("compareRows", host_compare_rows),
 ];
 
 #[cfg(test)]

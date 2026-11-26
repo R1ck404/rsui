@@ -27,6 +27,8 @@ const parts = {
     capture: 'rsui/desktop/pictures',
     audio: 'rsui/desktop/media',
     media: 'rsui/desktop/media',
+    video: 'rsui/desktop/media',
+    pty: 'rsui/desktop/pty',
 };
 
 // As an ES module's exports, so that `import { clipboard } from 'rsui/desktop'` asks for `clipboard` alone, rather than every part

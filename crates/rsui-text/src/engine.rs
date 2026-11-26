@@ -1597,12 +1597,6 @@ impl TextEngine {
         let complexity = self.complexity(text, primary);
         if complexity != Complexity::Plain && text.len() < LONG_TEXT {
             let (lines, widest) = self.measure_shaped(text, primary, style.size, max_width);
-            // Lines as far apart as its shaping put them, which makes room for any other font in it.
-            let line_height = if style.line_height.is_none() {
-                self.text_line_metrics(text, primary, style.size).0
-            } else {
-                line_height
-            };
             return Size::new(widest, lines as f32 * line_height);
         }
         if complexity == Complexity::Complex {
@@ -1734,7 +1728,14 @@ impl TextEngine {
         layout.glyphs.clear();
         layout.line_height = line_height;
         if self.complexity(text, primary) != Complexity::Plain {
-            self.layout_shaped_into(text, primary, style.size, max_width, layout);
+            self.layout_shaped_into(
+                text,
+                primary,
+                style.size,
+                max_width,
+                (line_height, ascent),
+                layout,
+            );
             return;
         }
         // Nearly all text fits on one line, which only takes one pass.
@@ -2079,7 +2080,8 @@ impl TextEngine {
         let reach = style.size * 2.0;
         let (from, to) = (across.0 - reach, across.1 + reach);
         if self.complexity(text, primary) != Complexity::Plain {
-            self.layout_shaped_across(text, primary, style.size, (from, to), layout);
+            let (_, baseline) = self.metrics_for(text, primary, style);
+            self.layout_shaped_across(text, primary, style.size, (from, to), baseline, layout);
             return;
         }
         let mut pen = 0.0f32;

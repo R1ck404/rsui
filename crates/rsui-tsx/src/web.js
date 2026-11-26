@@ -80,6 +80,8 @@ function newSheet() {
 /// Empties a sheet, for what it says to be put in again.
 function emptySheet(one) {
     forgetSheet(one);
+    one.groupUnsafe = false;
+    one.groupScrollSteps = undefined;
     Object.assign(one, { page: [], body: [], root: [], rootFont: [], bodyFont: [], classes: new Map(), tags: new Map(), tagRules: new Map(), complex: [], complexOrder: [], compiled: undefined, pageWhen: [], keys: new Set(), mediaQueries: undefined, viewportKeys: undefined, viewportVariables: undefined });
 }
 
@@ -860,13 +862,14 @@ let resizeFirst = false;
 
 /// The page's elements that are skipping what's in them until they're near being seen, by their keys.
 const skippingLives = new Map();
+const skippingGroups = new Set();
 /// How far from being seen something's taken to be near it, as a share of the bigger of the window's width and height.
 const NEAR_VIEW = 0.5;
 
 /// What's in `live` as drawn, as its `content-visibility` says, or `null` for what it was given. It takes what CSS said about that
 /// out of `look`, as that's nothing for the rest. `auto` is for a row of a long list that's skipped as if it said `auto` without
 /// saying anything (see `LongRun`), whose elements are kept for code to find (see `skippedParts`).
-function contentVisibility(look, live, children, auto = false) {
+function contentVisibility(look, live, children, auto = false, estimate = undefined) {
     const said = look.__contentVisibility;
     const sizes = [look.__intrinsicSize, look.__intrinsicWidth, look.__intrinsicHeight];
     delete look.__contentVisibility;
@@ -875,9 +878,7 @@ function contentVisibility(look, live, children, auto = false) {
     delete look.__intrinsicHeight;
     const how = auto ? 'auto' : typeof said === 'string' ? said.trim().toLowerCase() : 'visible';
     if ((how !== 'auto' && how !== 'hidden') || (how === 'auto' && live.contentSeen === true)) {
-        if (skippingLives.get(live.domKey) === live) {
-            skippingLives.delete(live.domKey);
-        }
+        stopSkipping(live);
         if (live.skippedKids !== undefined) {
             forgetSkippedParts(live);
         }
@@ -896,8 +897,8 @@ function contentVisibility(look, live, children, auto = false) {
     if (how === 'hidden') {
         live.contentSeen = false;
     }
-    const [width, height] = intrinsicSize(sizes, typeof look.fontSize === 'number' ? look.fontSize : 16);
-    const name = how === 'auto' ? textWrittenIn(children).replace(/\s+/g, ' ').trim() : '';
+    const [width, height = estimate] = intrinsicSize(sizes, typeof look.fontSize === 'number' ? look.fontSize : 16);
+    const name = how === 'auto' ? textWrittenIn(children, estimate !== undefined).replace(/\s+/g, ' ').trim() : '';
     const box = { key: '__skipped', shrink: 0 };
     if (width !== undefined) {
         box.width = width;
@@ -916,12 +917,18 @@ function skipsUntilNear(live) {
     if (live.skipsUntilNear === true && live.domKey !== undefined) {
         const first = skippingLives.size === 0;
         skippingLives.set(live.domKey, live);
+        if (live.deferredGroup !== undefined) skippingGroups.add(live);
         if (first) {
             lookForResizes();
         }
-    } else if (skippingLives.get(live.domKey) === live) {
-        skippingLives.delete(live.domKey);
+    } else {
+        stopSkipping(live);
     }
+}
+
+function stopSkipping(live) {
+    if (skippingLives.get(live.domKey) === live) skippingLives.delete(live.domKey);
+    skippingGroups.delete(live);
 }
 
 /// How wide and tall `contain-intrinsic-size` and the rest say something that's skipping what's in it is, as `[width, height]`,
@@ -956,7 +963,7 @@ function intrinsicSize([both, width, height], fontSize) {
 }
 
 /// The text written in what's given, as far as it's text and the page's own tags with text in them, for naming what skips it.
-function textWrittenIn(children) {
+function textWrittenIn(children, accessible = false) {
     if (children === null || children === undefined || typeof children === 'boolean') {
         return '';
     }
@@ -964,12 +971,17 @@ function textWrittenIn(children) {
         return String(children);
     }
     if (Array.isArray(children)) {
-        return children.map(textWrittenIn).join('');
+        return children.map((one) => textWrittenIn(one, accessible)).join('');
     }
     // The page's own tags are made with a component of their own for each, which says which tag it is. What's in one is apart from
     // what's beside it.
     if (isValidElement(children) && (typeof children.type !== 'function' || children.type.__webTag !== undefined)) {
-        return ' ' + textWrittenIn(children.kids ?? children.props?.children) + ' ';
+        const props = children.props;
+        const hidden = props?.['aria-hidden'];
+        if (accessible && (props?.hidden === true || hidden === true || hidden === 'true'
+            || props?.style?.display === 'none' || props?.style?.visibility === 'hidden')) return '';
+        const label = accessible && typeof props?.['aria-label'] === 'string' ? props['aria-label'] : undefined;
+        return ' ' + (label ?? textWrittenIn(children.kids ?? props?.children, accessible)) + ' ';
     }
     return '';
 }
@@ -1019,6 +1031,85 @@ function longRunOf(live, look, given) {
     return count < LONG_RUN_FROM ? null : (live.longRun ??= { live });
 }
 
+// Grouped block lists have fewer siblings than a flat list. Only estimate groups in a vertical scrollport, and only
+// for ordinary host markup. Running a component, assigning a ref or creating a tab stop must not wait for scrolling.
+const GROUP_TAGS = new Set(['div', 'section', 'article', 'ul', 'ol']);
+const GROUP_ROW_TAGS = new Set(['div', 'section', 'article', 'li', 'p']);
+const GROUP_MIN_ROWS = 8;
+// A box that can escape its group's extent, a time-dependent style, or a
+// selector that uses a descendant to style an ancestor needs normal rendering.
+const GROUP_UNSAFE_CSS = /:has\s*\(|(?:^|[;{])\s*(?:position\s*:\s*(?:absolute|fixed|sticky|var\()|(?:transform|translate|rotate|scale|animation[\w-]*|transition[\w-]*|content-visibility)\s*:|margin[\w-]*\s*:[^;{}]*-\d)/i;
+const GROUP_UNSAFE_INLINE = /^(position|transform|translate|rotate|scale|animation|transition|margin|overflow|contentVisibility|content-visibility)/i;
+const GROUP_SCROLL_CSS = /(?:^|[;{])\s*overflow(?:-[xy])?\s*:[^;{}]*(?:\bauto\b|\bscroll\b|var\()/i;
+const groupScrollSteps = () => sheets.flatMap((one) => one.groupScrollSteps ?? []);
+
+function groupRowCount(children) {
+    if (!Array.isArray(children)) return 0;
+    let rows = 0;
+    for (const child of children.flat(1)) {
+        if (child == null || typeof child === 'boolean') continue;
+        if (!isValidElement(child)) return 0;
+        const tag = child.type?.__webTag;
+        if (GROUP_ROW_TAGS.has(tag)) rows += 1;
+        else if (tag !== 'header' && !/^h[1-6]$/.test(tag)) return 0;
+    }
+    return rows;
+}
+
+function groupedRunOf(live, look, given, owners, nested) {
+    const children = given.children;
+    if (!AUTO_SKIP_FROM_ENV || globalThis.__rsuiAutoSkip === false || !Array.isArray(children)
+        || (children.length < 4 && !children.some(Array.isArray)) || !ordinaryBlock(look)) {
+        return null;
+    }
+    let groups = 0;
+    let rows = 0;
+    for (const child of children.flat(1)) {
+        if (isValidElement(child) && GROUP_TAGS.has(child.type?.__webTag)) {
+            const count = groupRowCount(child.kids ?? child.props?.children);
+            if (count >= GROUP_MIN_ROWS) {
+                groups += 1;
+                rows += count;
+            }
+        }
+        if (groups >= 4 && rows >= 64) break;
+    }
+    if (groups < 4 || rows < 64 || hasWatched.size !== 0 || saysEditable(given) || editableSaidAbove(live) === true
+        || nested.length !== 0 || owners?.some((owner) => owner.page !== null) || sheets.some((one) => one.groupUnsafe === true)) return null;
+    let scroller = live;
+    if (look.__scroll !== 'vertical') {
+        for (let at = rsui.__instanceNow()?.parent; at != null; at = at.parent) {
+            const above = at.__pageLive;
+            if (above?.groupScroll !== undefined) {
+                scroller = above.groupScroll === 'vertical' ? above : null;
+                break;
+            }
+        }
+        if (scroller === live || scroller === null) return null;
+    }
+    const run = live.groupedRun ??= {};
+    run.scroller = scroller;
+    run.scrollSteps = groupScrollSteps();
+    return run;
+}
+
+function ordinaryBlock(look) {
+    return (look.display === undefined || look.display === 'block') && look.__flex !== true && look.direction === undefined
+        && look.__inline !== true && look.__hidden !== true && look.__fixed !== true && look.float === undefined
+        && (look.position === undefined || look.position === 'static' || look.position === 'relative') && look.transform === undefined;
+}
+
+function groupedEstimate(live, look, given, tag, children, run, flow, parts, nested) {
+    if (run === undefined || flow !== 'block' || !GROUP_TAGS.has(tag) || !ordinaryBlock(look) || look.__scroll !== undefined
+        || look.__contentVisibility !== undefined || look.height !== undefined || look.fitHeight === true
+        || live.contentSeen === true || (live.given !== undefined && live.skippedKids === undefined)
+        || given.dangerouslySetInnerHTML !== undefined || saysEditable(given) || live.handle?.__kids !== undefined
+        || nested.length !== 0 || Object.keys(parts).length !== 0) return undefined;
+    const rows = groupRowCount(children);
+    if (rows < GROUP_MIN_ROWS || !plainKids(children, 0, run.scrollSteps)) return undefined;
+    return rows * Math.max(32, typeof look.fontSize === 'number' ? look.fontSize * 2 : 0);
+}
+
 /// Whether a row of a long list skips what's in it: see `LongRun`. `look` is what it is, worked out, and `given` what it was given.
 function skipsByItself(live, look, given, children) {
     if (live.contentSeen === true || look.__contentVisibility !== undefined) {
@@ -1045,7 +1136,7 @@ const PLAIN_TAGS = new Set(['div', 'span', 'p', 'strong', 'em', 'b', 'i', 'u', '
 const PLAIN_PROP = /^(children|className|id|title|style|lang|dir|hidden|role|translate|(data|aria)-.*)$/;
 
 /// Whether everything in `children` is text and plain elements, for skipping it: see `skipsByItself`.
-function plainKids(children, depth) {
+function plainKids(children, depth, scrollSteps = null) {
     if (children === null || children === undefined || typeof children === 'boolean' || typeof children === 'string' || typeof children === 'number') {
         return true;
     }
@@ -1054,25 +1145,35 @@ function plainKids(children, depth) {
     }
     if (Array.isArray(children)) {
         for (const one of children) {
-            if (!plainKids(one, depth)) {
+            if (!plainKids(one, depth, scrollSteps)) {
                 return false;
             }
         }
         return true;
     }
+    const grouped = scrollSteps !== null;
     if (!isValidElement(children) || typeof children.type !== 'function' || children.type.__webStyled !== true
-        || !PLAIN_TAGS.has(children.type.__webTag) || children.ref != null) {
+        || !(PLAIN_TAGS.has(children.type.__webTag) || (grouped && (GROUP_TAGS.has(children.type.__webTag) || children.type.__webTag === 'header')))
+        || children.ref != null) {
         return false;
     }
+    // A styled component can compute arbitrary styles from props. Plain host tags carry the browser's shared renderer.
+    if (grouped && domElements.get(children.type.__webTag) !== children.type) return false;
     const props = children.props;
+    // An overflowing descendant can itself take Tab focus in the native tree.
+    // Check necessary selector conditions only. A possible match renders eagerly.
+    if (grouped && scrollSteps.some((step) => (step.tag === null || step.tag === children.type.__webTag)
+        && (step.id === null || step.id === props?.id) && step.classes.every((name) => classesOf(props?.className).includes(name)))) return false;
     if (props !== null && typeof props === 'object') {
         for (const name in props) {
-            if (props[name] !== undefined && !PLAIN_PROP.test(name)) {
+            const groupProp = grouped && (name === 'key' || (name === 'tabIndex' && Number(props[name]) < 0));
+            if (props[name] !== undefined && !groupProp && !PLAIN_PROP.test(name)) {
                 return false;
             }
         }
+        if (grouped && props.style != null && Object.keys(props.style).some((name) => GROUP_UNSAFE_INLINE.test(name))) return false;
     }
-    return plainKids(children.kids ?? props?.children, depth + 1);
+    return plainKids(children.kids ?? props?.children, depth + 1, scrollSteps);
 }
 
 /// What's in a row that's skipping it, as elements of the page that aren't drawn, made as they're first looked for and kept for
@@ -1113,6 +1214,9 @@ function skippedParts(live) {
         kept.notShown = true;
         // The row that's skipping it, which is drawn once code asks where it is or how it looks: see `drawSkipped`.
         kept.skippedBy = live;
+        if (live.deferredGroup !== undefined) {
+            kept.redraw ??= () => drawSkipped(live);
+        }
         // What's in it, in order: its text, and the place in `parts` of each element.
         kept.pieces = [];
         kept.weak ??= new WeakRef(kept);
@@ -1137,15 +1241,41 @@ function skippedParts(live) {
     return parts;
 }
 
+// Reuse the DOM handles exposed by selectors while the group was deferred. Only paths with an observed handle need a copy.
+function restoreGroupedChildren(live, children) {
+    if (live.deferredGroup === undefined || live.skippedParts === undefined || children !== live.skippedKids) return children;
+    const parts = skippedParts(live);
+    if (!parts.some((part) => part.handle != null)) return children;
+    let at = 0;
+    const restore = (one) => {
+        if (Array.isArray(one)) return one.map(restore);
+        if (!isValidElement(one)) return one;
+        const part = parts[at++];
+        const inside = one.kids ?? one.props?.children;
+        const kids = restore(inside);
+        if (kids === inside && part.handle == null) return one;
+        return { ...one, kids, props: { ...one.props, children: kids, __deferredPart: part.handle == null ? undefined : part } };
+    };
+    return restore(children);
+}
+
+function afterGroupedDraw(element, run) {
+    const part = element.__live;
+    drawSkipped(part.skippedBy);
+    afterLayout.add(() => {
+        if (element.__live !== part && inPageNow(element)) run();
+    });
+    lookForResizes();
+}
+
 /// Has a row that's skipping what's in it draw it, from the next frame on, as code has asked where something in it is or how it looks,
 /// which a browser would lay out there and then. Until it's drawn, what's in it says it's nowhere, as what isn't shown does.
 function drawSkipped(live) {
     if (live.skippedKids === undefined || live.contentSeen === true) {
         return;
     }
-    if (skippingLives.get(live.domKey) === live) {
-        skippingLives.delete(live.domKey);
-    }
+    if (live.deferredGroup !== undefined) rememberGroupAnchor(live.deferredGroup);
+    stopSkipping(live);
     live.contentSeen = true;
     live.redraw?.();
 }
@@ -1201,15 +1331,78 @@ function showNear() {
         if (live === undefined) {
             continue;
         }
-        skippingLives.delete(key);
-        live.contentSeen = true;
-        live.redraw();
+        if (live.skippedKids === undefined) {
+            // Explicit content-visibility does not keep a virtual DOM subtree.
+            skippingLives.delete(key);
+            live.contentSeen = true;
+            live.redraw();
+        } else {
+            drawSkipped(live);
+        }
+    }
+}
+
+// Take one receipt per scrollport and frame. A shell persists across materialization, so the first group's position at
+// the viewport edge can be held even when several earlier estimates change. Keep a scroll to the very end pinned there.
+const groupAnchors = new Map();
+let groupViewFrame = null;
+
+function checkGroupsAfterScroll() {
+    if (groupViewFrame !== null) return;
+    groupViewFrame = requestAnimationFrame(() => {
+        groupViewFrame = null;
+        if (skippingLives.size !== 0) showNear();
+    });
+}
+
+function rememberGroupAnchor(run) {
+    const scroller = run.scroller;
+    if (groupAnchors.has(scroller)) return;
+    const scroll = askedOfTree('scrollOf', scroller.domKey);
+    if (scroll === undefined || scroll[1] <= 0) return;
+    const clip = layoutBoxOf(handleOf(scroller, scroller.tag));
+    if (scroll[1] >= scroll[3] - scroll[5] - 1) {
+        groupAnchors.set(scroller, { request: scroller.scrollAsk });
+        return;
+    }
+    let first;
+    let top = Infinity;
+    for (const group of scroller.groupShells) {
+        const box = layoutBoxOf(handleOf(group, group.tag));
+        if (box.bottom > clip.top && box.top < clip.top + scroll[5] && box.top < top) {
+            first = group;
+            top = box.top;
+        }
+    }
+    if (first !== undefined) {
+        groupAnchors.set(scroller, { first, offset: top - clip.top, y: scroll[1], request: scroller.scrollAsk });
+    }
+}
+
+function restoreGroupAnchors() {
+    const anchors = [...groupAnchors];
+    groupAnchors.clear();
+    for (const [scroller, anchor] of anchors) {
+        if (scroller.scrollAsk !== anchor.request || pageLives.get(scroller.domKey)?.deref() !== scroller) continue;
+        const element = handleOf(scroller, scroller.tag);
+        if (anchor.first === undefined) {
+            const { height, viewHeight } = scrollState(scroller, element);
+            scrollTo(scroller, element, undefined, height - viewHeight);
+        } else if (pageLives.get(anchor.first.domKey)?.deref() === anchor.first) {
+            const box = layoutBoxOf(handleOf(anchor.first, anchor.first.tag));
+            const clip = layoutBoxOf(element);
+            if (box.height > 0) {
+                const y = scrollOffsets(scroller).y;
+                // A new native scroll is already represented by the new offset. Compensate only for layout movement.
+                scrollTo(scroller, element, undefined, y + (box.top - clip.top - anchor.offset) + (y - anchor.y));
+            }
+        }
     }
 }
 
 /// Has what's watched looked at after each time the window's laid out, while there's anything watched.
 function lookForResizes() {
-    const wanted = resizeWatches.size !== 0 || afterLayout.size !== 0 || hasWatched.size !== 0 || containerWatched.size !== 0 || skippingLives.size !== 0;
+    const wanted = resizeWatches.size !== 0 || afterLayout.size !== 0 || hasWatched.size !== 0 || containerWatched.size !== 0 || skippingLives.size !== 0 || groupAnchors.size !== 0;
     rsuiHostMethods.wantLaidOut(wanted);
     globalThis.__rsuiLaidOut = wanted ? laidOut : undefined;
 }
@@ -1218,6 +1411,7 @@ function lookForResizes() {
 const afterLayout = new Set();
 
 function laidOut() {
+    restoreGroupAnchors();
     if (skippingLives.size !== 0) {
         showNear();
     }
@@ -10395,9 +10589,8 @@ function liveGone(live) {
     }
     forgetNotShown(live);
     forgetSvgParts(live.domKey);
-    if (skippingLives.get(live.domKey) === live) {
-        skippingLives.delete(live.domKey);
-    }
+    live.groupScroller?.groupShells.delete(live);
+    stopSkipping(live);
     if (live.skippedKids !== undefined) {
         forgetSkippedParts(live);
     }
@@ -10495,6 +10688,19 @@ function makeStyled(target, settings = {}) {
             const flow = onLine ? 'row' : given_flow;
             const nth = given_nth;
             const [state, setState] = placed === null ? useState(0) : placedState(placed);
+            const deferredPart = given.__deferredPart;
+            if (deferredPart !== undefined && live.handle == null) {
+                live.handle = deferredPart.handle;
+                live.attributes = deferredPart.attributes;
+                live.attributesSet = deferredPart.attributesSet;
+                live.cssom = deferredPart.cssom;
+                live.cssomRemoved = deferredPart.cssomRemoved;
+                live.styleProp = deferredPart.given.style;
+                live.styleDeclaration = deferredPart.styleDeclaration;
+                deferredPart.drawn = live;
+                if (live.styleDeclaration !== undefined) live.styleDeclaration.__owner.live = live;
+                Object.defineProperty(live.handle, '__live', { value: live, enumerable: false, configurable: true });
+            }
             // What sets its state from what Rust says, made once, as `setState` is the same for as long as it's there.
             const handlers = (live.handlers ??= makeHandlers(setState));
             // Where each thing in this was last time, for it to be told the same as long as it's the same.
@@ -10647,7 +10853,7 @@ function makeStyled(target, settings = {}) {
             ownParts(parts);
             }
             // Only once it's been drawn, which it's been given something by then.
-            kept = live.given === undefined ? null : live;
+            kept = live.given === undefined && deferredPart === undefined ? null : live;
             if (shared === undefined) {
             if (isHost && kept?.cssom != null) {
                 // What React says that's new goes over what code set for it, as React writes it then.
@@ -10915,7 +11121,15 @@ function makeStyled(target, settings = {}) {
             const passDown = rsui.__provideHere;
             const variablesDown = isHost && holdsFixed(look) ? withFixedBox(variablesInside ?? variablesAbove) : variablesInside ?? variablesAbove;
             // What's in it is a long list's rows when it's a long list that scrolls, and nothing deeper in is.
-            const runDown = isHost ? longRunOf(live, look, given) : undefined;
+            const flatRun = isHost ? longRunOf(live, look, given) : null;
+            const groupedRun = isHost && flatRun === null ? groupedRunOf(live, look, given, owners, nested) : null;
+            if (live.groupShells?.size > 0 && live.groupScroll === 'vertical' && look.__scroll !== 'vertical') {
+                queueMicrotask(() => {
+                    for (const group of live.groupShells) drawSkipped(group);
+                });
+            }
+            live.groupScroll = look.__scroll;
+            const runDown = flatRun ?? groupedRun;
             const passAllDown = () => {
                 passDown(InheritedFont, font);
                 passDown(NestedRules, innerNow());
@@ -10984,15 +11198,25 @@ function makeStyled(target, settings = {}) {
             const whiteSpaceSaid = look.__whiteSpace;
             // A long list's row that skips what's in it (see `LongRun`) keeps that as it was given, as nothing of it is drawn: putting it
             // through what's below would copy each of its elements to give it a key by where it is, for every such row.
-            const skipsGiven = isHost && !keptNow && runAbove !== null && codeKids === null && givenKids === given.children
-                && (live.portalKids === undefined || live.portalKids.size === 0) && skipsByItself(live, look, given, givenKids);
+            const canSkip = isHost && !keptNow && runAbove !== null && codeKids === null && givenKids === given.children
+                && (live.portalKids === undefined || live.portalKids.size === 0);
+            const groupRun = runAbove?.scroller !== undefined ? runAbove : undefined;
+            const estimate = canSkip ? groupedEstimate(live, look, given, tag, givenKids, groupRun, flow, parts, nested) : undefined;
+            const scroller = groupRun !== undefined && GROUP_TAGS.has(tag) && flow === 'block' && ordinaryBlock(look) ? groupRun.scroller : undefined;
+            if (live.groupScroller !== scroller) {
+                live.groupScroller?.groupShells.delete(live);
+                live.groupScroller = scroller;
+                if (scroller !== undefined) (scroller.groupShells ??= new Set()).add(live);
+            }
+            if (estimate !== undefined) live.deferredGroup = groupRun;
+            const skipsGiven = canSkip && (estimate !== undefined || (groupRun === undefined && skipsByItself(live, look, given, givenKids)));
             let children;
             if (keptNow) {
                 children = keptList;
             } else if (skipsGiven) {
                 children = givenKids;
             } else {
-                children = isHost ? spacesAsSaid(joinedText(givenKids), look.__whiteSpace) : givenKids;
+                children = isHost ? spacesAsSaid(joinedText(restoreGroupedChildren(live, givenKids)), look.__whiteSpace) : givenKids;
                 if (replaced) {
                     children = codeKids;
                 } else if (codeKids !== null) {
@@ -11007,7 +11231,12 @@ function makeStyled(target, settings = {}) {
             // What CSS says to skip while it's far from being seen (`content-visibility`) has a box of the size it says in place of
             // what's in it until then, and what's in it from then on: see `contentVisibility`.
             // A long list's row that's far from being seen is skipped the same way where that changes nothing (see `LongRun`).
-            const skipping = isHost ? contentVisibility(look, live, children, runAbove !== null && (skipsGiven || skipsByItself(live, look, given, children))) : null;
+            const fixedSkip = isHost && !skipsGiven && runAbove !== null && groupRun === undefined && skipsByItself(live, look, given, children);
+            const skipping = isHost ? contentVisibility(look, live, children, skipsGiven || fixedSkip, estimate) : null;
+            if (estimate === undefined && live.deferredGroup !== undefined) {
+                skippingGroups.delete(live);
+                live.deferredGroup = undefined;
+            }
             // What's in it is only told what this passes down once something in it could read it, which is a component: a span with
             // only text in it, as most of a page's are, keeps none of it. From the first time it's told, it's told on every render,
             // as `provideHere` needs (what reads it keeps reading the same place).
@@ -11037,6 +11266,7 @@ function makeStyled(target, settings = {}) {
             const { theme: _theme, children: _children, ...rest } = props;
             if (isHost) {
                 delete rest.style;
+                delete rest.__deferredPart;
             }
             if (!isHost) {
                 // Another component gets what this says through its class, which anything written for the web passes on to what it makes.
@@ -11287,9 +11517,8 @@ function makeStyled(target, settings = {}) {
                 live.handle = given.__handle;
             }
             // Every element of the page has a key of its own, by which what a selector asks about it is found: see `pageTree`.
-            const domKey = placed === null
-                ? useDomRef(isHost ? props.ref : null, isHost, live, tag, given.__handle?.__own === true ? given.__handle.__domKey : undefined)
-                : placedDomRef(placed, props.ref, given.__handle?.__own === true ? given.__handle.__domKey : undefined);
+            const heldKey = given.__handle?.__own === true ? given.__handle.__domKey : deferredPart?.domKey;
+            const domKey = placed === null ? useDomRef(isHost ? props.ref : null, isHost, live, tag, heldKey) : placedDomRef(placed, props.ref, heldKey);
             live.domKey = domKey;
             // Where it's drawn from, for what it's in before it's drawn (see `parentElement`).
             if (placed === null) {
@@ -11597,14 +11826,20 @@ function makeStyled(target, settings = {}) {
                 // A button's or a link's text is its own, though it's drawn as text inside it, so `text-overflow: ellipsis` on it
                 // cuts that text off with `…`, as it does on a page.
                 const lined = out.ellipsis === true && (type === 'button' || type === 'link') ? { ...decorated, ellipsis: true, noWrap: true } : decorated;
-                children = keptNow ? [...children.slice(0, keptCount), ...withFont(children.slice(keptCount), lined)] : withFont(children, lined);
+                if (!keptNow) {
+                    children = withFont(children, lined);
+                } else if (children.length > keptCount) {
+                    children = [...children.slice(0, keptCount), ...withFont(children.slice(keptCount), lined)];
+                }
             }
             if (scroll !== undefined) {
                 // What scrolls says when it's scrolled, and goes where code says: see `scrollTo`.
                 Object.assign(out, scrollProps(live));
             }
             // What's in it that's as it was is the same elements as last time, which aren't drawn again, as React has it.
-            children = sameElements(nthKept.children, children);
+            if (!keptNow || children !== keptList || !nthKept.kids.reconciled) {
+                children = sameElements(nthKept.children, children);
+            }
             nthKept.children = children;
             if (RESTYLE_ENV.check) {
                 restyleSigned(live, out, type, font, children, given, state);
@@ -12434,6 +12669,7 @@ function keptKids(kept, kids, said, tag, inner) {
         return null;
     }
     const old = last.list;
+    last.reconciled = false;
     if (old === kids) {
         return kids;
     }
@@ -12447,21 +12683,27 @@ function keptKids(kept, kids, said, tag, inner) {
     // them, which can be the same elements as what was kept here, or others like them, from when it was last given what wasn't kept.
     let merged = kids;
     if (old.length === kids.length) {
-        added = [];
         const shown = Array.isArray(kept.children) && kept.children.length === old.length ? kept.children : old;
-        for (let at = 0; at < kids.length; at += 1) {
-            const was = shown[at];
-            const kid = kids[at];
-            if (was === kid) {
-                continue;
-            }
-            if (sameElements(was, kid) === was) {
-                if (merged === kids) {
-                    merged = kids.slice();
+        const compared = natives.compareRows(old, shown, kids, said[0], said[0].__rsuiShallow === true);
+        if (compared !== undefined) {
+            [merged, added] = compared;
+            last.reconciled = shown === kept.children;
+        } else {
+            added = [];
+            for (let at = 0; at < kids.length; at += 1) {
+                const was = shown[at];
+                const kid = kids[at];
+                if (was === kid) {
+                    continue;
                 }
-                merged[at] = was;
-            } else if (!sameKid(old[at], kid)) {
-                added.push(kid);
+                if (sameElements(was, kid) === was) {
+                    if (merged === kids) {
+                        merged = kids.slice();
+                    }
+                    merged[at] = was;
+                } else if (!sameKid(old[at], kid)) {
+                    added.push(kid);
+                }
             }
         }
     } else {
@@ -13750,6 +13992,7 @@ function mouseClick(event) {
 let focusedElement = null;
 /// What Rust has said has lost the keyboard, until it says what has it now: see `onFocus` in `eventProps`.
 let focusLeaving = null;
+let focusRequest = 0;
 /// What code last gave the keyboard to, by its key, and when, until Rust says it has it: Rust saying something else has it before
 /// then is about what code gave it to before, as React Aria's button and then its list are given it one after the other.
 let focusAsked = { key: undefined, at: -Infinity };
@@ -13800,6 +14043,14 @@ function changedSinceFocus(field) {
 /// `options` are `focus()`'s: `focusVisible` says whether it shows that it has the keyboard (`:focus-visible`), rather than
 /// that following how the keyboard was last moved, which Rust works out (`script_ring` in app.rs).
 function moveFocus(next, tellRust = true, options = undefined) {
+    const request = ++focusRequest;
+    if (next?.__live?.skippedBy?.deferredGroup !== undefined) {
+        afterGroupedDraw(next, () => {
+            if (focusRequest === request) next.focus(options);
+        });
+        return;
+    }
+    if (next?.__live?.deferredGroup !== undefined) drawSkipped(next.__live);
     flushLostFocus();
     const before = focusedElement;
     if (before === next) {
@@ -14252,10 +14503,11 @@ function styleOfLive(live) {
         const style = styleFor({
             live,
             changed: () => {
-                live.cssom = style.__asProps?.() ?? null;
-                live.cssomRemoved = style.__removed?.() ?? null;
-                stillForReads(live, style);
-                live.redraw?.();
+                const target = live.drawn ?? live;
+                target.cssom = style.__asProps?.() ?? null;
+                target.cssomRemoved = style.__removed?.() ?? null;
+                stillForReads(target, style);
+                target.redraw?.();
             },
         });
         live.styleDeclaration = style;
@@ -16092,6 +16344,9 @@ function inPageNow(element) {
     if (notShownLives.has(key)) {
         return true;
     }
+    if (element.__live?.skippedBy?.deferredGroup !== undefined && pageLives.get(key)?.deref() === element.__live) {
+        return inPageNow(handleOf(element.__live.skippedBy, element.__live.skippedBy.tag));
+    }
     if (pageLives.get(key)?.deref() === undefined) {
         return false;
     }
@@ -16150,7 +16405,7 @@ function onlyLooksUp(selector) {
 /// is one of the page just as `pageTree` has it, with nothing next to it or in it.
 function nodeUpOf(element, selector) {
     const key = element?.__domKey;
-    if (key === undefined || notShownLives.has(key) || !onlyLooksUp(selector)) {
+    if (key === undefined || element.__live?.skippedBy !== undefined || notShownLives.has(key) || !onlyLooksUp(selector)) {
         return nodeOf(element);
     }
     if (pageNow !== null && rsuiHostMethods.pageTreeKept()) {
@@ -16561,7 +16816,7 @@ Object.assign(COMPUTED, {
     // What makes something a containing block, which Floating UI looks at to know where a dropdown's place is said from.
     perspective: () => 'none',
     filter: ({ __look: look }) => (typeof look?.filter === 'string' && look.filter !== '' ? look.filter : 'none'),
-    backdropFilter: () => 'none',
+    backdropFilter: ({ __look: look }) => look?.backdropBlur > 0 ? `blur(${computedPx(look.backdropBlur)})` : 'none',
     willChange: ({ __look: look }) => (typeof look?.willChange === 'string' && look.willChange !== '' ? look.willChange : 'auto'),
     contain: () => 'none',
     containerType: () => 'normal',
@@ -16873,6 +17128,8 @@ function tellScrolled(live, type = 'scroll') {
     if (type === 'scroll' && skippingLives.size !== 0) {
         // What's been scrolled near is drawn as it is, as the next frame shows it.
         showNear();
+        // Scroll-only frames can reuse layout. Check again once native geometry reflects the new offset.
+        if (skippingGroups.size !== 0) checkGroupsAfterScroll();
     }
     if (type === 'scroll') {
         // Once it's stopped moving, which is when no more of it's come for a little while, it says so with `scrollend`, as a
@@ -16938,6 +17195,10 @@ function scrollPlace(first, second) {
 function scrollIntoView(element, how) {
     const skippedBy = element?.__live?.skippedBy;
     if (skippedBy !== undefined) {
+        if (skippedBy.deferredGroup !== undefined) {
+            afterGroupedDraw(element, () => scrollIntoView(element, how));
+            return;
+        }
         // What a long list's row is skipping is brought into view with its row, which is where it is, and drawn as it comes near.
         drawSkipped(skippedBy);
         scrollIntoView(handleOf(skippedBy, skippedBy.tag), how);
@@ -18330,6 +18591,9 @@ function classify(event, type) {
     // What has the pointer is told so before the pointer event after it asked, and that it's lost it before the click that
     // follows the button coming up, whether or not the document listens (see `hearDocument`).
     if (pointerCapture !== null) {
+        if (type === 'pointerup') {
+            dispatchingPointerUp = true;
+        }
         if (type === 'pointermove' || type === 'pointerup') {
             tellCaptureGot();
         } else if (type === 'click' || (type === 'pointerdown' && pointerCapture.told)) {
@@ -20902,8 +21166,26 @@ function makeHost(tag, props, children, scroll, parts = {}, known = undefined) {
             const size = bar.__hidden === true ? 0 : typeof bar.width === 'number' ? bar.width : undefined;
             if (size !== undefined) {
                 outer.scrollbarSize = size;
-                // What CSS's scrollbar takes is room, which what's in it doesn't get.
-                outer.paddingRight = (outer.paddingRight ?? 0) + size;
+                if (own.textDirection === 'rtl') {
+                    // What CSS's scrollbar takes is room, which what's in it doesn't get.
+                    outer.paddingRight = (outer.paddingRight ?? 0) + size;
+                } else {
+                    // Only once there's more than shows, as a browser's does, and all the time with `overflow: scroll`.
+                    outer.scrollbarRoom = size;
+                    outer.fillAcross = true;
+                    if (always) {
+                        outer[barSide] = (outer[barSide] ?? 0) + size;
+                    }
+                }
+            }
+            // `border-radius` on its thumb makes it a pill, and a `border` as wide as it wants round it (with `background-clip:
+            // padding-box`, as Chromium's scrollbars have it) leaves room round it in the track.
+            const barThumb = parts['-webkit-scrollbar-thumb'];
+            if (typeof barThumb?.radius === 'number') {
+                outer.scrollbarRadius = barThumb.radius;
+            }
+            if (typeof barThumb?.borderWidth === 'number') {
+                outer.scrollbarInset = barThumb.borderWidth;
             }
             outer.scrollbarThumb = withCurrentColor({ background: parts['-webkit-scrollbar-thumb']?.background }, own.color).background;
             outer.scrollbarTrack = withCurrentColor({ background: parts['-webkit-scrollbar-track']?.background }, own.color).background;
@@ -21141,6 +21423,22 @@ function fillSheet(text, from = null, append = false) {
     if (!append) {
         sheet.sourceText = text;
         sheet.sourceFrom = from;
+    }
+    if (sheet.groupUnsafe !== true && GROUP_UNSAFE_CSS.test(text)) {
+        sheet.groupUnsafe = true;
+        queueMicrotask(() => {
+            for (const live of skippingLives.values()) {
+                if (live.deferredGroup !== undefined) drawSkipped(live);
+            }
+        });
+    }
+    if (GROUP_SCROLL_CSS.test(text) && skippingLives.size !== 0) {
+        queueMicrotask(() => {
+            const steps = groupScrollSteps();
+            for (const live of skippingLives.values()) {
+                if (live.deferredGroup !== undefined && !plainKids(live.skippedKids, 0, steps)) drawSkipped(live);
+            }
+        });
     }
     const block = readCss(text);
     const rules = inCascadeOrder(block.rules);
@@ -21611,10 +21909,14 @@ function addPageRule(rule) {
         }
         return;
     }
+    const mayScroll = rule.block.declarations.some(([name, value]) => /^overflow(?:-[xy])?$/.test(name) && /\b(?:auto|scroll)\b|var\(/i.test(value));
     for (const one of unwrappedSelectors(selector)) {
         const steps = readSelector(one);
         if (steps !== null) {
             noteRule(steps, rule.block.declarations);
+            if (mayScroll) {
+                (sheet.groupScrollSteps ??= []).push(steps[steps.length - 1]);
+            }
         }
         if (steps === null) {
             notHere('the selector ' + one);
@@ -22417,10 +22719,18 @@ function computedAnimationName(live) {
 /// Rust sends what the pointer does to it until the button comes up (`capture_pointer` in app.rs), and it's let go once that's
 /// been heard, as in a browser: `gotpointercapture` before the next pointer event, `lostpointercapture` after `pointerup`.
 let pointerCapture = null;
+let dispatchingPointerUp = false;
 const captureKey = (element) => element?.__domKey ?? element;
 const pointerCaptureMethods = {
     setPointerCapture(id) {
         if (pointerCapture !== null && pointerCapture.key === captureKey(this)) {
+            if (pointerCapture.releasing) {
+                pointerCapture.releasing = false;
+                const key = this.__domKey;
+                if (typeof key === 'string') {
+                    rsuiHostMethods.capturePointer?.(key);
+                }
+            }
             return;
         }
         if (pointerCapture?.told === true) {
@@ -22433,24 +22743,27 @@ const pointerCaptureMethods = {
             rsuiHostMethods.capturePointer?.(key);
         }
     },
-    releasePointerCapture() {
-        if (pointerCapture !== null && pointerCapture.key === captureKey(this)) {
-            if (pointerCapture.told) {
-                capturedEvent('lostpointercapture');
-            }
-            pointerCapture = null;
-            unlistenOn('window', 'pointerup', captureReleased);
-            rsuiHostMethods.capturePointer?.(null);
+    releasePointerCapture(id) {
+        if (!pointerCaptureMethods.hasPointerCapture.call(this, id)) {
+            return;
+        }
+        rsuiHostMethods.capturePointer?.(null);
+        if (dispatchingPointerUp) {
+            // The capture status changes immediately. Notify listeners after pointerup has finished bubbling.
+            pointerCapture.releasing = true;
+        } else {
+            tellCaptureLost();
         }
     },
     hasPointerCapture(id) {
-        return pointerCapture !== null && pointerCapture.key === captureKey(this) && (id === undefined || pointerCapture.id === id);
+        return pointerCapture !== null && !pointerCapture.releasing && pointerCapture.key === captureKey(this)
+            && (id === undefined || pointerCapture.id === id);
     },
 };
 
 /// `gotpointercapture` or `lostpointercapture`, to what has the pointer.
-function capturedEvent(type) {
-    const { element, id } = pointerCapture;
+function capturedEvent(type, capture = pointerCapture) {
+    const { element, id } = capture;
     // What's no longer on the page isn't told, as a browser's capture goes with an element that's taken out.
     if (!inPageNow(element)) {
         return;
@@ -22472,19 +22785,21 @@ function tellCaptureGot() {
 
 /// The button's come up and that's been heard, so the pointer's let go, as a mouse's is (Pointer Events 3, "implicit release").
 function tellCaptureLost() {
-    if (pointerCapture === null) {
+    const capture = pointerCapture;
+    if (capture === null) {
         return;
-    }
-    if (pointerCapture.told) {
-        capturedEvent('lostpointercapture');
     }
     pointerCapture = null;
     unlistenOn('window', 'pointerup', captureReleased);
+    if (capture.told) {
+        capturedEvent('lostpointercapture', capture);
+    }
 }
 
 // Implicit capture release follows the last pointerup's dispatch even when no click or compatibility mouse event follows.
 function captureReleased(event) {
-    if (event.buttons === 0) {
+    dispatchingPointerUp = false;
+    if (event.buttons === 0 || pointerCapture?.releasing) {
         tellCaptureLost();
     }
 }

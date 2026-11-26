@@ -44,12 +44,20 @@ pub enum GradientKind {
 
 const STEPS: usize = 1024;
 
+/// A gradient's colors at each of its steps, multiplied by alpha: from 0 to 255 as floating point, and packed as the canvas has
+/// pixels, rounded as `Shader::row32` rounds them, so a row of it at full strength is only looked up.
+#[derive(Debug)]
+pub struct GradientTable {
+    pub floats: Vec<[f32; 4]>,
+    pub packed: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Gradient {
     pub kind: GradientKind,
     /// Each stop's offset and color, without alpha multiplied in, in the order they were added, which is also by offset.
     stops: Vec<(f32, [u8; 4])>,
-    table: Option<Rc<Vec<[f32; 4]>>>,
+    table: Option<Rc<GradientTable>>,
 }
 
 impl Gradient {
@@ -69,7 +77,7 @@ impl Gradient {
     }
 
     /// The colors along it, multiplied by alpha, from 0 to 255.
-    pub fn table(&mut self) -> Rc<Vec<[f32; 4]>> {
+    pub fn table(&mut self) -> Rc<GradientTable> {
         if let Some(table) = &self.table {
             return table.clone();
         }
@@ -79,7 +87,8 @@ impl Gradient {
             let c = self.color_at(t);
             out.push([c[0] * 255.0, c[1] * 255.0, c[2] * 255.0, c[3] * 255.0]);
         }
-        let table = Rc::new(out);
+        let packed = out.iter().map(|s| pack([(s[0] + 0.5) as u32, (s[1] + 0.5) as u32, (s[2] + 0.5) as u32, (s[3] + 0.5) as u32])).collect();
+        let table = Rc::new(GradientTable { floats: out, packed });
         self.table = Some(table.clone());
         table
     }
@@ -130,15 +139,55 @@ pub enum Style {
 pub enum Shader {
     /// Multiplied by alpha, from 0 to 255.
     Solid([f32; 4]),
-    Linear { table: Rc<Vec<[f32; 4]>>, to_user: Matrix, x0: f32, y0: f32, dx: f32, dy: f32, inv_len2: f32 },
-    Radial { table: Rc<Vec<[f32; 4]>>, to_user: Matrix, kind: [f32; 6] },
-    Conic { table: Rc<Vec<[f32; 4]>>, to_user: Matrix, angle: f32, x: f32, y: f32 },
+    Linear { table: Rc<GradientTable>, to_user: Matrix, x0: f32, y0: f32, dx: f32, dy: f32, inv_len2: f32 },
+    Radial { table: Rc<GradientTable>, to_user: Matrix, kind: [f32; 6] },
+    Conic { table: Rc<GradientTable>, to_user: Matrix, angle: f32, x: f32, y: f32 },
     Image { image: Rc<Image>, to_image: Matrix, smooth: bool, repeat: Repeat, bounds: [i32; 4], pattern: bool },
     /// Nothing at all, as a gradient with no stops is.
     None,
 }
 
+/// A linear or radial gradient's shader as borrowed parts, which, unlike a `Shader`, can be shared by threads drawing bands of
+/// one fill (see `pool`).
+#[derive(Clone, Copy)]
+pub enum GradientRow<'a> {
+    Linear { table: &'a GradientTable, to_user: Matrix, x0: f32, y0: f32, dx: f32, dy: f32, inv_len2: f32 },
+    Radial { table: &'a GradientTable, to_user: Matrix, kind: [f32; 6] },
+}
+
+impl GradientRow<'_> {
+    /// A row of it from `x, y`, packed, at full strength, as `Shader::row32` gives it.
+    pub fn row32(&self, x: i32, y: i32, out: &mut [u32]) {
+        match *self {
+            Self::Linear { table, to_user, x0, y0, dx, dy, inv_len2 } => {
+                let (mut ux, mut uy) = to_user.apply(x as f32 + 0.5, y as f32 + 0.5);
+                let (step_x, step_y) = (to_user.a, to_user.b);
+                for px in out.iter_mut() {
+                    *px = table.packed[step_of(((ux - x0) * dx + (uy - y0) * dy) * inv_len2)];
+                    ux += step_x;
+                    uy += step_y;
+                }
+            }
+            Self::Radial { table, to_user, kind } => {
+                let packed = &table.packed[..];
+                radial_row(&kind, &to_user, x, y, out.len(), |i, t| {
+                    out[i] = t.map_or(0, |t| packed[step_of(t)]);
+                });
+            }
+        }
+    }
+}
+
 impl Shader {
+    /// A linear or radial gradient's parts, to be drawn by threads.
+    pub fn gradient(&self) -> Option<GradientRow<'_>> {
+        match self {
+            Self::Linear { table, to_user, x0, y0, dx, dy, inv_len2 } => Some(GradientRow::Linear { table, to_user: *to_user, x0: *x0, y0: *y0, dx: *dx, dy: *dy, inv_len2: *inv_len2 }),
+            Self::Radial { table, to_user, kind } => Some(GradientRow::Radial { table, to_user: *to_user, kind: *kind }),
+            _ => None,
+        }
+    }
+
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
@@ -162,53 +211,22 @@ impl Shader {
                 let (step_x, step_y) = (to_user.a, to_user.b);
                 for px in out.iter_mut() {
                     let t = ((ux - x0) * dx + (uy - y0) * dy) * inv_len2;
-                    *px = look_up(table, t);
+                    *px = look_up(&table.floats, t);
                     ux += step_x;
                     uy += step_y;
                 }
             }
             Self::Radial { table, to_user, kind } => {
-                let [x0, y0, r0, x1, y1, r1] = *kind;
-                let (cdx, cdy, dr) = (x1 - x0, y1 - y0, r1 - r0);
-                let a = cdx * cdx + cdy * cdy - dr * dr;
-                for (i, px) in out.iter_mut().enumerate() {
-                    let (ux, uy) = center(to_user, i);
-                    let (pdx, pdy) = (ux - x0, uy - y0);
-                    let b = pdx * cdx + pdy * cdy + r0 * dr;
-                    let c = pdx * pdx + pdy * pdy - r0 * r0;
-                    let mut found = None;
-                    if a.abs() < 1e-9 {
-                        if b != 0.0 {
-                            let w = c / (2.0 * b);
-                            if r0 + w * dr >= 0.0 {
-                                found = Some(w);
-                            }
-                        }
-                    } else {
-                        let disc = b * b - a * c;
-                        if disc >= 0.0 {
-                            let root = disc.sqrt();
-                            let (w1, w2) = ((b + root) / a, (b - root) / a);
-                            let (big, small) = if w1 > w2 { (w1, w2) } else { (w2, w1) };
-                            if r0 + big * dr >= 0.0 {
-                                found = Some(big);
-                            } else if r0 + small * dr >= 0.0 {
-                                found = Some(small);
-                            }
-                        }
-                    }
-                    *px = match found {
-                        Some(t) => look_up(table, t),
-                        None => [0.0; 4],
-                    };
-                }
+                radial_row(kind, to_user, x, y, out.len(), |i, t| {
+                    out[i] = t.map_or([0.0; 4], |t| look_up(&table.floats, t));
+                });
             }
             Self::Conic { table, to_user, angle, x: cx, y: cy } => {
                 for (i, px) in out.iter_mut().enumerate() {
                     let (ux, uy) = center(to_user, i);
                     let mut t = ((uy - cy).atan2(ux - cx) - angle) / std::f32::consts::TAU;
                     t -= t.floor();
-                    *px = look_up(table, t);
+                    *px = look_up(&table.floats, t);
                 }
             }
             Self::Image { image, to_image, smooth, repeat, bounds, pattern } => {
@@ -228,6 +246,14 @@ impl Shader {
     /// multiplied by alpha, and by `alpha8` out of 255 too. A picture that's only moved and resized gives that without going through
     /// floating point, as Skia's quick pipeline does.
     pub fn row32(&self, x: i32, y: i32, alpha8: u32, out: &mut [u32], scratch: &mut Vec<[f32; 4]>) {
+        // A gradient at full strength: each pixel's place along it, and its packed color from the table, which is what packing
+        // its floating point color would give.
+        if alpha8 == 255
+            && let Some(gradient) = self.gradient()
+        {
+            gradient.row32(x, y, out);
+            return;
+        }
         if let Self::Image { image, to_image, smooth, repeat, bounds, pattern } = self
             && to_image.b == 0.0
             && to_image.c == 0.0
@@ -337,6 +363,30 @@ pub fn div255(x: u32) -> u32 {
     (x + (x >> 8)) >> 8
 }
 
+/// Lays `s` on `d`, both from 0 to 255 and multiplied by alpha, in whole numbers, for the ways of laying one on the other that
+/// only weigh each by the other's alpha: what `composite` does in floating point, a few times quicker, as Skia's quick pipeline
+/// does them. `None` for the rest, which `composite` does.
+#[inline]
+pub fn composite8(op: Op, s: [u32; 4], d: [u32; 4]) -> Option<[u32; 4]> {
+    let (sa, da) = (s[3], d[3]);
+    // s * fs + d * fd, with both weights out of 255. Neither sum goes past 255 * 255, as no color is more than its alpha.
+    let pd = |fs: u32, fd: u32| [div255(s[0] * fs + d[0] * fd), div255(s[1] * fs + d[1] * fd), div255(s[2] * fs + d[2] * fd), div255(sa * fs + da * fd)];
+    Some(match op {
+        Op::DestinationOut => {
+            let keep = 255 - sa;
+            [div255(d[0] * keep), div255(d[1] * keep), div255(d[2] * keep), div255(da * keep)]
+        }
+        Op::SourceAtop => pd(da, 255 - sa),
+        Op::DestinationOver => {
+            let k = 255 - da;
+            [div255(s[0] * k) + d[0], div255(s[1] * k) + d[1], div255(s[2] * k) + d[2], div255(sa * k) + da]
+        }
+        Op::Xor => pd(255 - da, 255 - sa),
+        Op::Lighter => [(s[0] + d[0]).min(255), (s[1] + d[1]).min(255), (s[2] + d[2]).min(255), (sa + da).min(255)],
+        _ => return None,
+    })
+}
+
 /// Where along an axis to read for a sample at `at`, in a picture `size` across from `start`, as `wrap`, `decal` or clamping
 /// says, or `None` for nothing.
 #[inline]
@@ -352,7 +402,7 @@ fn texel_index(at: i32, start: i32, end: i32, wrap: bool, decal: bool) -> Option
 
 /// A row of a picture that's only moved and resized, sampled between pixels in steps of 256, or at the nearest, packed.
 #[allow(clippy::too_many_arguments)]
-fn image_row32(image: &Image, m: &Matrix, x: i32, y: i32, smooth: bool, repeat: Repeat, bounds: &[i32; 4], pattern: bool, out: &mut [u32]) {
+pub(crate) fn image_row32(image: &Image, m: &Matrix, x: i32, y: i32, smooth: bool, repeat: Repeat, bounds: &[i32; 4], pattern: bool, out: &mut [u32]) {
     let [bx0, by0, bx1, by1] = *bounds;
     let (wrap_x, decal_x, wrap_y, decal_y) = match (pattern, repeat) {
         (false, _) => (false, false, false, false),
@@ -379,6 +429,26 @@ fn image_row32(image: &Image, m: &Matrix, x: i32, y: i32, smooth: bool, repeat: 
     }
     if !smooth {
         let row = texel_index(super::raster::floor(v - 1.0e-4) as i32, by0, by1, wrap_y, decal_y);
+        // A picture drawn once, clamped to its edges: where each sample is, in steps of 1/2^32 of a pixel, so the row is read with
+        // a shift and a clamp a pixel, and nothing drifts over even the widest row.
+        if !pattern
+            && let Some(r) = row
+            && let ([], words, []) = unsafe { pixels.align_to::<u32>() }
+        {
+            let start = f64::from(m.a) * (f64::from(x) + 0.5) + f64::from(m.e) - 1.0e-4;
+            let step = f64::from(m.a);
+            if start.is_finite() && step.is_finite() && start.abs() + step.abs() * out.len() as f64 + 1.0 < 1.0e9 {
+                let line = &words[r * width..r * width + width];
+                let (first, last) = (i64::from(bx0.max(0)), i64::from(bx1.min(width as i32).max(1) - 1));
+                let mut at = (start * 4_294_967_296.0).floor() as i64;
+                let step = (step * 4_294_967_296.0).round() as i64;
+                for px in out.iter_mut() {
+                    *px = line[(at >> 32).clamp(first, last) as usize];
+                    at += step;
+                }
+                return;
+            }
+        }
         for (i, px) in out.iter_mut().enumerate() {
             let u = m.a * ((x + i as i32) as f32 + 0.5) + m.e;
             *px = if u.is_finite() { texel(row, texel_index(super::raster::floor(u - 1.0e-4) as i32, bx0, bx1, wrap_x, decal_x)) } else { 0 };
@@ -450,8 +520,80 @@ fn image_row32(image: &Image, m: &Matrix, x: i32, y: i32, smooth: bool, repeat: 
 
 #[inline]
 fn look_up(table: &[[f32; 4]], t: f32) -> [f32; 4] {
+    table[step_of(t)]
+}
+
+/// Which step of a gradient's table `t` along it is.
+#[inline(always)]
+fn step_of(t: f32) -> usize {
     let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
-    table[((t * STEPS as f32) as usize).min(STEPS - 1)]
+    ((t * STEPS as f32) as usize).min(STEPS - 1)
+}
+
+/// How far along a radial gradient (`[x0, y0, r0, x1, y1, r1]`) each pixel of a row from `x, y` is, `n` of them, as the canvas
+/// spec has it: the bigger of the two circles through it whose radius isn't negative, or `None` where none is. Each pixel's place
+/// is stepped to from the last, and what's the same along the row is worked out once, which makes it a few times quicker than
+/// each pixel worked out alone; `Shader::row` and `Shader::row32` both use this, so they find the same places.
+#[inline]
+fn radial_row(kind: &[f32; 6], to_user: &Matrix, x: i32, y: i32, n: usize, mut each: impl FnMut(usize, Option<f32>)) {
+    let [x0, y0, r0, x1, y1, r1] = *kind;
+    let (cdx, cdy, dr) = (x1 - x0, y1 - y0, r1 - r0);
+    let a = cdx * cdx + cdy * cdy - dr * dr;
+    let (mut ux, mut uy) = to_user.apply(x as f32 + 0.5, y as f32 + 0.5);
+    let (step_x, step_y) = (to_user.a, to_user.b);
+    let (r0r0, r0dr) = (r0 * r0, r0 * dr);
+    if cdx == 0.0 && cdy == 0.0 && dr != 0.0 {
+        // Circles about the same center, as a glow's are: the circle through a point is as far from the center as it is, so
+        // it's (distance - r0) / (r1 - r0) along, which is what the general way below comes to with one root and no choosing.
+        let inv_dr = 1.0 / dr;
+        for i in 0..n {
+            let (pdx, pdy) = (ux - x0, uy - y0);
+            each(i, Some(((pdx * pdx + pdy * pdy).sqrt() - r0) * inv_dr));
+            ux += step_x;
+            uy += step_y;
+        }
+        return;
+    }
+    if a.abs() < 1e-9 {
+        // One circle's edge goes through the other's center: one root.
+        for i in 0..n {
+            let (pdx, pdy) = (ux - x0, uy - y0);
+            let b = pdx * cdx + pdy * cdy + r0dr;
+            let c = pdx * pdx + pdy * pdy - r0r0;
+            let mut t = None;
+            if b != 0.0 {
+                let w = c / (2.0 * b);
+                if r0 + w * dr >= 0.0 {
+                    t = Some(w);
+                }
+            }
+            each(i, t);
+            ux += step_x;
+            uy += step_y;
+        }
+        return;
+    }
+    let inv_a = 1.0 / a;
+    for i in 0..n {
+        let (pdx, pdy) = (ux - x0, uy - y0);
+        let b = pdx * cdx + pdy * cdy + r0dr;
+        let c = pdx * pdx + pdy * pdy - r0r0;
+        let disc = b * b - a * c;
+        let mut t = None;
+        if disc >= 0.0 {
+            let root = disc.sqrt();
+            let (w1, w2) = ((b + root) * inv_a, (b - root) * inv_a);
+            let (big, small) = if w1 > w2 { (w1, w2) } else { (w2, w1) };
+            if r0 + big * dr >= 0.0 {
+                t = Some(big);
+            } else if r0 + small * dr >= 0.0 {
+                t = Some(small);
+            }
+        }
+        each(i, t);
+        ux += step_x;
+        uy += step_y;
+    }
 }
 
 /// What a picture has at a place in its own pixels, from 0 to 255.
@@ -722,5 +864,108 @@ mod tests {
     fn multiply_darkens() {
         let out = composite(Op::Multiply, [0.5, 0.5, 0.5, 1.0], [1.0, 0.5, 0.0, 1.0]);
         assert!((out[0] - 0.5).abs() < 1e-6 && (out[1] - 0.25).abs() < 1e-6 && out[2].abs() < 1e-6);
+    }
+
+    /// Sampling at the nearest pixel a whole row at once, in fixed point, reads the same pixels as working out each sample's
+    /// place in floating point does, at many sizes and offsets.
+    #[test]
+    fn nearest_samples_in_fixed_point_are_the_same_as_one_at_a_time() {
+        let (w, h) = (37usize, 5usize);
+        let pixels: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
+        assert_eq!(pixels.as_ptr() as usize % 4, 0, "the quick way is only taken for pixels on a 4-byte boundary");
+        let image = Image { width: w as u32, height: h as u32, pixels };
+        let bounds = [0, 0, w as i32, h as i32];
+        for scale in [0.1f32, 0.25, 1.0 / 6.0, 0.5, 1.0, 1.5, 3.0, 7.25] {
+            for offset in [-3.0f32, 0.0, 0.3, 2.0, 11.7] {
+                let m = Matrix::new([scale, 0.0, 0.0, scale, offset, 0.0]);
+                for x in [-5, 0, 3, 40] {
+                    let mut fast = vec![0u32; 300];
+                    image_row32(&image, &m, x, 2, false, Repeat::Neither, &bounds, false, &mut fast);
+                    let v = m.d * (2.0 + 0.5) + m.f;
+                    let row = (super::super::raster::floor(v - 1.0e-4) as i32).clamp(0, h as i32 - 1) as usize;
+                    for (i, got) in fast.iter().enumerate() {
+                        let u = m.a * ((x + i as i32) as f32 + 0.5) + m.e;
+                        let column = (super::super::raster::floor(u - 1.0e-4) as i32).clamp(0, w as i32 - 1) as usize;
+                        let at = (row * w + column) * 4;
+                        let want = u32::from_le_bytes([image.pixels[at], image.pixels[at + 1], image.pixels[at + 2], image.pixels[at + 3]]);
+                        assert_eq!(*got, want, "scale {scale} offset {offset} x {x} pixel {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A row of a picture drawn bigger, from two of its rows sampled across and then between them, as `draw_image_rows` makes
+    /// it, is the same as sampling it whole, as its shader does.
+    #[test]
+    fn rows_sampled_across_then_between_are_the_same_as_sampled_whole() {
+        let (w, h) = (23usize, 9usize);
+        let pixels: Vec<u8> = (0..w * h * 4).map(|i| (i * 13 % 253) as u8).collect();
+        let image = Image { width: w as u32, height: h as u32, pixels };
+        let bounds = [0, 0, w as i32, h as i32];
+        for (sx, sy) in [(0.1f32, 0.15f32), (1.0 / 6.0, 1.0 / 6.0), (0.5, 0.25), (1.0, 1.0), (2.0, 0.7)] {
+            for (ex, fy) in [(0.0f32, 0.0f32), (-1.3, 0.4), (2.5, -0.75)] {
+                let m = Matrix::new([sx, 0.0, 0.0, sy, ex, fy]);
+                for y in -3..60 {
+                    let len = 90;
+                    let mut whole = vec![0u32; len];
+                    image_row32(&image, &m, -4, y, true, Repeat::Neither, &bounds, false, &mut whole);
+                    let v = m.d * (y as f32 + 0.5) + m.f;
+                    let fy0 = v - 0.5;
+                    let top = super::super::raster::floor(fy0);
+                    let wy = ((fy0 - top) * 256.0) as u32;
+                    let row = |r: i32| {
+                        let r = r.clamp(0, h as i32 - 1);
+                        let mut out = vec![0u32; len];
+                        image_row32(&image, &Matrix::new([m.a, 0.0, 0.0, 0.0, m.e, r as f32 + 0.5]), -4, 0, true, Repeat::Neither, &bounds, false, &mut out);
+                        out
+                    };
+                    let (upper, lower) = (row(top as i32), row(top as i32 + 1));
+                    let mut got = vec![0u32; len];
+                    super::super::pixels::lerp_rows(&mut got, &upper, &lower, wy);
+                    assert_eq!(got, whole, "scale {sx},{sy} offset {ex},{fy} row {y}");
+                }
+            }
+        }
+    }
+
+    /// A gradient's row packed from its table is what packing its floating point row gives, for linear and radial ones of
+    /// every shape, turned or not.
+    #[test]
+    fn gradient_rows_packed_from_the_table_are_the_same_as_packed_floats() {
+        let kinds = [
+            GradientKind::Linear { x0: 3.0, y0: 2.0, x1: 90.0, y1: 40.0 },
+            GradientKind::Linear { x0: 10.0, y0: 10.0, x1: 10.0, y1: 10.0 },
+            GradientKind::Radial { x0: 40.0, y0: 30.0, r0: 0.0, x1: 40.0, y1: 30.0, r1: 35.0 },
+            GradientKind::Radial { x0: 20.0, y0: 25.0, r0: 5.0, x1: 60.0, y1: 30.0, r1: 30.0 },
+            GradientKind::Radial { x0: 50.0, y0: 30.0, r0: 40.0, x1: 52.0, y1: 31.0, r1: 2.0 },
+        ];
+        for kind in kinds {
+            let mut g = Gradient::new(kind);
+            g.add_stop(0.0, [255, 40, 0, 255]);
+            g.add_stop(0.4, [20, 200, 90, 128]);
+            g.add_stop(1.0, [0, 0, 255, 0]);
+            let table = g.table();
+            for to_user in [Matrix::IDENTITY, Matrix::new([0.8, 0.3, -0.2, 1.1, 4.0, -3.0])] {
+                let shader = match kind {
+                    GradientKind::Linear { x0, y0, x1, y1 } => {
+                        let (dx, dy) = (x1 - x0, y1 - y0);
+                        let len2 = dx * dx + dy * dy;
+                        Shader::Linear { table: table.clone(), to_user, x0, y0, dx, dy, inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 } }
+                    }
+                    GradientKind::Radial { x0, y0, r0, x1, y1, r1 } => Shader::Radial { table: table.clone(), to_user, kind: [x0, y0, r0, x1, y1, r1] },
+                    GradientKind::Conic { .. } => unreachable!(),
+                };
+                let mut scratch = Vec::new();
+                for y in [0, 7, 29, 55] {
+                    let mut fast = vec![0u32; 100];
+                    shader.row32(-5, y, 255, &mut fast, &mut scratch);
+                    let mut floats = vec![[0.0f32; 4]; 100];
+                    shader.row(-5, y, &mut floats);
+                    let slow: Vec<u32> = floats.iter().map(|s| pack([(s[0] + 0.5) as u32, (s[1] + 0.5) as u32, (s[2] + 0.5) as u32, (s[3] + 0.5) as u32])).collect();
+                    assert_eq!(fast, slow, "{kind:?} row {y}");
+                }
+            }
+        }
     }
 }

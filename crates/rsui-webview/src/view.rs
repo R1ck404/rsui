@@ -33,7 +33,7 @@ enum Still {
     #[default]
     None,
     /// It's being taken.
-    Taking,
+    Taking(u64),
     /// It's been said.
     Said,
 }
@@ -76,10 +76,12 @@ struct State {
     /// Whether a page has arrived, before which what's under it shows.
     arrived: bool,
     still: Still,
+    capture_number: u64,
 }
 
 struct Shared {
     settings: Settings,
+    keys: RefCell<Vec<Key>>,
     sink: RefCell<Box<dyn FnMut(Event)>>,
     state: RefCell<State>,
     /// Events that happened while one was being told, which follow it.
@@ -113,8 +115,9 @@ pub struct WebView(Rc<Shared>);
 
 impl WebView {
     /// One that tells `sink` what happens in it. Nothing's made until it's put somewhere.
-    pub fn new(settings: Settings, sink: impl FnMut(Event) + 'static) -> Self {
+    pub fn new(mut settings: Settings, sink: impl FnMut(Event) + 'static) -> Self {
         Self(Rc::new(Shared {
+            keys: RefCell::new(std::mem::take(&mut settings.keys)),
             settings,
             sink: RefCell::new(Box::new(sink)),
             state: RefCell::new(State::default()),
@@ -214,6 +217,11 @@ impl WebView {
 
     pub fn set_zoom(&self, factor: f64) {
         self.run(Command::Zoom(factor));
+    }
+
+    /// Replaces the keys the app keeps while the page has focus.
+    pub fn set_keys(&self, keys: Vec<Key>) {
+        *self.0.keys.borrow_mut() = keys;
     }
 
     /// The cookies `url` would be sent, or all of them if it's empty, said with `call`.
@@ -609,7 +617,7 @@ fn set_up(shared: &Rc<Shared>, controller: ICoreWebView2Controller) -> Result<()
             }
             let held = |key: i32| GetKeyState(key) < 0;
             let pressed = Key { code, ctrl: held(0x11), shift: held(0x10), alt: kind == 2 || held(0x12) };
-            if !shared.settings.keys.contains(&pressed) {
+            if !shared.keys.borrow().contains(&pressed) {
                 return None;
             }
             let _ = args.put_Handled(BOOL(1));
@@ -783,13 +791,18 @@ fn keep_still(shared: &Rc<Shared>) {
     };
     match (wanted, still, core) {
         (true, Still::None, Some(core)) => {
-            shared.state.borrow_mut().still = Still::Taking;
-            if let Err(error) = take_still(shared, &core) {
+            let number = {
+                let mut state = shared.state.borrow_mut();
+                state.capture_number += 1;
+                state.still = Still::Taking(state.capture_number);
+                state.capture_number
+            };
+            if let Err(error) = take_still(shared, &core, number) {
                 crate::log(|| format!("couldn't take a still picture: {error}"));
                 shared.state.borrow_mut().still = Still::None;
             }
         }
-        (false, Still::Taking | Still::Said, _) => {
+        (false, Still::Taking(_) | Still::Said, _) => {
             shared.state.borrow_mut().still = Still::None;
             shared.tell(Event::Still(None));
         }
@@ -799,7 +812,7 @@ fn keep_still(shared: &Rc<Shared>) {
 
 /// Asks the page for a picture of itself, as a PNG, into a stream in memory, and says it once it's there, unless it's no
 /// longer wanted by then.
-fn take_still(shared: &Rc<Shared>, core: &ICoreWebView2) -> Result<(), String> {
+fn take_still(shared: &Rc<Shared>, core: &ICoreWebView2, number: u64) -> Result<(), String> {
     use windows::Win32::System::Com::{IStream, STREAM_SEEK_END, STREAM_SEEK_SET};
     use windows::Win32::UI::Shell::SHCreateMemStream;
     // SAFETY: a stream made empty, to be written by WebView2.
@@ -815,6 +828,10 @@ fn take_still(shared: &Rc<Shared>, core: &ICoreWebView2) -> Result<(), String> {
             let Some(shared) = weak.upgrade() else {
                 return HRESULT(0);
             };
+            // The overlay may have closed and reopened before this asynchronous capture finished.
+            if shared.state.borrow().still != Still::Taking(number) {
+                return HRESULT(0);
+            }
             let read = || -> windows::core::Result<Vec<u8>> {
                 handler::code(first).ok()?;
                 let mut size = 0;
@@ -829,13 +846,15 @@ fn take_still(shared: &Rc<Shared>, core: &ICoreWebView2) -> Result<(), String> {
                     Ok(bytes)
                 }
             };
-            let wanted = shared.state.borrow().still == Still::Taking;
-            match read() {
-                Ok(png) if wanted => {
+            let result = read();
+            if shared.state.borrow().still != Still::Taking(number) {
+                return HRESULT(0);
+            }
+            match result {
+                Ok(png) => {
                     shared.state.borrow_mut().still = Still::Said;
                     shared.tell(Event::Still(Some(Png(png))));
                 }
-                Ok(_) => {}
                 Err(error) => {
                     crate::log(|| format!("couldn't take a still picture: {}", error.message()));
                     shared.state.borrow_mut().still = Still::None;

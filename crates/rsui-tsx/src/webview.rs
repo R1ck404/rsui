@@ -25,19 +25,27 @@ pub(crate) const FUNCTIONS: [(&str, HostFunction); 5] = [
     ("webviewRuntime", host_runtime),
 ];
 
+type KeptKeys = Vec<(Key, String)>;
+
 /// A view that isn't really there, and what it would have.
 #[derive(Default)]
 struct Pretend {
     action: u32,
+    keys: KeptKeys,
     history: Vec<String>,
     at: usize,
     title: String,
 }
 
+struct NativeView {
+    view: WebView,
+    keys: Rc<RefCell<KeptKeys>>,
+}
+
 thread_local! {
     static PRETEND: RefCell<HashMap<u64, Pretend>> = RefCell::default();
     /// Real views, beside what `rsui::embed` holds, which is what keeps them, for what's asked of them by number.
-    static REAL: RefCell<HashMap<u64, Weak<WebView>>> = RefCell::default();
+    static REAL: RefCell<HashMap<u64, Weak<NativeView>>> = RefCell::default();
     /// Which view the `webview` steps are about: the last one opened that's still there.
     static LAST: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
@@ -53,6 +61,21 @@ fn tell(action: u32, id: u64, mut said: Json) {
 /// A key the app keeps, by the name it was given as, such as `Ctrl+T`.
 fn key_json(key: &Key, name: &str) -> Json {
     json!({ "name": name, "code": key.code, "ctrl": key.ctrl, "shift": key.shift, "alt": key.alt })
+}
+
+fn key_names(data: &Json) -> KeptKeys {
+    data.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let name = value.as_str()?;
+            Some((Key::parse(name)?, name.to_owned()))
+        })
+        .collect()
+}
+
+fn name_of_key(key: Key, keys: &[(Key, String)]) -> Option<&str> {
+    keys.iter().find(|(known, _)| *known == key).map(|(_, name)| name.as_str())
 }
 
 fn event_json(event: &Event, keys: &[(Key, String)]) -> Option<Json> {
@@ -78,14 +101,11 @@ fn event_json(event: &Event, keys: &[(Key, String)]) -> Option<Json> {
         Event::CloseRequested => json!({ "type": "close" }),
         Event::History => json!({ "type": "history" }),
         Event::Key(key) => {
-            let name = keys.iter().find(|(known, _)| known == key).map_or("", |(_, name)| name.as_str());
-            json!({ "type": "key", "key": key_json(key, name) })
+            json!({ "type": "key", "key": key_json(key, name_of_key(*key, keys)?) })
         }
         Event::FullScreen(on) => json!({ "type": "fullScreen", "on": on }),
-        Event::Still(picture) => match picture {
-            Some(png) => json!({ "type": "still", "url": format!("data:image/png;base64,{}", crate::native_more::base64(&png.0)) }),
-            None => json!({ "type": "still", "url": null }),
-        },
+        // Still pictures are moved straight into the renderer by the event sink.
+        Event::Still(_) => return None,
         Event::ScriptDone { call, result } => match result {
             Ok(value) => json!({ "type": "script", "call": call, "json": value }),
             Err(error) => json!({ "type": "script", "call": call, "error": error }),
@@ -128,6 +148,7 @@ fn host_open(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     };
     let profile = text("profile");
     let private = given.get("private").and_then(Json::as_bool).unwrap_or(false);
+    let keys = key_names(&given["keys"]);
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.retain(|one| *one != id);
@@ -140,10 +161,9 @@ fn host_open(vm: &mut Vm, args: Args) -> Result<Value, Value> {
             (None, false) => String::new(),
         };
         bridge::say(format!("it would show a web page in WebView2{whose}"));
-        PRETEND.with(|views| views.borrow_mut().insert(id, Pretend { action, ..Pretend::default() }));
+        PRETEND.with(|views| views.borrow_mut().insert(id, Pretend { action, keys, ..Pretend::default() }));
         return Ok(Value::UNDEFINED);
     }
-    let keys: Vec<(Key, String)> = texts("keys").into_iter().filter_map(|name| Some((Key::parse(&name)?, name))).collect();
     let settings = Settings {
         data_folder: data_folder(),
         profile: profile.map(|name| rsui_webview::profile_name(&name)),
@@ -153,18 +173,33 @@ fn host_open(vm: &mut Vm, args: Args) -> Result<Value, Value> {
         dev_tools: true,
         keys: keys.iter().map(|(key, _)| *key).collect(),
     };
-    let view = Rc::new(WebView::new(settings, move |event| {
-        if let Some(said) = event_json(&event, &keys) {
+    let keys = Rc::new(RefCell::new(keys));
+    let event_keys = Rc::clone(&keys);
+    let mut still = None;
+    let view = WebView::new(settings, move |event| {
+        let message = match event {
+            Event::Still(Some(png)) => {
+                let image = still.insert(rsui::render::MemoryImage::new(png.0));
+                Some(json!({ "type": "still", "url": image.source() }))
+            }
+            Event::Still(None) => {
+                still.take();
+                Some(json!({ "type": "still", "url": null }))
+            }
+            other => event_json(&other, &event_keys.borrow()),
+        };
+        if let Some(said) = message {
             tell(action, id, said);
         }
-    }));
+    });
+    let view = Rc::new(NativeView { view, keys });
     REAL.with(|real| real.borrow_mut().insert(id, Rc::downgrade(&view)));
     rsui::embed::embed(id, Box::new(Hosted(view)));
     Ok(Value::UNDEFINED)
 }
 
 /// A real view, kept where its element is.
-struct Hosted(Rc<WebView>);
+struct Hosted(Rc<NativeView>);
 
 impl rsui::embed::Embedded for Hosted {
     fn place(&mut self, window: isize, place: Option<&rsui::embed::Place>) {
@@ -177,15 +212,15 @@ impl rsui::embed::Embedded for Hosted {
             still: place.still,
             radius: place.radius,
         });
-        self.0.place(window, bounds.as_ref());
+        self.0.view.place(window, bounds.as_ref());
     }
 
     fn window_moved(&mut self) {
-        self.0.window_moved();
+        self.0.view.window_moved();
     }
 }
 
-fn real_view(id: u64) -> Option<Rc<WebView>> {
+fn real_view(id: u64) -> Option<Rc<NativeView>> {
     REAL.with(|real| real.borrow().get(&id).and_then(Weak::upgrade))
 }
 
@@ -195,7 +230,19 @@ fn host_do(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     let what = text_at(vm, args, 1);
     let given = text_at(vm, args, 2);
     let call = u64::from(number_at(vm, args, 3));
-    if let Some(view) = real_view(id) {
+    let native = real_view(id);
+    if what == "keys" {
+        let keys = key_names(&serde_json::from_str(&given).unwrap_or(Json::Null));
+        if let Some(native) = native {
+            native.view.set_keys(keys.iter().map(|(key, _)| *key).collect());
+            *native.keys.borrow_mut() = keys;
+        } else {
+            with_view(id, |view| view.keys = keys);
+        }
+        return Ok(Value::UNDEFINED);
+    }
+    if let Some(native) = native {
+        let view = &native.view;
         match what.as_str() {
             "navigate" => view.navigate(&given),
             "back" => view.back(),
@@ -292,7 +339,8 @@ fn pretend_do(id: u64, what: &str, given: &str, call: u64) -> Result<(), String>
 fn host_ask(vm: &mut Vm, args: Args) -> Result<Value, Value> {
     let id = u64::from(number_at(vm, args, 0));
     let what = text_at(vm, args, 1);
-    if let Some(view) = real_view(id) {
+    if let Some(native) = real_view(id) {
+        let view = &native.view;
         return Ok(match what.as_str() {
             "url" => view.url().map_or(Value::UNDEFINED, |url| vm.new_string(&url)),
             "title" => view.title().map_or(Value::UNDEFINED, |title| vm.new_string(&title)),
@@ -383,7 +431,10 @@ pub(crate) fn step(words: &[String]) -> Result<(), String> {
         Some("key") => {
             let keys = word(1)?;
             let key = Key::parse(&keys).ok_or_else(|| format!("{keys} isn't a key, like Ctrl+T"))?;
-            tell(action, id, json!({ "type": "key", "key": key_json(&key, &keys) }));
+            let name = with_view(id, |view| name_of_key(key, &view.keys).map(str::to_owned)).flatten();
+            if let Some(name) = name {
+                tell(action, id, json!({ "type": "key", "key": key_json(&key, &name) }));
+            }
         }
         Some("fullscreen") => tell(action, id, json!({ "type": "fullScreen", "on": word(1)? != "off" })),
         Some("message") => tell(action, id, json!({ "type": "message", "json": words[1..].join(" ") })),

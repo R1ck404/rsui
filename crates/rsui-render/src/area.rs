@@ -88,6 +88,30 @@ pub(crate) fn placed_area(quad: &Quad, matrix: Matrix) -> PixelRect {
     }
 }
 
+pub(crate) fn backdrop_sigma(quad: &Quad, matrix: Option<Matrix>) -> f32 {
+    let scale = matrix.map_or(1.0, |[a, b, c, d, ..]| (a * d - b * c).abs().sqrt());
+    (f32::from(quad.glyph[0]) / 16.0 * scale).min(4096.0)
+}
+
+/// The visible part of a backdrop and the strip of pixels around it the blur can sample, both in target coordinates.
+pub(crate) fn backdrop_areas(
+    quad: &Quad, clip: PixelRect, matrix: Option<Matrix>, origin: (i32, i32), size: (u32, u32),
+) -> (PixelRect, PixelRect) {
+    let target = PixelRect { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 };
+    let placed = matrix.map_or_else(|| area_of(quad), |matrix| placed_area(quad, matrix));
+    let visible = intersect(placed, clip);
+    let visible = intersect(target, PixelRect {
+        left: visible.left - origin.0, top: visible.top - origin.1,
+        right: visible.right - origin.0, bottom: visible.bottom - origin.1,
+    });
+    let padding = (backdrop_sigma(quad, matrix) * 3.0).ceil() as i32 + 2;
+    let sample = intersect(target, PixelRect {
+        left: visible.left - padding, top: visible.top - padding,
+        right: visible.right + padding, bottom: visible.bottom + padding,
+    });
+    (visible, sample)
+}
+
 /// The round clips a batch is cut off by, as the shaders take them, filled from the first: the one it's in, then the one that's
 /// in. A third around those is rare, and only the rectangle around it cuts off what's drawn. Each says whether it's measured on
 /// the screen, as one made outside what turns or resizes the batch is. One made inside another transform than the batch's is

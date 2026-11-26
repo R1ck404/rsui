@@ -25,6 +25,43 @@ fn fill_rect_paints_whole_pixels() {
 }
 
 #[test]
+fn scaled_destination_in_matches_the_layered_compositor() {
+    let image = Rc::new(Image { width: 7, height: 5, pixels: (0..140).map(|n| (n * 73 % 256) as u8).collect() });
+    for smooth in [false, true] {
+        for alpha in [0.0, 0.17, 0.5, 1.0] {
+            for flip in [false, true] {
+                let render = |layered: bool, dx: f32| {
+                    let mut world = World::default();
+                    let mut surface = Surface::new(61, 39, false);
+                    let mut drawing = Drawing { surface: &mut surface, world: &mut world, surface_id: 1 };
+                    drawing.draw(Coverage::Rect([3.0, 2.0, 59.0, 37.0]), &Shader::Solid([23.0, 91.0, 127.0, 163.0]), None);
+                    let mut clip = Path::default();
+                    clip.rect(&Matrix::IDENTITY, 4.0, 1.0, 47.0, 34.0);
+                    drawing.clip(&clip, false);
+                    let m = if flip { Matrix::new([-1.0, 0.0, 0.0, -1.0, 61.0, 39.0]) } else { Matrix::IDENTITY };
+                    drawing.surface.state.transform = m;
+                    drawing.surface.state.op = Op::DestinationIn;
+                    drawing.surface.state.smoothing = smooth;
+                    drawing.surface.state.alpha = alpha;
+                    if layered {
+                        let to_image = Matrix::new([6.5 / 61.0, 0.0, 0.0, 4.5 / 39.0, 0.25 - dx * 6.5 / 61.0, 0.25]).then(&m.invert().unwrap());
+                        let shader = Shader::Image { image: image.clone(), to_image, smooth, repeat: Repeat::Neither, bounds: [0, 0, 7, 5], pattern: false };
+                        let left = if flip { -dx } else { dx };
+                        drawing.draw(Coverage::Rect([left, 0.0, left + 61.0, 39.0]), &shader, None);
+                    } else {
+                        drawing.draw_image(&image, [0.25, 0.25, 6.5, 4.5, dx, 0.0, 61.0, 39.0]);
+                    }
+                    surface.pixels
+                };
+                for dx in [0.0, 17.0, -9.0, 80.0] {
+                    assert_eq!(render(false, dx), render(true, dx), "smooth={smooth}, alpha={alpha}, flipped={flip}, x={dx}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn half_pixels_are_half_covered() {
     let id = create(10, 10, false);
     run(&[op(SELECT), f64::from(id), op(FILL_RECT), 0.5, 0.0, 2.0, 2.0], &[]);
@@ -260,6 +297,19 @@ fn uploads_give_what_changed() {
     let (area, pixels, _) = take_upload(id, false, version).unwrap();
     assert_eq!(area, IRectOut { x: 10, y: 10, width: 5, height: 5 });
     assert_eq!(pixels.len(), 5 * 5 * 4);
+}
+
+#[test]
+fn an_upload_after_shrinking_stays_inside_the_canvas() {
+    // Drawn on at one size, then made smaller before the GPU took it: what changed at the old size mustn't be read at the new.
+    let id = create(100, 100, false);
+    let (_, _, version) = take_upload(id, true, 0).unwrap();
+    run(&[op(SELECT), f64::from(id), op(FILL_RECT), 0.0, 0.0, 100.0, 100.0], &[]);
+    resize(id, 60, 40);
+    run(&[op(SELECT), f64::from(id), op(FILL_RECT), 0.0, 0.0, 10.0, 10.0], &[]);
+    let (area, pixels, _) = take_upload(id, false, version).unwrap();
+    assert!(area.x + area.width <= 60 && area.y + area.height <= 40, "{area:?}");
+    assert_eq!(pixels.len(), (area.width * area.height * 4) as usize);
 }
 
 #[test]
@@ -500,4 +550,228 @@ fn drawing_through_a_soft_rectangle_clip_stays_inside_it() {
     assert_eq!(pixel(id, 20, 10), [0, 0, 0, 255]);
     let edge = pixel(id, 3, 10)[3];
     assert!(edge > 0 && edge < 255, "{edge}");
+}
+
+/// A fill of many small shapes, big enough to be split into bands on threads, is the same as it filled without bands, by both
+/// rules and laid on as usual, taken out and added.
+#[test]
+fn a_fill_split_into_bands_is_the_same_as_one_not() {
+    let (w, h) = (400usize, 300usize);
+    // Dots on a grid that don't touch, at fractions of a pixel, so their edges are partly covered.
+    let mut dots = Vec::new();
+    for y in 0..28 {
+        for x in 0..38 {
+            dots.push((5.3 + x as f64 * 10.4, 6.1 + y as f64 * 10.2, 3.6));
+        }
+    }
+    let path = |dots: &[(f64, f64, f64)]| {
+        let mut list = vec![op(BEGIN)];
+        for &(x, y, r) in dots {
+            // Not quite all the way round, so they're filled from their lines, not as circles.
+            list.extend([op(MOVE), x + r, y, op(ARC), x, y, r, 0.0, 6.1, 0.0]);
+        }
+        list
+    };
+    for (composite, even_odd) in [(0.0, 0.0), (0.0, 1.0), (6.0, 0.0), (8.0, 0.0)] {
+        let draw = |split: bool| {
+            let id = create(w as u32, h as u32, false);
+            let mut list = vec![op(SELECT), f64::from(id), op(FILL_COLOR), color(40, 90, 200, 255), op(FILL_RECT), 0.0, 0.0, w as f64, h as f64];
+            list.extend([op(COMPOSITE), composite, op(FILL_COLOR), color(250, 200, 60, 180)]);
+            list.extend(path(&dots));
+            list.extend([op(FILL), even_odd]);
+            super::pool::SERIAL.with(|serial| serial.set(!split));
+            run(&list, &[]);
+            super::pool::SERIAL.with(|serial| serial.set(false));
+            let mut out = vec![0u8; w * h * 4];
+            read(id, 0, 0, w as u32, h as u32, &mut out);
+            out
+        };
+        assert!(dots.len() * 13 >= 2048, "enough lines to be split");
+        assert!(draw(true) == draw(false), "composite {composite} even-odd {even_odd}");
+    }
+}
+
+/// A rectangle of a gradient big enough to be split into bands on threads is the same as it drawn without bands, linear and
+/// radial, its edges on fractions of a pixel.
+#[test]
+fn a_gradient_split_into_bands_is_the_same_as_one_not() {
+    let (w, h) = (640usize, 420usize);
+    for kind in [LINEAR, RADIAL] {
+        let draw = |split: bool| {
+            let id = create(w as u32, h as u32, false);
+            let mut list = vec![op(SELECT), f64::from(id), op(FILL_COLOR), color(10, 20, 30, 255), op(FILL_RECT), 0.0, 0.0, w as f64, h as f64];
+            if kind == LINEAR {
+                list.extend([op(LINEAR), 9.0, 20.0, 10.0, 600.0, 380.0]);
+            } else {
+                list.extend([op(RADIAL), 9.0, 300.0, 200.0, 0.0, 300.0, 200.0, 350.0]);
+            }
+            list.extend([op(STOP), 9.0, 0.0, color(250, 120, 40, 200), op(STOP), 9.0, 1.0, color(40, 80, 250, 0)]);
+            list.extend([op(FILL_GRADIENT), 9.0, op(FILL_RECT), 0.5, 1.25, 630.0, 410.6]);
+            super::pool::SERIAL.with(|serial| serial.set(!split));
+            run(&list, &[]);
+            super::pool::SERIAL.with(|serial| serial.set(false));
+            let mut out = vec![0u8; w * h * 4];
+            read(id, 0, 0, w as u32, h as u32, &mut out);
+            out
+        };
+        assert!(draw(true) == draw(false), "{kind}");
+    }
+}
+
+/// Dots filled as circles, from each pixel's distance to the center, cover what the same dots filled from their lines do: the
+/// same area, and no pixel more than a little different, at the edge.
+#[test]
+fn circles_cover_what_their_lines_do() {
+    let (w, h) = (200usize, 120usize);
+    let mut dots = Vec::new();
+    for y in 0..5 {
+        for x in 0..9 {
+            dots.push((10.3 + x as f64 * 21.7, 11.6 + y as f64 * 22.1, 1.5 + (x + y) as f64 * 0.9));
+        }
+    }
+    let draw = |whole: bool| {
+        let id = create(w as u32, h as u32, false);
+        let mut list = vec![op(SELECT), f64::from(id), op(FILL_COLOR), color(255, 255, 255, 255), op(BEGIN)];
+        // All the way round is a circle; a hair short of it is filled from its lines, with the gap closed by a line.
+        let sweep = if whole { std::f64::consts::TAU } else { std::f64::consts::TAU - 0.0002 };
+        for &(x, y, r) in &dots {
+            list.extend([op(MOVE), x + r, y, op(ARC), x, y, r, 0.0, sweep, 0.0]);
+        }
+        list.extend([op(FILL), 0.0]);
+        run(&list, &[]);
+        let mut out = vec![0u8; w * h * 4];
+        read(id, 0, 0, w as u32, h as u32, &mut out);
+        out
+    };
+    let (circles, lines) = (draw(true), draw(false));
+    let area = |px: &[u8]| px.chunks_exact(4).map(|p| f64::from(p[3]) / 255.0).sum::<f64>();
+    let true_area: f64 = dots.iter().map(|d| std::f64::consts::PI * d.2 * d.2).sum();
+    assert!((area(&circles) - true_area).abs() / true_area < 0.02, "circles {} against {true_area}", area(&circles));
+    assert!((area(&lines) - true_area).abs() / true_area < 0.02, "lines {} against {true_area}", area(&lines));
+    let most = circles.chunks_exact(4).zip(lines.chunks_exact(4)).map(|(a, b)| a[3].abs_diff(b[3])).max().unwrap();
+    assert!(most <= 64, "{most}");
+}
+
+/// A grid of small rectangles filled one by one (see `Path::rects`) covers what filling them from their lines does, to the pixel.
+#[test]
+fn rects_cover_what_their_lines_do() {
+    let (w, h) = (160usize, 90usize);
+    let draw = |separately: bool, alpha: u8| {
+        let id = create(w as u32, h as u32, false);
+        let mut list = vec![op(SELECT), f64::from(id), op(FILL_COLOR), color(40, 120, 255, alpha), op(BEGIN)];
+        for row in 0..20 {
+            let shift = if row % 2 == 0 { 0.0 } else { 2.0 };
+            for col in 0..38 {
+                // Some on whole pixels, some not, none sharing a pixel.
+                let (x, y) = (shift + col as f64 * 4.0 + 0.3 * f64::from(col % 3 == 1), row as f64 * 4.0 + 0.25 * f64::from(row % 2));
+                list.extend([op(RECT), x, y, 2.0, 2.0]);
+            }
+        }
+        if !separately {
+            // A part with no inside, which the rectangles can't be filled one by one with, so that their lines are walked.
+            list.extend([op(MOVE), 1.0, 85.0, op(LINE), 5.0, 85.0, op(LINE), 9.0, 85.0]);
+        }
+        list.extend([op(FILL), 0.0]);
+        run(&list, &[]);
+        let mut out = vec![0u8; w * h * 4];
+        read(id, 0, 0, w as u32, h as u32, &mut out);
+        out
+    };
+    for alpha in [255, 90] {
+        let (each, walked) = (draw(true, alpha), draw(false, alpha));
+        let most = each.iter().zip(walked.iter()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(most <= 2, "alpha {alpha}: {most}");
+        assert!(each.iter().any(|v| *v != 0));
+    }
+}
+
+#[test]
+#[ignore = "a measurement, for looking at with --nocapture"]
+fn timing_dots() {
+    let (w, h) = (3840usize, 2160usize);
+    let id = create(w as u32, h as u32, false);
+    for (name, rects) in [("rects", true), ("walked", false), ("build only", true)] {
+        let mut list = vec![op(SELECT), f64::from(id), op(FILL_COLOR), color(120, 140, 255, 40), op(BEGIN)];
+        let mut count = 0;
+        for row in 0..540 {
+            let shift = if row % 2 == 0 { 0.0 } else { 2.0 };
+            for col in 0..400 {
+                if (row * 7 + col * 3) % 10 < 4 {
+                    list.extend([op(RECT), shift + col as f64 * 4.0, row as f64 * 4.0, 2.0, 2.0]);
+                    count += 1;
+                }
+            }
+        }
+        if !rects {
+            list.extend([op(MOVE), 1.0, 2000.0, op(LINE), 5.0, 2000.0, op(LINE), 9.0, 2000.0]);
+        }
+        if name != "build only" {
+            list.extend([op(FILL), 0.0]);
+        }
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            run(&list, &[]);
+            best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("{name}: {count} dots, best of 7: {best:.2} ms");
+    }
+}
+
+/// `fillDither()` draws the dots that a `fillRect()` for each of them draws, where the field is above their threshold, and what
+/// follows it in the list is still drawn (the field is skipped over right).
+#[test]
+fn dither_draws_the_dots_a_fill_rect_each_would() {
+    let (w, h) = (120usize, 80usize);
+    let (cols, rows, cell) = (9usize, 6usize, 14.0f64);
+    let field: Vec<f64> = (0..rows * cols).map(|k| 1.7 - ((k % cols) as f64 * 0.17 + (k / cols) as f64 * 0.21)).collect();
+    let bayer = [0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0];
+    let at = |x: f64, y: f64| {
+        let (i, j) = (((x / cell) as usize).min(cols - 2), ((y / cell) as usize).min(rows - 2));
+        let (fx, fy) = (x / cell - i as f64, y / cell - j as f64);
+        let top = field[j * cols + i] * (1.0 - fx) + field[j * cols + i + 1] * fx;
+        let bottom = field[(j + 1) * cols + i] * (1.0 - fx) + field[(j + 1) * cols + i + 1] * fx;
+        top + (bottom - top) * fy
+    };
+    let draw = |native: bool| {
+        let id = create(w as u32, h as u32, false);
+        let mut list = vec![op(SELECT), f64::from(id), op(FILL_COLOR), color(255, 255, 255, 120)];
+        // Moved and scaled, as it may be.
+        list.extend([op(TRANSFORM), 1.0, 0.0, 0.0, 1.0, 3.0, 2.0]);
+        if native {
+            list.extend([op(FILL_DITHER), cols as f64, rows as f64, cell, 4.0, 2.0]);
+            list.extend(field.iter().copied());
+        } else {
+            let (width, height) = ((cols - 1) as f64 * cell, (rows - 1) as f64 * cell);
+            let mut row = 0usize;
+            while row as f64 * 4.0 <= height {
+                let y = row as f64 * 4.0;
+                let mut col = 0usize;
+                loop {
+                    let x = if row % 2 == 0 { 0.0 } else { 2.0 } + col as f64 * 4.0;
+                    if x > width {
+                        break;
+                    }
+                    if at(x, y) > (bayer[(row % 4) * 4 + col % 4] + 0.5) / 16.0 {
+                        list.extend([op(FILL_RECT), x, y, 2.0, 2.0]);
+                    }
+                    col += 1;
+                }
+                row += 1;
+            }
+        }
+        // Something after it, which a field read wrongly would lose.
+        list.extend([op(FILL_COLOR), color(255, 0, 0, 255), op(FILL_RECT), 100.0, 60.0, 4.0, 4.0]);
+        run(&list, &[]);
+        let mut out = vec![0u8; w * h * 4];
+        read(id, 0, 0, w as u32, h as u32, &mut out);
+        out
+    };
+    let (native, each) = (draw(true), draw(false));
+    assert!(native.iter().any(|v| *v != 0));
+    let most = native.iter().zip(each.iter()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    assert!(most <= 1, "{most}");
+    // The red square after it is there.
+    let red = ((62 * w) + 103) * 4;
+    assert_eq!(&native[red..red + 4], &[255, 0, 0, 255]);
 }

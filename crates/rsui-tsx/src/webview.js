@@ -33,23 +33,37 @@ function hearing() {
 /// PNG, which every picture the page can show can be drawn as, whatever it was: `.ico` and `.svg` included. One from another
 /// site that doesn't allow it to be read is skipped for the next.
 const ICON_SCRIPT = `(async () => {
-    const links = [...document.querySelectorAll('link[rel~="icon" i], link[rel="apple-touch-icon" i]')];
-    const size = (link) => Math.max(0, ...String(link.getAttribute('sizes') || '').split(/\\s+/).map((one) => parseInt(one, 10) || 0));
-    const fit = (link) => /svg/i.test(link.type || link.href) ? 1000 : size(link) >= 32 && size(link) <= 192 ? 500 + size(link) : size(link);
-    links.sort((a, b) => fit(b) - fit(a));
-    const tries = links.map((link) => link.href);
-    if (/^https?:/.test(location.protocol)) tries.push(location.origin + '/favicon.ico');
-    for (const href of tries) {
-        try {
-            const picture = new Image();
-            picture.crossOrigin = new URL(href).origin === location.origin ? '' : 'anonymous';
-            await new Promise((done, failed) => { picture.onload = done; picture.onerror = failed; picture.src = href; });
-            const canvas = document.createElement('canvas');
-            canvas.width = canvas.height = 64;
-            canvas.getContext('2d').drawImage(picture, 0, 0, 64, 64);
-            window.chrome.webview.postMessage({ rsuiIcon: canvas.toDataURL('image/png'), at: location.href });
-            return;
-        } catch {}
+    const tried = new Set();
+    let shown = null;
+    const loaded = document.readyState === 'complete' ? null : new Promise(done => window.addEventListener('load', done, { once: true }));
+    const find = async () => {
+        const links = [...document.querySelectorAll('link[rel~="icon" i], link[rel="apple-touch-icon" i]')];
+        const size = (link) => Math.max(0, ...String(link.getAttribute('sizes') || '').split(/\\s+/).map((one) => parseInt(one, 10) || 0));
+        const fit = (link) => /svg/i.test(link.type || link.href) ? 1000 : size(link) >= 32 && size(link) <= 192 ? 500 + size(link) : size(link);
+        links.sort((a, b) => fit(b) - fit(a));
+        const tries = links.map((link) => link.href);
+        if (/^https?:/.test(location.protocol)) tries.push(location.origin + '/favicon.ico');
+        for (const href of tries) {
+            if (href === shown) return;
+            if (tried.has(href)) continue;
+            tried.add(href);
+            try {
+                const picture = new Image();
+                picture.crossOrigin = new URL(href).origin === location.origin ? '' : 'anonymous';
+                await new Promise((done, failed) => { picture.onload = done; picture.onerror = failed; picture.src = href; });
+                const canvas = document.createElement('canvas');
+                canvas.width = canvas.height = 64;
+                canvas.getContext('2d').drawImage(picture, 0, 0, 64, 64);
+                window.chrome.webview.postMessage({ rsuiIcon: canvas.toDataURL('image/png'), at: location.href });
+                shown = href;
+                return;
+            } catch {}
+        }
+    };
+    await find();
+    if (loaded) {
+        await loaded;
+        await find();
     }
 })(); null`;
 
@@ -69,11 +83,12 @@ class View {
         this.calls = new Map();
         this.nextCall = 1;
         views.set(this.id, this);
+        this.keys = keyList(keys);
         const settings = {
             profile: typeof profile === 'string' ? profile : '',
             private: inPrivate === true,
             userAgent: typeof userAgent === 'string' ? userAgent : '',
-            keys: Array.isArray(keys) ? keys.map(String) : [],
+            keys: this.keys,
         };
         host.webviewOpen(this.id, hearing(), JSON.stringify(settings));
     }
@@ -104,6 +119,7 @@ class View {
                 this.#set({ loading: true, error: null, url: event.url });
                 break;
             case 'navigated':
+                this.iconRequest = null;
                 this.#set({ url: event.url, icon: '', ...this.#history() });
                 break;
             case 'inPage':
@@ -192,7 +208,12 @@ class View {
     }
 
     #findIcon() {
-        this.run(ICON_SCRIPT).catch(() => {});
+        if (this.iconRequest) return;
+        const request = this.run(ICON_SCRIPT);
+        this.iconRequest = request;
+        request.catch(() => {
+            if (this.iconRequest === request) this.iconRequest = null;
+        });
     }
 
     go(url) {
@@ -234,6 +255,13 @@ class View {
         this.#do('zoom', Number(factor) || 1);
     }
 
+    setKeys(keys) {
+        const next = keyList(keys);
+        if (next.length === this.keys.length && next.every((key, i) => key === this.keys[i])) return;
+        this.keys = next;
+        this.#do('keys', JSON.stringify(next));
+    }
+
     post(value) {
         this.#do('post', JSON.stringify(value ?? null));
     }
@@ -269,6 +297,10 @@ class View {
     }
 }
 
+function keyList(keys) {
+    return Array.isArray(keys) ? keys.map(String) : [];
+}
+
 /// The view an element has, made the first time it renders and closed when it goes, told what's handed to it each time.
 function useView(props) {
     const { src, profile, private: inPrivate, userAgent, keys, zoom, ref, onState, onNewWindow, onKey, onMessage, onFocus, onClose, onUnavailable } = props;
@@ -278,6 +310,7 @@ function useView(props) {
     view.onStill = setStill;
     view.still = still;
     useEffect(() => () => view.close(), []);
+    useEffect(() => view.setKeys(keys), [keys]);
     useEffect(() => {
         if (typeof src === 'string' && src !== '' && src !== view.asked && src !== view.state.url) {
             view.go(src);

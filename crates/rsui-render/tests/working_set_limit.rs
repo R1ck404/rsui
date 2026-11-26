@@ -46,6 +46,10 @@ fn a_limit_holds_for_as_long_as_it_lasts_and_then_is_gone() {
         Some(512 * MB),
         "the least allowed wins when there's less than that in RAM"
     );
+    let overlapping = WorkingSetLimit::with_room(MB, 256 * MB);
+    assert_eq!(hard_maximum(), Some(512 * MB));
+    drop(overlapping);
+    assert_eq!(hard_maximum(), Some(512 * MB));
     drop(limit);
     assert_eq!(
         hard_maximum(),

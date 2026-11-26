@@ -15,6 +15,38 @@ fn open(source: &str, css: &str) -> hands::Hands {
 }
 
 #[test]
+fn backdrop_blur_follows_the_current_css_value() {
+    let mut ui = open(
+        r#"
+        import { PageWindow, dom } from 'rsui/web';
+        import { useState } from 'react';
+        export default function App() {
+            const [on, setOn] = useState(false);
+            const [result, setResult] = useState('waiting');
+            return <PageWindow><dom.div style={{'--effect': on ? 'blur(12px)' : 'none'}}>
+                <dom.div id="card" className="card" />
+                <dom.button key="toggle" onClick={() => setOn(!on)}>toggle</dom.button>
+                <dom.button key="read" onClick={() => {
+                    const filter = getComputedStyle(document.getElementById('card')).backdropFilter;
+                    setResult('effect: ' + filter);
+                }}>read</dom.button>
+                <dom.p>{result}</dom.p>
+            </dom.div></PageWindow>;
+        }
+        "#,
+        ".card { height: 20px; backdrop-filter: var(--effect); }",
+    );
+    ui.click("read");
+    ui.wait_for("effect: none");
+    ui.click("toggle");
+    ui.click("read");
+    ui.wait_for("effect: blur(12px)");
+    ui.click("toggle");
+    ui.click("read");
+    ui.wait_for("effect: none");
+}
+
+#[test]
 fn fresh_wrappers_local_setters_and_custom_rects_are_isolated() {
     let mut ui = open(r#"
         import { PageWindow, dom } from 'rsui/web';

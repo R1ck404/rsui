@@ -24,6 +24,9 @@ mod agent;
 mod bridge;
 mod canvas;
 mod config;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod crash_report;
 mod css;
 mod css_build;
 mod debugger;
@@ -38,6 +41,8 @@ mod matching;
 mod native;
 mod native_look;
 mod native_more;
+mod native_pty;
+mod native_video;
 mod new;
 mod pack;
 mod plans;
@@ -129,6 +134,10 @@ pub(crate) const STACK: usize = 32 * 1024 * 1024;
 
 /// Runs an app from a file, whose default export is its root component, until its window closes.
 pub fn run(path: impl AsRef<Path>, options: Options) -> Result<(), Error> {
+    run_with_app_panic(path.as_ref(), options, || {})
+}
+
+fn run_with_app_panic(path: &Path, options: Options, on_panic: impl FnOnce()) -> Result<(), Error> {
     // The graphics driver loads while the app's scripts do, rather than after, and a packed app's scripts are read
     // while the ones before them run.
     rsui::render::start_gpu_early();
@@ -138,14 +147,15 @@ pub fn run(path: impl AsRef<Path>, options: Options) -> Result<(), Error> {
     if rsui_js::running_packed() {
         rsui::text::read_files_with(rsui_js::read_packed_file);
     }
-    let path: PathBuf = path.as_ref().to_owned();
+    let path = path.to_owned();
     let thread = std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || run_here(&path, options))
         .map_err(Error::Thread)?;
-    thread
-        .join()
-        .unwrap_or_else(|_| Err(Error::Script("the app's thread panicked".to_owned())))
+    thread.join().unwrap_or_else(|_| {
+        on_panic();
+        Err(Error::Script("the app's thread panicked".to_owned()))
+    })
 }
 
 fn run_here(path: &Path, options: Options) -> Result<(), Error> {

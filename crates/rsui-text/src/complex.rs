@@ -116,7 +116,6 @@ struct ShapedLine {
     end: u32,
     width: f32,
     x: f32,
-    baseline: f32,
     glyphs: Range<u32>,
 }
 
@@ -955,7 +954,7 @@ impl TextEngine {
         max_width: Option<f32>,
         key: ShapedKey,
     ) -> Shaped {
-        let (line_height, ascent) = self.text_line_metrics(text, primary, size);
+        // Cache glyph positions relative to their baselines so styles with different line heights share the shaping.
         let mut shaped = Shaped {
             key,
             lines: Vec::new(),
@@ -972,13 +971,12 @@ impl TextEngine {
                 clusters: Some(&mut shaped.clusters),
             };
             let count = paragraph.characters.len();
-            let width = self.shape_line(&paragraph, 0..count, size, ascent, &mut output);
+            let width = self.shape_line(&paragraph, 0..count, size, 0.0, &mut output);
             shaped.lines.push(ShapedLine {
                 start: 0,
                 end: text.len() as u32,
                 width,
                 x: 0.0,
-                baseline: ascent,
                 glyphs: 0..shaped.glyphs.len() as u32,
             });
             return shaped;
@@ -997,13 +995,12 @@ impl TextEngine {
                 vec![(0, visible)]
             };
             for (from, to) in lines {
-                let baseline = ascent + shaped.lines.len() as f32 * line_height;
                 let first = shaped.glyphs.len() as u32;
                 let mut output = Output {
                     glyphs: &mut shaped.glyphs,
                     clusters: None,
                 };
-                let width = self.shape_line(&paragraph, from..to, size, baseline, &mut output);
+                let width = self.shape_line(&paragraph, from..to, size, 0.0, &mut output);
                 // A line of nothing but spaces starts where the paragraph does, as plain text does.
                 let start = if from == 0 {
                     at as u32
@@ -1024,7 +1021,6 @@ impl TextEngine {
                     end,
                     width,
                     x: 0.0,
-                    baseline,
                     glyphs: first..shaped.glyphs.len() as u32,
                 });
             }
@@ -1085,19 +1081,30 @@ impl TextEngine {
         primary: usize,
         size: f32,
         max_width: f32,
+        (line_height, ascent): (f32, f32),
         layout: &mut TextLayout,
     ) {
         let shaped = self.shaped(text, primary, size, Some(max_width));
-        layout.glyphs.extend_from_slice(&shaped.glyphs);
-        layout.lines.extend(shaped.lines.iter().map(|line| Line {
-            start: line.start as usize,
-            end: line.end as usize,
-            width: line.width,
-            x: line.x,
-            baseline: line.baseline,
-            first_glyph: line.glyphs.start,
-            glyph_count: line.glyphs.end - line.glyphs.start,
-        }));
+        for (index, line) in shaped.lines.iter().enumerate() {
+            let baseline = ascent + index as f32 * line_height;
+            layout.glyphs.extend(
+                shaped.glyphs[line.glyphs.start as usize..line.glyphs.end as usize]
+                    .iter()
+                    .map(|glyph| PlacedGlyph {
+                        y: glyph.y + baseline,
+                        ..*glyph
+                    }),
+            );
+            layout.lines.push(Line {
+                start: line.start as usize,
+                end: line.end as usize,
+                width: line.width,
+                x: line.x,
+                baseline,
+                first_glyph: line.glyphs.start,
+                glyph_count: line.glyphs.end - line.glyphs.start,
+            });
+        }
     }
 
     /// How many lines text that isn't plain takes up, and how wide the widest is.
@@ -1123,6 +1130,7 @@ impl TextEngine {
         primary: usize,
         size: f32,
         across: (f32, f32),
+        baseline: f32,
         layout: &mut TextLayout,
     ) {
         let shaped = self.shaped(text, primary, size, None);
@@ -1130,7 +1138,11 @@ impl TextEngine {
             shaped
                 .glyphs
                 .iter()
-                .filter(|glyph| glyph.x >= across.0 && glyph.x <= across.1),
+                .filter(|glyph| glyph.x >= across.0 && glyph.x <= across.1)
+                .map(|glyph| PlacedGlyph {
+                    y: glyph.y + baseline,
+                    ..*glyph
+                }),
         );
     }
 

@@ -179,6 +179,11 @@ extend(Readable, Stream, class {
     push(chunk, encoding) {
         this._reading = false;
         if (chunk === null) {
+            const tail = this._decoder?.end();
+            if (tail) {
+                this._chunks.push(tail);
+                this._bufferedLength += tail.length;
+            }
             this._ended = true;
             this._readableState.ended = true;
         } else if (this.readableObjectMode) {
@@ -234,11 +239,14 @@ extend(Readable, Stream, class {
             return;
         }
         if (this.readableFlowing === true) {
-            while (this._chunks.length > 0 && this.readableFlowing === true) {
+            while (this._chunks.length > 0 && this.readableFlowing === true && !this.destroyed) {
                 this.emit('data', this._takeChunk());
             }
         } else if (this._chunks.length > 0 || this._ended) {
             this.emit('readable');
+        }
+        if (this.destroyed) {
+            return;
         }
         if (this._ended && this._chunks.length === 0 && !this.readableEnded && this.readableFlowing !== false) {
             this.readableEnded = true;
@@ -314,40 +322,52 @@ extend(Readable, Stream, class {
     }
 
     async *[Symbol.asyncIterator]() {
-        const queue = new StreamQueue();
         let wake = null;
         let finished = false;
         let failure = null;
+        const chunks = new StreamQueue();
         const notify = () => {
             if (wake) {
                 wake();
                 wake = null;
             }
         };
-        this.on('data', (chunk) => {
-            queue.push(chunk);
+        const onData = (next) => {
+            this.pause();
+            chunks.push(next);
             notify();
-        });
-        this.once('end', () => {
+        };
+        const onEnd = () => {
             finished = true;
             notify();
-        });
-        this.once('error', (error) => {
+        };
+        const onError = (error) => {
             failure = error;
             notify();
-        });
-        for (;;) {
-            if (queue.length > 0) {
-                yield queue.shift();
-            } else if (failure) {
-                throw failure;
-            } else if (finished) {
-                return;
-            } else {
-                await new Promise((resolve) => {
-                    wake = resolve;
-                });
+        };
+        this.on('data', onData);
+        this.once('end', onEnd);
+        this.once('close', onEnd);
+        this.once('error', onError);
+        try {
+            for (;;) {
+                if (chunks.length) {
+                    yield chunks.shift();
+                } else if (failure) {
+                    throw failure;
+                } else if (finished || this.closed || this.readableEnded) {
+                    return;
+                } else {
+                    this.resume();
+                    await new Promise((resolve) => { wake = resolve; });
+                }
             }
+        } finally {
+            this.removeListener('data', onData);
+            this.removeListener('end', onEnd);
+            this.removeListener('close', onEnd);
+            this.removeListener('error', onError);
+            if (!finished) this.destroy();
         }
     }
 });

@@ -21,10 +21,10 @@ use std::fmt;
 
 use rsui_text::Upload;
 
-use crate::area::{NO_ROUND_CLIPS, RoundSlots, intersect, is_empty, layer_quad, round_clips_of};
+use crate::area::{NO_ROUND_CLIPS, RoundSlots, backdrop_areas, backdrop_sigma, intersect, is_empty, layer_quad, round_clips_of};
 use crate::images::ImageUpload;
 use crate::paint::Color;
-use crate::scene::{Batch, Filter, Layer, PixelRect, Quad, RoundClip, Scene};
+use crate::scene::{BACKDROP_IMAGE, Batch, Filter, Layer, PixelRect, Quad, RoundClip, Scene};
 use crate::transform::{IDENTITY, Matrix, apply_matrix, invert_matrix};
 
 /// What a shadow inside something is marked with, in place of a glyph's width in the atlas, as the shaders have it.
@@ -407,6 +407,17 @@ impl Renderer {
             let look = Look::new(matrix, filter, rounds, self.atlas_size, self.text_look);
             let quads = scene.quads.get(batch.first as usize..(batch.first + batch.count) as usize).unwrap_or_default();
             let origin = in_layer.map_or((0, 0), |at| layer_origin(&scene.layers[at], self.size));
+            if batch.image == BACKDROP_IMAGE {
+                if let Some(quad) = quads.first() {
+                    let (pixels, size) = if in_layer.is_some() {
+                        (&mut self.layer, self.layer_size)
+                    } else {
+                        (&mut self.pixels, self.size)
+                    };
+                    blur_backdrop(pixels, size, origin, clip, quad, matrix, &look);
+                }
+                continue;
+            }
             let image = if batch.image != 0 {
                 match self.images.get(&batch.image) {
                     Some(image) => Some(image),
@@ -567,6 +578,16 @@ impl Renderer {
         self.known = false;
     }
 
+    /// Waits for the submitted frame without allocating a copy of its pixels.
+    #[doc(hidden)]
+    pub fn wait_for_frame(&self) -> Result<(), RenderError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vulkan) = &self.vulkan {
+            return vulkan.wait_for_frame();
+        }
+        Ok(())
+    }
+
     /// The pixels drawn so far, as red, green, blue and alpha for each, in rows from the top.
     pub fn read_pixels(&self) -> Result<Vec<u8>, RenderError> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -641,6 +662,37 @@ impl Renderer {
             changed |= referenced(&self.last.batches, id) && referenced(&scene.batches, id);
         }
         changed
+    }
+}
+
+fn blur_backdrop(
+    pixels: &mut [[u8; 4]], size: (u32, u32), origin: (i32, i32), clip: PixelRect,
+    quad: &Quad, matrix: Option<Matrix>, look: &Look,
+) {
+    let (visible, sample) = backdrop_areas(quad, clip, matrix, origin, size);
+    if is_empty(visible) { return; }
+    let width = (sample.right - sample.left) as usize;
+    let height = (sample.bottom - sample.top) as usize;
+    let stride = size.0 as usize;
+    let mut blurred = Vec::with_capacity(width * height * 4);
+    for y in sample.top as usize..sample.bottom as usize {
+        let start = y * stride + sample.left as usize;
+        blurred.extend(pixels[start..start + width].iter().flat_map(|color| color.map(f32::from)));
+    }
+    crate::canvas::blur::backdrop(&mut blurred, width, height, backdrop_sigma(quad, matrix));
+    let [x, y, across, down] = quad.rect;
+    for py in visible.top..visible.bottom {
+        for px in visible.left..visible.right {
+            let (sx, sy) = ((px + origin.0) as f32 + 0.5, (py + origin.1) as f32 + 0.5);
+            let (lx, ly) = apply_matrix(look.inverse, sx, sy);
+            let cover = rounded_cover([lx - x - across / 2.0, ly - y - down / 2.0], [across / 2.0, down / 2.0], quad.radius, look.sharpness)
+                * round_clips_cover(&look.rounds, [lx, ly, sx, sy], look.sharpness);
+            let at = ((py - sample.top) as usize * width + (px - sample.left) as usize) * 4;
+            let dest = &mut pixels[py as usize * stride + px as usize];
+            for (to, from) in dest.iter_mut().zip(&blurred[at..at + 4]) {
+                *to = (f32::from(*to) + (from - f32::from(*to)) * cover).round() as u8;
+            }
+        }
     }
 }
 

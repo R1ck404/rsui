@@ -54,9 +54,11 @@ fn main() {
     let vertex = compile(s!("vs"), s!("vs_4_0"));
     let pixel = compile(s!("ps"), s!("ps_4_0"));
     let image = compile(s!("image_ps"), s!("ps_4_0"));
+    let backdrop = compile(s!("backdrop_ps"), s!("ps_4_0"));
     std::fs::write(format!("{folder}/quad_vs.dxbc"), &vertex).expect("can write the shader");
     std::fs::write(format!("{folder}/quad_ps.dxbc"), &pixel).expect("can write the shader");
     std::fs::write(format!("{folder}/image_ps.dxbc"), &image).expect("can write the shader");
+    std::fs::write(format!("{folder}/backdrop_ps.dxbc"), &backdrop).expect("can write the shader");
     println!("vertex shader: {} bytes", vertex.len());
     println!("pixel shader: {} bytes", pixel.len());
     println!("image shader: {} bytes", image.len());

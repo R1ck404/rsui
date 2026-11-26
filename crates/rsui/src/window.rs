@@ -6,6 +6,8 @@
 #[cfg(feature = "idle-probe")]
 #[path = "idle_probe.rs"]
 mod idle_probe;
+#[path = "window_wake.rs"]
+mod wake;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -134,12 +136,10 @@ const FRAME_PACE_CHECKED: Duration = Duration::from_secs(1);
 /// How long to wait after a frame of something moving that nobody got to see.
 const UNSEEN_FRAME: Duration = Duration::from_millis(8);
 const STARTUP_TRIM_MILLISECONDS: u32 = 250;
-/// How much more can be in RAM while the GPU is starting up. See [`WorkingSetLimit`]. Less than this takes noticeably
-/// longer to reach the first frame, and more only makes the peak higher.
-const GPU_STARTUP_ROOM: usize = 4 * 1024 * 1024;
-/// The least that's allowed in RAM while the GPU is starting up. Coming back from deep idle starts with almost nothing
-/// in RAM, and needs this much to do it without slowing down.
-const GPU_STARTUP_AT_LEAST: usize = 18 * 1024 * 1024;
+/// Temporary startup budgets (additional resident bytes, minimum budget). A larger budget
+/// avoids repeatedly faulting in driver pages on machines where Windows reports spare memory.
+const GPU_STARTUP_TIGHT: (usize, usize) = (4 * 1024 * 1024, 18 * 1024 * 1024);
+const GPU_STARTUP_NORMAL: (usize, usize) = (16 * 1024 * 1024, 32 * 1024 * 1024);
 /// Sent when the pointer leaves the window, after asking with `TrackMouseEvent`.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Windows reports 120 units for one wheel notch, which moves the web page by 100 logical pixels.
@@ -167,6 +167,7 @@ struct WindowState {
     /// What this has stopped from being used until it's gone.
     /// What draws. There's none until the driver has loaded, or after a long time minimized.
     renderer: Option<Renderer>,
+    capture_renderer: Option<Renderer>,
     renderer_slot: RendererSlot,
     /// The thread making a renderer, if one is.
     building: Option<JoinHandle<()>>,
@@ -297,6 +298,21 @@ impl WindowState {
             next => next,
         };
         let wanted = next.map(|wait| Instant::now() + wait);
+        // On time, rather than on the system's next clock tick or later (see `wake`), where that can be done.
+        if wake::start() {
+            // Asking again for the same time, as the pointer moving does, is left alone; anything else is asked for.
+            let same = match (wanted, self.wake_at) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.max(b).duration_since(a.min(b)) < Duration::from_micros(500),
+                _ => false,
+            };
+            if !same {
+                self.wake_at = wanted;
+                crate::input_log::note("wake-set", crate::input_log::now(), format_args!("in={:?}", next));
+                wake::set(window, wanted);
+            }
+            return;
+        }
         // Asking the system to change a timer isn't free, and the pointer moves a lot.
         let same = match (wanted, self.wake_at) {
             (None, None) => true,
@@ -456,7 +472,19 @@ impl WindowState {
 
     /// How long things have to be quiet before letting go of the GPU, as things stand now.
     fn deep_idle_wait(&self) -> Duration {
-        if self.app.attended() {
+        // Keeping the compact, trimmed renderer costs less CPU than rebuilding it during
+        // an ordinary pause. Windows' memory signal lets constrained machines release it early.
+        let attended = self.app.attended();
+        if windows_has_spare_memory() {
+            return if attended {
+                DEEP_IDLE_WORTHWHILE
+            } else {
+                // A visible window can still receive keyboard input with the pointer elsewhere.
+                // Allow a minute before paying to destroy and rebuild its graphics device.
+                self.unattended_wait.max(Duration::from_secs(60))
+            };
+        }
+        if attended {
             DEEP_IDLE.max(self.unattended_wait)
         } else {
             self.unattended_wait
@@ -542,6 +570,7 @@ impl WindowState {
         #[cfg(feature = "idle-probe")]
         let probe_start = Instant::now();
         self.renderer = None;
+        self.capture_renderer = None;
         self.app.renderer_replaced();
         // The app's own long-quiet work (rsui-tsx collects its JavaScript's garbage), unless someone's already back.
         let gave_up = !input_waiting() && crate::app::run_quiet_hook(crate::app::Quiet::Long);
@@ -2664,6 +2693,16 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             });
             LRESULT(0)
         }
+        wake::WAKE_DUE => {
+            crate::input_log::note("wake-due", crate::input_log::now(), format_args!(""));
+            with_state(window, |state| {
+                state.wake_at = None;
+                state.app.wake();
+                state.update_frame(window);
+                state.schedule_wake(window);
+            });
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == CARET_TIMER => {
             with_state(window, |state| {
                 state.app.blink();
@@ -2695,6 +2734,7 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             // What was kept inside it has gone with it.
             crate::embed::window_gone(window.0 as isize);
+            wake::set(window, None);
             window_destroyed(window);
             LRESULT(0)
         }
@@ -2986,6 +3026,96 @@ pub fn capture_window(id: WindowId) -> Result<(u32, u32, Vec<u8>), String> {
         state.app.renderer_replaced();
     });
     out
+}
+
+fn capture_window_region(
+    window: HWND,
+    region: [f64; 4],
+    bgra: bool,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    let _logged = crate::input_log::Span::new("capture-region");
+    let mut out = Err("the window couldn't be drawn".to_owned());
+    with_state(window, |state| {
+        let size = state.app.size();
+        let scale = f64::from(state.app.scale());
+        let bounds = match capture_bounds(size, region, scale) {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                out = Err(error);
+                return;
+            }
+        };
+        let width = (bounds.right - bounds.left) as u32;
+        let height = (bounds.bottom - bounds.top) as u32;
+        if let Some(renderer) = state.renderer.as_mut().filter(|_| !state.hidden) {
+            out = renderer
+                .capture_window_region(bounds, |renderer| state.app.draw_only(renderer))
+                .map(|mut pixels| {
+                    if !bgra {
+                        for pixel in pixels.chunks_exact_mut(4) {
+                            pixel.swap(0, 2);
+                        }
+                    }
+                    (width, height, pixels)
+                })
+                .map_err(|error| error.to_string());
+            return;
+        }
+        state.app.renderer_replaced();
+        out = (|| {
+            if state.capture_renderer.is_none() {
+                state.capture_renderer = Some(
+                    Renderer::offscreen_on_hardware(size)
+                        .or_else(|_| Renderer::offscreen(size))
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let renderer = state
+                .capture_renderer
+                .as_mut()
+                .expect("capture renderer initialized");
+            if renderer.size() != size {
+                renderer.resize(size).map_err(|error| error.to_string())?;
+            }
+            state
+                .app
+                .draw_only(renderer)
+                .map_err(|error| error.to_string())?;
+            let pixels = renderer
+                .read_offscreen_region(bounds, bgra)
+                .map_err(|error| error.to_string())?;
+            Ok((width, height, pixels))
+        })();
+        state.app.renderer_replaced();
+    });
+    out
+}
+
+fn capture_bounds(
+    (width, height): (u32, u32),
+    [x, y, w, h]: [f64; 4],
+    scale: f64,
+) -> Result<rsui_render::PixelRect, String> {
+    let bound = |value: f64, limit: u32| value.clamp(0.0, f64::from(limit)) as i32;
+    let left = bound((x * scale).floor(), width);
+    let top = bound((y * scale).floor(), height);
+    let right = bound(((x + w) * scale).ceil(), width);
+    let bottom = bound(((y + h) * scale).ceil(), height);
+    if left < right && top < bottom {
+        Ok(rsui_render::PixelRect { left, top, right, bottom })
+    } else {
+        Err("The capture area is outside the window".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    #[test]
+    fn capture_region_uses_logical_coordinates_and_clips_to_the_window() {
+        let rect = super::capture_bounds((4, 3), [0.5, 0.5, 1.0, 2.0], 2.0).unwrap();
+        assert_eq!((rect.left, rect.top, rect.right, rect.bottom), (1, 1, 3, 3));
+        assert!(super::capture_bounds((4, 3), [5.0, 0.0, 1.0, 1.0], 1.0).is_err());
+    }
 }
 
 /// What the system says once the taskbar has a window's button, which the buttons under its picture have to wait for.
@@ -3332,10 +3462,16 @@ fn apply_window_change(window: HWND, change: WindowChange) {
                 });
                 crate::system::set_frameless_look(window, is_frameless(window), fullscreen, see_through);
             }
-            WindowChange::Capture(number) => {
-                let mut id = None;
-                with_state(window, |state| id = Some(state.id));
-                let picture = id.map_or_else(|| Err("the window's gone".to_owned()), capture_window);
+            WindowChange::Capture(number) | WindowChange::CaptureRegion(number, _) | WindowChange::CapturePixels(number, _) => {
+                let picture = match change {
+                    WindowChange::CaptureRegion(_, region) => capture_window_region(window, region, false),
+                    WindowChange::CapturePixels(_, region) => capture_window_region(window, region, true),
+                    _ => {
+                        let mut id = None;
+                        with_state(window, |state| id = Some(state.id));
+                        id.map_or_else(|| Err("the window's gone".to_owned()), capture_window)
+                    }
+                };
                 let hear = CAPTURE_HEARD.with(|heard| heard.borrow().clone());
                 if let Some(hear) = hear {
                     hear(number, picture);
@@ -3593,11 +3729,25 @@ fn window_class() -> Result<(PCWSTR, [HCURSOR; 3], HINSTANCE), RunError> {
     }
 }
 
-/// Opens a window, with what's in it following when the GPU's ready.
-///
-/// # Safety
-///
-/// This has to be on the thread that runs the message loop.
+/// Whether Windows currently reports abundant physical memory.
+fn windows_has_spare_memory() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Memory::{
+        CreateMemoryResourceNotification, HighMemoryResourceNotification,
+        QueryMemoryResourceNotification,
+    };
+    // SAFETY: the notification is queried while owned and closed exactly once.
+    unsafe {
+        let Ok(handle) = CreateMemoryResourceNotification(HighMemoryResourceNotification) else {
+            return false;
+        };
+        let mut high = BOOL::default();
+        let queried = QueryMemoryResourceNotification(handle, &mut high);
+        let _ = CloseHandle(handle);
+        queried.is_ok() && high.as_bool()
+    }
+}
+
 /// Starts making a renderer for a window on another thread, into `slot`, which the window hears about with `RENDERER_READY`
 /// when it's done, along with what keeps the memory the GPU starts with in check until then.
 fn start_building_renderer(
@@ -3609,8 +3759,10 @@ fn start_building_renderer(
     let slot = slot.clone();
     let handle = WindowHandle(window.0);
     // Not while input's being handled, which needs what it needs (see `window_procedure`).
-    let limit = (!HANDLING_INPUT.with(Cell::get))
-        .then(|| WorkingSetLimit::with_room(GPU_STARTUP_ROOM, GPU_STARTUP_AT_LEAST));
+    let limit = (!HANDLING_INPUT.with(Cell::get)).then(|| {
+        let (room, minimum) = if windows_has_spare_memory() { GPU_STARTUP_NORMAL } else { GPU_STARTUP_TIGHT };
+        WorkingSetLimit::with_room(room, minimum)
+    });
     let building = std::thread::spawn(move || {
         let handle = handle;
         let result = Renderer::for_window_seen_through(HWND(handle.0), size, see_through);
@@ -3624,6 +3776,10 @@ fn start_building_renderer(
     (building, limit)
 }
 
+/// Opens a window on the thread running the message loop.
+///
+/// # Safety
+/// The caller must own that thread's window state.
 unsafe fn open_a_window(
     id: WindowId,
     options: &WindowOptions,
@@ -3707,6 +3863,7 @@ unsafe fn open_a_window(
             smallest: options.smallest,
             largest: None,
             renderer: None,
+            capture_renderer: None,
             renderer_slot,
             building: Some(building),
             hidden: false,

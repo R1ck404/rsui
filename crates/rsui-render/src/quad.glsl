@@ -11,6 +11,7 @@
 //     glslangValidator -V --target-env vulkan1.0 -S vert -DVERTEX quad.glsl -o quad_vert.spv
 //     glslangValidator -V --target-env vulkan1.0 -S frag -DQUAD quad.glsl -o quad_frag.spv
 //     glslangValidator -V --target-env vulkan1.0 -S frag -DIMAGE quad.glsl -o image_frag.spv
+//     glslangValidator -V --target-env vulkan1.0 -S frag -DBACKDROP quad.glsl -o backdrop_frag.spv
 
 #version 450
 
@@ -150,10 +151,28 @@ vec4 filter_color(vec4 color) {
     return vec4(rgb * alpha, alpha);
 }
 
-#ifdef IMAGE
+#if defined(IMAGE) || defined(BACKDROP)
 
 layout(set = 1, binding = 0) uniform sampler2D picture;
 
+#ifdef BACKDROP
+void main() {
+    vec2 size = vec2(textureSize(picture, 0));
+    float step = min(in_shape.w * sharpness, 4096.0) * 0.75;
+    const float weights[4] = float[4](0.30131, 0.22743, 0.09782, 0.024095);
+    vec4 color = vec4(0);
+    for (int y = -3; y <= 3; ++y) {
+        for (int x = -3; x <= 3; ++x) {
+            vec2 at = (gl_FragCoord.xy + vec2(x, y) * step) / size;
+            color += textureLod(picture, at, 0) * (weights[abs(x)] * weights[abs(y)]);
+        }
+    }
+    vec2 inside = abs(in_local) - in_shape.xy + in_shape.z;
+    float distance = length(max(inside, 0.0)) + min(max(inside.x, inside.y), 0.0) - in_shape.z;
+    float cover = clamp(0.5 - distance * sharpness, 0.0, 1.0) * round_clips_cover();
+    drawn = mix(texelFetch(picture, ivec2(gl_FragCoord.xy), 0), color, cover);
+}
+#else
 // An image reads its texture from where in it this pixel falls, in 65535ths of its size, and its corners can be round. A
 // rectangle's outline doesn't apply, so that number means nothing here.
 vec4 image_color() {
@@ -169,6 +188,7 @@ vec4 image_color() {
 void main() {
     drawn = filter_color(image_color() * round_clips_cover());
 }
+#endif
 
 #else
 

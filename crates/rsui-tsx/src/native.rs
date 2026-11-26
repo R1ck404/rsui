@@ -56,6 +56,8 @@ pub(crate) fn let_go_of_everything() {
         system::let_go_of_everything();
     }
     crate::webview::let_go_of_everything();
+    crate::native_pty::let_go_of_everything();
+    crate::native_video::let_go_of_everything();
     with_pretend(|pretend| {
         let kept = pretend.start_at_login.take();
         *pretend = Pretend::default();

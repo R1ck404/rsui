@@ -107,6 +107,15 @@ fn shell_verb(verb: &str, file: &str, parameters: Option<&str>) -> Result<(), St
     Ok(())
 }
 
+/// Opens a URL and waits until the shell has handed it off. Used by the crash reporter, which exits afterward.
+#[doc(hidden)]
+pub fn open_url_on_this_thread(url: &str) -> Result<(), String> {
+    if !crate::can_open_url(url) {
+        return Err("the URL scheme can't be opened".to_owned());
+    }
+    shell_verb("open", url, None)
+}
+
 /// Opens a file or folder with what the system has for it.
 pub fn open_path(path: &Path) -> Result<(), String> {
     if !path.exists() {
@@ -238,10 +247,14 @@ struct Opened;
 
 impl Opened {
     fn new() -> Result<Self, String> {
+        Self::for_window(HWND::default())
+    }
+
+    fn for_window(window: HWND) -> Result<Self, String> {
         // It's held by something else for a moment as often as not, as when what's copying is still writing to it.
         for _ in 0..10 {
-            // SAFETY: no window is the clipboard's owner, which is fine for reading it and writing it.
-            if unsafe { OpenClipboard(0) } != 0 {
+            // SAFETY: callers pass a live window when setting clipboard data, or null for reads.
+            if unsafe { OpenClipboard(window.0 as isize) } != 0 {
                 return Ok(Opened);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -359,9 +372,12 @@ pub fn read_clipboard() -> Result<ClipboardContents, String> {
 
 /// Puts this on the clipboard in place of what's there: text, HTML, files and a PNG picture, each that's given.
 pub fn write_clipboard(contents: &ClipboardContents) -> Result<(), String> {
-    let _open = Opened::new()?;
+    // EmptyClipboard makes this window the owner, which SetClipboardData requires.
+    let _open = Opened::for_window(desk_window()?)?;
     // SAFETY: it's open.
-    unsafe { EmptyClipboard() };
+    if unsafe { EmptyClipboard() } == 0 {
+        return Err("the clipboard couldn't be cleared".to_owned());
+    }
     if let Some(text) = &contents.text {
         let units = wide(text);
         let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();

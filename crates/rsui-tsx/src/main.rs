@@ -139,6 +139,10 @@ fn new_app(name: Option<String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    if let Some(status) = rsui_tsx::crash_report::reporter_main() {
+        return status;
+    }
     rsui::mark("start");
     #[cfg(feature = "alloc-owners")]
     if std::env::var_os("RSUI_ALLOC_SITES").is_some() {
@@ -338,14 +342,21 @@ fn main() -> ExitCode {
             },
         ),
         (None, Some(png)) => rsui_tsx::draw_to_file(file.as_ref(), png.as_ref(), (960, 640)),
-        (None, None) => rsui_tsx::run(
-            &file,
-            rsui_tsx::Options {
+        (None, None) => {
+            let options = rsui_tsx::Options {
                 title: None,
                 watch: watch && !is_packed,
                 write_code_cache: None,
-            },
-        ),
+            };
+            #[cfg(windows)]
+            if is_packed {
+                rsui_tsx::crash_report::run_packed(file.as_ref(), options)
+            } else {
+                rsui_tsx::run(&file, options)
+            }
+            #[cfg(not(windows))]
+            rsui_tsx::run(&file, options)
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

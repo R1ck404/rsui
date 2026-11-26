@@ -285,6 +285,14 @@ impl Vm {
         })
     }
 
+    /// Runs a job off-thread and resolves with its bytes as a Uint8Array.
+    pub fn later_bytes(&mut self, job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static) -> Value {
+        self.in_background(move || match job() {
+            Ok(bytes) => crate::background::Outcome::Bytes(bytes),
+            Err(reason) => crate::background::Outcome::Failed(reason),
+        })
+    }
+
     /// A function that JavaScript can call.
     pub fn host_function(&mut self, name: &str, length: u8, function: HostFunction) -> Value {
         // With `RSUI_SPLIT` set, each host function's time is its own part: see `split.rs` in rsui-alloc.
@@ -514,6 +522,17 @@ impl Vm {
         matches!(object.kind, Kind::Plain)
             && !self.shapes.is_dict(object.shape)
             && object.slots().iter().all(|slot| !slot.is_object())
+    }
+
+    /// The own, enumerable string properties of an ordinary data object and their slots. A caller can reuse
+    /// these slots for other objects with the same shape stamp, without running getters.
+    pub fn named_data_slots(&self, value: Value, out: &mut Vec<(Atom, u32)>) -> bool {
+        if !self.is_plain_object(value) || !self.plain_shape(self.objects[value.index()].shape) {
+            return false;
+        }
+        self.own_slots_into(value, out);
+        out.iter()
+            .all(|(key, _)| self.atoms.kind_of(*key) == AtomKind::Name)
     }
 
     /// Whether a component given the props `new`, after `old`, would show and do the same, so that it needn't render again, as

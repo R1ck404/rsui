@@ -162,6 +162,14 @@ pub fn blend_span(out: &mut [u8], color: u32) {
 pub fn rect_solid(pixels: &mut [u8], width: usize, [x0, y0, x1, y1]: [f32; 4], reach: [i32; 4], color: u32) -> Option<(i32, i32)> {
     let [rx0, ry0, rx1, ry1] = reach;
     let n = (rx1 - rx0) as usize;
+    // Edges on whole pixels, as a dot's are: every pixel is covered all through, so each row is one span.
+    if x0 == rx0 as f32 && x1 == rx1 as f32 && y0 == ry0 as f32 && y1 == ry1 as f32 {
+        for py in ry0..ry1 {
+            let start = (py as usize * width + rx0 as usize) * 4;
+            blend_span(&mut pixels[start..start + n * 4], color);
+        }
+        return (ry0 < ry1).then_some((ry0, ry1));
+    }
     let across = |i: usize| {
         let px = rx0 + i as i32;
         ((px + 1) as f32).min(x1) - (px as f32).max(x0)
@@ -319,6 +327,138 @@ pub fn rect_masked(
         }
     }
     rows
+}
+
+/// Lays a row on the canvas through how much of each pixel it covers, for the ways of laying one on the other besides
+/// `source-over` that only weigh each by the other's alpha (`destination-out`, `lighter`, `source-atop`, `destination-over` and
+/// `xor`), with packed pixels and whole numbers out of 256, as `source-over`'s are. What's drawn is `color`, or `source`'s pixels
+/// where it's `None`. Returns false for any other way, which is left to be done in floating point.
+pub fn blend_other(out: &mut [u8], cover: &[f32], op: super::paint::Op, color: Option<u32>, source: &[u32]) -> bool {
+    use super::paint::Op;
+    let n = cover.len().min(out.len() / 4);
+    let at = |i: usize| color.unwrap_or_else(|| source[i]);
+    match op {
+        // What's there, less as much as is drawn: as `over` without adding what's drawn.
+        Op::DestinationOut => {
+            for (i, &k) in cover[..n].iter().enumerate() {
+                let c = cover256(k);
+                if c == 0 {
+                    continue;
+                }
+                let s = at(i);
+                let sa = if c >= 256 { s >> 24 } else { scale32(s, c) >> 24 };
+                if sa == 0 {
+                    continue;
+                }
+                put(out, i, scale32(get(out, i), 256 - (sa + (sa >> 7))));
+            }
+        }
+        // Both added up, each part held to 255.
+        Op::Lighter => {
+            for (i, &k) in cover[..n].iter().enumerate() {
+                let c = cover256(k);
+                if c == 0 {
+                    continue;
+                }
+                let s = at(i);
+                let s = if c >= 256 { s } else { scale32(s, c) };
+                let d = get(out, i);
+                // Two parts at a time in 16-bit lanes, where a sum of two bytes can't spill into the next.
+                let rb = (d & 0x00FF_00FF) + (s & 0x00FF_00FF);
+                let ag = ((d >> 8) & 0x00FF_00FF) + ((s >> 8) & 0x00FF_00FF);
+                // A lane that went past 255 has its ninth bit set: make it 255.
+                let rb = (rb | (((rb >> 8) & 0x0001_0001) * 0xFF)) & 0x00FF_00FF;
+                let ag = (ag | (((ag >> 8) & 0x0001_0001) * 0xFF)) & 0x00FF_00FF;
+                put(out, i, rb | (ag << 8));
+            }
+        }
+        Op::SourceAtop | Op::DestinationOver | Op::Xor => {
+            for i in 0..n {
+                let k = cover[i];
+                if !(k > 0.0) {
+                    continue;
+                }
+                let cover = (k.min(1.0) * 255.0 + 0.5) as u32;
+                let s = super::paint::unpack(at(i));
+                let s = if cover >= 255 { s } else { [div255(s[0] * cover), div255(s[1] * cover), div255(s[2] * cover), div255(s[3] * cover)] };
+                let d = super::paint::unpack(get(out, i));
+                if let Some(r) = super::paint::composite8(op, s, d) {
+                    put(out, i, super::paint::pack(r));
+                }
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// `out` between rows `a` and `b` of packed pixels, `by` out of 256 of the way to `b`: what `paint::lerp32` gives each pixel,
+/// four at a time. Each part comes to at most 255 * 256 + 128, which a 16-bit lane holds.
+pub fn lerp_rows(out: &mut [u32], a: &[u32], b: &[u32], by: u32) {
+    let n = out.len().min(a.len()).min(b.len());
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is always there on x86-64, and each load and store is of four pixels below `n`.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let wb = _mm_set1_epi16(by as i16);
+        let wa = _mm_set1_epi16((256 - by) as i16);
+        let half = _mm_set1_epi16(0x80);
+        while i + 4 <= n {
+            let pa = _mm_loadu_si128(a.as_ptr().add(i) as *const __m128i);
+            let pb = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
+            let mix = |x: __m128i, y: __m128i| {
+                _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(x, wa), _mm_mullo_epi16(y, wb)), half), 8)
+            };
+            let lo = mix(_mm_unpacklo_epi8(pa, zero), _mm_unpacklo_epi8(pb, zero));
+            let hi = mix(_mm_unpackhi_epi8(pa, zero), _mm_unpackhi_epi8(pb, zero));
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, _mm_packus_epi16(lo, hi));
+            i += 4;
+        }
+    }
+    for j in i..n {
+        out[j] = super::paint::lerp32(a[j], b[j], by);
+    }
+}
+
+/// Takes `source`'s pixels out of a row of the canvas, as `destination-out` does with all of each covered: what's there is
+/// left as much as each source pixel isn't there, four at a time, with `blend_other`'s rounding.
+pub fn take_out(out: &mut [u8], source: &[u32]) {
+    let n = source.len().min(out.len() / 4);
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is always there on x86-64, and each load and store is of four pixels below `n`.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let whole = _mm_set1_epi32(256);
+        let half = _mm_set1_epi16(0x80);
+        while i + 4 <= n {
+            let s = _mm_loadu_si128(source.as_ptr().add(i) as *const __m128i);
+            let a = _mm_srli_epi32(s, 24);
+            if _mm_movemask_epi8(_mm_cmpeq_epi32(a, zero)) == 0xFFFF {
+                // Nothing taken out of any of the four.
+                i += 4;
+                continue;
+            }
+            // How much of each is kept, out of 256: 256 less its alpha made out of 256, as `scale32` takes it.
+            let keep = _mm_sub_epi32(whole, _mm_add_epi32(a, _mm_srli_epi32(a, 7)));
+            let keep16 = _mm_packs_epi32(keep, keep);
+            let pairs = _mm_unpacklo_epi16(keep16, keep16);
+            let (klo, khi) = (_mm_unpacklo_epi32(pairs, pairs), _mm_unpackhi_epi32(pairs, pairs));
+            let at = out.as_mut_ptr().add(i * 4) as *mut __m128i;
+            let d = _mm_loadu_si128(at);
+            let lo = _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(d, zero), klo), half), 8);
+            let hi = _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(d, zero), khi), half), 8);
+            _mm_storeu_si128(at, _mm_packus_epi16(lo, hi));
+            i += 4;
+        }
+    }
+    for (j, &s) in source.iter().enumerate().take(n).skip(i) {
+        let sa = s >> 24;
+        if sa != 0 {
+            put(out, j, scale32(get(out, j), 256 - (sa + (sa >> 7))));
+        }
+    }
 }
 
 /// The most columns [`rect_masked`] is for.
@@ -891,6 +1031,73 @@ mod tests {
                     }
                 }
                 assert_eq!(got, expected, "alpha {alpha8}");
+            }
+        }
+    }
+
+    /// The ways besides `source-over` done in whole numbers come to what `paint::composite` does in floating point, give or
+    /// take one step in each part, as Skia's quick pipeline and its precise one do.
+    #[test]
+    fn other_ways_in_whole_numbers_are_the_same_as_in_floating_point() {
+        use super::super::paint::{composite, unpack, Op};
+        let mut seed = 11;
+        for op in [Op::DestinationOut, Op::Lighter, Op::SourceAtop, Op::DestinationOver, Op::Xor] {
+            for _ in 0..200 {
+                let (canvas, cover, source) = row(&mut seed, 9);
+                for solid in [true, false] {
+                    let color = solid.then(|| source[0]);
+                    let mut got = canvas.clone();
+                    assert!(blend_other(&mut got, &cover, op, color, &source));
+                    for i in 0..cover.len() {
+                        let k = cover[i];
+                        let d = unpack(get(&canvas, i));
+                        let want = if k <= 0.0 {
+                            d
+                        } else {
+                            let s = unpack(color.unwrap_or(source[i]));
+                            let f = |v: u32| v as f32 * k / 255.0;
+                            let r = composite(op, [f(s[0]), f(s[1]), f(s[2]), f(s[3])], [d[0] as f32 / 255.0, d[1] as f32 / 255.0, d[2] as f32 / 255.0, d[3] as f32 / 255.0]);
+                            let a = r[3].clamp(0.0, 1.0);
+                            [0, 1, 2, 3].map(|c| ((if c == 3 { a } else { r[c].clamp(0.0, a) }) * 255.0 + 0.5) as u32)
+                        };
+                        let have = unpack(get(&got, i));
+                        for c in 0..4 {
+                            assert!(have[c].abs_diff(want[c]) <= 1, "{op:?} pixel {i}: {have:?} against {want:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Between two rows four at a time is what `lerp32` gives each pixel.
+    #[test]
+    fn rows_between_four_at_a_time_are_the_same_as_one_at_a_time() {
+        let mut seed = 3;
+        for n in [0, 1, 3, 4, 7, 33] {
+            let a: Vec<u32> = (0..n).map(|_| premultiplied(&mut seed)).collect();
+            let b: Vec<u32> = (0..n).map(|_| premultiplied(&mut seed)).collect();
+            for by in [0, 1, 77, 128, 255, 256] {
+                let mut got = vec![0u32; n];
+                lerp_rows(&mut got, &a, &b, by);
+                let want: Vec<u32> = (0..n).map(|i| super::super::paint::lerp32(a[i], b[i], by)).collect();
+                assert_eq!(got, want, "by {by}");
+            }
+        }
+    }
+
+    /// Taking a row out four at a time is what `blend_other`'s `destination-out` does with all of each pixel covered.
+    #[test]
+    fn taking_out_four_at_a_time_is_the_same_as_one_at_a_time() {
+        let mut seed = 5;
+        for n in [0, 1, 3, 4, 7, 33] {
+            for _ in 0..40 {
+                let (canvas, _, source) = row(&mut seed, n);
+                let mut got = canvas.clone();
+                take_out(&mut got, &source);
+                let mut want = canvas.clone();
+                assert!(blend_other(&mut want, &vec![1.0; n], super::super::paint::Op::DestinationOut, None, &source));
+                assert_eq!(got, want);
             }
         }
     }

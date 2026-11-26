@@ -599,6 +599,9 @@ pub struct Scene {
     pub layers: Vec<Layer>,
 }
 
+/// A batch that samples what's already drawn instead of an uploaded image. Its quad carries the blur in sixteenths of a pixel.
+pub(crate) const BACKDROP_IMAGE: u32 = u32::MAX;
+
 /// Something see-through whose parts overlap, as a disabled button's text over its background does: its batches, `first..end`,
 /// are drawn by themselves, then put over what's behind them at `opacity`, so that what's under one part doesn't show through
 /// it, as a browser has it. Fading each part by itself made the button's dark background show through its text.
@@ -2631,6 +2634,29 @@ impl<const PRUNE: bool> SceneBuilder<'_, PRUNE> {
         let [left, top, right, bottom] = edges;
         let area = [left, top, right - left, bottom - top];
         let radius = fitting_radius(look.corner_radius * self.scale, area);
+        if look.backdrop_blur > 0.0 && area[2] > 0.0 && area[3] > 0.0 {
+            self.finish_batch();
+            let clip = self.clip_on_screen(self.clip());
+            let corners = look.shaped.then(|| self.corners(element, area)).flatten();
+            if let Some(corners) = corners {
+                self.push_round_clip(edges, corners, false);
+            }
+            let blur = (look.backdrop_blur * self.scale * 16.0).round().clamp(1.0, f32::from(u16::MAX)) as u16;
+            self.quads.push(Quad { rect: area, glyph: [blur, 0, 0, 0], color: [0; 4], radius });
+            self.batches.push(Batch {
+                first: self.batch_start as u32,
+                count: 1,
+                clip,
+                image: BACKDROP_IMAGE,
+                transform: self.transform,
+                filter: 0,
+                round: self.round(),
+            });
+            self.batch_start = self.quads.len();
+            if corners.is_some() {
+                self.rounded.pop();
+            }
+        }
         let shadows = if look.shadowed {
             Shadow::all(element)
         } else {
@@ -4882,7 +4908,24 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
             self.pop_clip();
             return;
         }
-        let radius = if said.is_some() { 0.0 } else { thickness / 2.0 };
+        // A thumb that's given a size can still be drawn as rsui's own is: rounded, and with some room round it in its track, which is
+        // what CSS's `::-webkit-scrollbar-thumb` says with `border-radius` and a transparent `border` (`scrollbar_radius`,
+        // `scrollbar_inset`). Without them a thumb that's given a size is a plain rectangle that fills it.
+        let number = |name: &str| match element.props.get(name) {
+            Some(PropValue::Float(value)) => Some(*value as f32),
+            Some(PropValue::Int(value)) => Some(*value as f32),
+            _ => None,
+        };
+        let room_round = if said.is_some() {
+            (number("scrollbar_inset").unwrap_or(0.0) * self.scale).round().clamp(0.0, thickness / 2.0)
+        } else {
+            0.0
+        };
+        let radius = if said.is_some() {
+            (number("scrollbar_radius").unwrap_or(0.0) * self.scale).max(0.0)
+        } else {
+            thickness / 2.0
+        };
         // On a phone, rsui's own only shows while it's scrolling, and as much as it still does.
         let shows = match self.interaction.scrolling {
             _ if said.is_some() || !scrollbars_fade() => 1.0,
@@ -4918,25 +4961,27 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
         }
         let vertical = vertical.filter(|_| thumb.a > 0);
         if let Some((start, length)) = vertical {
-            let top = ((rect.y + start) * self.scale).round();
-            let bottom = ((rect.y + start + length) * self.scale).round();
-            let left = ((rect.x + rect.width) * self.scale).round() - inset - thickness;
+            let top = ((rect.y + start) * self.scale).round() + room_round;
+            let bottom = ((rect.y + start + length) * self.scale).round() - room_round;
+            let left = ((rect.x + rect.width) * self.scale).round() - inset - thickness + room_round;
+            let (across, down) = (thickness - room_round * 2.0, bottom - top);
             self.quads.push(solid_quad(
-                [left, top, thickness, bottom - top],
+                [left, top, across, down],
                 thumb,
-                radius,
+                radius.min(across.min(down) / 2.0),
             ));
         }
         let across =
             scroll_thumb(info.view.width, info.content.width, info.x).filter(|_| thumb.a > 0);
         if let Some((start, length)) = across {
-            let left = ((rect.x + start) * self.scale).round();
-            let right = ((rect.x + start + length) * self.scale).round();
-            let top = ((rect.y + rect.height) * self.scale).round() - inset - thickness;
+            let left = ((rect.x + start) * self.scale).round() + room_round;
+            let right = ((rect.x + start + length) * self.scale).round() - room_round;
+            let top = ((rect.y + rect.height) * self.scale).round() - inset - thickness + room_round;
+            let (across, down) = (right - left, thickness - room_round * 2.0);
             self.quads.push(solid_quad(
-                [left, top, right - left, thickness],
+                [left, top, across, down],
                 thumb,
-                radius,
+                radius.min(across.min(down) / 2.0),
             ));
         }
         self.pop_clip();
@@ -4997,6 +5042,7 @@ impl<const PRUNE: bool> LayoutVisitor for SceneBuilder<'_, PRUNE> {
                 && self.transform == 0
                 && self.filter == 0
                 && self.fading == 0
+                && self.look.backdrop_blur == 0.0
                 && mutation_pilot::interaction_safe(element, self.interaction);
             let inherited = self.around_color();
             self.pilot.capture(

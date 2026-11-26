@@ -306,6 +306,10 @@ pub enum WindowChange {
     /// [`on_window_captured`](crate::on_window_captured) with this number. It's taken once nothing's drawing the window,
     /// as a program's own code is run while something is, and can't take one then.
     Capture(u32),
+    /// Takes the same renderer snapshot for a rectangle expressed in logical pixels.
+    CaptureRegion(u32, [f64; 4]),
+    /// Reads a rectangle expressed in logical pixels as BGRA, from the window's frame when available.
+    CapturePixels(u32, [f64; 4]),
 }
 
 /// A button under a window's picture in the taskbar.

@@ -53,6 +53,64 @@ fn run(name: &str, source: &str) -> String {
 }
 
 #[test]
+fn file_streams_pull_bounded_ranges_and_survive_path_replacement() {
+    assert_eq!(
+        run("file-ranges", r#"
+        const fs = require('fs');
+        const file = require('path').join(__dirname, 'stream.bin');
+        const collect = async s => { const out = []; for await (const x of s) out.push(x); return out; };
+        const delay = () => new Promise(resolve => setTimeout(resolve, 8));
+        (async () => {
+            fs.writeFileSync(file, 'a€xyz');
+            const range = fs.createReadStream(file, { start: 1, end: 3, highWaterMark: 1, encoding: 'utf8' });
+            equal((await collect(range)).join(''), '€'); equal(range.bytesRead, 3);
+            equal((await collect(fs.createReadStream(file, { start: 1, end: 1, encoding: 'utf8' }))).join(''), '�');
+            equal((await collect(fs.createReadStream(file, { start: 4, end: 999, highWaterMark: 2 }))).map(String), ['xy','z']);
+            equal(await collect(fs.createReadStream(file, { start: 999 })), []);
+            equal(await collect(fs.createReadStream(file, { highWaterMark: 0 })), []);
+            const empty = file + '.empty'; fs.writeFileSync(empty, '');
+            equal(await collect(fs.createReadStream(empty)), []);
+            let bad; try { await collect(fs.createReadStream(file + '.missing')); } catch (e) { bad = e.code; }
+            equal(bad, 'ENOENT');
+            for (const options of [{start:-1}, {end:-2}, {start:2,end:1}, {highWaterMark:-1}]) {
+                let rejected = false; try { fs.createReadStream(file,options); } catch { rejected = true; }
+                check(rejected,'invalid range');
+            }
+            fs.writeFileSync(file, 'abcdefghijklmnop');
+            const slow = fs.createReadStream(file, { highWaterMark: 2 });
+            const iter = slow[Symbol.asyncIterator]();
+            equal(String((await iter.next()).value),'ab');
+            await delay(); equal(slow.bytesRead,2);
+            fs.renameSync(file,file+'.old'); fs.writeFileSync(file,'replacement');
+            equal(String((await iter.next()).value),'cd');
+            await iter.return(); await delay();
+            check(slow.closed && slow.bytesRead === 4,'early iterator close');
+            const paused = fs.createReadStream(file, { highWaterMark: 2 });
+            const chunks = [];
+            await new Promise((done, reject) => {
+                paused.on('error',reject);
+                paused.on('data',x=>{
+                    chunks.push(String(x));
+                    if (chunks.length===1) { paused.pause(); setTimeout(()=>{ if(paused.bytesRead!==2) reject(Error('read ahead')); paused.resume(); },8); }
+                });
+                paused.on('end',done);
+            });
+            equal(chunks.join(''),'replacement');
+            const stopped = fs.createReadStream(file, { highWaterMark: 2 });
+            await new Promise((done, reject) => {
+                stopped.once('close', done);
+                stopped.on('error', reject);
+                stopped.on('data', () => stopped.destroy());
+            });
+            equal(stopped.bytesRead,2);
+            console.log('file streams ok');
+        })().catch(e=>console.log(e.stack));
+        "#),
+        "file streams ok"
+    );
+}
+
+#[test]
 fn readable_lengths_decoding_and_read_all() {
     assert_eq!(
         run(

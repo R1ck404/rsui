@@ -121,7 +121,7 @@ fn meaning_of(name: &str) -> Meaning {
         | "paddingBottom" | "paddingLeft" | "rowHeight" | "scrollX" | "scrollY" | "overlayX"
         | "overlayY" | "borderWidth" | "cornerRadius" | "opacity" | "fontSize" | "lineHeight"
         | "borderTopWidth" | "borderRightWidth" | "borderBottomWidth" | "borderLeftWidth"
-        | "scrollbarSize" | "stickyTop" | "stickyBottom" => symbol(&snake_case(name)),
+        | "scrollbarSize" | "scrollbarRadius" | "scrollbarInset" | "stickyTop" | "stickyBottom" => symbol(&snake_case(name)),
         other => Meaning::Plain(Symbol::new(&snake_case(other))),
     }
 }

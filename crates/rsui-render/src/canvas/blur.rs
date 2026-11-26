@@ -25,6 +25,16 @@ pub fn reach(sigma: f32) -> usize {
 
 /// Blurs `channels` numbers for each of `width` by `height` pixels, with nothing past the edges.
 pub fn blur(values: &mut [f32], width: usize, height: usize, channels: usize, sigma_x: f32, sigma_y: f32) {
+    blur_edges(values, width, height, channels, sigma_x, sigma_y, false);
+}
+
+/// Blurs pixels from a backdrop, extending the window's edge pixels past the window.
+#[cfg(not(windows))]
+pub(crate) fn backdrop(values: &mut [f32], width: usize, height: usize, sigma: f32) {
+    blur_edges(values, width, height, 4, sigma, sigma, true);
+}
+
+fn blur_edges(values: &mut [f32], width: usize, height: usize, channels: usize, sigma_x: f32, sigma_y: f32, extend: bool) {
     let mut line = Vec::new();
     let mut out = Vec::new();
     for (left, right) in boxes(sigma_x) {
@@ -35,7 +45,7 @@ pub fn blur(values: &mut [f32], width: usize, height: usize, channels: usize, si
             for c in 0..channels {
                 line.clear();
                 line.extend((0..width).map(|x| values[(y * width + x) * channels + c]));
-                box_line(&line, left, right, &mut out);
+                box_line(&line, left, right, &mut out, extend);
                 for x in 0..width {
                     values[(y * width + x) * channels + c] = out[x];
                 }
@@ -50,7 +60,7 @@ pub fn blur(values: &mut [f32], width: usize, height: usize, channels: usize, si
             for c in 0..channels {
                 line.clear();
                 line.extend((0..height).map(|y| values[(y * width + x) * channels + c]));
-                box_line(&line, left, right, &mut out);
+                box_line(&line, left, right, &mut out, extend);
                 for y in 0..height {
                     values[(y * width + x) * channels + c] = out[y];
                 }
@@ -60,7 +70,7 @@ pub fn blur(values: &mut [f32], width: usize, height: usize, channels: usize, si
 }
 
 /// The average of each value with `left` before it and `right` after it, counting what's past the ends as nothing.
-fn box_line(line: &[f32], left: usize, right: usize, out: &mut Vec<f32>) {
+fn box_line(line: &[f32], left: usize, right: usize, out: &mut Vec<f32>, extend: bool) {
     let n = line.len();
     out.clear();
     out.resize(n, 0.0);
@@ -70,15 +80,13 @@ fn box_line(line: &[f32], left: usize, right: usize, out: &mut Vec<f32>) {
     for value in line.iter().take(right.min(n.saturating_sub(1)) + 1) {
         sum += value;
     }
-    for x in 0..n {
-        out[x] = sum / size;
+    let (first, last) = if extend && n > 0 { (line[0], line[n - 1]) } else { (0.0, 0.0) };
+    sum += first * left as f32 + last * (right + 1).saturating_sub(n) as f32;
+    for (x, value) in out.iter_mut().enumerate() {
+        *value = sum / size;
         let add = x + right + 1;
-        if add < n {
-            sum += line[add];
-        }
-        if x >= left {
-            sum -= line[x - left];
-        }
+        sum += line.get(add).copied().unwrap_or(last);
+        sum -= x.checked_sub(left).and_then(|at| line.get(at)).copied().unwrap_or(first);
     }
 }
 

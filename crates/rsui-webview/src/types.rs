@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-/// How a view is set up, which can't change once it's made.
+/// How a view is set up when it's made.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// Where the browser keeps what it keeps: cookies, storage and its cache. Views with the same folder share one set of
@@ -65,6 +65,7 @@ fn key_code(name: &str) -> Option<u32> {
         return Some(0x6F + number);
     }
     Some(match name {
+        "backspace" => 0x08,
         "tab" => 0x09,
         "enter" => 0x0D,
         "escape" | "esc" => 0x1B,
@@ -77,15 +78,19 @@ fn key_code(name: &str) -> Option<u32> {
         "up" | "arrowup" => 0x26,
         "right" | "arrowright" => 0x27,
         "down" | "arrowdown" => 0x28,
+        "insert" => 0x2D,
         "delete" => 0x2E,
+        ";" => 0xBA,
         "=" | "plus" => 0xBB,
         "," => 0xBC,
         "-" | "minus" => 0xBD,
         "." => 0xBE,
         "/" => 0xBF,
+        "`" => 0xC0,
         "[" => 0xDB,
         "\\" => 0xDC,
         "]" => 0xDD,
+        "'" => 0xDE,
         _ => return None,
     })
 }
@@ -139,7 +144,7 @@ pub enum Event {
     CloseRequested,
     /// Whether there's anything to go back or forward to may have changed.
     History,
-    /// One of the [`Settings::keys`] was pressed while the page had the keyboard.
+    /// A key kept by the app was pressed while the page had the keyboard.
     Key(Key),
     /// Something in the page went full screen, as a video does, or came back.
     FullScreen(bool),

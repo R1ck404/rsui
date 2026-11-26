@@ -19,17 +19,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use ash::vk;
 use rsui_text::Upload;
 
-use crate::area::{NO_ROUND_CLIPS, RoundSlots, intersect, is_empty, layer_quad, round_clips_of};
+use crate::area::{NO_ROUND_CLIPS, RoundSlots, backdrop_areas, intersect, is_empty, layer_quad, round_clips_of};
 use crate::gpu::RenderError;
 use crate::images::ImageUpload;
 use crate::paint::Color;
-use crate::scene::{Filter, Layer, PixelRect, Quad, Scene};
+use crate::scene::{BACKDROP_IMAGE, Filter, Layer, PixelRect, Quad, Scene};
 use crate::transform::Matrix;
 
 /// The shaders, compiled from `quad.glsl` by glslang: see the commands at its top.
 const VERTEX_SHADER: &[u8] = include_bytes!("quad_vert.spv");
 const QUAD_SHADER: &[u8] = include_bytes!("quad_frag.spv");
 const IMAGE_SHADER: &[u8] = include_bytes!("image_frag.spv");
+const BACKDROP_SHADER: &[u8] = include_bytes!("backdrop_frag.spv");
 
 /// How big the shaders' constants are, which is also how far apart each batch's are in the buffer they're read from: no
 /// GPU asks for more than this between them.
@@ -117,6 +118,7 @@ struct MemoryTarget {
 struct Swapchain {
     handle: vk::SwapchainKHR,
     extent: vk::Extent2D,
+    can_sample_backdrop: bool,
     images: Vec<vk::Image>,
     views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
@@ -168,6 +170,7 @@ pub(crate) struct Vulkan {
     layout: vk::PipelineLayout,
     quad_pipeline: vk::Pipeline,
     image_pipeline: vk::Pipeline,
+    backdrop_pipeline: vk::Pipeline,
     smooth: vk::Sampler,
     exact: vk::Sampler,
     pool: vk::DescriptorPool,
@@ -192,6 +195,7 @@ pub(crate) struct Vulkan {
     pictures: HashMap<u32, Picture>,
     picture_work: Vec<ImageUpload>,
     layer: Option<Canvas>,
+    backdrops: [Option<Picture>; 2],
     memory: Option<MemoryTarget>,
     retired: Vec<Retired>,
 }
@@ -623,6 +627,7 @@ impl Vulkan {
             layout: vk::PipelineLayout::null(),
             quad_pipeline: vk::Pipeline::null(),
             image_pipeline: vk::Pipeline::null(),
+            backdrop_pipeline: vk::Pipeline::null(),
             smooth: vk::Sampler::null(),
             exact: vk::Sampler::null(),
             pool: vk::DescriptorPool::null(),
@@ -644,6 +649,7 @@ impl Vulkan {
             pictures: HashMap::new(),
             picture_work: Vec::new(),
             layer: None,
+            backdrops: [None, None],
             memory: None,
             retired: Vec::new(),
         };
@@ -772,22 +778,15 @@ impl Vulkan {
                 let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes)).map_err(|_| failed("a shader isn't SPIR-V"))?;
                 Ok(device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?)
             };
-            let vertex = module(VERTEX_SHADER)?;
-            let shaders = module(QUAD_SHADER).and_then(|quad| match module(IMAGE_SHADER) {
-                Ok(image) => Ok((quad, image)),
-                Err(error) => {
-                    device.destroy_shader_module(quad, None);
-                    Err(error)
+            let mut shaders = Vec::with_capacity(4);
+            let made = (|| {
+                for bytes in [VERTEX_SHADER, QUAD_SHADER, IMAGE_SHADER, BACKDROP_SHADER] {
+                    shaders.push(module(bytes)?);
                 }
-            });
-            let made = shaders.and_then(|(quad, image)| {
-                let made = self.make_pipeline_pair(vertex, quad, image);
-                device.destroy_shader_module(quad, None);
-                device.destroy_shader_module(image, None);
-                made
-            });
-            device.destroy_shader_module(vertex, None);
-            (self.quad_pipeline, self.image_pipeline) = made?;
+                self.make_draw_pipelines(shaders[0], shaders[1], shaders[2], shaders[3])
+            })();
+            for shader in shaders { device.destroy_shader_module(shader, None); }
+            (self.quad_pipeline, self.image_pipeline, self.backdrop_pipeline) = made?;
 
             self.commands = device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -807,13 +806,14 @@ impl Vulkan {
         Ok(())
     }
 
-    /// The two pipelines, which differ only in their pixel shader: one for rectangles and glyphs, one for images.
-    fn make_pipeline_pair(
+    /// Pipelines share a vertex format. A backdrop replaces existing pixels instead of blending over them.
+    fn make_draw_pipelines(
         &self,
         vertex: vk::ShaderModule,
         quad: vk::ShaderModule,
         image: vk::ShaderModule,
-    ) -> Result<(vk::Pipeline, vk::Pipeline), RenderError> {
+        backdrop: vk::ShaderModule,
+    ) -> Result<(vk::Pipeline, vk::Pipeline, vk::Pipeline), RenderError> {
         // The quad's four numbers, then its glyph's, then its color, then its radius, as the Direct3D input layout reads it.
         let bindings = [vk::VertexInputBindingDescription { binding: 0, stride: 32, input_rate: vk::VertexInputRate::INSTANCE }];
         let attribute = |location, format, offset| vk::VertexInputAttributeDescription { location, binding: 0, format, offset };
@@ -847,6 +847,8 @@ impl Vulkan {
             color_write_mask: vk::ColorComponentFlags::RGBA,
         }];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let replace_attachments = [blend_attachments[0].blend_enable(false)];
+        let replace = vk::PipelineColorBlendStateCreateInfo::default().attachments(&replace_attachments);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let stages = |pixel| {
@@ -856,6 +858,7 @@ impl Vulkan {
             ]
         };
         let (quad_stages, image_stages) = (stages(quad), stages(image));
+        let backdrop_stages = stages(backdrop);
         let info = vk::GraphicsPipelineCreateInfo::default()
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&assembly)
@@ -867,7 +870,7 @@ impl Vulkan {
             .layout(self.layout)
             .render_pass(self.clearing)
             .subpass(0);
-        let infos = [info.stages(&quad_stages), info.stages(&image_stages)];
+        let infos = [info.stages(&quad_stages), info.stages(&image_stages), info.stages(&backdrop_stages).color_blend_state(&replace)];
         // What the driver compiled the shaders to, kept from the last time, where there's a file for it: compiling them is
         // most of the time a GPU takes to start on a phone (~50 ms of ~65 on an Adreno 740). The driver checks the file is
         // its own, for this GPU and this version of itself, and compiles them again if it isn't.
@@ -895,7 +898,7 @@ impl Vulkan {
             }
         }
         match made {
-            Ok(pipelines) => Ok((pipelines[0], pipelines[1])),
+            Ok(pipelines) => Ok((pipelines[0], pipelines[1], pipelines[2])),
             Err((pipelines, error)) => {
                 for pipeline in pipelines {
                     // SAFETY: what was made of them, if anything, is used by nothing.
@@ -946,6 +949,9 @@ impl Vulkan {
         }
         if let Some(staging) = self.staging.take() {
             self.retired.push(Retired::Buffer(staging));
+        }
+        for picture in self.backdrops.iter_mut().filter_map(Option::take) {
+            self.retired.push(Retired::Picture(picture));
         }
         if self.surfaces.is_some()
             && let Some(memory) = self.memory.take()
@@ -1240,6 +1246,9 @@ impl Vulkan {
         } else {
             capabilities.current_transform
         };
+        let can_sample_backdrop = capabilities.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if can_sample_backdrop { usage |= vk::ImageUsageFlags::TRANSFER_SRC; }
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(count)
@@ -1247,7 +1256,7 @@ impl Vulkan {
             .image_color_space(self.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(transform)
             .composite_alpha(composite)
@@ -1262,7 +1271,7 @@ impl Vulkan {
         }
         let handle = handle?;
         let mut chain =
-            Swapchain { handle, extent, images: Vec::new(), views: Vec::new(), framebuffers: Vec::new(), done: Vec::new() };
+            Swapchain { handle, extent, can_sample_backdrop, images: Vec::new(), views: Vec::new(), framebuffers: Vec::new(), done: Vec::new() };
         // SAFETY: the images are the swapchain's, and each view and framebuffer is made for them; on failure what was made
         // so far goes with the swapchain.
         let made = unsafe {
@@ -1453,7 +1462,7 @@ impl Vulkan {
         if !scene.layers.is_empty()
             && self.layer.as_ref().is_none_or(|layer| layer.texture.width < layer_size.0 || layer.texture.height < layer_size.1)
         {
-            let made = self.make_canvas(layer_size, vk::ImageUsageFlags::SAMPLED)?;
+            let made = self.make_canvas(layer_size, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)?;
             if let Some(old) = self.layer.replace(made) {
                 self.retired.push(Retired::Canvas(old));
             }
@@ -1472,6 +1481,12 @@ impl Vulkan {
             unsafe { self.device.update_descriptor_sets(&[write], &[]) };
         }
         let layer_size = self.layer.as_ref().map_or(layer_size, |layer| (layer.texture.width, layer.texture.height));
+        let can_sample_backdrop = to_memory || self.swapchain.as_ref().is_some_and(|chain| chain.can_sample_backdrop);
+        let has_backdrop = scene.batches.iter().any(|batch| batch.image == BACKDROP_IMAGE);
+        if has_backdrop {
+            if can_sample_backdrop { self.prepare_backdrop(0, extent)?; }
+            if !scene.layers.is_empty() { self.prepare_backdrop(1, layer_size)?; }
+        }
         let quad_count = scene.quads.len() as u64 + scene.layers.len() as u64;
         self.make_room(
             |this| &mut this.instances,
@@ -1537,7 +1552,13 @@ impl Vulkan {
         let atlas_size = self.atlas.as_ref().map_or(1, |atlas| atlas.width);
         // SAFETY: everything recorded is this renderer's own and stays alive until the frame's fence says it's done.
         unsafe {
-            self.record_scene(command, scene, clear, text_look, atlas_size, framebuffer, extent, layer_size);
+            for picture in self.backdrops.iter_mut().flatten() {
+                if picture.texture.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                    transition(&self.device, command, &mut picture.texture, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
+            }
+            self.record_scene(command, scene, clear, text_look, atlas_size, framebuffer, extent, layer_size,
+                can_sample_backdrop.then_some(target_image));
             if to_memory {
                 let memory = self.memory.as_mut().expect("made above");
                 image_barrier(
@@ -1592,7 +1613,11 @@ impl Vulkan {
             self.device.end_command_buffer(command)?;
             let commands = [command];
             let waits = [self.ready];
-            let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let mut wait_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+            if has_backdrop && can_sample_backdrop {
+                wait_stage |= vk::PipelineStageFlags::TRANSFER;
+            }
+            let stages = [wait_stage];
             let done = match (to_memory, &self.swapchain, self.acquired) {
                 (false, Some(chain), Some(index)) => Some(chain.done[index as usize]),
                 _ => None,
@@ -1870,6 +1895,49 @@ impl Vulkan {
         Ok((pool, set))
     }
 
+    fn prepare_backdrop(&mut self, slot: usize, size: (u32, u32)) -> Result<(), RenderError> {
+        if self.backdrops[slot].as_ref().is_some_and(|picture| (picture.texture.width, picture.texture.height) == size) {
+            return Ok(());
+        }
+        let texture = self.make_texture(size.0, size.1, self.format, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)?;
+        let (pool, set) = match self.picture_set(texture.view) {
+            Ok(set) => set,
+            Err(error) => {
+                self.destroy_texture(texture);
+                return Err(error);
+            }
+        };
+        if let Some(old) = self.backdrops[slot].replace(Picture { texture, pool, set }) {
+            self.retired.push(Retired::Picture(old));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// The command is outside a render pass. The source has just been drawn on and the snapshot was ready to sample.
+    /// Both images are alive, transfer-enabled and of the same format, and `sample` fits inside them.
+    unsafe fn copy_backdrop(&self, command: vk::CommandBuffer, source: vk::Image, snapshot: vk::Image, sample: PixelRect) {
+        let color = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        let sampled = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let read = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        let write = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+        let device = &self.device;
+        let offset = vk::Offset3D { x: sample.left, y: sample.top, z: 0 };
+        let copy = vk::ImageCopy {
+            src_subresource: COLOR_LAYERS, src_offset: offset,
+            dst_subresource: COLOR_LAYERS, dst_offset: offset,
+            extent: vk::Extent3D { width: (sample.right - sample.left) as u32, height: (sample.bottom - sample.top) as u32, depth: 1 },
+        };
+        // SAFETY: as the function says; these transitions restore the layouts for further drawing.
+        unsafe {
+            image_barrier(device, command, source, color, read);
+            image_barrier(device, command, snapshot, sampled, write);
+            device.cmd_copy_image(command, source, read, snapshot, write, &[copy]);
+            image_barrier(device, command, source, read, color);
+            image_barrier(device, command, snapshot, write, sampled);
+        }
+    }
+
     /// Records drawing the scene's batches on what `framebuffer` is, as the CPU renderer's `draw_all` draws them: each
     /// batch's quads cut to its clip, with what's faded as a whole drawn on the layer first and put down after.
     ///
@@ -1887,6 +1955,7 @@ impl Vulkan {
         framebuffer: vk::Framebuffer,
         extent: (u32, u32),
         layer_size: (u32, u32),
+        target_image: Option<vk::Image>,
     ) {
         let device = &self.device;
         let size = self.size;
@@ -2009,7 +2078,7 @@ impl Vulkan {
                 None => ((0, 0), extent),
             };
             let Some(scissor) = scissor_of(clip, origin, target) else { continue };
-            let picture = if batch.image != 0 {
+            let picture = if batch.image != 0 && batch.image != BACKDROP_IMAGE {
                 match self.pictures.get(&batch.image) {
                     Some(picture) => Some(picture),
                     None => continue,
@@ -2024,6 +2093,31 @@ impl Vulkan {
                     filter.checked_sub(1).and_then(|at| scene.filters.get(usize::from(at))),
                     round_clips_of(batch, &scene.round_clips),
                 );
+            }
+            if batch.image == BACKDROP_IMAGE {
+                let (slot, source, surface) = match in_layer.and(layer) {
+                    Some(canvas) => (1, Some(canvas.texture.image), canvas.framebuffer),
+                    None => (0, target_image, framebuffer),
+                };
+                if let (Some(source), Some(snapshot), Some(quad)) = (source, &self.backdrops[slot], scene.quads.get(batch.first as usize)) {
+                    let matrix = batch.transform.checked_sub(1).and_then(|at| scene.transforms.get(usize::from(at))).copied();
+                    let (visible, sample) = backdrop_areas(quad, clip, matrix, origin, target);
+                    if !is_empty(visible) {
+                        // SAFETY: the source was being drawn on, the snapshot has the same format and size, and the sample fits both.
+                        unsafe {
+                            device.cmd_end_render_pass(command);
+                            self.copy_backdrop(command, source, snapshot.texture.image, sample);
+                            begin(surface, target, None);
+                            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, self.backdrop_pipeline);
+                            device.cmd_bind_descriptor_sets(command, vk::PipelineBindPoint::GRAPHICS, self.layout, 1, &[snapshot.set], &[]);
+                            device.cmd_set_scissor(command, 0, &[scissor]);
+                            device.cmd_draw(command, 4, 1, 0, batch.first);
+                            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, self.quad_pipeline);
+                        }
+                        drawing_image = false;
+                    }
+                }
+                continue;
             }
             // SAFETY: as the function says.
             unsafe {
@@ -2059,6 +2153,14 @@ impl Vulkan {
         unsafe { device.cmd_end_render_pass(command) };
     }
 
+    pub(crate) fn wait_for_frame(&self) -> Result<(), RenderError> {
+        if self.in_flight {
+            // SAFETY: the fence was submitted with the frame; it's reset when the next starts.
+            unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
+        }
+        Ok(())
+    }
+
     /// What was last drawn into memory, as red, green, blue and alpha for each pixel, in rows from the top.
     pub(crate) fn read_pixels(&self) -> Result<Vec<u8>, RenderError> {
         let pixels = self.size.0 as usize * self.size.1 as usize * 4;
@@ -2068,10 +2170,7 @@ impl Vulkan {
             }
             return Ok(vec![0; pixels]);
         };
-        if self.in_flight {
-            // SAFETY: the fence was submitted with the frame; it's reset when the next starts.
-            unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
-        }
+        self.wait_for_frame()?;
         // SAFETY: the frame that copied into the buffer is done, and the buffer is as big as the picture.
         let read = unsafe { std::slice::from_raw_parts(memory.readback.mapped, pixels) };
         let mut out = read.to_vec();
@@ -2106,6 +2205,9 @@ impl Drop for Vulkan {
             if let Some(layer) = self.layer.take() {
                 self.retired.push(Retired::Canvas(layer));
             }
+            for picture in self.backdrops.iter_mut().filter_map(Option::take) {
+                self.retired.push(Retired::Picture(picture));
+            }
             if let Some(memory) = self.memory.take() {
                 self.retired.push(Retired::Canvas(memory.canvas));
                 self.retired.push(Retired::Buffer(memory.readback));
@@ -2121,6 +2223,7 @@ impl Drop for Vulkan {
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_pipeline(self.quad_pipeline, None);
             device.destroy_pipeline(self.image_pipeline, None);
+            device.destroy_pipeline(self.backdrop_pipeline, None);
             device.destroy_pipeline_layout(self.layout, None);
             for layout in self.set_layouts {
                 device.destroy_descriptor_set_layout(layout, None);

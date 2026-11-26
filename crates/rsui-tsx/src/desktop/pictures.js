@@ -8,10 +8,20 @@ function picture(text) {
         return null;
     }
     const [width, height, data] = String(text).split(' ');
+    let png;
     return {
         width: Number(width),
         height: Number(height),
-        png: new Uint8Array(Buffer.from(data, 'base64')),
+        get png() {
+            if (png === undefined) {
+                const bytes = Buffer.from(data, 'base64');
+                png = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            }
+            return png;
+        },
+        set png(value) {
+            Object.defineProperty(this, 'png', { value, writable: true, enumerable: true, configurable: true });
+        },
         url: 'data:image/png;base64,' + data,
     };
 }
@@ -25,29 +35,32 @@ function asked(ask) {
     }
 }
 
-/// A folder's listing as Rust gives it, a line for each thing, as objects.
+/// Decode directly into the result so a large folder needs no temporary array of lines or fields.
 function listing(text) {
     const found = [];
     if (!text) {
         return found;
     }
-    for (const line of String(text).split('\n')) {
-        if (line === '') {
-            continue;
-        }
-        const [name, flags, size, modified, created] = line.split('\t');
-        const bits = Number(flags);
+    let start = 0;
+    while (start < text.length) {
+        const nameEnd = text.indexOf('\0', start);
+        const flagsEnd = text.indexOf('\t', nameEnd + 1);
+        const sizeEnd = text.indexOf('\t', flagsEnd + 1);
+        const modifiedEnd = text.indexOf('\t', sizeEnd + 1);
+        const end = text.indexOf('\n', modifiedEnd + 1);
+        const bits = Number(text.slice(nameEnd + 1, flagsEnd));
         found.push({
-            name,
+            name: text.slice(start, nameEnd),
             folder: (bits & 1) !== 0,
             hidden: (bits & 2) !== 0,
             system: (bits & 4) !== 0,
             readonly: (bits & 8) !== 0,
             link: (bits & 16) !== 0,
-            size: Number(size),
-            modified: Number(modified),
-            created: Number(created),
+            size: Number(text.slice(flagsEnd + 1, sizeEnd)),
+            modified: Number(text.slice(sizeEnd + 1, modifiedEnd)),
+            created: Number(text.slice(modifiedEnd + 1, end)),
         });
+        start = end + 1;
     }
     return found;
 }

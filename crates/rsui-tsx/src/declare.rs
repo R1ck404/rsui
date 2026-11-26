@@ -2169,6 +2169,18 @@ impl<'v> Declarer<'v> {
                     }
                 }
             }
+            "backdrop-filter" | "-webkit-backdrop-filter" => {
+                if matches!(value, "none" | "blur()") {
+                    props.set("backdropBlur", Val::Number(0.0));
+                } else if let Some(length) = value.strip_prefix("blur(").and_then(|value| value.strip_suffix(')')) {
+                    match self.length(length.trim(), font_size) {
+                        Size::Pixels(size) if size >= 0.0 => props.set("backdropBlur", Val::Number(size)),
+                        _ => self.not_here(format!("{name} as {value}")),
+                    }
+                } else {
+                    self.not_here(format!("{name} as {value}"));
+                }
+            }
             "filter" => {
                 if value == "none" {
                     props.delete("cssFilter");
@@ -3357,7 +3369,8 @@ fn prop_key(name: &str) -> Option<&'static str> {
     PROP_KEYS.iter().find(|key| **key == name).copied()
 }
 
-const PROP_KEYS: [&str; 49] = [
+const PROP_KEYS: [&str; 50] = [
+    "backdropBlur",
     "basis",
     "borderBottomWidth",
     "borderLeftWidth",

@@ -7,10 +7,11 @@
 //! The renderer shows a canvas as an image whose source is `canvas:ID:WxH` (see [`source`]): [`crate::Images`] asks here for its
 //! size and pixels, and uploads only the part that changed since it last did.
 
-mod blur;
+pub(crate) mod blur;
 pub(crate) mod geom;
 mod paint;
 mod pixels;
+mod pool;
 mod raster;
 mod text;
 
@@ -89,6 +90,7 @@ pub mod ops {
     pub const FREE: u32 = 61;
     pub const IMAGE_SOURCE: u32 = 62;
     pub const ADD_PATH: u32 = 65;
+    pub const FILL_DITHER: u32 = 66;
 }
 
 /// How many arguments each kind of path step has, in a Path2D's own list.
@@ -242,6 +244,9 @@ struct Surface {
     path: Path,
     /// What's changed since the GPU was last given it.
     dirty: IRect,
+    /// Where anything's been drawn since it was last cleared: outside this, every pixel is as a cleared one is. Clearing what's
+    /// already clear changes nothing, so a canvas cleared whole each frame and drawn on in a corner only sends that corner.
+    ink: IRect,
     version: u64,
     /// The version the GPU was last given, from which `dirty` counts.
     uploaded: u64,
@@ -261,6 +266,7 @@ impl Surface {
             saved: Vec::new(),
             path: Path::default(),
             dirty: IRect::new(0, 0, 0, 0),
+            ink: IRect::new(0, 0, 0, 0),
             version: 1,
             uploaded: 0,
             opaque,
@@ -276,7 +282,11 @@ impl Surface {
         self.height = height;
         let bytes = width as usize * height as usize * 4;
         self.pixels.clear();
-        self.pixels.shrink_to(bytes);
+        if bytes > self.pixels.capacity() {
+            self.pixels.reserve_exact(bytes);
+        } else {
+            self.pixels.shrink_to(bytes);
+        }
         self.pixels.resize(bytes, 0);
         if self.opaque {
             for pixel in self.pixels.chunks_exact_mut(4) {
@@ -287,7 +297,11 @@ impl Surface {
         self.saved.clear();
         self.path.clear();
         self.picture = None;
+        // What changed at the old size is past the edge of the new one, and is all of it anyway.
+        self.dirty = IRect::new(0, 0, 0, 0);
         self.changed(self.whole());
+        // Every pixel is as a cleared one is.
+        self.ink = IRect::new(0, 0, 0, 0);
     }
 
     fn whole(&self) -> IRect {
@@ -298,6 +312,7 @@ impl Surface {
         let area = area.intersect(&self.whole());
         if !area.is_empty() {
             self.dirty = self.dirty.union(&area);
+            self.ink = self.ink.union(&area);
             self.version += 1;
             self.picture = None;
             GENERATION.with(|g| g.set(g.get() + 1));
@@ -346,6 +361,10 @@ struct Tools {
     stroker: Stroker,
     text: TextWorld,
     lines: Vec<[f32; 4]>,
+    /// The last clip with soft edges made over no other: its lines, rule and what it was inside, and the clip. A canvas
+    /// redrawn each frame inside the same shape clips to it again each time, and making its mask can take longer than what's
+    /// drawn through it.
+    last_clip: Option<(Vec<[f32; 4]>, bool, IRect, Rc<Clip>)>,
     path: Path,
     shaded: Vec<[f32; 4]>,
     shaded32: Vec<u32>,
@@ -364,6 +383,12 @@ struct Tools {
     on_arcs: Vec<(f32, f32)>,
     /// A hairline's color, and that color through each coverage with how much of what's under it stays.
     hair_table: (u32, Vec<(u32, u32)>),
+    /// A path's circles, when it's only circles.
+    circles: Vec<(f32, f32, f32)>,
+    /// A path's rectangles, when it's only rectangles that don't share a pixel.
+    rects: Vec<[f32; 4]>,
+    /// A dither's field down one row.
+    lane: Vec<f32>,
 }
 
 fn with_world<R>(f: impl FnOnce(&mut World) -> R) -> R {
@@ -377,6 +402,17 @@ fn with_world<R>(f: impl FnOnce(&mut World) -> R) -> R {
 /// Changes whenever any canvas's pixels do.
 pub fn generation() -> u64 {
     GENERATION.with(std::cell::Cell::get)
+}
+
+/// Live canvas count and retained CPU pixel-buffer capacity on this thread.
+#[cfg(feature = "render-diagnostics")]
+pub fn surface_storage() -> (usize, usize) {
+    WORLD.with(|world| {
+        world.borrow().as_ref().map_or((0, 0), |world| {
+            let surfaces = &world.surfaces;
+            (surfaces.len(), surfaces.values().map(|surface| surface.pixels.capacity()).sum())
+        })
+    })
 }
 
 /// Makes a canvas of this size, see-through unless `opaque`, and says its number.
@@ -448,7 +484,7 @@ pub(crate) fn take_upload(id: u32, whole: bool, last: u64) -> Option<(IRectOut, 
         if !whole && last == surface.version {
             return None;
         }
-        let area = if whole || last != surface.uploaded { surface.whole() } else { surface.dirty };
+        let area = if whole || last != surface.uploaded { surface.whole() } else { surface.dirty.intersect(&surface.whole()) };
         surface.dirty = IRect::new(0, 0, 0, 0);
         surface.uploaded = surface.version;
         if area.is_empty() {
@@ -862,6 +898,10 @@ fn skip(op: u32, list: &[f64], at: usize) -> usize {
         ops::DRAW_IMAGE => 10,
         ops::ROUND_RECT => 12,
         ops::DASH => return at + 1 + list.get(at).copied().unwrap_or(0.0) as usize,
+        ops::FILL_DITHER => {
+            let cell = |n: usize| list.get(at + n).copied().unwrap_or(0.0).max(0.0) as usize;
+            return (at + 5).saturating_add(cell(0).saturating_mul(cell(1))).min(list.len());
+        }
         _ => return list.len(),
     };
     at + fixed
@@ -993,6 +1033,9 @@ enum Coverage<'a> {
     Mask8 { x: i32, y: i32, width: usize, height: usize, data: &'a [u8] },
     /// A rectangle on the canvas, from `[x0, y0]` to `[x1, y1]`, which needs nothing worked out but its edges.
     Rect([f32; 4]),
+    /// Circles that don't touch, as `(x, y, radius)` on the canvas, each pixel covered as much as it's inside the circle by its
+    /// distance from the center (see `Path::circles`). Only drawn directly: `fill_path` checks it will be.
+    Circles(&'a [(f32, f32, f32)]),
 }
 
 /// A row of how much of each pixel is covered, from 0 to 1, or from 0 to 255.
@@ -1229,9 +1272,85 @@ impl Drawing<'_> {
                     self.draw_image(&image, v);
                 }
             }
+            ops::FILL_DITHER => {
+                let (cols, rows) = (read(&mut at).max(0.0) as usize, read(&mut at).max(0.0) as usize);
+                let (cell, step, size) = (f(&mut at), f(&mut at), f(&mut at));
+                let end = at.saturating_add(cols.saturating_mul(rows)).min(list.len());
+                let field = &list[at..end];
+                at = end;
+                if field.len() == cols * rows {
+                    self.dither(field, cols, rows, [cell, step, size]);
+                }
+            }
             _ => return skip(op, list, at),
         }
         at
+    }
+
+    /// `fillDither()`: dots of `size` pixels on a grid `step` apart, every other row half a step along, in the fill, wherever the
+    /// level of `field` there is above the dot's threshold in a 4 by 4 Bayer matrix, so that the dots thin out in an even weave
+    /// where the field falls. The field is `cols` by `rows` levels `cell` apart from the origin, read between by their
+    /// neighbours. Only where the transform moves and resizes, as a grid of dots can't be turned.
+    fn dither(&mut self, field: &[f64], cols: usize, rows: usize, [cell, step, size]: [f32; 3]) {
+        // The thresholds, each between 0 and 1.
+        const BAYER: [f32; 16] = [0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0];
+        let m = self.surface.state.transform;
+        if cols < 2 || rows < 2 || !(cell > 0.0 && step > 0.0 && size > 0.0) || !m.is_axis_aligned() || !m.is_finite() {
+            return;
+        }
+        let shader = self.shader(self.surface.state.fill);
+        let (width, height) = ((cols - 1) as f32 * cell, (rows - 1) as f32 * cell);
+        // Too many dots to be one canvas's: a field can't be asked for more than there are pixels, a dot to a pixel.
+        if (width / step) * (height / step) > 1.0e8 {
+            return;
+        }
+        let mut rects = std::mem::take(&mut self.world.tools.rects);
+        rects.clear();
+        let mut lane = std::mem::take(&mut self.world.tools.lane);
+        lane.clear();
+        lane.resize(cols, 0.0);
+        let per = 1.0 / cell;
+        let mut row = 0usize;
+        loop {
+            let y = row as f32 * step;
+            if y > height {
+                break;
+            }
+            // The field down this row, at each of its columns.
+            let at = y * per;
+            let j = (at as usize).min(rows - 2);
+            let fy = at - j as f32;
+            let (above, below) = (&field[j * cols..(j + 1) * cols], &field[(j + 1) * cols..(j + 2) * cols]);
+            for i in 0..cols {
+                lane[i] = (above[i] + (below[i] - above[i]) * f64::from(fy)) as f32;
+            }
+            let first = if row % 2 == 0 { 0.0 } else { step / 2.0 };
+            let thresholds = &BAYER[(row % 4) * 4..(row % 4) * 4 + 4];
+            let (y0, y1) = (m.d * y + m.f, m.d * (y + size) + m.f);
+            let mut col = 0usize;
+            loop {
+                let x = first + col as f32 * step;
+                if x > width {
+                    break;
+                }
+                let at = x * per;
+                let i = (at as usize).min(cols - 2);
+                let level = lane[i] + (lane[i + 1] - lane[i]) * (at - i as f32);
+                if level > (thresholds[col & 3] + 0.5) / 16.0 {
+                    let (x0, x1) = (m.a * x + m.e, m.a * (x + size) + m.e);
+                    rects.push([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]);
+                }
+                col += 1;
+            }
+            row += 1;
+        }
+        self.world.tools.lane = lane;
+        if !self.solid_rects(&rects, &shader) {
+            for rect in &rects {
+                self.draw(Coverage::Rect(*rect), &shader, None);
+            }
+        }
+        self.world.tools.rects = rects;
     }
 
     /// What a fill or stroke style paints with, as it is now.
@@ -1291,12 +1410,70 @@ impl Drawing<'_> {
         }
     }
 
+    /// Lays rectangles in one color on the canvas, as `draw` does each one, but with what it works out about the state once for
+    /// all of them, as thousands of dots need. Says whether it could, which is for a plain color laid on as usual with no clip
+    /// that's soft at its edges.
+    fn solid_rects(&mut self, rects: &[[f32; 4]], shader: &Shader) -> bool {
+        let state = &self.surface.state;
+        let masked = state.clip.as_ref().is_some_and(|clip| clip.mask.is_some());
+        let Some(solid) = shader.solid() else {
+            return false;
+        };
+        if state.op != Op::SourceOver || masked {
+            return false;
+        }
+        let color = paint::pack(quantize(solid, state.alpha));
+        let clipping = self.surface.clip_bounds();
+        if clipping.is_empty() {
+            return true;
+        }
+        let surface = &mut *self.surface;
+        let width = surface.width as usize;
+        let mut touched: Option<IRect> = None;
+        for &[x0, y0, x1, y1] in rects {
+            let reach = IRect::new(raster::floor(x0) as i32, raster::floor(y0) as i32, raster::ceil(x1) as i32, raster::ceil(y1) as i32).intersect(&clipping);
+            if reach.is_empty() {
+                continue;
+            }
+            if let Some((top, bottom)) = pixels::rect_solid(&mut surface.pixels, width, [x0, y0, x1, y1], [reach.x0, reach.y0, reach.x1, reach.y1], color) {
+                let one = IRect::new(reach.x0, top, reach.x1, bottom);
+                touched = Some(touched.map_or(one, |all| all.union(&one)));
+            }
+        }
+        if let Some(touched) = touched {
+            surface.changed(touched);
+        }
+        true
+    }
+
     fn fill_path(&mut self, path: &Path, even_odd: bool) {
         if let Some(rect) = axis_rect(path) {
             let shader = self.shader(self.surface.state.fill);
             self.draw(Coverage::Rect(rect), &shader, None);
             return;
         }
+        // Dots: each circle's cover worked out from how far each pixel is from its center, not from its lines.
+        let mut circles = std::mem::take(&mut self.world.tools.circles);
+        if self.drawn_directly(None) && path.circles(&mut circles) {
+            let shader = self.shader(self.surface.state.fill);
+            self.draw(Coverage::Circles(&circles), &shader, None);
+            self.world.tools.circles = circles;
+            return;
+        }
+        self.world.tools.circles = circles;
+        // Dots that are squares, as a dither's are: each is a rectangle laid on by itself, not four lines in a walk of the whole.
+        let mut rects = std::mem::take(&mut self.world.tools.rects);
+        if self.drawn_directly(None) && path.rects(&mut rects) {
+            let shader = self.shader(self.surface.state.fill);
+            if !self.solid_rects(&rects, &shader) {
+                for rect in &rects {
+                    self.draw(Coverage::Rect(*rect), &shader, None);
+                }
+            }
+            self.world.tools.rects = rects;
+            return;
+        }
+        self.world.tools.rects = rects;
         let mut lines = std::mem::take(&mut self.world.tools.lines);
         lines.clear();
         path.fill_lines(&mut lines);
@@ -1502,10 +1679,14 @@ impl Drawing<'_> {
             let (l, r) = (x0.min(x1), x0.max(x1));
             let (t, b) = (y0.min(y1), y0.max(y1));
             if l == l.round() && r == r.round() && t == t.round() && b == b.round() {
-                let area = IRect::new(l as i32, t as i32, r as i32, b as i32).intersect(&self.surface.clip_bounds());
+                let asked = IRect::new(l as i32, t as i32, r as i32, b as i32).intersect(&self.surface.clip_bounds());
+                // Only what's been drawn on needs clearing; the rest is clear already.
+                let ink = self.surface.ink;
+                let area = asked.intersect(&ink);
                 if area.is_empty() {
                     return;
                 }
+                let all_ink = asked.x0 <= ink.x0 && asked.y0 <= ink.y0 && asked.x1 >= ink.x1 && asked.y1 >= ink.y1;
                 let stride = self.surface.width as usize * 4;
                 let fill = if self.surface.opaque { [0, 0, 0, 255] } else { [0; 4] };
                 for y in area.y0..area.y1 {
@@ -1520,6 +1701,9 @@ impl Drawing<'_> {
                     }
                 }
                 self.surface.changed(area);
+                if all_ink {
+                    self.surface.ink = IRect::new(0, 0, 0, 0);
+                }
                 return;
             }
         }
@@ -1555,9 +1739,19 @@ impl Drawing<'_> {
             self.surface.state.clip = Some(Rc::new(Clip { bounds: none, mask: None, full: none }));
             return;
         };
+        let under = old.as_ref().filter(|clip| clip.mask.is_some());
+        if under.is_none()
+            && let Some((was, rule, inside, clip)) = &self.world.tools.last_clip
+            && *rule == even_odd
+            && *inside == bounds
+            && *was == lines
+        {
+            self.surface.state.clip = Some(clip.clone());
+            self.world.tools.lines = lines;
+            return;
+        }
         let width = (reach.x1 - reach.x0) as usize;
         let mut mask = vec![0u8; width * (reach.y1 - reach.y0) as usize];
-        let under = old.as_ref().filter(|clip| clip.mask.is_some());
         let height = (reach.y1 - reach.y0) as usize;
         // A rectangle whose sides go across and down covers each row between its first and last the same, as its sides are
         // straight down: that row is worked out once, along with the first and the last, and copied to the rest.
@@ -1595,11 +1789,30 @@ impl Drawing<'_> {
                 row.copy_from_slice(inside);
             }
         }
-        self.world.tools.lines = lines;
         let full = full_part(&mask, width, height, rows.len() == 3).map_or(IRect::new(0, 0, 0, 0), |[x0, y0, x1, y1]| {
             IRect::new(reach.x0 + x0 as i32, reach.y0 + y0 as i32, reach.x0 + x1 as i32, reach.y0 + y1 as i32)
         });
-        self.surface.state.clip = Some(Rc::new(Clip { bounds: reach, mask: Some(mask), full }));
+        let clip = Rc::new(Clip { bounds: reach, mask: Some(mask), full });
+        if under.is_none() {
+            // Kept with its own copy of the lines; the tools' are for the next shape.
+            let mut was = self.world.tools.last_clip.take().map(|(was, ..)| was).unwrap_or_default();
+            was.clear();
+            was.extend_from_slice(&lines);
+            self.world.tools.last_clip = Some((was, even_odd, bounds, clip.clone()));
+        }
+        self.world.tools.lines = lines;
+        self.surface.state.clip = Some(clip);
+    }
+
+    /// Whether `draw` would lay what's drawn straight on the canvas, with no shadow, filter or layer between.
+    fn drawn_directly(&self, op: Option<Op>) -> bool {
+        let state = &self.surface.state;
+        let op = op.unwrap_or(state.op);
+        let shadow = op != Op::Clear
+            && state.shadow_color[3] != 0
+            && (state.shadow_blur > 0.0 || state.shadow_x != 0.0 || state.shadow_y != 0.0);
+        let filtered = op != Op::Clear && state.filter.is_some();
+        !shadow && !filtered && !op.unbounded()
     }
 
     /// Lays what `shader` paints through `coverage` on the canvas, with what the state says, and `op` in place of its own.
@@ -1619,6 +1832,9 @@ impl Drawing<'_> {
         let filtered = op != Op::Clear && state.filter.is_some();
         if !shadow && !filtered && !op.unbounded() {
             self.draw_direct(coverage, shader, op, clipping);
+        } else if let Coverage::Circles(_) = coverage {
+            // `fill_path` only makes these when they're drawn directly.
+            debug_assert!(false, "circles drawn through a layer");
         } else if let Coverage::Rect(rect) = coverage {
             let mut lines = std::mem::take(&mut self.world.tools.rect_lines);
             lines.clear();
@@ -1696,6 +1912,104 @@ impl Drawing<'_> {
                 return;
             }
         }
+        // A big rectangle of a gradient, as a glow over a canvas is: split into bands of rows, each worked out and laid on by a
+        // thread of its own.
+        if let (Coverage::Rect([x0, y0, x1, y1]), Some(gradient), Op::SourceOver, false) = (&coverage, shader.gradient(), op, masked)
+            && alpha8 == 255
+            && pool::bands() > 1
+            && x0.is_finite()
+            && y0.is_finite()
+            && x1.is_finite()
+            && y1.is_finite()
+        {
+            let (x0, y0, x1, y1) = (*x0, *y0, *x1, *y1);
+            let reach = IRect::new(raster::floor(x0.max(-1.0e8)) as i32, raster::floor(y0.max(-1.0e8)) as i32, raster::ceil(x1.min(1.0e8)) as i32, raster::ceil(y1.min(1.0e8)) as i32)
+                .intersect(&clipping);
+            let len = (reach.x1 - reach.x0).max(0) as usize;
+            let height = (reach.y1 - reach.y0).max(0) as usize;
+            if len * height >= 200_000 {
+                // How much of each pixel across the rectangle covers, as the one-thread way below has it.
+                let across: Vec<f32> = (reach.x0..reach.x1).map(|px| ((px + 1) as f32).min(x1) - (px as f32).max(x0)).collect();
+                let count = pool::bands();
+                let per = height.div_ceil(count);
+                let stride = width * 4;
+                let rows = pool::Rows::new(pixels);
+                pool::each(count, &|band| {
+                    let from = reach.y0 + (band * per) as i32;
+                    let to = (from + per as i32).min(reach.y1);
+                    if from >= to {
+                        return;
+                    }
+                    // SAFETY: each band's rows are its own, and the pixels outlive `pool::each`.
+                    let out = unsafe { rows.band(from as usize * stride, to as usize * stride) };
+                    let mut shaded = vec![0u32; len];
+                    let mut down = vec![0.0f32; len];
+                    for py in from..to {
+                        let part = ((py + 1) as f32).min(y1) - (py as f32).max(y0);
+                        if part <= 0.0 {
+                            continue;
+                        }
+                        let cover: &[f32] = if part >= 1.0 {
+                            &across
+                        } else {
+                            for (d, a) in down.iter_mut().zip(&across) {
+                                *d = a * part;
+                            }
+                            &down
+                        };
+                        gradient.row32(reach.x0, py, &mut shaded);
+                        let start = (py - from) as usize * stride + reach.x0 as usize * 4;
+                        pixels::blend_shaded(&mut out[start..start + len * 4], cover, &shaded);
+                    }
+                });
+                surface.changed(reach);
+                return;
+            }
+        }
+        // A big fill in a color, as a field of dots or slats is: split into bands of rows, each worked out and laid on by a thread
+        // of its own (see `pool`), as no row reads another.
+        if let (Coverage::Lines(lines, even_odd), Some(color), false) = (&coverage, solid32, masked)
+            && op != Op::Clear
+            && (op == Op::SourceOver || paint::composite8(op, [0; 4], [0; 4]).is_some())
+            && pool::bands() > 1
+            && lines.len() >= 2048
+            && let Some(reach) = IRect::around(lines).map(|r| r.intersect(&clipping))
+            && reach.y1 - reach.y0 >= 64
+        {
+            let (lines, even_odd) = (*lines, *even_odd);
+            let count = pool::bands();
+            let per = ((reach.y1 - reach.y0) as usize).div_ceil(count);
+            let stride = width * 4;
+            let rows = pool::Rows::new(pixels);
+            let reached = std::sync::Mutex::new(IRect::new(0, 0, 0, 0));
+            pool::each(count, &|band| {
+                let top = reach.y0 + (band * per) as i32;
+                let bottom = (top + per as i32).min(reach.y1);
+                if top >= bottom {
+                    return;
+                }
+                // SAFETY: each band's rows are its own, and the pixels outlive `pool::each`.
+                let out = unsafe { rows.band(top as usize * stride, bottom as usize * stride) };
+                let clip = IRect::new(clipping.x0, top, clipping.x1, bottom);
+                let got = BAND_RASTER.with(|raster| {
+                    raster.borrow_mut().fill(lines, clip, even_odd, |y, x, row| {
+                        let start = ((y - top) as usize * width + x as usize) * 4;
+                        let dest = &mut out[start..start + row.len() * 4];
+                        if op == Op::SourceOver {
+                            pixels::blend_solid(dest, row, color);
+                        } else {
+                            pixels::blend_other(dest, row, op, Some(color), &[]);
+                        }
+                    })
+                });
+                if let Some(got) = got {
+                    let mut all = reached.lock().unwrap_or_else(|e| e.into_inner());
+                    *all = all.union(&got);
+                }
+            });
+            surface.changed(reached.into_inner().unwrap_or_else(|e| e.into_inner()));
+            return;
+        }
         let mut shaded = std::mem::take(&mut self.world.tools.shaded);
         let mut shaded32 = std::mem::take(&mut self.world.tools.shaded32);
         let mut floats = std::mem::take(&mut self.world.tools.floats);
@@ -1745,6 +2059,21 @@ impl Drawing<'_> {
                 pixels::blend_masked(out, row, mask, solid32.unwrap_or(0), source);
                 return;
             }
+            // The other ways that only weigh each by the other's alpha, in whole numbers, a row at a time: `destination-out`
+            // takes scanlines and holes out of what's there, `lighter` adds glows up.
+            if !masked && op != Op::Clear {
+                let cover = match row {
+                    Row::Float(row) => row,
+                    Row::Byte(row) => {
+                        floats.clear();
+                        floats.extend(row.iter().map(|v| f32::from(*v) / 255.0));
+                        &floats[..]
+                    }
+                };
+                if pixels::blend_other(out, cover, op, solid32, &shaded32[..if solid32.is_some() { 0 } else { len }]) {
+                    return;
+                }
+            }
             for i in 0..len {
                 let mut k = row.at(i);
                 if masked {
@@ -1776,6 +2105,17 @@ impl Drawing<'_> {
                     }
                 } else {
                     let s8 = solid8.unwrap_or_else(|| paint::unpack(shaded32[i]));
+                    // The ways that only weigh each by the other's alpha, in whole numbers, as `source-over` is.
+                    let cover = (k * 255.0 + 0.5) as u32;
+                    let s = if cover >= 255 {
+                        s8
+                    } else {
+                        [div255(s8[0] * cover), div255(s8[1] * cover), div255(s8[2] * cover), div255(s8[3] * cover)]
+                    };
+                    if let Some(r) = paint::composite8(op, s, [u32::from(d[0]), u32::from(d[1]), u32::from(d[2]), u32::from(d[3])]) {
+                        d.copy_from_slice(&[r[0] as u8, r[1] as u8, r[2] as u8, r[3] as u8]);
+                        continue;
+                    }
                     let sp = [s8[0] as f32 * k / 255.0, s8[1] as f32 * k / 255.0, s8[2] as f32 * k / 255.0, s8[3] as f32 * k / 255.0];
                     let dp = [f32::from(d[0]) / 255.0, f32::from(d[1]) / 255.0, f32::from(d[2]) / 255.0, f32::from(d[3]) / 255.0];
                     store(d, paint::composite(op, sp, dp));
@@ -1846,6 +2186,33 @@ impl Drawing<'_> {
                     }
                 }
             }
+            Coverage::Circles(circles) => {
+                // Each pixel as much inside as its center is less than half a pixel past the edge: r + 0.5 - distance.
+                let mut down = std::mem::take(&mut self.world.tools.down);
+                for &(cx, cy, r) in circles {
+                    let reach = r + 0.5;
+                    let area = IRect::new(raster::floor(cx - reach) as i32, raster::floor(cy - reach) as i32, raster::ceil(cx + reach) as i32, raster::ceil(cy + reach) as i32)
+                        .intersect(&clipping);
+                    if area.is_empty() {
+                        continue;
+                    }
+                    for py in area.y0..area.y1 {
+                        let dy = py as f32 + 0.5 - cy;
+                        down.clear();
+                        let mut any = false;
+                        for px in area.x0..area.x1 {
+                            let dx = px as f32 + 0.5 - cx;
+                            let k = (reach - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                            any |= k > 0.0;
+                            down.push(k);
+                        }
+                        if any {
+                            row_fn(py, area.x0, &down);
+                        }
+                    }
+                }
+                self.world.tools.down = down;
+            }
         }
         self.world.tools.floats = floats;
         self.world.tools.shaded = shaded;
@@ -1873,6 +2240,10 @@ impl Drawing<'_> {
         let reach = match &coverage {
             Coverage::Rect(_) => None,
             Coverage::Lines(lines, _) => IRect::around(lines),
+            Coverage::Circles(circles) => circles.iter().fold(None, |all: Option<IRect>, &(x, y, r)| {
+                let one = IRect::new(raster::floor(x - r - 0.5) as i32, raster::floor(y - r - 0.5) as i32, raster::ceil(x + r + 0.5) as i32, raster::ceil(y + r + 0.5) as i32);
+                Some(all.map_or(one, |all| all.union(&one)))
+            }),
             Coverage::Mask { x, y, width, height, .. } | Coverage::Mask8 { x, y, width, height, .. } => {
                 Some(IRect::new(*x, *y, *x + *width as i32, *y + *height as i32))
             }
@@ -1921,7 +2292,7 @@ impl Drawing<'_> {
                     self.world.tools.raster.fill(lines, area, even_odd, &mut put);
                 }
                 // Made into a `Mask` by `draw()` before it comes here.
-                Coverage::Rect(_) | Coverage::Mask8 { .. } => {}
+                Coverage::Rect(_) | Coverage::Mask8 { .. } | Coverage::Circles(_) => {}
                 Coverage::Mask { x, y, width, height, data } => {
                     let inside = IRect::new(x, y, x + width as i32, y + height as i32).intersect(&area);
                     for py in inside.y0..inside.y1 {
@@ -2054,6 +2425,10 @@ impl Drawing<'_> {
             self.blit(image, (sx as i32, sy as i32, sw as i32, sh as i32), ((dx + m.e) as i32, (dy + m.f) as i32));
             return;
         }
+        if self.draw_image_rows(image, &user_to_image.then(&to_user), &m, [dx, dy, dw, dh], bounds) {
+            return;
+        }
+        let state = &self.surface.state;
         let shader = Shader::Image {
             image: image.clone(),
             to_image: user_to_image.then(&to_user),
@@ -2086,6 +2461,103 @@ impl Drawing<'_> {
         self.draw(Coverage::Lines(&lines, false), &shader, None);
         self.world.tools.lines = lines;
         self.world.tools.path = path;
+    }
+
+    /// A picture that's only moved and resized, laid on as usual or used as a destination-in or destination-out mask.
+    /// The same pixels as drawing it through its shader, a row at a time, but each row of the picture is sampled across
+    /// only once, and each row of the canvas is then between two of those (or is one, at the nearest pixel). Drawn bigger, as a
+    /// small picture stretched over a canvas is, most rows of the canvas fall on the same rows of the picture as the row above,
+    /// so most of the work is done once for several rows. A big one is split into bands of rows, each on a thread of its own,
+    /// as no row reads another. Says whether it could: for anything else, as a picture that's turned, a clip with soft edges or
+    /// another way of laying it on, it's drawn through its shader. A clip with soft edges, as one of a rounded shape is, is
+    /// looked at for each pixel where it doesn't let all of it through, as the shader's way does.
+    fn draw_image_rows(&mut self, image: &Image, to_image: &Matrix, m: &Matrix, [dx, dy, dw, dh]: [f32; 4], bounds: [i32; 4]) -> bool {
+        let state = &self.surface.state;
+        let clip = state.clip.clone();
+        let plain = matches!(state.op, Op::SourceOver | Op::DestinationOut | Op::DestinationIn)
+            && state.filter.is_none()
+            && (state.shadow_color[3] == 0 || (state.shadow_blur == 0.0 && state.shadow_x == 0.0 && state.shadow_y == 0.0))
+            && m.is_axis_aligned()
+            && to_image.b == 0.0
+            && to_image.c == 0.0;
+        if !plain {
+            return false;
+        }
+        // Where it goes, in whole pixels, as `draw_image` rounds it, inside what's clipped.
+        let (x0, y0) = m.apply(dx, dy);
+        let (x1, y1) = m.apply(dx + dw, dy + dh);
+        let (l, r, t, b) = (x0.min(x1).round(), x0.max(x1).round(), y0.min(y1).round(), y0.max(y1).round());
+        if (x1 - x0).abs() < 1.0 || (y1 - y0).abs() < 1.0 || !(l.is_finite() && r.is_finite() && t.is_finite() && b.is_finite()) {
+            return false;
+        }
+        let clipping = self.surface.clip_bounds();
+        let area = IRect::new(l.max(-1.0e8) as i32, t.max(-1.0e8) as i32, r.min(1.0e8) as i32, b.min(1.0e8) as i32).intersect(&clipping);
+        // A soft clip needs the layer's coverage interpolation even outside the image.
+        if state.op == Op::DestinationIn && clip.as_ref().is_some_and(|clip| clip.mask.is_some()) {
+            return false;
+        }
+        if area.is_empty() && state.op != Op::DestinationIn {
+            return true;
+        }
+        // Where its rows are in the picture, at the first and last row: in between, it's a straight line, so finite too.
+        let v_first = to_image.d * (area.y0 as f32 + 0.5) + to_image.f;
+        let v_last = to_image.d * (area.y1 as f32 - 0.5) + to_image.f;
+        if !(v_first.is_finite() && v_last.is_finite() && to_image.a.is_finite() && to_image.e.is_finite()) {
+            return false;
+        }
+        if state.op == Op::DestinationIn {
+            let affected = if self.surface.opaque { clipping } else { clipping.intersect(&self.surface.ink) };
+            let inside = area.intersect(&affected);
+            if !inside.is_empty() {
+                let u = |x: i32| to_image.a * (x as f32 + 0.5) + to_image.e;
+                if !u(inside.x0).is_finite() || !u(inside.x1 - 1).is_finite() {
+                    return false;
+                }
+                mask_image_rows(self.surface, image, to_image, inside);
+            }
+            // Outside the source image its alpha is zero. Destination-in must erase these clipped pixels too.
+            if !affected.is_empty() && inside != affected {
+                let stride = self.surface.width as usize * 4;
+                for y in affected.y0..affected.y1 {
+                    let start = y as usize * stride;
+                    let row = &mut self.surface.pixels[start..start + stride];
+                    if inside.is_empty() || y < inside.y0 || y >= inside.y1 {
+                        row[affected.x0 as usize * 4..affected.x1 as usize * 4].fill(0);
+                    } else {
+                        row[affected.x0 as usize * 4..inside.x0 as usize * 4].fill(0);
+                        row[inside.x1 as usize * 4..affected.x1 as usize * 4].fill(0);
+                    }
+                }
+            }
+            self.surface.changed(affected);
+            return true;
+        }
+        let clip = clip.as_ref().and_then(|clip| clip.mask.as_deref().map(|mask| (mask, clip.bounds, clip.full)));
+        let rows = ImageRows { image, to_image: *to_image, bounds, smooth: state.smoothing, out: state.op == Op::DestinationOut, alpha8: (state.alpha * 255.0 + 0.5) as u32, x0: area.x0, len: (area.x1 - area.x0) as usize, clip };
+        let surface = &mut *self.surface;
+        let width = surface.width as usize;
+        let stride = width * 4;
+        let pixels = &mut surface.pixels[area.y0 as usize * stride..area.y1 as usize * stride];
+        let height = (area.y1 - area.y0) as usize;
+        // Bands are worth it for a few hundred thousand pixels.
+        let count = if rows.len * height >= 200_000 { pool::bands() } else { 1 };
+        if count <= 1 {
+            rows.draw(pixels, area.y0, stride);
+        } else {
+            let per = height.div_ceil(count);
+            let shared = pool::Rows::new(pixels);
+            pool::each(count, &|band| {
+                let from = (band * per).min(height);
+                let to = ((band + 1) * per).min(height);
+                if from < to {
+                    // SAFETY: each band's rows are its own, and the pixels outlive `pool::each`.
+                    let band_rows = unsafe { shared.band(from * stride, to * stride) };
+                    rows.draw(band_rows, area.y0 + from as i32, stride);
+                }
+            });
+        }
+        surface.changed(area);
+        true
     }
 
     /// Lays part of a picture on the canvas pixel for pixel, at `to`.
@@ -2570,3 +3042,166 @@ fn parse_color(text: &str) -> Option<[u8; 4]> {
 
 #[cfg(test)]
 mod tests;
+
+thread_local! {
+    /// Each drawing thread's own rasterizer, for its band of a fill split into bands (see `pool`).
+    static BAND_RASTER: std::cell::RefCell<Rasterizer> = std::cell::RefCell::new(Rasterizer::default());
+}
+
+/// Applies a scaled image as an alpha mask, without rasterizing a rectangle into a floating-point RGBA layer.
+/// Keep the interpolated alpha in floating point: rounding it before multiplying the destination changes pixels.
+fn mask_image_rows(surface: &mut Surface, image: &Image, m: &Matrix, area: IRect) {
+    let smooth = surface.state.smoothing;
+    let alpha = surface.state.alpha;
+    let sample_axis = |point: f32, size: u32| {
+        let at = if smooth { point - 0.5 } else { point - 1.0e-4 };
+        let base = raster::floor(at);
+        let last = (size - 1) as usize;
+        let first = (base as usize).min(last);
+        if smooth {
+            (first, (base as i64).saturating_add(1).clamp(0, last as i64) as usize, at - base)
+        } else {
+            (first, first, 0.0)
+        }
+    };
+    let across: Vec<_> = (area.x0..area.x1).map(|x| sample_axis(m.a * (x as f32 + 0.5) + m.e, image.width)).collect();
+    let width = across.len();
+    let stride = surface.width as usize * 4;
+    let source_stride = image.width as usize * 4;
+    let mut upper = vec![0.0; width];
+    let mut lower = vec![0.0; width];
+    let mut upper_y = usize::MAX;
+    let mut lower_y = usize::MAX;
+    let sample_row = |y: usize, row: &mut [f32]| {
+        let src = &image.pixels[y * source_stride..(y + 1) * source_stride];
+        for (out, &(left, right, mix)) in row.iter_mut().zip(&across) {
+            let a = f32::from(src[left * 4 + 3]);
+            let b = f32::from(src[right * 4 + 3]);
+            *out = a + (b - a) * mix;
+        }
+    };
+    for y in area.y0..area.y1 {
+        let (top, bottom, mix) = sample_axis(m.d * (y as f32 + 0.5) + m.f, image.height);
+        if upper_y != top && lower_y == top {
+            std::mem::swap(&mut upper, &mut lower);
+            std::mem::swap(&mut upper_y, &mut lower_y);
+        }
+        if upper_y != top {
+            sample_row(top, &mut upper);
+            upper_y = top;
+        }
+        if lower_y != bottom {
+            sample_row(bottom, &mut lower);
+            lower_y = bottom;
+        }
+        let start = y as usize * stride + area.x0 as usize * 4;
+        let dest = &mut surface.pixels[start..start + width * 4];
+        for ((pixel, &a), &b) in dest.chunks_exact_mut(4).zip(&upper).zip(&lower) {
+            if pixel[3] == 0 {
+                continue;
+            }
+            let mask = ((a + (b - a) * mix) / 255.0) * alpha;
+            if mask < 1.0 {
+                // Match composite_layer's premultiplied blend and quantization, including half-way rounding.
+                for channel in pixel {
+                    let d = f32::from(*channel) / 255.0;
+                    *channel = ((d + (d * mask - d)) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// What `Drawing::draw_image_rows` lays on a band of rows: a picture moved and resized, sampled across once a row of it.
+struct ImageRows<'a> {
+    image: &'a Image,
+    to_image: Matrix,
+    bounds: [i32; 4],
+    smooth: bool,
+    /// Taken out of what's there (`destination-out`), rather than laid on it.
+    out: bool,
+    alpha8: u32,
+    x0: i32,
+    len: usize,
+    /// A clip's mask, the rectangle it's of, and where it lets all of each pixel through, for a clip with soft edges.
+    clip: Option<(&'a [u8], IRect, IRect)>,
+}
+
+impl ImageRows<'_> {
+    /// Draws the rows of `band`, the canvas's rows from `top` on, `stride` bytes each.
+    fn draw(&self, band: &mut [u8], top: i32, stride: usize) {
+        let len = self.len;
+        let m = &self.to_image;
+        let [_, by0, _, by1] = self.bounds;
+        // The picture's rows sampled across, which rows they are, and the row laid on.
+        let mut kept: [(i64, Vec<u32>); 2] = [(i64::MIN, vec![0; len]), (i64::MIN, vec![0; len])];
+        let mut row = vec![0u32; len];
+        let ones = vec![1.0f32; len];
+        let across = |which: usize, at: i64, kept: &mut [(i64, Vec<u32>); 2]| {
+            if kept[which].0 != at {
+                // That row of the picture alone, across: a sample at its middle, down, is that row and nothing below it.
+                let only = Matrix::new([m.a, 0.0, 0.0, 0.0, m.e, at as f32 + 0.5]);
+                paint::image_row32(self.image, &only, self.x0, 0, self.smooth, Repeat::Neither, &self.bounds, false, &mut kept[which].1);
+                kept[which].0 = at;
+            }
+        };
+        for (k, line) in band.chunks_mut(stride).enumerate() {
+            let y = top + k as i32;
+            let v = m.d * (y as f32 + 0.5) + m.f;
+            if self.smooth {
+                // The two rows of the picture this row of the canvas is between, as `paint::image_row32` works them out.
+                let fy = v - 0.5;
+                let upper = raster::floor(fy);
+                let wy = ((fy - upper) * 256.0) as u32;
+                let pair = [(upper as i32).clamp(by0, by1 - 1) as i64, (upper as i32 + 1).clamp(by0, by1 - 1) as i64];
+                // A row whose rows are the last row's, or the next one along, keeps what it can.
+                if kept[0].0 != pair[0] && kept[1].0 == pair[0] {
+                    kept.swap(0, 1);
+                }
+                across(0, pair[0], &mut kept);
+                across(1, pair[1], &mut kept);
+                if wy == 0 {
+                    row.copy_from_slice(&kept[0].1);
+                } else {
+                    pixels::lerp_rows(&mut row, &kept[0].1, &kept[1].1, wy);
+                }
+            } else {
+                // The nearest row, as `paint::image_row32` picks it: one exactly between two takes the first.
+                let at = (raster::floor(v - 1.0e-4) as i32).clamp(by0, by1 - 1) as i64;
+                across(0, at, &mut kept);
+                row.copy_from_slice(&kept[0].1);
+            }
+            if self.alpha8 < 255 {
+                let by = self.alpha8 + (self.alpha8 >> 7);
+                for px in row.iter_mut() {
+                    *px = paint::scale32(*px, by);
+                }
+            }
+            let start = self.x0 as usize * 4;
+            let dest = &mut line[start..start + len * 4];
+            // The clip's mask along the row, where it doesn't let all of it through. `area` is inside the clip's rectangle.
+            let mask = self.clip.and_then(|(mask, b, full)| {
+                let all = y >= full.y0 && y < full.y1 && self.x0 >= full.x0 && self.x0 + len as i32 <= full.x1;
+                let w = (b.x1 - b.x0) as usize;
+                let from = (y - b.y0) as usize * w + (self.x0 - b.x0) as usize;
+                (!all).then(|| &mask[from..from + len])
+            });
+            match (self.out, mask) {
+                (true, None) => pixels::take_out(dest, &row),
+                (true, Some(mask)) => {
+                    // Each pixel weighed by the mask, in whole steps of 255, as the shader's way has it, then taken out.
+                    for (px, m) in row.iter_mut().zip(mask) {
+                        let m = u32::from(*m);
+                        if m < 255 {
+                            let c = paint::unpack(*px);
+                            *px = paint::pack([div255(c[0] * m), div255(c[1] * m), div255(c[2] * m), div255(c[3] * m)]);
+                        }
+                    }
+                    pixels::take_out(dest, &row);
+                }
+                (false, None) => pixels::blend_shaded(dest, &ones, &row),
+                (false, Some(mask)) => pixels::blend_masked(dest, &ones, Some(mask), 0, Some(&row)),
+            }
+        }
+    }
+}

@@ -147,7 +147,9 @@ declare module 'rsui' {
         /** Runs with how it is each time that changes. What it gives back stops it. */
         onStateChange(run: (state: WindowState) => void): () => void;
         /** What's in it, as a PNG file's bytes. */
-        capture(): Promise<Uint8Array>;
+        capture(region?: { x: number; y: number; width: number; height: number }): Promise<Uint8Array>;
+        /** App-rendered pixels in premultiplied BGRA order, with physical dimensions. */
+        capturePixels(region: { x: number; y: number; width: number; height: number }): Promise<{ width: number; height: number; data: Uint8Array }>;
         /**
          * Up to seven buttons under its picture in the taskbar, which shows when the pointer's over its button, in place of those
          * that were there. `[]` takes them away. `thumb ID` clicks one in steps.
@@ -462,6 +464,7 @@ declare module 'rsui' {
         maxLines?: number;
         /** How soft a shadow is, in pixels, which is what gives something one. */
         shadowBlur?: number;
+        backdropBlur?: number;
         shadowColor?: Color;
         shadowX?: number;
         shadowY?: number;
@@ -1232,6 +1235,51 @@ declare module 'rsui/desktop' {
         /** Runs when one's pressed while one of this program's windows has the keyboard. `media KEY` presses one in steps. What it gives back stops it. */
         onKey(run: (key: MediaKey) => void): () => void;
     };
+    /** Native window recording and video frame decoding on Windows. */
+    export const video: {
+        open(file: string, options?: { width?: number; fps?: number; seconds?: number }): Promise<{
+            width: number;
+            height: number;
+            fps: number;
+            count: number;
+            /** Copies frame `index`'s RGBA into `into`, which is `width * height * 4` long. It's whether there was one. */
+            read(index: number, into: Uint8Array | Uint8ClampedArray): boolean;
+            close(): void;
+        }>;
+    };
+    /** A program run in a pseudo terminal (ConPTY on Windows), for an app that draws a terminal. */
+    export const pty: {
+        /**
+         * Starts a command line, such as `powershell.exe -NoLogo`, in a terminal of `cols` by `rows`. `onData` runs with what it prints,
+         * escape sequences and all, in whole characters, and `onExit` with its exit code once all of that has been given. `env` is added
+         * to what it inherits. While an app's being checked it's pretended: nothing runs, and the steps `pty out TEXT` and `pty exit`
+         * make it print and end. `RSUI_PTY=real` has it run for real then.
+         */
+        spawn(options: {
+            command: string;
+            cwd?: string;
+            env?: Record<string, string>;
+            cols?: number;
+            rows?: number;
+            onData?: (text: string) => void;
+            onExit?: (code: number) => void;
+        }): Pty;
+    };
+    export interface Pty {
+        /** The program's number in the system, or 0 while it's pretended or over. */
+        readonly pid: number;
+        readonly cols: number;
+        readonly rows: number;
+        readonly exited: boolean;
+        /** Types this, as the keyboard would. */
+        write(text: string): void;
+        /** Tells the program how big its terminal is now. */
+        resize(cols: number, rows: number): void;
+        /** Ends the program. `onExit` still runs. */
+        kill(): void;
+        /** Lets go of it: the program ends if it's still running, and nothing more is told. */
+        dispose(): void;
+    }
     export interface Store {
         get(key: string): any;
         has(key: string): boolean;
@@ -1517,6 +1565,9 @@ declare const process: {
 
 /** Whole files of text, and folders. There's no `Buffer` here, so what's read is always text. */
 declare module 'fs' {
+    export function openSync(path: string, flags: string): number;
+    export function closeSync(fd: number): void;
+    export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number;
     export function readFileSync(path: string, encoding: BufferEncoding | { encoding: BufferEncoding }): string;
     export function readFileSync(path: string): Buffer;
     export function writeFileSync(path: string, data: string | Uint8Array, encoding?: BufferEncoding): void;
@@ -1546,8 +1597,8 @@ declare module 'fs' {
         readFile(path: string): Promise<Buffer>;
         copyFile(from: string, to: string): Promise<void>;
         access(path: string): Promise<void>;
-        writeFile(path: string, data: string): Promise<void>;
-        appendFile(path: string, data: string): Promise<void>;
+        writeFile(path: string, data: string | Uint8Array): Promise<void>;
+        appendFile(path: string, data: string | Uint8Array): Promise<void>;
         mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
         unlink(path: string): Promise<void>;
         rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
@@ -1647,6 +1698,17 @@ interface HTMLButtonElement extends HTMLElement {}
 interface HTMLFormElement extends HTMLElement {}
 interface HTMLLabelElement extends HTMLElement {}
 interface HTMLCanvasElement extends HTMLElement {}
+/** What rsui's 2D context has that the standard's doesn't. */
+interface CanvasRenderingContext2D {
+    /**
+     * Fills dots in the fill style, `size` pixels across on a grid `step` apart (every other row half a step along), where a
+     * field's level is above the dot's threshold in a 4 by 4 Bayer matrix, so they thin out in an even weave as it falls.
+     * `field` is `cols` by `rows` levels, `cell` apart from the origin and read between by their neighbours: 1 or more shows
+     * every dot and 0 or less none. One call, which is far cheaper than a `rect()` for each dot. Needs a transform that only
+     * moves and resizes.
+     */
+    fillDither(field: ArrayLike<number>, cols: number, rows: number, cell: number, step?: number, size?: number): void;
+}
 /** A field's `value` is what it shows now, and setting it changes that. */
 interface HTMLInputElement extends HTMLElement {
     value: string;

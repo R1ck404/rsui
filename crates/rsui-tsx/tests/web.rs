@@ -1951,8 +1951,13 @@ fn the_pointer_coming_and_going_says_where_it_is_and_hover_styles_still_follow_i
     let [x, y, _, height] = hands.rect_of("tip");
     hands.move_at(x + 20.0, y + height / 2.0);
     assert!(hands.says("said in 20"), "{}", hands.app.outline());
-    let (x, y) = hands.middle_of("away");
-    hands.move_at(x, y);
+    let (away_x, away_y) = hands.middle_of("away");
+    hands.move_at(away_x, away_y);
+    assert!(hands.says("said out mouseleave"), "{}", hands.app.outline());
+    hands.move_at(x + 20.0, y + height / 2.0);
+    assert!(hands.says("said in 20"), "{}", hands.app.outline());
+    hands.app.pointer_leave();
+    hands.settle();
     assert!(hands.says("said out mouseleave"), "{}", hands.app.outline());
 }
 

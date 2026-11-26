@@ -18,12 +18,55 @@ function fileFor(name) {
     return require('path').join(folder(), base + '.json');
 }
 
+// A caller's input is snapshotted on set. Keep that JSON until someone needs the value,
+// so later saves can copy it and the store owns only one of the two representations.
+class StoredJSON {
+    constructor(text) {
+        this.text = text;
+    }
+}
+
+function storedValue(value) {
+    if (typeof value === 'string') return value;
+    const text = JSON.stringify(value);
+    if (value !== null && typeof value === 'object' && text !== undefined) return new StoredJSON(text);
+    return JSON.parse(text);
+}
+
+function storeText(values, encoded) {
+    if (!encoded) return JSON.stringify(values);
+    const parts = [];
+    let group = null;
+    const finishGroup = () => {
+        if (group === null) return;
+        const text = JSON.stringify(group);
+        if (text !== '{}') parts.push(text.slice(1, -1));
+        group = null;
+    };
+    // Serialize adjacent ordinary values together. This honors mutations through get(), named
+    // toJSON calls, omitted values, and property ordering, while reusing unobserved snapshots.
+    for (const key of Object.keys(values)) {
+        const value = values[key];
+        if (value instanceof StoredJSON) {
+            finishGroup();
+            parts.push(JSON.stringify(key) + ':' + value.text);
+        } else {
+            if (group === null) group = Object.create(null);
+            group[key] = value;
+        }
+    }
+    finishGroup();
+    return '{' + parts.join(',') + '}';
+}
+
 /// One store. What's in it is read the first time it's asked for, and written straight away after each change, to another file
 /// first, so that stopping halfway can't lose what's there.
 class Store {
     #file;
     #items = null;
     #listeners = new Set();
+    #lastLength = -1;
+    #encoded = 0;
 
     constructor(file) {
         this.#file = file;
@@ -34,10 +77,13 @@ class Store {
             this.#items = new Map();
             if (this.#file !== null) {
                 try {
-                    const read = JSON.parse(require('fs').readFileSync(this.#file, 'utf8'));
+                    const fs = require('fs');
+                    const text = fs.readFileSync(this.#file, 'utf8');
+                    const read = JSON.parse(text);
                     for (const [key, value] of Object.entries(read)) {
                         this.#items.set(key, value);
                     }
+                    this.#lastLength = text.length;
                 } catch {
                     // There's nothing there yet, or it isn't something this can read, so it starts empty.
                 }
@@ -46,14 +92,59 @@ class Store {
         return this.#items;
     }
 
-    #keep() {
-        if (this.#file === null) {
-            return;
+    #commit(key, value) {
+        const items = this.#load();
+        const old = items.get(key);
+        const encoded = key === null ? 0 : this.#encoded - Number(old instanceof StoredJSON) + Number(value instanceof StoredJSON);
+        if (this.#file !== null) {
+            let text = '{}';
+            if (key !== null) {
+                const values = Object.fromEntries(items);
+                if (value === undefined) {
+                    delete values[key];
+                } else {
+                    // An own data property even when the key happens to be "__proto__".
+                    Object.defineProperty(values, key, { value, enumerable: true, configurable: true, writable: true });
+                }
+                text = storeText(values, encoded);
+            }
+            const maybeSame = old === value || (value instanceof StoredJSON && (
+                old instanceof StoredJSON ? value.text === old.text : old !== null && typeof old === 'object'
+            ));
+            this.#write(text, maybeSame);
         }
+        if (key === null) {
+            items.clear();
+            this.#encoded = 0;
+        } else {
+            // Serializing an exposed value can call toJSON, which can read other keys.
+            this.#encoded += Number(value instanceof StoredJSON) - Number(items.get(key) instanceof StoredJSON);
+            if (value === undefined) items.delete(key);
+            else items.set(key, value);
+        }
+    }
+
+    #write(text, maybeSame) {
         const fs = require('fs');
+        if (maybeSame && text.length === this.#lastLength) {
+            // An external replacement can have the same size and timestamp. Verify the
+            // exact file before skipping a synchronous commit, without retaining its bytes.
+            try {
+                if (fs.readFileSync(this.#file, 'utf8') === text) return;
+            } catch {
+                // Recreate a missing file, or surface the write error below.
+            }
+        }
         fs.mkdirSync(require('path').dirname(this.#file), { recursive: true });
-        fs.writeFileSync(this.#file + '.new', JSON.stringify(Object.fromEntries(this.#load())));
-        fs.renameSync(this.#file + '.new', this.#file);
+        const temp = this.#file + '.' + process.pid + '.new';
+        try {
+            fs.writeFileSync(temp, text);
+            fs.renameSync(temp, this.#file);
+        } catch (error) {
+            try { fs.unlinkSync(temp); } catch {}
+            throw error;
+        }
+        this.#lastLength = text.length;
     }
 
     #changed(key, value, old, from) {
@@ -64,7 +155,14 @@ class Store {
 
     /// What's kept for this key, or `undefined`.
     get(key) {
-        return this.#load().get(String(key));
+        key = String(key);
+        const items = this.#load();
+        const stored = items.get(key);
+        if (!(stored instanceof StoredJSON)) return stored;
+        const value = JSON.parse(stored.text);
+        items.set(key, value);
+        this.#encoded--;
+        return value;
     }
 
     has(key) {
@@ -77,13 +175,9 @@ class Store {
             return this.delete(key, from);
         }
         key = String(key);
-        const items = this.#load();
-        const old = items.get(key);
-        // What JSON makes of it is what's kept, so what comes back is the same after the program starts again.
-        const kept = typeof value === 'string' ? value : JSON.parse(JSON.stringify(value));
-        items.set(key, kept);
-        this.#keep();
-        this.#changed(key, kept, old, from);
+        const old = this.#listeners.size ? this.get(key) : undefined;
+        this.#commit(key, storedValue(value));
+        if (this.#listeners.size) this.#changed(key, this.get(key), old, from);
     }
 
     delete(key, from = 'storage') {
@@ -92,9 +186,8 @@ class Store {
         if (!items.has(key)) {
             return false;
         }
-        const old = items.get(key);
-        items.delete(key);
-        this.#keep();
+        const old = this.#listeners.size ? this.get(key) : undefined;
+        this.#commit(key, undefined);
         this.#changed(key, undefined, old, from);
         return true;
     }
@@ -108,8 +201,7 @@ class Store {
         if (items.size === 0) {
             return;
         }
-        items.clear();
-        this.#keep();
+        this.#commit(null, undefined);
         this.#changed(null, undefined, undefined, from);
     }
 

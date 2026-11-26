@@ -191,8 +191,159 @@ fn going_to_the_end_of_a_long_list_lays_out_none_of_its_rows() {
     assert!(solved < 100, "{solved} boxes laid out again for {ROWS} rows\n{said}");
 }
 
+#[test]
+fn batching_leaf_rows_preserves_ordinary_and_memo_component_props() {
+    let file = app("leaf-props", "");
+    std::fs::write(&file, r#"
+        'use no memo';
+        import { memo, useState } from 'react';
+        import { PageWindow } from 'rsui/web';
+        const box = { current: 0 };
+        const ids = Array.from({length: 80}, (_, i) => i);
+        function Row({id, box}) { return <div className="plain">{id + ':' + box.current}</div> }
+        const MemoRow = memo(function({id, box}) { return <div className="memo">{id + ':' + box.current}</div> });
+        function List() {
+            const [revision, setRevision] = useState(0);
+            const order = revision === 2 ? [...ids].reverse() : ids;
+            return <div>
+                <button onClick={() => { box.current++; setRevision(revision + 1) }}>Advance</button>
+                <div>{order.map(id => <Row key={id} id={id} box={box}/>)}</div>
+                <div>{order.map(id => <MemoRow key={id} id={id} box={box}/>)}</div>
+            </div>
+        }
+        export default function Root() { return <PageWindow><List/></PageWindow> }
+    "#).unwrap();
+    let said = run(
+        &file,
+        r#"click "Advance"
+        eval "document.querySelector('.plain').textContent + '/' + document.querySelector('.memo').textContent"
+        click "Advance"
+        eval "document.querySelector('.plain').textContent + ' vs ' + document.querySelector('.memo').textContent""#,
+    );
+    assert_eq!(
+        value(
+            &said,
+            r#"eval "document.querySelector('.plain').textContent + '/'"#
+        ),
+        "0:1/0:0",
+        "{said}"
+    );
+    assert_eq!(
+        value(
+            &said,
+            r#"eval "document.querySelector('.plain').textContent + ' vs '"#
+        ),
+        "79:2 vs 79:0",
+        "{said}"
+    );
+}
+
 /// Rows that skip what's in them until they're near being seen, taken to be as tall as they are.
 const SKIPPING: &str = ".row { content-visibility: auto; contain-intrinsic-size: auto 20px }";
+
+fn grouped_app(name: &str) -> PathBuf {
+    let file = app(name, "");
+    std::fs::write(
+        &file,
+        r#"
+        import { PageWindow } from 'rsui/web';
+        import { useLayoutEffect, useState } from 'react';
+        globalThis.mounted = 0;
+        function Counter() {
+            const [count, update] = useState(0);
+            useLayoutEffect(() => { globalThis.mounted += 1 }, []);
+            return <button id="stateful" onClick={() => update(count + 1)}>Count {count}</button>;
+        }
+        export default function App() {
+            return <PageWindow><div style={{ height: 360, overflowY: 'auto' }} id="scrollport">
+                <div>
+                    {Array.from({ length: 12 }, (_, group) => (
+                        <section key={group} id={'group-' + group} tabIndex={0} aria-label={'Group ' + group}>
+                            <h2>Heading {group}</h2>
+                            {Array.from({ length: 16 }, (_, row) => (
+                                <div key={row} tabIndex={row === 15 ? -1 : undefined} className="group-row"
+                                    id={'row-' + group + '-' + row} style={{ height: 64 }}>
+                                    <span><strong>{group}/{row}</strong></span>
+                                </div>
+                            ))}
+                            {group === 10 ? <div><Counter/></div> : null}
+                        </section>
+                    ))}
+                </div>
+            </div></PageWindow>;
+        }
+        "#,
+    )
+    .unwrap();
+    file
+}
+
+#[test]
+fn grouped_scroll_views_defer_plain_rows_and_keep_dom_targets() {
+    let file = grouped_app("grouped-dom");
+    let steps = r#"size 600 400
+wait 100
+eval "document.querySelectorAll('.group-row').length"
+eval "document.querySelector('#group-7').getBoundingClientRect().height < 1000"
+eval "document.querySelector('#group-0').getBoundingClientRect().height > 1000"
+eval "globalThis.target = document.querySelector('#row-7-15'); target.isConnected && target.closest('section').id === 'group-7'"
+eval "target.setAttribute('data-test', 'kept'); target.style.color = 'red'; target.addEventListener('click', () => globalThis.heard = true)"
+wait 100
+eval "target === document.querySelector('#row-7-15') && target.dataset.test === 'kept' && getComputedStyle(target).color === 'rgb(255, 0, 0)'"
+eval "target.click(); globalThis.heard === true"
+eval "globalThis.viewport = document.querySelector('#scrollport'); globalThis.end = document.querySelector('#row-11-15'); end.scrollIntoView({block:'end'})"
+wait 100
+eval "Math.abs(end.getBoundingClientRect().bottom - viewport.getBoundingClientRect().bottom) < 1 && end === document.querySelector('#row-11-15')"
+eval "globalThis.focusRow = document.querySelector('#row-4-15'); focusRow.focus({preventScroll:true})"
+wait 100
+eval "document.activeElement === focusRow && Math.abs(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop) < 1"
+eval "globalThis.mounted === 1 && document.querySelector('#stateful').textContent === 'Count 0'"
+eval "document.querySelector('#stateful').click()"
+wait 100
+eval "viewport.scrollTop = 0"
+wait 100
+eval "document.querySelector('#stateful').textContent === 'Count 1' && globalThis.mounted === 1"
+"#;
+    let said = run(&file, steps);
+    let answers = values(&said);
+    assert_eq!(answers[0..4], ["192", "true", "true", "true"], "{said}");
+    for index in [5, 6, 8, 10, 11, 14] {
+        assert_eq!(answers[index], "true", "answer {index}\n{said}");
+    }
+    let eager = run_with(&file, steps, &[("RSUI_AUTO_SKIP", "0")]);
+    assert_eq!(values(&eager)[1], "false", "{eager}");
+}
+
+#[test]
+fn grouped_scroll_views_anchor_resolved_estimates_and_follow_tab_order() {
+    let file = grouped_app("grouped-anchor");
+    let said = run(
+        &file,
+        r#"size 600 400
+wait 100
+eval "globalThis.viewport = document.querySelector('#scrollport'); globalThis.group = document.querySelector('#group-7'); viewport.scrollTop = group.getBoundingClientRect().top - viewport.getBoundingClientRect().top + 100"
+wait 100
+eval "Math.round(group.getBoundingClientRect().top - viewport.getBoundingClientRect().top)"
+eval "[6, 7].every(i => document.querySelector('#group-'+i).getBoundingClientRect().height > 1000) && document.querySelector('#group-4').getBoundingClientRect().height < 1000"
+eval "group.focus()"
+wait 40
+press Tab
+wait 100
+eval "document.activeElement.id"
+press Shift+Tab
+wait 100
+eval "document.activeElement.id"
+wheel 200 250 0 -2100
+wait 100
+eval "document.querySelector('#group-4').getBoundingClientRect().height > 1000"
+"#,
+    );
+    assert_eq!(
+        values(&said)[1..],
+        ["-100", "true", "undefined", "group-8", "group-7", "true"],
+        "{said}"
+    );
+}
 
 #[test]
 fn rows_far_from_being_seen_are_as_tall_as_they_say_with_nothing_in_them() {

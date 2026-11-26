@@ -86,21 +86,58 @@ module.exports = ({ __fs, pathOf, encodingOf, promises, closeSync, fstatSync, ft
         return handle;
     }
 
-    // Streams read or write all of a file at once, on another thread, as nothing here reads part of one.
+    let abandonedReaders;
+
     function createReadStream(path, options) {
         const { Readable } = require('stream');
         const encoding = encodingOf(options);
         const size = options?.highWaterMark ?? 64 * 1024;
-        const stream = new Readable({ encoding, read() {} });
-        stream.path = pathOf(path);
-        promises.readFile(path).then((bytes) => {
-            const from = options?.start ?? 0;
-            const to = options?.end === undefined ? bytes.length : options.end + 1;
-            for (let at = from; at < to; at += size) {
-                stream.push(bytes.subarray(at, Math.min(at + size, to)));
+        const start = options?.start ?? 0;
+        const end = options?.end ?? Infinity;
+        if (!Number.isSafeInteger(start) || start < 0 || (end !== Infinity && !Number.isSafeInteger(end)) || end < start) {
+            throw Object.assign(new RangeError('Invalid file stream start or end'), { code: 'ERR_OUT_OF_RANGE' });
+        }
+        if (!Number.isSafeInteger(size) || size < 0) {
+            throw Object.assign(new RangeError('Invalid highWaterMark'), { code: 'ERR_INVALID_ARG_VALUE' });
+        }
+        const where = pathOf(path);
+        let remaining = end === Infinity ? Infinity : end - start + 1;
+        let pending = null;
+        const reader = __fs.streamReader(where, start);
+        const stream = new Readable({
+            highWaterMark: size,
+            encoding,
+            read() {
+                pending = __fs.streamRead(reader, Math.min(size, remaining));
+                pending.then((bytes) => {
+                    pending = null;
+                    if (this.destroyed) return;
+                    remaining -= bytes.length;
+                    this.bytesRead += bytes.length;
+                    if (bytes.length > 0) this.push(bytes);
+                    if (remaining === 0 || bytes.length === 0) this.push(null);
+                }).catch((error) => {
+                    pending = null;
+                    this.destroy(error);
+                });
+            },
+            destroy(error, done) {
+                abandonedReaders.unregister(this);
+                __fs.streamClose(reader);
+                if (pending) {
+                    pending.then(() => done(error), () => done(error));
+                } else {
+                    done(error);
+                }
             }
-            stream.push(null);
-        }, (error) => stream.destroy(error));
+        });
+        stream.path = where;
+        stream.bytesRead = 0;
+        abandonedReaders ??= new FinalizationRegistry((id) => __fs.streamClose(id));
+        abandonedReaders.register(stream, reader, stream);
+        // Opening a missing file still reports the error to a stream with only an error listener.
+        if (size === 0) stream._read(0);
+        else stream.read(0);
         return stream;
     }
 

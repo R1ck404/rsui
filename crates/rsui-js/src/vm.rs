@@ -430,6 +430,7 @@ pub struct Vm {
     pub(crate) unhandled_rejections: Vec<Value>,
     /// What's happening on other threads.
     pub(crate) background: crate::background::Background,
+    pub(crate) file_streams: crate::builtins::host::file_stream::Readers,
     pub(crate) symbol_registry: HashMap<String, Atom, FixedState>,
     pub(crate) joining: Vec<Value>,
     pub(crate) random_state: u64,
@@ -552,6 +553,7 @@ impl Vm {
             throw_type_error: Value::UNDEFINED,
             unhandled_rejections: Vec::new(),
             background: crate::background::Background::new(),
+            file_streams: Default::default(),
             symbol_registry: HashMap::default(),
             joining: Vec::new(),
             random_state: 0,

@@ -34,4 +34,33 @@ const media = {
     onKey: (run) => keys.on(run),
 };
 
-module.exports = { audio, media };
+let abandonedVideos;
+
+const video = {
+    /// Reads a video's frames, with the system's own decoders: the first `seconds` of it (15 unless said), `fps` a second (12),
+    /// shrunk to at most `width` across (320). What it gives has the size and how many frames there are; `read(i, into)` copies
+    /// frame `i`'s RGBA into a `Uint8ClampedArray` of `width * height * 4`, and `close()` lets go of them.
+    async open(file, { width = 320, fps = 12, seconds = 15 } = {}) {
+        const info = JSON.parse(await host.videoOpen(String(file), width, fps, seconds));
+        // A caller can retain read or close independently of the returned object.
+        const lifetime = { open: true };
+        abandonedVideos ??= new FinalizationRegistry(id => host.videoFree(id));
+        abandonedVideos.register(lifetime, info.id, lifetime);
+        return {
+            width: info.width,
+            height: info.height,
+            fps: info.fps,
+            count: info.count,
+            read: (index, into) => lifetime.open && host.videoRead(info.id, index, into),
+            close() {
+                if (lifetime.open) {
+                    lifetime.open = false;
+                    abandonedVideos.unregister(lifetime);
+                    host.videoFree(info.id);
+                }
+            },
+        };
+    },
+};
+
+module.exports = { audio, media, video };

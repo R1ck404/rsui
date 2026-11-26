@@ -2618,25 +2618,27 @@ class WindowControls {
     }
 
     /// A picture of what's in it, as a PNG file's bytes. It's drawn for this once what's running now is done.
-    capture() {
-        return new Promise((resolve, reject) => {
-            const { action, forget } = require('rsui/desktop/core');
-            const id = action((said) => {
-                forget([id]);
-                const text = String(said);
-                if (text.startsWith('png ')) {
-                    resolve(Uint8Array.from(text.slice(4).match(/../g) ?? [], (pair) => parseInt(pair, 16)));
-                } else {
-                    reject(new Error(text.replace(/^error /, '')));
-                }
-            });
-            try {
-                host.windowCapture(this.#id, id);
-            } catch (error) {
-                forget([id]);
-                reject(error);
-            }
-        });
+    async capture(region) {
+        if (region === undefined) {
+            return Buffer.from(await host.windowCapture(this.#id), 'base64');
+        }
+        return Buffer.from(await this.#captureRegion(region, false), 'base64');
+    }
+
+    /// App-rendered pixels, four bytes per pixel in premultiplied BGRA order.
+    async capturePixels(region) {
+        const bytes = await this.#captureRegion(region, true);
+        const end = bytes.byteLength - 8;
+        const size = new DataView(bytes.buffer, bytes.byteOffset + end, 8);
+        return { width: size.getUint32(0, true), height: size.getUint32(4, true), data: bytes.subarray(0, end) };
+    }
+
+    #captureRegion(region, raw) {
+        const { x, y, width, height } = region;
+        if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+            throw new Error('The capture area must be a nonempty rectangle');
+        }
+        return host.windowCapture(this.#id, x, y, width, height, raw);
     }
 
     /// Puts a menu bar on it, or takes it off with `null`. Each item has a `label`, and an `onClick`, `items` for what opens

@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -34,7 +35,7 @@ struct PackedFiles {
     program: File,
     /// Where each file is in the program, by its path as [`key`] writes it, how long it is, and how long it's kept,
     /// squeezed, or 0 if it's kept as it is.
-    files: HashMap<String, (u64, u32, u32)>,
+    files: FileIndex,
     /// Where the dictionary that squeezed files need is, and how long it is, and the dictionary once it's been read.
     dictionary: Option<(u64, u64)>,
     dictionary_read: OnceLock<Option<Vec<u8>>>,
@@ -57,8 +58,37 @@ struct PackedFiles {
 
 static PACKED: OnceLock<PackedFiles> = OnceLock::new();
 
-/// A file's path, and how far into the program it starts, how long it is, and how long it's kept (0 for as it is).
-type PackedFile = (String, (u64, u32, u32));
+/// Offset in the executable, uncompressed size, and compressed size (zero for a plain entry).
+type FileLocation = (u64, u32, u32);
+/// The name's UTF-8 byte range in the archive index and the location of its contents.
+type PackedFile = (Range<usize>, FileLocation);
+
+/// Large packages often put thousands of files in one directory. Keep its
+/// normalized path once, and allocate only the filename for each entry.
+#[derive(Default)]
+struct FileIndex {
+    directories: HashMap<Box<str>, HashMap<Box<str>, FileLocation>>,
+}
+
+impl FileIndex {
+    fn parts(path: &str) -> (&str, &str) {
+        path.split_at(path.rfind('\\').map_or(0, |at| at + 1))
+    }
+
+    fn insert(&mut self, path: &str, place: FileLocation) {
+        let (directory, name) = Self::parts(path);
+        if let Some(files) = self.directories.get_mut(directory) {
+            files.insert(name.into(), place);
+        } else {
+            self.directories.insert(directory.into(), HashMap::from([(name.into(), place)]));
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<&FileLocation> {
+        let (directory, name) = Self::parts(path);
+        self.directories.get(directory)?.get(name)
+    }
+}
 
 /// A folder that was a link when the program was packed, and the folder it led to.
 pub type PackedLink = (PathBuf, PathBuf);
@@ -66,6 +96,7 @@ pub type PackedLink = (PathBuf, PathBuf);
 /// What's on the end of a program: which file to run, every file with where it is, which were run when it was
 /// packed, in the order they were, the modules that come with the engine that were, and the folders that were links.
 struct PackedList {
+    bytes: crate::code_bytes::CodeBytes,
     entry: String,
     files: Vec<PackedFile>,
     run_order: Vec<String>,
@@ -74,6 +105,12 @@ struct PackedList {
     code: Option<(u64, u64)>,
     diagnostics: bool,
     dictionary: Option<(u64, u64)>,
+}
+
+impl PackedList {
+    fn file_name<'a>(bytes: &'a [u8], range: &Range<usize>) -> &'a str {
+        std::str::from_utf8(&bytes[range.clone()]).expect("filename validated by read_text")
+    }
 }
 
 /// A path as files are looked up by, with what can be worked out from it worked out. Letters are all
@@ -139,7 +176,7 @@ pub fn open_packed_files() -> Option<PathBuf> {
     let root = program.parent()?;
     let mut packed = PackedFiles {
         program: File::open(&program).ok()?,
-        files: HashMap::with_capacity(list.files.len()),
+        files: FileIndex::default(),
         folders: HashSet::new(),
         run_order: list.run_order.iter().map(|path| root.join(path)).collect(),
         builtins: list.builtins,
@@ -159,10 +196,10 @@ pub fn open_packed_files() -> Option<PathBuf> {
             folder = found.parent();
         }
     };
-    for (path, place) in list.files {
-        let path = root.join(path);
+    for (name, place) in list.files {
+        let path = root.join(PackedList::file_name(&list.bytes, &name));
         add_folders(&path, &mut packed.folders);
-        packed.files.insert(key(&path), place);
+        packed.files.insert(&key(&path), place);
     }
     for (link, target) in list.links {
         let link = root.join(link);
@@ -190,18 +227,17 @@ fn read_list(program: &Path) -> Option<PackedList> {
     if at.checked_add(length)? > file.metadata().ok()?.len() {
         return None;
     }
-    file.seek(SeekFrom::Start(at)).ok()?;
-    let mut list = vec![0u8; usize::try_from(length).ok()?];
-    file.read_exact(&mut list).ok()?;
-    let mut rest = list.as_slice();
+    let list = crate::code_bytes::CodeBytes::read(&file, at, length).ok()?;
+    let mut rest = &list[..];
     let entry = read_text(&mut rest)?.to_owned();
     let count = read_u32(&mut rest)?;
     let mut files = Vec::with_capacity((count as usize).min(rest.len() / 16));
     for _ in 0..count {
-        let path = read_text(&mut rest)?.to_owned();
+        let name_len = read_text(&mut rest)?.len();
+        let end = list.len() - rest.len();
         let place = read_u64(&mut rest)?;
         let size = read_u32(&mut rest)?;
-        files.push((path, (place, size, 0)));
+        files.push((end - name_len..end, (place, size, 0)));
     }
     // A program packed before this was kept doesn't have it.
     let mut run_order = Vec::new();
@@ -253,6 +289,7 @@ fn read_list(program: &Path) -> Option<PackedList> {
         }
     }
     Some(PackedList {
+        bytes: list,
         entry,
         files,
         run_order,
@@ -518,6 +555,42 @@ pub fn read_packed_file(path: &Path) -> Option<Vec<u8>> {
     packed_bytes(packed, found).ok()
 }
 
+/// A bounded view of one entry. Plain entries share the executable using positioned reads;
+/// dictionary-compressed source entries are inflated once, as when loading a module.
+pub(crate) fn open_packed_reader(path: &Path, start: u64) -> Option<io::Result<Box<dyn Read + Send>>> {
+    let packed = PACKED.get()?;
+    let found = packed.files.get(&packed_key(packed, path))?;
+    Some(packed_reader(packed, found, start))
+}
+
+fn packed_reader<'a>(packed: &'a PackedFiles, found: &(u64, u32, u32), start: u64) -> io::Result<Box<dyn Read + Send + 'a>> {
+    let (place, size, kept) = *found;
+    let start = start.min(u64::from(size));
+    if start == u64::from(size) {
+        return Ok(Box::new(io::empty()));
+    }
+    if kept != 0 {
+        let mut cursor = io::Cursor::new(packed_bytes(packed, found)?);
+        cursor.set_position(start);
+        return Ok(Box::new(cursor));
+    }
+    struct Entry<'a> {
+        file: &'a File,
+        at: u64,
+        left: u64,
+    }
+    impl Read for Entry<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let count = self.left.min(out.len() as u64) as usize;
+            read_at(self.file, &mut out[..count], self.at)?;
+            self.at += count as u64;
+            self.left -= count as u64;
+            Ok(count)
+        }
+    }
+    Ok(Box::new(Entry { file: &packed.program, at: place + start, left: u64::from(size) - start }))
+}
+
 /// The block of compiled code inside this program, if it's packed with one, and the folder its files' paths are from.
 pub(crate) fn read_code_block() -> Option<(crate::code_bytes::CodeBytes, PathBuf)> {
     let packed = PACKED.get()?;
@@ -558,7 +631,7 @@ pub(crate) fn packed_size(path: &Path) -> Option<u32> {
 pub(crate) fn is_packed_file(path: &Path) -> bool {
     PACKED
         .get()
-        .is_some_and(|packed| packed.files.contains_key(&packed_key(packed, path)))
+        .is_some_and(|packed| packed.files.get(&packed_key(packed, path)).is_some())
 }
 
 /// Whether there's a folder here with files in it, inside the program.
@@ -678,7 +751,7 @@ mod tests {
             [(native(r"node_modules\pkg"), native(r"node_modules\.pnpm\pkg@1"))]
         );
         assert_eq!(list.files.len(), 2);
-        assert_eq!(list.files[1].0, native(r"sub\other.js"));
+        assert_eq!(PackedList::file_name(&list.bytes, &list.files[1].0), native(r"sub\other.js"));
         assert_eq!(list.code, None);
         let bytes = std::fs::read(&program).unwrap();
         let (place, size, kept) = list.files[1].1;
@@ -687,6 +760,7 @@ mod tests {
         let found = &bytes[place as usize..place as usize + size as usize];
         assert_eq!(std::str::from_utf8(found).unwrap(), "\u{4F60} other");
         // A file with nothing on it, or something too short to say, is just a program.
+        drop(list);
         std::fs::write(&program, b"short").unwrap();
         assert!(read_list(&program).is_none());
         let _ = std::fs::remove_dir_all(&folder);
@@ -718,7 +792,7 @@ mod tests {
         ];
         let packed = PackedFiles {
             program: File::open(std::env::current_exe().unwrap()).unwrap(),
-            files: HashMap::new(),
+            files: FileIndex::default(),
             folders: HashSet::new(),
             run_order: Vec::new(),
             builtins: Vec::new(),
@@ -793,9 +867,14 @@ mod tests {
         drop(file);
         let list = read_list(&program).unwrap();
         assert!(list.dictionary.is_some());
+        let mut index = FileIndex::default();
+        for (name, place) in &list.files {
+            let path = PackedList::file_name(&list.bytes, name);
+            index.insert(&key(&folder.join(path)), *place);
+        }
         let packed = PackedFiles {
             program: File::open(&program).unwrap(),
-            files: list.files.iter().map(|(path, place)| (key(&folder.join(path)), *place)).collect(),
+            files: index,
             folders: HashSet::new(),
             run_order: Vec::new(),
             builtins: Vec::new(),
@@ -807,7 +886,7 @@ mod tests {
             dictionary_read: OnceLock::new(),
         };
         for path in &files {
-            let found = packed.files[&key(path)];
+            let found = *packed.files.get(&key(path)).unwrap();
             let squeezed = found.2 != 0;
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             // What ran, what isn't a package's code, its manifest, and what wouldn't get smaller are as they are.
@@ -816,18 +895,26 @@ mod tests {
             if squeezed {
                 assert!(found.2 < found.1 / 2, "{name}: {found:?}");
             }
-            assert_eq!(packed_bytes(&packed, &found).unwrap(), std::fs::read(path).unwrap(), "{name}");
+            let expected = std::fs::read(path).unwrap();
+            assert_eq!(packed_bytes(&packed, &found).unwrap(), expected, "{name}");
+            for offset in [0, 3, expected.len() + 1] {
+                let mut range = Vec::new();
+                packed_reader(&packed, &found, offset as u64).unwrap().take(7).read_to_end(&mut range).unwrap();
+                assert_eq!(range, expected[offset.min(expected.len())..(offset + 7).min(expected.len())], "{name}");
+            }
         }
         // A squeezed file that's been damaged isn't read as what it was, as one kept as it is wouldn't be. (Neither has
         // a sum of its own to be checked against.)
         let mut bytes = std::fs::read(&program).unwrap();
-        let moon = packed.files[&key(&package.join("moon.js"))];
+        let moon = *packed.files.get(&key(&package.join("moon.js"))).unwrap();
         bytes[moon.0 as usize + moon.2 as usize / 2] ^= 0x55;
+        let dictionary = list.dictionary;
+        drop(list);
         drop(packed);
         std::fs::write(&program, &bytes).unwrap();
         let packed = PackedFiles {
             program: File::open(&program).unwrap(),
-            files: HashMap::new(),
+            files: FileIndex::default(),
             folders: HashSet::new(),
             run_order: Vec::new(),
             builtins: Vec::new(),
@@ -835,7 +922,7 @@ mod tests {
             root: folder.clone(),
             code: None,
             diagnostics: false,
-            dictionary: list.dictionary,
+            dictionary,
             dictionary_read: OnceLock::new(),
         };
         assert!(packed_bytes(&packed, &moon).map_or(true, |read| read != std::fs::read(package.join("moon.js")).unwrap()));

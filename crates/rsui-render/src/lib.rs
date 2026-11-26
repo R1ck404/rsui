@@ -52,7 +52,7 @@ mod vulkan;
 pub use vulkan::set_pipeline_cache_file;
 
 pub use gpu::{RenderError, Renderer, WorkingSetLimit, give_back_memory, start_gpu_early};
-pub use images::{ImageUpload, Images, image_size, register_image, set_files_from};
+pub use images::{ImageUpload, Images, MemoryImage, image_size, register_image, set_files_from};
 pub use paint::{Color, Paint, has_hover, has_pressed};
 pub use scene::{
     Batch, ContentBox, Editing, EditingLines, Filter, Interaction, Layer, Overlay, OverlayBox, OverlayText, Ripple,

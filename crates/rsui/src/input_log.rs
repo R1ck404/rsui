@@ -53,7 +53,7 @@ impl Drop for Span {
 
 /// The time now, in nanoseconds of the monotonic clock, which every process on the machine shares too.
 #[cfg(unix)]
-pub(crate) fn now() -> i64 {
+fn clock() -> i64 {
     let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `now` is a valid place for the time.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
@@ -62,7 +62,7 @@ pub(crate) fn now() -> i64 {
 
 /// The time now, in performance counter ticks.
 #[cfg(windows)]
-pub(crate) fn now() -> i64 {
+fn clock() -> i64 {
     let mut ticks = 0;
     // SAFETY: `ticks` is a valid place for the count, and this can't fail on Windows XP and later.
     unsafe {
@@ -71,12 +71,18 @@ pub(crate) fn now() -> i64 {
     ticks
 }
 
+/// Starts an optional interval. Disabled instrumentation never reads the platform clock.
+pub(crate) fn now() -> i64 {
+    if on() { clock() } else { 0 }
+}
+
 /// Writes down that `what` was handled from `start` until now, with `extra` after it.
 pub(crate) fn note(what: &str, start: i64, extra: std::fmt::Arguments) {
-    let end = now();
-    if let Some(file) = file()
-        && let Ok(mut file) = file.lock()
-    {
+    let Some(file) = file() else {
+        return;
+    };
+    let end = clock();
+    if let Ok(mut file) = file.lock() {
         let _ = writeln!(file, "{what} {start} {end} {extra}");
     }
 }

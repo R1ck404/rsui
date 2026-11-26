@@ -156,6 +156,7 @@ pub const MOVES_PAINT: &[&str] = &[
     "opacity",
     "disabled",
     "css_filter",
+    "backdrop_blur",
     // Drawn around it, past its edges, or cut to a shape.
     "shadows",
     "shadow_blur",

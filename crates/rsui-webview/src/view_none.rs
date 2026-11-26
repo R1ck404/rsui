@@ -43,6 +43,7 @@ impl WebView {
     pub fn focus(&self) {}
     pub fn blur(&self) {}
     pub fn set_zoom(&self, _factor: f64) {}
+    pub fn set_keys(&self, _keys: Vec<Key>) {}
 
     pub fn cookies(&self, _url: &str, call: u64) {
         (self.sink.borrow_mut())(Event::Cookies { call, result: Err(crate::runtime::missing()) });
