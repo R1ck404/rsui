@@ -1,0 +1,17 @@
+{
+  "name": "rsui-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A terminal where the windows are a strip: near-full-width columns side by side that you slide between.",
+  "dependencies": {
+    "blode-icons-react": "^1.0.1",
+    "tailwindcss": "^4.3.5"
+  },
+  "scripts": {
+    "start": "rsui-tsx app.tsx",
+    "test": "node --import ./test/register.mjs --test test/*.test.ts",
+    "pack": "rsui-tsx --pack terminal.exe app.tsx"
+  },
+  "license": "MIT OR Apache-2.0"
+}

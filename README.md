@@ -26,6 +26,8 @@ rsui-tsx app.tsx
 That opens a window, which updates when you save `app.tsx`. `rsui.d.ts` next to it is the whole API. `AGENTS.md` tells an agent how
 to check its work with no window.
 `rsui-tsx --pack my-app.exe app.tsx` makes one program you can hand to someone.
+If it crashes, Windows shows a dialog with **Report on GitHub**, which opens a prefilled issue in the RSUI repository.
+**Copy details** includes the panic message and backtrace when available, so you can review them before sharing.
 
 ## An app
 
@@ -60,6 +62,10 @@ opens a folder of 25,000 files in about 80 ms.
 [`demos/browser`](demos/browser) is a calm, minimal web browser laid out like Arc: tabs in a sidebar on a tinted frame, a command
 bar, spaces with sign-ins kept apart, sleeping tabs and a first-run tour, all drawn by rsui, with each page in the system's
 browser view through rsui's `<webview>` element.
+
+[`demos/terminal`](demos/terminal) is a terminal whose shells are a strip of near-full-width columns you slide between, with an
+overview of them all, shell integration (marks, jumping between prompts, copying a command's output), search, hints, vi copy
+mode, a dropdown mode, recording to asciinema files, and its own emulator, all in TypeScript over ConPTY.
 
 ## For agents
 
@@ -97,7 +103,7 @@ Working on an app needs no window and no person.
 - Events and the DOM: events carry where the pointer was and which keys were held. Keys reach `keydown` handlers before a field takes
   them. Clipboard, text composition, `tabIndex`, drag and drop (including from other programs), `document.addEventListener`,
   `scrollTop`, `scrollIntoView` and `scroll` events all work, and so do refs to elements, `getBoundingClientRect` and
-  `getComputedStyle`. `<dialog>` has `showModal()`. `scrollbar-color` and `scrollbar-width` are supported.
+  `getComputedStyle`. `<dialog>` has `showModal()`. `scrollbar-color` and `scrollbar-width` are supported. So is `::-webkit-scrollbar`: a `::-webkit-scrollbar-thumb` with `border-radius` and a transparent `border` draws a thin pill with room round it, and a bar only takes room once there's more to see.
 - Browser state: `localStorage` works, and `history` and `location` are kept in memory, so react-router's `BrowserRouter` runs as it is.
   A rejected promise with nothing to catch it is logged and delivered to `unhandledrejection`, as in a browser.
 - Libraries from npm run as they are. Packages are found the way a bundler for a browser finds them, using their `browser` builds, and
