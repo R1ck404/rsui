@@ -8,3 +8,12 @@ node_modules/
 # whoever recorded it, so none belongs here.
 rsui-storage/
 *.rsuitrace
+
+# Programs packed beside a demo go in a release, not the tree.
+*.exe
+
+# Left by a PowerShell run with its profile folder pointed here.
+demos/*/Microsoft/
+
+# Local measurements, which hold the paths of whoever ran them.
+/performance-audit/
