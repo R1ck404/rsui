@@ -3785,7 +3785,12 @@ fn build_host(
         }
     }
     element.key = key;
-    if element.key.is_none() && (!handlers.is_empty() || native.is_some()) && !keyed_root {
+    let is_native = native.is_some();
+    let handled = !handlers.is_empty() || is_native;
+    // A key only has to be different from its siblings', so rows of two lists in one component can share one. What
+    // handles something is found by its key in its component, so the second such row takes a key of its own.
+    let taken = |cx: &Cx<'_>, element: &Element| element.key.as_ref().is_some_and(|key| cx.handles_key(key));
+    if (element.key.is_none() && handled && !keyed_root) || (handled && taken(cx, &element)) {
         element.key = Some(auto.next());
     }
     if let Some(native) = native {
@@ -3802,6 +3807,10 @@ fn build_host(
                 element = element.child(build_kid(cx, kid, auto, old));
             }
         }
+    }
+    // What's inside it is wired up first, and can have taken the key since. A native control's key is already its own.
+    if !is_native && !handlers.is_empty() && taken(cx, &element) {
+        element.key = Some(auto.next());
     }
     wire_handlers(cx, element, handlers)
 }

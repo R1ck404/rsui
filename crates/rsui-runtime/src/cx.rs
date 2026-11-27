@@ -895,6 +895,15 @@ impl<'a> Cx<'a> {
         element.action(action)
     }
 
+    /// Whether this component already handles something for an element with `key`, which
+    /// [`on`](Self::on) can't be given again for the same action.
+    pub fn handles_key(&self, key: &Key) -> bool {
+        self.store.instances[self.id as usize]
+            .handlers
+            .iter()
+            .any(|existing| existing.key == *key)
+    }
+
     /// Renders a child component. It keeps its state from one render to the next as
     /// long as it's called in the same position among unkeyed children, and it only
     /// renders again if `props` changed or its state did.
