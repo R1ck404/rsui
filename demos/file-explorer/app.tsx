@@ -21,7 +21,7 @@ import { mainWindow, useColorScheme } from 'rsui';
 import { PageWindow } from 'rsui/web';
 import './app.css';
 
-import { COMPUTER, nameOf, normalize, readDrives, type Drive } from './src/files';
+import { COMPUTER, driveName, nameOf, normalize, readDrives, type Drive } from './src/files';
 import { Customize, Splitter, Tabs, WindowButtons, type TabView } from './src/Chrome';
 import * as I from './src/icons';
 import { keyOf } from './src/keys';
@@ -818,7 +818,7 @@ function App() {
         const drive = drives.find((d) => d.path.toLowerCase() === folder.toLowerCase());
         return {
             id: one.id,
-            title: folder === COMPUTER ? 'This PC' : drive ? (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')' : nameOf(folder),
+            title: drive ? driveName(drive) : nameOf(folder),
             icon: folder === COMPUTER ? I.ComputerIcon : drive ? driveIcon(drive.kind) : I.FolderIcon,
             panes: one.panes.length,
         };

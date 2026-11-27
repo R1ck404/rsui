@@ -8,7 +8,7 @@ import { promises as fs, watch } from 'fs';
 import { exec } from 'child_process';
 
 import {
-    COMPUTER, formatSize, freeName, join, matcher, nameOf, parentOf, readFolder, search, sortEntries, transfer, type Drive, type Entry,
+    COMPUTER, driveName, formatSize, freeName, join, matcher, nameOf, parentOf, readFolder, search, sortEntries, transfer, type Drive, type Entry,
 } from './files';
 import { keyOf } from './keys';
 import { COLUMN_WIDTH, ColumnHeaders, FileList, type Handlers, type Look } from './List';
@@ -135,7 +135,7 @@ function shownItems(
 ): Entry[] {
     if (folder === COMPUTER) {
         return drives.map((drive) => ({
-            name: (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')',
+            name: driveName(drive),
             path: drive.path,
             ext: '',
             kind: 'folder' as const,
@@ -960,7 +960,7 @@ function Drives(props: { drives: Drive[]; settings: Settings; onOpen: (path: str
                             <span className="flex shrink-0 text-(--fx-accent)"><Icon size={30} strokeWidth={1.4} /></span>
                             <span className="flex min-w-0 flex-1 flex-col gap-1.5">
                                 <span className="truncate font-medium">
-                                    {drive.label || 'Local Disk'} ({drive.path.slice(0, 2)})
+                                    {driveName(drive)}
                                 </span>
                                 {drive.total > 0 ? (
                                     <>

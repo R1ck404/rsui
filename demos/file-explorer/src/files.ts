@@ -76,41 +76,90 @@ export function kindLabel(entry: Entry): string {
     return LABELS[entry.kind];
 }
 
+/** Windows paths start at a drive and are split by `\`. Everywhere else there's one tree, from `/`. */
+export const WINDOWS = process.platform === 'win32';
+export const SEP = WINDOWS ? '\\' : '/';
+
+/** Whether `path` is where a tree starts: a drive, as `C:\`, or `/`. */
+function isRoot(path: string): boolean {
+    return WINDOWS ? /^[A-Za-z]:\\?$/.test(path) : path === '/';
+}
+
+/** `path` without the separators it ends in, unless it's a root. */
+function trimmed(path: string): string {
+    if (isRoot(path)) {
+        return path;
+    }
+    return WINDOWS ? path.replace(/\\+$/, '') : path.replace(/\/+$/, '');
+}
+
 export function join(folder: string, name: string): string {
-    return folder.endsWith('\\') ? folder + name : folder + '\\' + name;
+    return folder.endsWith(SEP) ? folder + name : folder + SEP + name;
+}
+
+/** Whether `path` is inside `folder`, comparing names as the system does: in any case on Windows. */
+export function isInside(path: string, folder: string): boolean {
+    const [inner, outer] = WINDOWS ? [path.toLowerCase(), folder.toLowerCase()] : [path, folder];
+    return inner.startsWith(outer.endsWith(SEP) ? outer : outer + SEP);
+}
+
+/** Whether two paths are the same, as the system compares them. */
+export function samePath(one: string, other: string): boolean {
+    return WINDOWS ? one.toLowerCase() === other.toLowerCase() : one === other;
 }
 
 /** The folder a path is in, or `COMPUTER` for a drive's root. */
 export function parentOf(path: string): string {
-    if (path === COMPUTER || /^[A-Za-z]:\\?$/.test(path)) {
+    if (path === COMPUTER || isRoot(path)) {
         return COMPUTER;
     }
-    const cut = path.replace(/\\+$/, '').lastIndexOf('\\');
+    const clean = trimmed(path);
+    const cut = clean.lastIndexOf(SEP);
     if (cut < 0) {
         return COMPUTER;
     }
-    const parent = path.slice(0, cut);
+    if (!WINDOWS && cut === 0) {
+        return '/';
+    }
+    const parent = clean.slice(0, cut);
     return /^[A-Za-z]:$/.test(parent) ? parent + '\\' : parent;
+}
+
+/** What a drive is called: its label and letter on Windows, as `Local Disk (C:)`, and its label or folder elsewhere. */
+export function driveName(drive: { label: string; path: string }): string {
+    if (WINDOWS) {
+        return (drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')';
+    }
+    return drive.label || (drive.path === '/' ? 'File System' : nameOf(drive.path));
 }
 
 export function nameOf(path: string): string {
     if (path === COMPUTER) {
-        return 'This PC';
+        return WINDOWS ? 'This PC' : 'Computer';
     }
-    if (/^[A-Za-z]:\\?$/.test(path)) {
-        return path.slice(0, 2).toUpperCase();
+    if (isRoot(path)) {
+        return WINDOWS ? path.slice(0, 2).toUpperCase() : '/';
     }
-    const trimmed = path.replace(/\\+$/, '');
-    return trimmed.slice(trimmed.lastIndexOf('\\') + 1);
+    const clean = trimmed(path);
+    return clean.slice(clean.lastIndexOf(SEP) + 1);
 }
 
 /** Each folder from the drive down to `path`, for breadcrumbs. */
 export function crumbsOf(path: string): { name: string; path: string }[] {
-    const crumbs = [{ name: 'This PC', path: COMPUTER }];
+    const crumbs = [{ name: nameOf(COMPUTER), path: COMPUTER }];
     if (path === COMPUTER) {
         return crumbs;
     }
-    const parts = path.replace(/\\+$/, '').split('\\');
+    if (!WINDOWS) {
+        crumbs.push({ name: '/', path: '/' });
+        let at = '/';
+        for (const part of trimmed(path).split('/').filter((part) => part !== '')) {
+            at = join(at, part);
+            crumbs.push({ name: part, path: at });
+        }
+        return crumbs;
+    }
+    const parts = trimmed(path).split('\\');
     let at = '';
     for (const part of parts) {
         at = at === '' ? part + '\\' : join(at, part);
@@ -120,14 +169,16 @@ export function crumbsOf(path: string): { name: string; path: string }[] {
 }
 
 export function normalize(path: string): string {
-    let clean = path.trim().replace(/\//g, '\\').replace(/^"|"$/g, '');
+    let clean = path.trim().replace(/^"|"$/g, '');
+    if (!WINDOWS) {
+        clean = clean.replace(/\/{2,}/g, '/');
+        return clean === '' ? '/' : trimmed(clean);
+    }
+    clean = clean.replace(/\//g, '\\');
     if (/^[A-Za-z]:$/.test(clean)) {
         clean += '\\';
     }
-    if (clean.length > 3) {
-        clean = clean.replace(/\\+$/, '');
-    }
-    return clean;
+    return trimmed(clean);
 }
 
 function entryOf(folder: string, found: FolderEntry): Entry {
@@ -380,7 +431,7 @@ export async function search(
             }
             folders += 1;
             const batch: Entry[] = [];
-            const within = folder === root ? '' : folder.slice(root.length).replace(/^\\/, '');
+            const within = folder === root ? '' : folder.slice(root.length).replace(WINDOWS ? /^\\/ : /^\//, '');
             for (const entry of listed) {
                 if (!options.hidden && (entry.hidden || entry.system)) {
                     continue;
@@ -439,14 +490,14 @@ export async function transfer(paths: string[], folder: string, move: boolean): 
     const taken = new Set((await fs.readdir(folder)).map(String));
     const made: string[] = [];
     for (const from of paths) {
-        const sameFolder = parentOf(from).toLowerCase() === folder.toLowerCase();
+        const sameFolder = samePath(parentOf(from), folder);
         if (move && sameFolder) {
             continue;
         }
         const name = freeName(taken, nameOf(from));
         taken.add(name);
         const to = join(folder, name);
-        if (folder.toLowerCase().startsWith(from.toLowerCase() + '\\')) {
+        if (samePath(folder, from) || isInside(folder, from)) {
             throw new Error(`can't put ${nameOf(from)} inside itself`);
         }
         if (move) {

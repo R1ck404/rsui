@@ -391,7 +391,7 @@ export const SECTIONS: Section[] = [
         fields: [
             { key: 'openWith', label: 'Open items with', kind: 'choice', options: [['double', 'Double click'], ['single', 'Single click']] },
             { key: 'startAt', label: 'Start in', kind: 'choice', options: [['home', 'Home folder'], ['computer', 'This PC'], ['last', 'Last folder'], ['custom', 'A folder I choose']] },
-            { key: 'startPath', label: 'Start folder', hint: 'Used when "Start in" is set to a folder you choose.', kind: 'text', placeholder: 'C:\\Users\\you\\Projects', browse: true },
+            { key: 'startPath', label: 'Start folder', hint: 'Used when "Start in" is set to a folder you choose.', kind: 'text', placeholder: process.platform === 'win32' ? 'C:\\Users\\you\\Projects' : '/home/you/Projects', browse: true },
             { key: 'confirmDelete', label: 'Ask before deleting', kind: 'toggle' },
             { key: 'useRecycleBin', label: 'Delete to the Recycle Bin', hint: 'Off deletes for good.', kind: 'toggle' },
             { key: 'liveRefresh', label: 'Update as files change', hint: 'Watches the open folder.', kind: 'toggle' },

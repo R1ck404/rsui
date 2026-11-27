@@ -3,7 +3,7 @@
 // the sections too, by their headings, and the order is kept.
 
 import { app } from 'rsui/desktop';
-import { COMPUTER, formatSize, nameOf, type Drive } from './files';
+import { COMPUTER, driveName, formatSize, nameOf, SEP, WINDOWS, type Drive } from './files';
 import * as I from './icons';
 import { moved, ordered, useReorder, type Reorder } from './reorder';
 import type { Settings } from './settings';
@@ -21,7 +21,7 @@ export const PLACES: { name: string; path: string; icon: any }[] = [
     { name: 'Videos', path: paths.videos ?? '', icon: I.VideoIcon },
 ].filter((place) => place.path !== '');
 
-export const HOME = paths.home ?? 'C:\\';
+export const HOME = paths.home ?? (WINDOWS ? 'C:' + SEP : SEP);
 
 export function driveIcon(kind: string): any {
     return kind === 'removable' ? I.UsbIcon : kind === 'network' ? I.CloudIcon : kind === 'optical' ? I.DiskIcon : I.DriveIcon;
@@ -267,7 +267,7 @@ export function Sidebar(props: {
                     return (
                         <Item
                             key={key}
-                            name={(drive.label || 'Local Disk') + ' (' + drive.path.slice(0, 2) + ')'}
+                            name={driveName(drive)}
                             icon={driveIcon(drive.kind)}
                             stroke={stroke}
                                 rail={rail}

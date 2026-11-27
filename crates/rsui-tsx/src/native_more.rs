@@ -544,16 +544,26 @@ fn host_window_on_state(vm: &mut Vm, args: Args) -> Result<Value, Value> {
 
 fn host_app_paths(vm: &mut Vm, _: Args) -> Result<Value, Value> {
     let out = vm.new_object();
-    let env = |name: &str| std::env::var(name).ok();
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
     let program = std::env::current_exe().ok().map(|path| path.display().to_string());
     let app = bridge::app_file().display().to_string();
     let name = bridge::program_name();
-    let app_data = env("APPDATA").map(|folder| PathBuf::from(folder).join(&name).display().to_string());
+    // Elsewhere than Windows, settings go where the XDG folders say, as Electron has them.
+    let (home, roaming, local) = if cfg!(windows) {
+        (env("USERPROFILE"), env("APPDATA"), env("LOCALAPPDATA"))
+    } else {
+        let home = env("HOME");
+        let under = |variable: &str, folder: &str| {
+            env(variable).or_else(|| home.as_ref().map(|home| PathBuf::from(home).join(folder).display().to_string()))
+        };
+        (home.clone(), under("XDG_CONFIG_HOME", ".config"), under("XDG_DATA_HOME", ".local/share"))
+    };
+    let app_data = roaming.as_ref().map(|folder| PathBuf::from(folder).join(&name).display().to_string());
     let temp = std::env::temp_dir().display().to_string();
     let mut paths: Vec<(&str, Option<String>)> = vec![
-        ("home", env("USERPROFILE")),
-        ("appData", env("APPDATA")),
-        ("localAppData", env("LOCALAPPDATA")),
+        ("home", home),
+        ("appData", roaming),
+        ("localAppData", local),
         ("userData", app_data),
         ("temp", Some(temp)),
         ("exe", program),
