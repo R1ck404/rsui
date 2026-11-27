@@ -123,9 +123,11 @@ $compiled = @(Get-ChildItem $classes -Recurse -Filter *.class | ForEach-Object F
 & "$($tools.FullName)\d8.bat" --release --min-api 29 --lib "$($platform.FullName)\android.jar" --output $work $compiled
 if ($LASTEXITCODE -ne 0) { throw 'd8 failed' }
 
-# The app's files, and the list of them, which is what the library copies out on the phone.
+# The app's files, and the list of them, which is what the library copies out on the phone. Only the path inside the
+# app's folder is looked at, so a checkout under C:\Users\Public or a folder called assets doesn't take everything.
 $files = Get-ChildItem $appPath -Recurse -File | Where-Object {
-    $_.FullName -notmatch '\\(\.git|screenshots|target)\\' -and $_.Extension -notin '.rsuitrace', '.exe', '.png' -or $_.FullName -match '\\(assets|public)\\'
+    $inside = '\' + $_.FullName.Substring($appPath.Length + 1)
+    $inside -notmatch '\\(\.git|screenshots|target)\\' -and $_.Extension -notin '.rsuitrace', '.exe', '.png' -or $inside -match '\\(assets|public)\\'
 }
 $list = foreach ($file in $files) {
     $relative = $file.FullName.Substring($appPath.Length + 1)
