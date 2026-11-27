@@ -636,6 +636,14 @@ pub(super) const NATIVES: [(&str, u8, crate::object::NativeFn); 5] = [
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// What's watched is kept for the whole process, and the first test ends by stopping all of it, which would stop
+    /// the other's watcher too if they ran at the same time. So they take turns.
+    fn one_at_a_time() -> MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// Runs a program in a folder of its own, which it's given as `dir`, and says what it printed.
     fn run(name: &str, source: &str) -> String {
@@ -657,6 +665,7 @@ mod tests {
 
     #[test]
     fn changes_are_told_of_and_the_thread_goes_when_nothing_is_watched() {
+        let _turn = one_at_a_time();
         let shown = run(
             "events",
             r#"
@@ -708,6 +717,7 @@ mod tests {
 
     #[test]
     fn watch_file_says_what_the_file_was_and_is() {
+        let _turn = one_at_a_time();
         let shown = run(
             "poll",
             r#"
