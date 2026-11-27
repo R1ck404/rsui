@@ -554,6 +554,25 @@ pub fn pack_with_options(
                     }
                     Vec::new()
                 };
+                // A worker's script, and what it imports, is only read once the worker's started, which can be later
+                // than packing waits for. The app's own files say which they are, and each is started once to see.
+                let mut graph = graph;
+                let main = pack::plain_path(&std::fs::canonicalize(&app).unwrap_or_else(|_| app.clone()));
+                let mut workers: Vec<PathBuf> = Vec::new();
+                for file in bridge::loaded_files().iter().chain(graph.clone().iter()) {
+                    if pack::package_folder(file).is_some() {
+                        continue;
+                    }
+                    for worker in pack::worker_files(file, &main) {
+                        if !workers.contains(&worker) {
+                            workers.push(worker);
+                        }
+                    }
+                }
+                for worker in workers {
+                    graph.extend(rsui_js::files_a_worker_loads(&worker));
+                    graph.push(worker);
+                }
                 bridge::before_packing();
                 if let Some(build) = &build {
                     build.validate().map_err(Error::Script)?;

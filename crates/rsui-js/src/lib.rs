@@ -85,6 +85,7 @@ pub use packed::{
     packed_diagnostics, read_packed_file, running_packed,
 };
 pub use source_overlay::{SourceOverlay, with_source_overlay};
+pub use worker::files_a_worker_loads;
 pub use startup::write as write_startup_times;
 
 /// Starts reading the files this packed program ran when it was packed, on other threads, so they're ready by the time

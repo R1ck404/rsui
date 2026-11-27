@@ -332,6 +332,56 @@ pub(crate) fn dynamic_imports(file: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The scripts `file` starts workers with, as `new Worker("./worker.ts")` or `new Worker(new URL("./worker.ts",
+/// import.meta.url))` has them. A path on its own is from where the app is, `main`, as rsui's `Worker` takes it, and one
+/// in a URL from the file that says it.
+pub(crate) fn worker_files(file: &Path, main: &Path) -> Vec<PathBuf> {
+    let Ok(source) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    let quoted = |said: &str| -> Option<String> {
+        let quote = said.chars().next().filter(|quote| matches!(quote, '"' | '\'' | '`'))?;
+        let end = said[1..].find(quote)?;
+        let wanted = &said[1..=end];
+        (!wanted.contains("${")).then(|| wanted.to_owned())
+    };
+    let mut found = Vec::new();
+    for start in ["new Worker(", "new SharedWorker("] {
+        let mut rest = source.as_str();
+        while let Some(at) = rest.find(start) {
+            rest = &rest[at + start.len()..];
+            let said = rest.trim_start();
+            let (wanted, from) = if let Some(inside) = said.strip_prefix("new URL(") {
+                let inside = inside.trim_start();
+                let Some(wanted) = quoted(inside) else {
+                    continue;
+                };
+                let after = inside[wanted.len() + 2..].trim_start();
+                if !after.starts_with(',') || !after[1..].trim_start().starts_with("import.meta.url") {
+                    continue;
+                }
+                (wanted, file.parent())
+            } else {
+                let Some(wanted) = quoted(said) else {
+                    continue;
+                };
+                (wanted, main.parent())
+            };
+            let Some(from) = from else {
+                continue;
+            };
+            let wanted = wanted.strip_prefix("file://").map_or(wanted.as_str(), |rest| rest);
+            if let Ok(path) = std::fs::canonicalize(from.join(wanted)) {
+                let path = plain_path(&path);
+                if path.is_file() && !found.contains(&path) {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// The folder of the package this file's in, if it's in one: what comes after the last `node_modules`, or
 /// the two parts after it for one with a scope.
 pub(crate) fn package_folder(path: &Path) -> Option<PathBuf> {
@@ -630,6 +680,35 @@ mod tests {
             Some(PathBuf::from(r"C:\a\node_modules\one\node_modules\two"))
         );
         assert_eq!(of(r"C:\a\src\x.js"), None);
+    }
+
+    #[test]
+    fn the_scripts_an_app_starts_workers_with_are_found() {
+        let folder = std::env::temp_dir().join(format!("rsui-pack-workers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        for (path, text) in [
+            ("app.tsx", ""),
+            (
+                "src/view.ts",
+                "new Worker('./src/workers/a.ts'); new Worker(new URL('./b.ts', import.meta.url), { type: 'module' });\n\
+                 new SharedWorker(`./src/c.js`); new Worker(name); new Worker(`./src/${name}.ts`); new Worker('./gone.ts');",
+            ),
+            ("src/workers/a.ts", ""),
+            ("src/b.ts", ""),
+            ("src/c.js", ""),
+        ] {
+            let path = folder.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let folder = plain_path(&std::fs::canonicalize(&folder).unwrap());
+        let found = worker_files(&folder.join("src/view.ts"), &folder.join("app.tsx"));
+        let names: Vec<_> = found
+            .iter()
+            .map(|path| path.strip_prefix(&folder).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(names, ["src/workers/a.ts", "src/b.ts", "src/c.js"]);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

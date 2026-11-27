@@ -316,6 +316,25 @@ fn link(number: u32) -> Option<Arc<Link>> {
     workers().lock().ok()?.get(&number).cloned()
 }
 
+/// The files a worker started with `file` reads as it starts, which a packed program has to have in it as well. It's
+/// started on a thread of its own, as it would be, and let go of once it's waiting for its first message.
+pub fn files_a_worker_loads(file: &Path) -> Vec<PathBuf> {
+    let file = file.to_owned();
+    let started = std::thread::Builder::new()
+        .name("rsui worker, for packing".into())
+        .stack_size(STACK)
+        .spawn(move || {
+            let mut engine = crate::Engine::new();
+            engine.set_stack_limit(STACK / 8 * 7);
+            if engine.load_worker_globals().is_err() {
+                return Vec::new();
+            }
+            let _ = engine.run_file(&file);
+            engine.loaded_files()
+        });
+    started.ok().and_then(|thread| thread.join().ok()).unwrap_or_default()
+}
+
 fn run_worker(link: &Arc<Link>, file: &Path) -> Result<(), String> {
     let mut engine = crate::Engine::new();
     engine.set_stack_limit(STACK / 8 * 7);
